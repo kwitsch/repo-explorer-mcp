@@ -12,3 +12,6 @@ thiserror = "2"
 # Gates the in-crate `MockMemoryBackend` (memory::mock) for downstream tests.
 # Empty feature set: no extra dependencies, module-visibility gate only.
 test-support = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
