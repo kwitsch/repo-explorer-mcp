@@ -7,3 +7,8 @@ edition.workspace = true
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 thiserror = "2"
+
+[features]
+# Gates the in-crate `MockMemoryBackend` (memory::mock) for downstream tests.
+# Empty feature set: no extra dependencies, module-visibility gate only.
+test-support = []
