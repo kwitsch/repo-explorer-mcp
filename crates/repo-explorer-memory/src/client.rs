@@ -110,7 +110,8 @@ pub(crate) fn decode_result(
 
 /// Derive the project name from the repo root's final path component (matching
 /// `index_repository`'s documented default of the directory name). Root or
-/// non-UTF-8 paths error as `Transport`.
+/// non-UTF-8 paths error as `InvalidInput` — a bad `repo_root` is not a
+/// transport/connection failure, so callers must not treat it as retryable.
 ///
 /// Canonicalizes `repo_root` first — same normalization `run_index` applies
 /// before calling `index_repository` — so a relative value like `.` resolves
@@ -121,7 +122,7 @@ pub(crate) fn project_name(repo_root: &Path) -> Result<String, MemoryError> {
         .and_then(|n| n.to_str())
         .map(|s| s.to_string())
         .ok_or_else(|| {
-            MemoryError::Transport(format!(
+            MemoryError::InvalidInput(format!(
                 "cannot derive project name from repo_root `{}`",
                 repo_root.display()
             ))
@@ -163,6 +164,6 @@ mod tests {
     #[test]
     fn project_name_root_path_errors() {
         let err = project_name(Path::new("/")).unwrap_err();
-        assert!(matches!(err, MemoryError::Transport(_)));
+        assert!(matches!(err, MemoryError::InvalidInput(_)));
     }
 }

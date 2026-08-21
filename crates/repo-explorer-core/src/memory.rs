@@ -59,6 +59,10 @@ pub enum MemoryError {
     /// The chosen transport is not supported in this stage (e.g. network endpoint).
     #[error("unsupported codebase-memory transport: {0}")]
     UnsupportedTransport(String),
+    /// `repo_root` could not be turned into a valid input (e.g. a project
+    /// name), independent of any connection to the backend.
+    #[error("invalid codebase-memory input: {0}")]
+    InvalidInput(String),
 }
 
 /// The exploration contract implemented by a concrete memory backend.
@@ -139,18 +143,22 @@ pub mod mock {
             query: GraphQuery,
         },
         QueryGraph {
+            repo_root: PathBuf,
             query: String,
             max_results: Option<u32>,
         },
         TracePath {
+            repo_root: PathBuf,
             from: String,
             to: String,
             max_depth: Option<u32>,
         },
         GetArchitecture {
+            repo_root: PathBuf,
             depth: Option<u32>,
         },
         GetCodeSnippet {
+            repo_root: PathBuf,
             target: SnippetTarget,
         },
     }
@@ -289,11 +297,12 @@ pub mod mock {
 
         async fn query_graph(
             &self,
-            _repo_root: &Path,
+            repo_root: &Path,
             query: &str,
             max_results: Option<u32>,
         ) -> Result<ExplorationResult, MemoryError> {
             self.record(Call::QueryGraph {
+                repo_root: repo_root.to_path_buf(),
                 query: query.to_string(),
                 max_results,
             });
@@ -302,12 +311,13 @@ pub mod mock {
 
         async fn trace_path(
             &self,
-            _repo_root: &Path,
+            repo_root: &Path,
             from: &str,
             to: &str,
             max_depth: Option<u32>,
         ) -> Result<ExplorationResult, MemoryError> {
             self.record(Call::TracePath {
+                repo_root: repo_root.to_path_buf(),
                 from: from.to_string(),
                 to: to.to_string(),
                 max_depth,
@@ -317,19 +327,23 @@ pub mod mock {
 
         async fn get_architecture(
             &self,
-            _repo_root: &Path,
+            repo_root: &Path,
             depth: Option<u32>,
         ) -> Result<ExplorationResult, MemoryError> {
-            self.record(Call::GetArchitecture { depth });
+            self.record(Call::GetArchitecture {
+                repo_root: repo_root.to_path_buf(),
+                depth,
+            });
             self.get_architecture.clone()
         }
 
         async fn get_code_snippet(
             &self,
-            _repo_root: &Path,
+            repo_root: &Path,
             target: &SnippetTarget,
         ) -> Result<ExplorationResult, MemoryError> {
             self.record(Call::GetCodeSnippet {
+                repo_root: repo_root.to_path_buf(),
                 target: target.clone(),
             });
             self.get_code_snippet.clone()
@@ -487,6 +501,7 @@ mod tests {
         assert_eq!(
             calls[3],
             Call::QueryGraph {
+                repo_root: root.clone(),
                 query: "MATCH".to_string(),
                 max_results: Some(5)
             }
@@ -494,6 +509,7 @@ mod tests {
         assert_eq!(
             calls[4],
             Call::TracePath {
+                repo_root: root.clone(),
                 from: "a".to_string(),
                 to: "b".to_string(),
                 max_depth: Some(3)
