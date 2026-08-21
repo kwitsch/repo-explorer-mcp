@@ -1,0 +1,25 @@
+[llm]
+cooldown_seconds = 90
+
+[[llm.providers]]
+name = "primary"
+kind = "anthropic"
+api_key_env = "REPO_EXPLORER_TEST_KEY_VALID"
+model = "claude-sonnet-4"
+
+[[llm.providers]]
+name = "secondary"
+kind = "openai"
+api_key_env = "REPO_EXPLORER_TEST_KEY_VALID"
+model = "gpt-4o"
+
+[codebase_memory]
+command = "codebase-memory-mcp"
+args = ["--stdio"]
+
+[search]
+timeout_seconds = 45
+prefer_rtk = false
+
+[logging]
+level = "debug"
