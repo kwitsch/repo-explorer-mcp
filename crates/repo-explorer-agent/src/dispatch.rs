@@ -103,7 +103,7 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
                 mode: SearchMode::Content,
                 max_results: args.max_results,
             };
-            let scope = args.scope.map(PathBuf::from);
+            let scope = validate_scope(args.scope.as_deref())?;
             let findings = search
                 .search(repo_root, &args.pattern, scope.as_deref(), &opts)
                 .await
@@ -116,7 +116,7 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
                 mode: SearchMode::FileName,
                 max_results: args.max_results,
             };
-            let scope = args.scope.map(PathBuf::from);
+            let scope = validate_scope(args.scope.as_deref())?;
             let findings = search
                 .search(repo_root, &args.pattern, scope.as_deref(), &opts)
                 .await
@@ -150,6 +150,21 @@ fn snippet_target(args: GetCodeSnippetArgs) -> Result<SnippetTarget, String> {
     }
 }
 
+/// Reject a model-supplied `scope` that is absolute or escapes the repository
+/// root via a `..` component, mirroring `read_file`'s guard below — a
+/// filesystem-backed `SearchBackend` must not be handed a path that walks
+/// outside `repo_root`.
+fn validate_scope(scope: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let Some(scope) = scope else {
+        return Ok(None);
+    };
+    let rel = Path::new(scope);
+    if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!("scope `{scope}` escapes the repository root"));
+    }
+    Ok(Some(rel.to_path_buf()))
+}
+
 fn read_file(
     repo_root: &Path,
     path: &str,
@@ -163,7 +178,16 @@ fn read_file(
         ));
     }
     let full = repo_root.join(rel);
-    let contents = std::fs::read_to_string(&full)
+    let canonical_full =
+        std::fs::canonicalize(&full).map_err(|e| format!("read_file failed for `{path}`: {e}"))?;
+    let canonical_root = std::fs::canonicalize(repo_root)
+        .map_err(|e| format!("read_file failed for `{path}`: {e}"))?;
+    if !canonical_full.starts_with(&canonical_root) {
+        return Err(format!(
+            "read_file path `{path}` escapes the repository root"
+        ));
+    }
+    let contents = std::fs::read_to_string(&canonical_full)
         .map_err(|e| format!("read_file failed for `{path}`: {e}"))?;
     Ok(slice_lines(&contents, start_line, end_line))
 }

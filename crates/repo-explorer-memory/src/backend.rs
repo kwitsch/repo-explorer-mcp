@@ -106,11 +106,14 @@ impl MemoryClientBackend {
     /// -> `IndexingFailed`; transport failure -> `Err`.
     async fn run_index(&self, repo_root: &Path) -> Result<IndexStatus, MemoryError> {
         let abs = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+        let path_str = abs.to_str().ok_or_else(|| {
+            MemoryError::InvalidInput(format!(
+                "repo_root `{}` is not valid UTF-8",
+                repo_root.display()
+            ))
+        })?;
         let mut args = Map::new();
-        args.insert(
-            "path".to_string(),
-            Value::String(abs.to_string_lossy().into_owned()),
-        );
+        args.insert("path".to_string(), Value::String(path_str.to_string()));
         match self.client.call("index_repository", args).await {
             Ok(_) => Ok(IndexStatus::Reindexed),
             Err(MemoryError::ToolFailed { message, .. }) => {
@@ -139,10 +142,12 @@ fn first_field<'a>(json: &'a Value, keys: &[&str]) -> Option<&'a Value> {
 /// Does a tool-failure message indicate "this project is not indexed yet"
 /// (as opposed to some other recoverable-or-not failure)? Matches the
 /// observed `codebase-memory-mcp` phrasing ("project not found or not
-/// indexed") case-insensitively so close variants still match.
+/// indexed") case-insensitively so close variants still match, while
+/// requiring "project" alongside a bare "not found" so unrelated failures
+/// (e.g. "config file not found") are not misclassified as "not indexed".
 fn is_not_indexed_error(message: &str) -> bool {
     let lower = message.to_lowercase();
-    lower.contains("not indexed") || lower.contains("not found")
+    lower.contains("not indexed") || (lower.contains("project") && lower.contains("not found"))
 }
 
 /// Build a `FileLocation` from a JSON row's `file`/`line_start`/`line_end`,

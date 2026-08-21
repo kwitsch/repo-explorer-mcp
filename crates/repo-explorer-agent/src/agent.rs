@@ -105,6 +105,21 @@ where
         // Step 3: turn loop.
         for _turn in 0..self.config.max_iterations {
             match self.router.complete_with_tools(&messages, &tools).await {
+                Ok(ProviderResponse::ToolCalls(calls)) if calls.is_empty() => {
+                    messages.push(Message {
+                        role: Role::Assistant,
+                        content: String::new(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                    messages.push(Message {
+                        role: Role::User,
+                        content: "You must respond with a tool call; call finish when done."
+                            .to_string(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                }
                 Ok(ProviderResponse::ToolCalls(calls)) => {
                     messages.push(Message {
                         role: Role::Assistant,

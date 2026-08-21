@@ -204,10 +204,14 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
 
         for entry in &self.entries {
             {
+                // Recover from a poisoned lock instead of propagating the panic:
+                // a prior panic while holding this entry's cooldown state must
+                // not turn into a permanent, unrecoverable failure of the whole
+                // failover router for the rest of the process lifetime.
                 let mut guard = entry
                     .cooling_until
                     .lock()
-                    .expect("router cooldown mutex poisoned");
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 match *guard {
                     Some(until) if now < until => {
                         cooling.push(&entry.name);
