@@ -1,0 +1,219 @@
+//! MCP server handler exposing the single `explore_repository` tool, plus the
+//! serde/schemars request/response DTOs and their mapping to/from the pure,
+//! serde-free `repo-explorer-core` domain types. Keeping the DTOs here (not on
+//! core) preserves the one-impure-dependency-per-crate convention.
+
+use repo_explorer_agent::AgentLoop;
+use repo_explorer_core::domain::{ExplorationQuery, ExplorationResult};
+use repo_explorer_core::llm::SystemClock;
+use repo_explorer_llm::GenaiProvider;
+use repo_explorer_memory::MemoryClientBackend;
+use repo_explorer_search::CliSearchBackend;
+use rmcp::{
+    Json, ServerHandler,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{ServerCapabilities, ServerInfo},
+    tool, tool_handler, tool_router,
+};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+/// The concrete agent type wired to the production backends. All backend trait
+/// methods and `AgentLoop::run` take `&self`, so a shared `Arc<Agent>` (no
+/// `Mutex`) supports concurrent tool calls.
+pub type Agent = AgentLoop<MemoryClientBackend, CliSearchBackend, GenaiProvider, SystemClock>;
+
+/// Input schema for `explore_repository`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ExploreRepositoryRequest {
+    /// Free-text exploration request.
+    query: String,
+    /// Optional path prefix to restrict the search to.
+    #[serde(default)]
+    scope_hint: Option<String>,
+    /// Optional cap on the number of findings.
+    #[serde(default)]
+    max_results: Option<u32>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct FileLocationDto {
+    path: String,
+    line_start: u32,
+    line_end: u32,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct ExplorationFindingDto {
+    location: FileLocationDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct ExplorationResultDto {
+    findings: Vec<ExplorationFindingDto>,
+    summary: String,
+}
+
+impl From<&ExplorationResult> for ExplorationResultDto {
+    fn from(result: &ExplorationResult) -> Self {
+        Self {
+            findings: result
+                .findings
+                .iter()
+                .map(|f| ExplorationFindingDto {
+                    location: FileLocationDto {
+                        // Deterministic; lossy only for non-UTF-8 path bytes,
+                        // acceptable for a display/JSON field.
+                        path: f.location.path.to_string_lossy().into_owned(),
+                        line_start: f.location.line_start,
+                        line_end: f.location.line_end,
+                    },
+                    snippet: f.snippet.clone(),
+                    note: f.note.clone(),
+                })
+                .collect(),
+            summary: result.summary.clone(),
+        }
+    }
+}
+
+/// The MCP server handler: a shared `Arc<Agent>` plus the repo root to explore.
+#[derive(Clone)]
+pub struct RepoExplorerServer {
+    tool_router: ToolRouter<Self>,
+    agent: Arc<Agent>,
+    repo_root: Arc<PathBuf>,
+}
+
+#[tool_router]
+impl RepoExplorerServer {
+    pub fn new(agent: Arc<Agent>, repo_root: PathBuf) -> Self {
+        Self {
+            tool_router: Self::tool_router(),
+            agent,
+            repo_root: Arc::new(repo_root),
+        }
+    }
+
+    /// Explore the repository and return structured findings plus a summary.
+    #[tool(
+        name = "explore_repository",
+        description = "Explore the repository for the given request and return \
+                       matching file locations (with line numbers and optional \
+                       snippet/context) plus a summary. Args: query (required), \
+                       optional scope_hint (path prefix), optional max_results."
+    )]
+    async fn explore_repository(
+        &self,
+        params: Parameters<ExploreRepositoryRequest>,
+    ) -> Result<Json<ExplorationResultDto>, String> {
+        let req = params.0;
+        let query = ExplorationQuery {
+            text: req.query,
+            scope_hint: req.scope_hint.map(PathBuf::from),
+            max_results: req.max_results,
+        };
+        let result = self
+            .agent
+            .run(self.repo_root.as_ref(), &query)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Json(ExplorationResultDto::from(&result)))
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for RepoExplorerServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "Repository exploration server. Call `explore_repository` with a \
+             free-text query to receive structured findings and a summary.",
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use repo_explorer_core::domain::{ExplorationFinding, FileLocation};
+
+    #[test]
+    fn maps_result_to_dto_json_shape() {
+        let result = ExplorationResult {
+            findings: vec![
+                ExplorationFinding {
+                    location: FileLocation {
+                        path: PathBuf::from("src").join("lib.rs"),
+                        line_start: 10,
+                        line_end: 20,
+                    },
+                    snippet: Some("fn main() {}".to_string()),
+                    note: Some("entry".to_string()),
+                },
+                ExplorationFinding {
+                    location: FileLocation {
+                        path: PathBuf::from("src/other.rs"),
+                        line_start: 1,
+                        line_end: 1,
+                    },
+                    snippet: None,
+                    note: None,
+                },
+            ],
+            summary: "two findings".to_string(),
+        };
+
+        let dto = ExplorationResultDto::from(&result);
+        let value = serde_json::to_value(&dto).expect("serialize dto");
+
+        assert_eq!(value["summary"], "two findings");
+        let findings = value["findings"].as_array().expect("findings array");
+        assert_eq!(findings.len(), 2);
+
+        assert_eq!(findings[0]["location"]["line_start"], 10);
+        assert_eq!(findings[0]["location"]["line_end"], 20);
+        assert_eq!(findings[0]["snippet"], "fn main() {}");
+        assert_eq!(findings[0]["note"], "entry");
+        assert!(
+            findings[0]["location"]["path"]
+                .as_str()
+                .expect("path string")
+                .contains("lib.rs")
+        );
+
+        // snippet/note omitted when None.
+        assert!(findings[1].get("snippet").is_none());
+        assert!(findings[1].get("note").is_none());
+    }
+
+    #[test]
+    fn deserializes_minimal_request() {
+        let req: ExploreRepositoryRequest =
+            serde_json::from_str(r#"{"query":"where is main"}"#).expect("minimal request");
+        assert_eq!(req.query, "where is main");
+        assert!(req.scope_hint.is_none());
+        assert!(req.max_results.is_none());
+    }
+
+    #[test]
+    fn deserializes_full_request() {
+        let req: ExploreRepositoryRequest =
+            serde_json::from_str(r#"{"query":"q","scope_hint":"src","max_results":5}"#)
+                .expect("full request");
+        assert_eq!(req.query, "q");
+        assert_eq!(req.scope_hint.as_deref(), Some("src"));
+        assert_eq!(req.max_results, Some(5));
+    }
+
+    #[test]
+    fn rejects_unknown_field() {
+        let err = serde_json::from_str::<ExploreRepositoryRequest>(r#"{"query":"q","bogus":true}"#);
+        assert!(err.is_err());
+    }
+}
