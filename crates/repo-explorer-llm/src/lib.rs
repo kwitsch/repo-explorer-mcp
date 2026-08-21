@@ -28,10 +28,12 @@ pub(crate) struct GenaiErrorFacts {
 fn message_indicates_quota(message: &str) -> bool {
     let m = message.to_lowercase();
     m.contains("insufficient_quota")
-        || m.contains("quota")
+        || m.contains("quota exceeded")
+        || m.contains("exceeded your current quota")
+        || m.contains("exceeded your quota")
+        || m.contains("out of quota")
         || m.contains("credit balance")
         || m.contains("billing")
-        || m.contains("exceeded your current quota")
 }
 
 /// Pure classification of error facts into a `ProviderError`. Best-effort and
