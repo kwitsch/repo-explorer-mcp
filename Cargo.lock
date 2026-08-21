@@ -1416,6 +1416,7 @@ dependencies = [
  "repo-explorer-core",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
 ]
 
