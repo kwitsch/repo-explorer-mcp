@@ -1,0 +1,662 @@
+//! Library-agnostic LLM boundary: the `LlmProvider` async trait, serde-free
+//! domain value types, the comparable `ProviderError`/`RouterError` types, the
+//! generic `ProviderRouter` with an injectable `Clock`, and a gated mock.
+//!
+//! Core stays free of any LLM SDK: the sole production impl (`GenaiProvider`)
+//! and the `genai` dependency live in the `repo-explorer-llm` crate, which
+//! flattens every non-comparable `genai` cause into a `String` message here —
+//! mirroring how `repo-explorer-memory` keeps `rmcp` out of `memory.rs`.
+
+/// Chat role of a `Message`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+/// One chat message in a tool-use conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+    pub role: Role,
+    pub content: String,
+    /// Set on Assistant messages that request tool execution.
+    pub tool_calls: Vec<ToolCall>,
+    /// Set on Tool-role messages: which call this result answers.
+    pub tool_call_id: Option<String>,
+}
+
+/// A single tool invocation requested by the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    /// Raw JSON arguments (kept as text so the type stays `Eq`).
+    pub arguments_json: String,
+}
+
+/// A tool the model may call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tool {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the parameters, as raw text.
+    pub parameters_schema_json: String,
+}
+
+/// The result of a single provider turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderResponse {
+    Text(String),
+    ToolCalls(Vec<ToolCall>),
+}
+
+/// Provider-call failures. Fully comparable so mock-based tests can `assert_eq!`
+/// on error values. Every variant carries the provider `name` for attribution;
+/// any non-comparable `genai`/HTTP cause is flattened into `message` at the
+/// `repo-explorer-llm` boundary (never stored as a `#[source]`, never a secret).
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum ProviderError {
+    #[error("provider `{provider}` rate limited: {message}")]
+    RateLimited { provider: String, message: String },
+    #[error("provider `{provider}` quota exceeded: {message}")]
+    QuotaExceeded { provider: String, message: String },
+    #[error("provider `{provider}` authentication failed: {message}")]
+    Authentication { provider: String, message: String },
+    #[error("provider `{provider}` request invalid: {message}")]
+    InvalidRequest { provider: String, message: String },
+    #[error("provider `{provider}` transport error: {message}")]
+    Transport { provider: String, message: String },
+    #[error("provider `{provider}` returned an unusable response: {message}")]
+    InvalidResponse { provider: String, message: String },
+    /// Construction/config-level failure for this provider entry (unrecognized
+    /// `kind`, a call-time-missing env var distinct from config-load validation,
+    /// or a client-build failure).
+    #[error("provider `{provider}` configuration error: {message}")]
+    Configuration { provider: String, message: String },
+}
+
+impl ProviderError {
+    /// Exactly the limit situations that trigger router failover.
+    pub fn is_failover_trigger(&self) -> bool {
+        matches!(self, Self::RateLimited { .. } | Self::QuotaExceeded { .. })
+    }
+
+    /// Provider name this error is attributed to.
+    pub fn provider(&self) -> &str {
+        match self {
+            Self::RateLimited { provider, .. }
+            | Self::QuotaExceeded { provider, .. }
+            | Self::Authentication { provider, .. }
+            | Self::InvalidRequest { provider, .. }
+            | Self::Transport { provider, .. }
+            | Self::InvalidResponse { provider, .. }
+            | Self::Configuration { provider, .. } => provider,
+        }
+    }
+}
+
+/// Router-level failures.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum RouterError {
+    #[error("no LLM providers are configured")]
+    NoProviders,
+    /// Every provider is exhausted (fresh limit error this pass) or still within
+    /// its cooldown window. The string summarizes attempts/skips (names only).
+    #[error("all configured LLM providers are exhausted or cooling down: {0}")]
+    AllExhausted(String),
+    /// A non-failover provider error, surfaced immediately (fail fast).
+    #[error(transparent)]
+    Provider(ProviderError),
+}
+
+/// The LLM contract implemented by a concrete provider.
+///
+/// Native `async fn` in trait (AFIT) — no `async-trait` dependency in core,
+/// mirroring `MemoryBackend`. Static dispatch suffices; the `allow` silences the
+/// warn-by-default `async_fn_in_trait` lint that `-D warnings` would reject.
+#[allow(async_fn_in_trait)]
+pub trait LlmProvider {
+    async fn complete_with_tools(
+        &self,
+        messages: &[Message],
+        tools: &[Tool],
+    ) -> Result<ProviderResponse, ProviderError>;
+}
+
+/// Monotonic time source, injectable so cooldown-expiry tests need no real
+/// sleeps. Production uses `SystemClock`; tests use `mock::FakeClock`.
+pub trait Clock {
+    fn now(&self) -> std::time::Instant;
+}
+
+/// Real monotonic clock.
+#[derive(Debug, Clone, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+}
+
+/// One provider slot plus its interior-mutable cooldown deadline.
+struct Entry<P> {
+    name: String,
+    provider: P,
+    cooling_until: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+/// Failover router over an ordered set of providers of one concrete type.
+///
+/// Generic over the provider `P` (static dispatch, no `async-trait`) and a
+/// `Clock` `C`. Cooldown state lives behind a `Mutex` because
+/// `complete_with_tools` takes `&self`.
+pub struct ProviderRouter<P: LlmProvider, C: Clock = SystemClock> {
+    entries: Vec<Entry<P>>,
+    cooldown: std::time::Duration,
+    clock: C,
+}
+
+impl<P: LlmProvider> ProviderRouter<P, SystemClock> {
+    /// Pair each ordered `(name, provider)` with the shared cooldown window and
+    /// the real system clock. File (= config) order is failover order.
+    pub fn new(providers: Vec<(String, P)>, cooldown_seconds: u64) -> Self {
+        Self::with_clock(providers, cooldown_seconds, SystemClock)
+    }
+}
+
+impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
+    /// Construct with an explicit clock (tests inject a `FakeClock`).
+    pub fn with_clock(providers: Vec<(String, P)>, cooldown_seconds: u64, clock: C) -> Self {
+        let entries = providers
+            .into_iter()
+            .map(|(name, provider)| Entry {
+                name,
+                provider,
+                cooling_until: std::sync::Mutex::new(None),
+            })
+            .collect();
+        Self {
+            entries,
+            cooldown: std::time::Duration::from_secs(cooldown_seconds),
+            clock,
+        }
+    }
+
+    /// One pass over the entries in configured order. Returns the first success;
+    /// on a limit error the entry is put on cooldown and the next is tried; a
+    /// non-limit error is surfaced immediately (fail fast); if every entry is
+    /// cooling or freshly limited, returns `AllExhausted`.
+    pub async fn complete_with_tools(
+        &self,
+        messages: &[Message],
+        tools: &[Tool],
+    ) -> Result<ProviderResponse, RouterError> {
+        if self.entries.is_empty() {
+            return Err(RouterError::NoProviders);
+        }
+
+        let now = self.clock.now();
+        let mut cooling: Vec<&str> = Vec::new();
+        let mut limited: Vec<&str> = Vec::new();
+
+        for entry in &self.entries {
+            {
+                let mut guard = entry
+                    .cooling_until
+                    .lock()
+                    .expect("router cooldown mutex poisoned");
+                match *guard {
+                    Some(until) if now < until => {
+                        cooling.push(&entry.name);
+                        continue;
+                    }
+                    _ => {
+                        // Expired (or never set): clear and proceed to call.
+                        *guard = None;
+                    }
+                }
+            }
+
+            match entry.provider.complete_with_tools(messages, tools).await {
+                Ok(resp) => return Ok(resp),
+                Err(e) if e.is_failover_trigger() => {
+                    let mut guard = entry
+                        .cooling_until
+                        .lock()
+                        .expect("router cooldown mutex poisoned");
+                    *guard = Some(now + self.cooldown);
+                    limited.push(&entry.name);
+                    continue;
+                }
+                Err(e) => return Err(RouterError::Provider(e)),
+            }
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+        if !limited.is_empty() {
+            parts.push(format!("limited: {}", limited.join(", ")));
+        }
+        if !cooling.is_empty() {
+            parts.push(format!("cooling: {}", cooling.join(", ")));
+        }
+        Err(RouterError::AllExhausted(parts.join("; ")))
+    }
+}
+
+/// Test harness: a scripted, call-recording `LlmProvider` and a controllable
+/// `Clock`. Gated so it compiles for core's own tests and for downstream crates
+/// that enable `features = ["test-support"]`.
+#[cfg(any(test, feature = "test-support"))]
+pub mod mock {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// One recorded `complete_with_tools` invocation.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct MockCall {
+        pub messages: Vec<Message>,
+        pub tools: Vec<Tool>,
+    }
+
+    /// A programmable `LlmProvider`: pops a scripted response per call, falling
+    /// back to `fallback` when the queue is empty, and records every call.
+    #[derive(Clone)]
+    pub struct MockLlmProvider {
+        responses: Arc<Mutex<VecDeque<Result<ProviderResponse, ProviderError>>>>,
+        fallback: Arc<Result<ProviderResponse, ProviderError>>,
+        calls: Arc<Mutex<Vec<MockCall>>>,
+    }
+
+    impl Default for MockLlmProvider {
+        fn default() -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(VecDeque::new())),
+                fallback: Arc::new(Ok(ProviderResponse::Text(String::new()))),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl MockLlmProvider {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Queue a scripted sequence, consumed front-to-back across calls.
+        pub fn with_responses(self, r: Vec<Result<ProviderResponse, ProviderError>>) -> Self {
+            *self.responses.lock().expect("mock responses poisoned") = r.into();
+            self
+        }
+
+        /// Set the response returned once the scripted queue is empty.
+        pub fn with_fallback(self, r: Result<ProviderResponse, ProviderError>) -> Self {
+            Self {
+                fallback: Arc::new(r),
+                ..self
+            }
+        }
+
+        /// Snapshot of recorded calls, in order.
+        pub fn calls(&self) -> Vec<MockCall> {
+            self.calls.lock().expect("mock calls poisoned").clone()
+        }
+    }
+
+    impl LlmProvider for MockLlmProvider {
+        async fn complete_with_tools(
+            &self,
+            messages: &[Message],
+            tools: &[Tool],
+        ) -> Result<ProviderResponse, ProviderError> {
+            self.calls
+                .lock()
+                .expect("mock calls poisoned")
+                .push(MockCall {
+                    messages: messages.to_vec(),
+                    tools: tools.to_vec(),
+                });
+            let popped = self
+                .responses
+                .lock()
+                .expect("mock responses poisoned")
+                .pop_front();
+            match popped {
+                Some(r) => r,
+                None => (*self.fallback).clone(),
+            }
+        }
+    }
+
+    /// A `Clock` whose `now()` only moves when `advance` is called. Starts at
+    /// `Instant::now()`; `Instant + Duration` avoids constructing arbitrary
+    /// instants.
+    #[derive(Clone)]
+    pub struct FakeClock {
+        now: Arc<Mutex<Instant>>,
+    }
+
+    impl Default for FakeClock {
+        fn default() -> Self {
+            Self {
+                now: Arc::new(Mutex::new(Instant::now())),
+            }
+        }
+    }
+
+    impl FakeClock {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Move the clock forward by `d`.
+        pub fn advance(&self, d: Duration) {
+            let mut guard = self.now.lock().expect("fake clock poisoned");
+            *guard += d;
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().expect("fake clock poisoned")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn domain_types_clone_and_eq() {
+        let call = ToolCall {
+            id: "c1".to_string(),
+            name: "search_code".to_string(),
+            arguments_json: r#"{"q":"main"}"#.to_string(),
+        };
+        assert_eq!(call, call.clone());
+
+        let msg = Message {
+            role: Role::Assistant,
+            content: "hi".to_string(),
+            tool_calls: vec![call.clone()],
+            tool_call_id: None,
+        };
+        assert_eq!(msg, msg.clone());
+        assert_ne!(msg.role, Role::User);
+
+        let tool = Tool {
+            name: "search_code".to_string(),
+            description: "search".to_string(),
+            parameters_schema_json: r#"{"type":"object"}"#.to_string(),
+        };
+        assert_eq!(tool, tool.clone());
+
+        let resp = ProviderResponse::ToolCalls(vec![call]);
+        assert_eq!(resp, resp.clone());
+        assert_ne!(resp, ProviderResponse::Text("x".to_string()));
+    }
+
+    #[test]
+    fn provider_error_display_eq_and_provider_accessor() {
+        let rl = ProviderError::RateLimited {
+            provider: "primary".to_string(),
+            message: "429".to_string(),
+        };
+        assert_eq!(rl, rl.clone());
+        assert_eq!(rl.to_string(), "provider `primary` rate limited: 429");
+        assert_eq!(rl.provider(), "primary");
+
+        let qe = ProviderError::QuotaExceeded {
+            provider: "p2".to_string(),
+            message: "no credit".to_string(),
+        };
+        assert_eq!(qe.to_string(), "provider `p2` quota exceeded: no credit");
+
+        let auth = ProviderError::Authentication {
+            provider: "p3".to_string(),
+            message: "bad key".to_string(),
+        };
+        assert_eq!(
+            auth.to_string(),
+            "provider `p3` authentication failed: bad key"
+        );
+        assert_eq!(auth.provider(), "p3");
+
+        let inv = ProviderError::InvalidRequest {
+            provider: "p4".to_string(),
+            message: "bad".to_string(),
+        };
+        assert_eq!(inv.to_string(), "provider `p4` request invalid: bad");
+
+        let tr = ProviderError::Transport {
+            provider: "p5".to_string(),
+            message: "conn".to_string(),
+        };
+        assert_eq!(tr.to_string(), "provider `p5` transport error: conn");
+
+        let ir = ProviderError::InvalidResponse {
+            provider: "p6".to_string(),
+            message: "empty".to_string(),
+        };
+        assert_eq!(
+            ir.to_string(),
+            "provider `p6` returned an unusable response: empty"
+        );
+
+        let cfg = ProviderError::Configuration {
+            provider: "p7".to_string(),
+            message: "unknown kind".to_string(),
+        };
+        assert_eq!(
+            cfg.to_string(),
+            "provider `p7` configuration error: unknown kind"
+        );
+        assert_ne!(rl, qe);
+    }
+
+    #[test]
+    fn only_rate_and_quota_are_failover_triggers() {
+        let p = "x".to_string();
+        assert!(
+            ProviderError::RateLimited {
+                provider: p.clone(),
+                message: String::new()
+            }
+            .is_failover_trigger()
+        );
+        assert!(
+            ProviderError::QuotaExceeded {
+                provider: p.clone(),
+                message: String::new()
+            }
+            .is_failover_trigger()
+        );
+        for e in [
+            ProviderError::Authentication {
+                provider: p.clone(),
+                message: String::new(),
+            },
+            ProviderError::InvalidRequest {
+                provider: p.clone(),
+                message: String::new(),
+            },
+            ProviderError::Transport {
+                provider: p.clone(),
+                message: String::new(),
+            },
+            ProviderError::InvalidResponse {
+                provider: p.clone(),
+                message: String::new(),
+            },
+            ProviderError::Configuration {
+                provider: p.clone(),
+                message: String::new(),
+            },
+        ] {
+            assert!(!e.is_failover_trigger());
+        }
+    }
+
+    #[test]
+    fn router_error_display_and_eq() {
+        assert_eq!(
+            RouterError::NoProviders.to_string(),
+            "no LLM providers are configured"
+        );
+        let ex = RouterError::AllExhausted("primary cooling; secondary limited".to_string());
+        assert_eq!(
+            ex.to_string(),
+            "all configured LLM providers are exhausted or cooling down: primary cooling; secondary limited"
+        );
+        let prov = RouterError::Provider(ProviderError::Authentication {
+            provider: "p".to_string(),
+            message: "bad".to_string(),
+        });
+        // `#[error(transparent)]` forwards the inner Display.
+        assert_eq!(prov.to_string(), "provider `p` authentication failed: bad");
+        assert_eq!(ex, ex.clone());
+        assert_ne!(ex, RouterError::NoProviders);
+    }
+
+    #[test]
+    fn llm_provider_trait_is_object_usable_via_generics() {
+        // Compile-time check that the trait exists with the intended signature.
+        fn _assert_impl<P: LlmProvider>() {}
+        // no runtime assertion needed
+    }
+
+    use mock::{FakeClock, MockCall, MockLlmProvider};
+    use std::time::Duration;
+
+    fn text(s: &str) -> ProviderResponse {
+        ProviderResponse::Text(s.to_string())
+    }
+    fn rate_limited(p: &str) -> ProviderError {
+        ProviderError::RateLimited {
+            provider: p.to_string(),
+            message: "429".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_provider_list_is_no_providers() {
+        let router: ProviderRouter<MockLlmProvider> = ProviderRouter::new(vec![], 60);
+        let got = router.complete_with_tools(&[], &[]).await;
+        assert_eq!(got, Err(RouterError::NoProviders));
+    }
+
+    #[tokio::test]
+    async fn first_limited_falls_over_to_second() {
+        let p1 = MockLlmProvider::new().with_fallback(Err(rate_limited("primary")));
+        let p2 = MockLlmProvider::new().with_fallback(Ok(text("from p2")));
+        let router = ProviderRouter::new(
+            vec![
+                ("primary".to_string(), p1.clone()),
+                ("secondary".to_string(), p2.clone()),
+            ],
+            60,
+        );
+        let msgs = vec![Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+        }];
+        let got = router.complete_with_tools(&msgs, &[]).await;
+        assert_eq!(got, Ok(text("from p2")));
+        // Provider 1 recorded the attempt.
+        assert_eq!(
+            p1.calls(),
+            vec![MockCall {
+                messages: msgs.clone(),
+                tools: vec![]
+            }]
+        );
+        assert_eq!(p2.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_limited_is_all_exhausted() {
+        let p1 = MockLlmProvider::new().with_fallback(Err(rate_limited("primary")));
+        let p2 = MockLlmProvider::new().with_fallback(Err(ProviderError::QuotaExceeded {
+            provider: "secondary".to_string(),
+            message: "no credit".to_string(),
+        }));
+        let router = ProviderRouter::new(
+            vec![("primary".to_string(), p1), ("secondary".to_string(), p2)],
+            60,
+        );
+        let got = router.complete_with_tools(&[], &[]).await;
+        match got {
+            Err(RouterError::AllExhausted(summary)) => {
+                assert!(summary.contains("primary"));
+                assert!(summary.contains("secondary"));
+            }
+            other => panic!("expected AllExhausted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_limit_error_fails_fast_without_trying_next() {
+        let p1 = MockLlmProvider::new().with_fallback(Err(ProviderError::Authentication {
+            provider: "primary".to_string(),
+            message: "bad key".to_string(),
+        }));
+        let p2 = MockLlmProvider::new().with_fallback(Ok(text("unused")));
+        let router = ProviderRouter::new(
+            vec![
+                ("primary".to_string(), p1),
+                ("secondary".to_string(), p2.clone()),
+            ],
+            60,
+        );
+        let got = router.complete_with_tools(&[], &[]).await;
+        assert_eq!(
+            got,
+            Err(RouterError::Provider(ProviderError::Authentication {
+                provider: "primary".to_string(),
+                message: "bad key".to_string(),
+            }))
+        );
+        // Fail fast: the second provider was never called.
+        assert_eq!(p2.calls().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn cooldown_skips_then_retries_after_window() {
+        // p1 scripted: limit on first call, success on the second (post-cooldown).
+        let p1 = MockLlmProvider::new()
+            .with_responses(vec![Err(rate_limited("primary")), Ok(text("p1 recovered"))]);
+        let p2 = MockLlmProvider::new().with_fallback(Err(rate_limited("secondary")));
+        let clock = FakeClock::new();
+        let router = ProviderRouter::with_clock(
+            vec![
+                ("primary".to_string(), p1.clone()),
+                ("secondary".to_string(), p2.clone()),
+            ],
+            60,
+            clock.clone(),
+        );
+
+        // Pass 1: p1 limited, p2 limited -> AllExhausted; p1 now cooling.
+        let first = router.complete_with_tools(&[], &[]).await;
+        assert!(matches!(first, Err(RouterError::AllExhausted(_))));
+
+        // Within cooldown (30s < 60s): p1 is skipped (not called again), p2 limited.
+        clock.advance(Duration::from_secs(30));
+        let second = router.complete_with_tools(&[], &[]).await;
+        assert!(matches!(second, Err(RouterError::AllExhausted(_))));
+        assert_eq!(p1.calls().len(), 1, "p1 must be skipped while cooling");
+
+        // Past cooldown (total 90s > 60s): p1 retried and succeeds.
+        clock.advance(Duration::from_secs(60));
+        let third = router.complete_with_tools(&[], &[]).await;
+        assert_eq!(third, Ok(text("p1 recovered")));
+        assert_eq!(p1.calls().len(), 2, "p1 retried after cooldown elapsed");
+    }
+}
