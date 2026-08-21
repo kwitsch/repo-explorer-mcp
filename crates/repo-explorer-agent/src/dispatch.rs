@@ -5,7 +5,7 @@
 //! panics, never fatal. `finish` is handled by the loop, not here.
 
 use repo_explorer_core::domain::{ExplorationFinding, ExplorationQuery, ExplorationResult};
-use repo_explorer_core::llm::{Message, Role, ToolCall};
+use repo_explorer_core::llm::{Message, ToolCall};
 use repo_explorer_core::memory::{GraphQuery, MemoryBackend, SnippetTarget};
 use repo_explorer_core::search::{SearchBackend, SearchMode, SearchOptions};
 use serde::Serialize;
@@ -44,11 +44,7 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
                 scope_hint: args.scope_hint.map(PathBuf::from),
                 max_results: args.max_results,
             };
-            let res = memory
-                .search_code(repo_root, &query)
-                .await
-                .map_err(|e| format!("search_code failed: {e}"))?;
-            Ok(render_result(res))
+            call_and_render("search_code", memory.search_code(repo_root, &query)).await
         }
         "search_graph" => {
             let args: SearchGraphArgs = parse_args(&call.arguments_json)?;
@@ -58,44 +54,40 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
                 label: args.label,
                 max_results: args.max_results,
             };
-            let res = memory
-                .search_graph(repo_root, &query)
-                .await
-                .map_err(|e| format!("search_graph failed: {e}"))?;
-            Ok(render_result(res))
+            call_and_render("search_graph", memory.search_graph(repo_root, &query)).await
         }
         "query_graph" => {
             let args: QueryGraphArgs = parse_args(&call.arguments_json)?;
-            let res = memory
-                .query_graph(repo_root, &args.query, args.max_results)
-                .await
-                .map_err(|e| format!("query_graph failed: {e}"))?;
-            Ok(render_result(res))
+            call_and_render(
+                "query_graph",
+                memory.query_graph(repo_root, &args.query, args.max_results),
+            )
+            .await
         }
         "trace_path" => {
             let args: TracePathArgs = parse_args(&call.arguments_json)?;
-            let res = memory
-                .trace_path(repo_root, &args.from, &args.to, args.max_depth)
-                .await
-                .map_err(|e| format!("trace_path failed: {e}"))?;
-            Ok(render_result(res))
+            call_and_render(
+                "trace_path",
+                memory.trace_path(repo_root, &args.from, &args.to, args.max_depth),
+            )
+            .await
         }
         "get_architecture" => {
             let args: GetArchitectureArgs = parse_args(&call.arguments_json)?;
-            let res = memory
-                .get_architecture(repo_root, args.depth)
-                .await
-                .map_err(|e| format!("get_architecture failed: {e}"))?;
-            Ok(render_result(res))
+            call_and_render(
+                "get_architecture",
+                memory.get_architecture(repo_root, args.depth),
+            )
+            .await
         }
         "get_code_snippet" => {
             let args: GetCodeSnippetArgs = parse_args(&call.arguments_json)?;
             let target = snippet_target(args)?;
-            let res = memory
-                .get_code_snippet(repo_root, &target)
-                .await
-                .map_err(|e| format!("get_code_snippet failed: {e}"))?;
-            Ok(render_result(res))
+            call_and_render(
+                "get_code_snippet",
+                memory.get_code_snippet(repo_root, &target),
+            )
+            .await
         }
         "grep" => {
             let args: GrepArgs = parse_args(&call.arguments_json)?;
@@ -130,6 +122,18 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
         }
         other => Err(format!("unknown tool: {other}")),
     }
+}
+
+/// Await a memory-backend call, mapping any error to the shared
+/// `"{name} failed: {e}"` format, then render its `ExplorationResult` — the
+/// one place the six memory-tool branches' identical
+/// call/map_err/render shape lives.
+async fn call_and_render<E: std::fmt::Display>(
+    name: &str,
+    fut: impl std::future::Future<Output = Result<ExplorationResult, E>>,
+) -> Result<(String, Vec<ExplorationFinding>), String> {
+    let res = fut.await.map_err(|e| format!("{name} failed: {e}"))?;
+    Ok(render_result(res))
 }
 
 fn parse_args<T: serde::de::DeserializeOwned>(json: &str) -> Result<T, String> {
@@ -239,34 +243,37 @@ fn finding_dto(f: &ExplorationFinding) -> FindingDto {
     }
 }
 
+/// Serialize `value`, falling back to `fallback` (a literal empty-JSON shape,
+/// e.g. `"{}"`/`"[]"`) on the practically-unreachable serialize failure — the
+/// one place that serialize-or-empty-fallback pattern lives.
+fn serialize_or_empty<T: Serialize>(value: &T, fallback: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| fallback.to_string())
+}
+
 fn render_result(res: ExplorationResult) -> (String, Vec<ExplorationFinding>) {
     let dto = ResultDto {
         findings: res.findings.iter().map(finding_dto).collect(),
-        summary: res.summary.clone(),
+        summary: res.summary,
     };
-    let content = serde_json::to_string(&dto).unwrap_or_else(|_| "{}".to_string());
+    let content = serialize_or_empty(&dto, "{}");
     (content, res.findings)
 }
 
 fn render_findings(findings: Vec<ExplorationFinding>) -> (String, Vec<ExplorationFinding>) {
     let dtos: Vec<FindingDto> = findings.iter().map(finding_dto).collect();
-    let content = serde_json::to_string(&dtos).unwrap_or_else(|_| "[]".to_string());
+    let content = serialize_or_empty(&dtos, "[]");
     (content, findings)
 }
 
 fn tool_message(call_id: &str, content: String) -> Message {
-    Message {
-        role: Role::Tool,
-        content,
-        tool_calls: Vec::new(),
-        tool_call_id: Some(call_id.to_string()),
-    }
+    Message::tool(call_id, content)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use repo_explorer_core::domain::FileLocation;
+    use repo_explorer_core::llm::Role;
     use repo_explorer_core::memory::IndexStatus;
     use repo_explorer_core::memory::mock::{Call as MemCall, MockMemoryBackend};
     use repo_explorer_core::search::mock::{Call as SearchCall, MockSearchBackend};

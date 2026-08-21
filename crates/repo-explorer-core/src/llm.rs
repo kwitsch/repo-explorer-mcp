@@ -27,6 +27,58 @@ pub struct Message {
     pub tool_call_id: Option<String>,
 }
 
+impl Message {
+    /// A `System` message: plain content, no tool fields.
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::System,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// A `User` message: plain content, no tool fields.
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// An `Assistant` message carrying plain text (no tool calls).
+    pub fn assistant_text(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// An `Assistant` message requesting tool execution (empty content).
+    pub fn assistant_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+
+    /// A `Tool` message answering `call_id` with `content`.
+    pub fn tool(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(call_id.into()),
+        }
+    }
+}
+
 /// A single tool invocation requested by the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {

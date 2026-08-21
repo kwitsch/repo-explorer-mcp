@@ -11,7 +11,7 @@ use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use serde_json::{Map, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A connected `rmcp` client to `codebase-memory-mcp`.
 #[derive(Debug)]
@@ -116,8 +116,16 @@ pub(crate) fn decode_result(
 /// Canonicalizes `repo_root` first — same normalization `run_index` applies
 /// before calling `index_repository` — so a relative value like `.` resolves
 /// to its real directory name instead of erroring out immediately.
+/// Canonicalize `path`, falling back to it unchanged if canonicalization
+/// fails (e.g. it doesn't exist yet) — the one place this normalize-or-keep
+/// pattern lives, shared by `project_name` and `run_index`'s absolute-path
+/// argument.
+pub(crate) fn canonicalize_or_self(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 pub(crate) fn project_name(repo_root: &Path) -> Result<String, MemoryError> {
-    let abs = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let abs = canonicalize_or_self(repo_root);
     abs.file_name()
         .and_then(|n| n.to_str())
         .map(|s| s.to_string())

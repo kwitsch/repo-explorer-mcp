@@ -9,8 +9,10 @@ pub(crate) struct IndexProbe {
     pub exists: bool,
     /// When the index was last built, if known.
     pub last_indexed_at: Option<SystemTime>,
-    /// Number of changed files reported by `detect_changes`.
-    pub changed_files: usize,
+    /// Number of changed files reported by `detect_changes`, or `None` when
+    /// that couldn't be confirmed (e.g. a soft tool failure) — distinct from
+    /// `Some(0)`, which means "confirmed no changes".
+    pub changed_files: Option<usize>,
 }
 
 /// The re-index decision.
@@ -19,10 +21,11 @@ pub(crate) enum FreshnessDecision {
     UpToDate,
 }
 
-/// Decide whether to re-index. Re-index when the project is not indexed, OR any
-/// file changed, OR the index age exceeds `staleness`, OR the last-index time is
-/// unknown; otherwise up-to-date. `age == staleness` counts as up-to-date; a
-/// last-index time in the future (clock skew) is treated as up-to-date.
+/// Decide whether to re-index. Re-index when the project is not indexed, OR
+/// the changed-files count is unconfirmable, OR any file changed, OR the index
+/// age exceeds `staleness`, OR the last-index time is unknown; otherwise
+/// up-to-date. `age == staleness` counts as up-to-date; a last-index time in
+/// the future (clock skew) is treated as up-to-date.
 pub(crate) fn decide_freshness(
     probe: &IndexProbe,
     staleness: Duration,
@@ -31,8 +34,12 @@ pub(crate) fn decide_freshness(
     if !probe.exists {
         return FreshnessDecision::Reindex;
     }
-    if probe.changed_files > 0 {
-        return FreshnessDecision::Reindex;
+    match probe.changed_files {
+        // Unconfirmable freshness must not be treated as "no changes" —
+        // force a reindex attempt rather than masking a degraded backend.
+        None => return FreshnessDecision::Reindex,
+        Some(n) if n > 0 => return FreshnessDecision::Reindex,
+        Some(_) => {}
     }
     match probe.last_indexed_at {
         Some(t) => match now.duration_since(t) {
@@ -57,7 +64,7 @@ mod tests {
         let probe = IndexProbe {
             exists: false,
             last_indexed_at: None,
-            changed_files: 0,
+            changed_files: Some(0),
         };
         assert!(matches!(
             decide_freshness(&probe, Duration::from_secs(3600), base_now()),
@@ -71,7 +78,21 @@ mod tests {
         let probe = IndexProbe {
             exists: true,
             last_indexed_at: Some(now - Duration::from_secs(1)),
-            changed_files: 3,
+            changed_files: Some(3),
+        };
+        assert!(matches!(
+            decide_freshness(&probe, Duration::from_secs(3600), now),
+            FreshnessDecision::Reindex
+        ));
+    }
+
+    #[test]
+    fn unconfirmable_changed_files_forces_reindex_even_if_fresh() {
+        let now = base_now();
+        let probe = IndexProbe {
+            exists: true,
+            last_indexed_at: Some(now - Duration::from_secs(1)),
+            changed_files: None,
         };
         assert!(matches!(
             decide_freshness(&probe, Duration::from_secs(3600), now),
@@ -85,7 +106,7 @@ mod tests {
         let probe = IndexProbe {
             exists: true,
             last_indexed_at: Some(now - Duration::from_secs(3601)),
-            changed_files: 0,
+            changed_files: Some(0),
         };
         assert!(matches!(
             decide_freshness(&probe, Duration::from_secs(3600), now),
@@ -99,7 +120,7 @@ mod tests {
         let probe = IndexProbe {
             exists: true,
             last_indexed_at: Some(now - Duration::from_secs(10)),
-            changed_files: 0,
+            changed_files: Some(0),
         };
         assert!(matches!(
             decide_freshness(&probe, Duration::from_secs(3600), now),
@@ -114,7 +135,7 @@ mod tests {
         let probe = IndexProbe {
             exists: true,
             last_indexed_at: Some(now - Duration::from_secs(3600)),
-            changed_files: 0,
+            changed_files: Some(0),
         };
         assert!(matches!(
             decide_freshness(&probe, Duration::from_secs(3600), now),
@@ -127,7 +148,7 @@ mod tests {
         let probe = IndexProbe {
             exists: true,
             last_indexed_at: None,
-            changed_files: 0,
+            changed_files: Some(0),
         };
         assert!(matches!(
             decide_freshness(&probe, Duration::from_secs(3600), base_now()),
@@ -142,7 +163,7 @@ mod tests {
         let probe = IndexProbe {
             exists: true,
             last_indexed_at: Some(now + Duration::from_secs(60)),
-            changed_files: 0,
+            changed_files: Some(0),
         };
         assert!(matches!(
             decide_freshness(&probe, Duration::from_secs(3600), now),

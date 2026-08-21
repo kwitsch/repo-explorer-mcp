@@ -2,7 +2,7 @@
 //! each of the six query methods onto an upstream `codebase-memory-mcp` tool,
 //! decoding every response into the uniform `ExplorationResult`.
 
-use crate::client::{MemoryClient, decode_result, project_name};
+use crate::client::{MemoryClient, canonicalize_or_self, decode_result, project_name};
 use crate::freshness::{FreshnessDecision, IndexProbe, decide_freshness};
 use repo_explorer_core::config::CodebaseMemoryConfig;
 use repo_explorer_core::domain::{
@@ -59,7 +59,9 @@ impl MemoryClientBackend {
                 Ok(IndexProbe {
                     exists,
                     last_indexed_at,
-                    changed_files: 0,
+                    // Not yet probed via `detect_changes`; `ensure_fresh_index`
+                    // fills this in (only when `exists`) via `probe_changes`.
+                    changed_files: Some(0),
                 })
             }
             // Only a tool error that explicitly indicates the project is
@@ -70,7 +72,7 @@ impl MemoryClientBackend {
                 Ok(IndexProbe {
                     exists: false,
                     last_indexed_at: None,
-                    changed_files: 0,
+                    changed_files: Some(0),
                 })
             }
             Err(e) => Err(e),
@@ -78,7 +80,9 @@ impl MemoryClientBackend {
     }
 
     /// Fill `changed_files` from `detect_changes` for an existing project.
-    async fn probe_changes(&self, project: &str) -> Result<usize, MemoryError> {
+    /// `None` means the count could not be confirmed (a soft tool failure),
+    /// distinct from `Some(0)` ("confirmed no changes").
+    async fn probe_changes(&self, project: &str) -> Result<Option<usize>, MemoryError> {
         let args = base_args(project.to_string());
         match self.client.call("detect_changes", args).await {
             Ok(result) => {
@@ -90,14 +94,14 @@ impl MemoryClientBackend {
                         _ => 0,
                     })
                     .unwrap_or(0);
-                Ok(changed)
+                Ok(Some(changed))
             }
             // Per the `MemoryBackend::ensure_fresh_index` contract, a soft tool
             // failure must not abort exploration outright. We cannot confirm
-            // freshness, so report an (arbitrary, nonzero) unknown change count
-            // that forces `decide_freshness` toward a reindex attempt rather
-            // than returning `Err` for a recoverable hiccup.
-            Err(MemoryError::ToolFailed { .. }) => Ok(1),
+            // freshness, so report "unknown" and let `decide_freshness` force a
+            // reindex attempt rather than returning `Err` for a recoverable
+            // hiccup, or fabricating a specific (misleading) changed-file count.
+            Err(MemoryError::ToolFailed { .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -105,7 +109,7 @@ impl MemoryClientBackend {
     /// Run `index_repository` against the absolute repo root. Soft tool failure
     /// -> `IndexingFailed`; transport failure -> `Err`.
     async fn run_index(&self, repo_root: &Path) -> Result<IndexStatus, MemoryError> {
-        let abs = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+        let abs = canonicalize_or_self(repo_root);
         let path_str = abs.to_str().ok_or_else(|| {
             MemoryError::InvalidInput(format!(
                 "repo_root `{}` is not valid UTF-8",
@@ -121,6 +125,23 @@ impl MemoryClientBackend {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Shared tail of every read-only memory-query method: build `{"project":
+    /// ...}` plus whatever `build_args` inserts, call `tool`, decode, and turn
+    /// the response into an `ExplorationResult` — the one place that
+    /// call/decode/summarize sequence lives.
+    async fn call_memory_tool(
+        &self,
+        tool: &'static str,
+        project: String,
+        build_args: impl FnOnce(&mut Map<String, Value>),
+    ) -> Result<ExplorationResult, MemoryError> {
+        let mut args = base_args(project);
+        build_args(&mut args);
+        let result = self.client.call(tool, args).await?;
+        let json = decode_result(tool, &result)?;
+        Ok(findings_and_summary(tool, &json))
     }
 }
 
@@ -219,20 +240,19 @@ impl MemoryBackend for MemoryClientBackend {
         query: &ExplorationQuery,
     ) -> Result<ExplorationResult, MemoryError> {
         let project = project_name(repo_root)?;
-        let mut args = base_args(project);
-        args.insert("pattern".to_string(), Value::String(query.text.clone()));
-        if let Some(scope) = &query.scope_hint {
-            args.insert(
-                "file_pattern".to_string(),
-                Value::String(scope.to_string_lossy().into_owned()),
-            );
-        }
-        if let Some(limit) = query.max_results {
-            args.insert("limit".to_string(), Value::Number(limit.into()));
-        }
-        let result = self.client.call("search_code", args).await?;
-        let json = decode_result("search_code", &result)?;
-        Ok(findings_and_summary("search_code", &json))
+        self.call_memory_tool("search_code", project, |args| {
+            args.insert("pattern".to_string(), Value::String(query.text.clone()));
+            if let Some(scope) = &query.scope_hint {
+                args.insert(
+                    "file_pattern".to_string(),
+                    Value::String(scope.to_string_lossy().into_owned()),
+                );
+            }
+            if let Some(limit) = query.max_results {
+                args.insert("limit".to_string(), Value::Number(limit.into()));
+            }
+        })
+        .await
     }
 
     async fn search_graph(
@@ -241,23 +261,22 @@ impl MemoryBackend for MemoryClientBackend {
         query: &GraphQuery,
     ) -> Result<ExplorationResult, MemoryError> {
         let project = project_name(repo_root)?;
-        let mut args = base_args(project);
-        args.insert("format".to_string(), Value::String("json".to_string()));
-        if let Some(v) = &query.name_pattern {
-            args.insert("name_pattern".to_string(), Value::String(v.clone()));
-        }
-        if let Some(v) = &query.file_pattern {
-            args.insert("file_pattern".to_string(), Value::String(v.clone()));
-        }
-        if let Some(v) = &query.label {
-            args.insert("label".to_string(), Value::String(v.clone()));
-        }
-        if let Some(limit) = query.max_results {
-            args.insert("limit".to_string(), Value::Number(limit.into()));
-        }
-        let result = self.client.call("search_graph", args).await?;
-        let json = decode_result("search_graph", &result)?;
-        Ok(findings_and_summary("search_graph", &json))
+        self.call_memory_tool("search_graph", project, |args| {
+            args.insert("format".to_string(), Value::String("json".to_string()));
+            if let Some(v) = &query.name_pattern {
+                args.insert("name_pattern".to_string(), Value::String(v.clone()));
+            }
+            if let Some(v) = &query.file_pattern {
+                args.insert("file_pattern".to_string(), Value::String(v.clone()));
+            }
+            if let Some(v) = &query.label {
+                args.insert("label".to_string(), Value::String(v.clone()));
+            }
+            if let Some(limit) = query.max_results {
+                args.insert("limit".to_string(), Value::Number(limit.into()));
+            }
+        })
+        .await
     }
 
     async fn query_graph(
@@ -267,14 +286,13 @@ impl MemoryBackend for MemoryClientBackend {
         max_results: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
         let project = project_name(repo_root)?;
-        let mut args = base_args(project);
-        args.insert("query".to_string(), Value::String(query.to_string()));
-        if let Some(limit) = max_results {
-            args.insert("limit".to_string(), Value::Number(limit.into()));
-        }
-        let result = self.client.call("query_graph", args).await?;
-        let json = decode_result("query_graph", &result)?;
-        Ok(findings_and_summary("query_graph", &json))
+        self.call_memory_tool("query_graph", project, |args| {
+            args.insert("query".to_string(), Value::String(query.to_string()));
+            if let Some(limit) = max_results {
+                args.insert("limit".to_string(), Value::Number(limit.into()));
+            }
+        })
+        .await
     }
 
     async fn trace_path(
@@ -285,15 +303,14 @@ impl MemoryBackend for MemoryClientBackend {
         max_depth: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
         let project = project_name(repo_root)?;
-        let mut args = base_args(project);
-        args.insert("from".to_string(), Value::String(from.to_string()));
-        args.insert("to".to_string(), Value::String(to.to_string()));
-        if let Some(depth) = max_depth {
-            args.insert("max_depth".to_string(), Value::Number(depth.into()));
-        }
-        let result = self.client.call("trace_path", args).await?;
-        let json = decode_result("trace_path", &result)?;
-        Ok(findings_and_summary("trace_path", &json))
+        self.call_memory_tool("trace_path", project, |args| {
+            args.insert("from".to_string(), Value::String(from.to_string()));
+            args.insert("to".to_string(), Value::String(to.to_string()));
+            if let Some(depth) = max_depth {
+                args.insert("max_depth".to_string(), Value::Number(depth.into()));
+            }
+        })
+        .await
     }
 
     async fn get_architecture(
@@ -302,13 +319,12 @@ impl MemoryBackend for MemoryClientBackend {
         depth: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
         let project = project_name(repo_root)?;
-        let mut args = base_args(project);
-        if let Some(d) = depth {
-            args.insert("depth".to_string(), Value::Number(d.into()));
-        }
-        let result = self.client.call("get_architecture", args).await?;
-        let json = decode_result("get_architecture", &result)?;
-        Ok(findings_and_summary("get_architecture", &json))
+        self.call_memory_tool("get_architecture", project, |args| {
+            if let Some(d) = depth {
+                args.insert("depth".to_string(), Value::Number(d.into()));
+            }
+        })
+        .await
     }
 
     async fn get_code_snippet(

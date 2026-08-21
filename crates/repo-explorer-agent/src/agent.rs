@@ -5,7 +5,7 @@
 
 use repo_explorer_core::domain::{ExplorationFinding, ExplorationQuery, ExplorationResult};
 use repo_explorer_core::llm::{
-    Clock, LlmProvider, Message, ProviderResponse, ProviderRouter, Role, SystemClock,
+    Clock, LlmProvider, Message, ProviderResponse, ProviderRouter, SystemClock,
 };
 use repo_explorer_core::memory::{IndexStatus, MemoryBackend};
 use repo_explorer_core::search::SearchBackend;
@@ -86,18 +86,8 @@ where
 
         // Step 2: seed messages.
         let mut messages: Vec<Message> = vec![
-            Message {
-                role: Role::System,
-                content: system_prompt(index_note.as_deref()),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            },
-            Message {
-                role: Role::User,
-                content: user_prompt(query),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            },
+            Message::system(system_prompt(index_note.as_deref())),
+            Message::user(user_prompt(query)),
         ];
 
         let mut findings: Vec<ExplorationFinding> = Vec::new();
@@ -106,40 +96,24 @@ where
         for _turn in 0..self.config.max_iterations {
             match self.router.complete_with_tools(&messages, &tools).await {
                 Ok(ProviderResponse::ToolCalls(calls)) if calls.is_empty() => {
-                    messages.push(Message {
-                        role: Role::Assistant,
-                        content: String::new(),
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                    });
-                    messages.push(Message {
-                        role: Role::User,
-                        content: "You must respond with a tool call; call finish when done."
-                            .to_string(),
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                    });
+                    messages.push(Message::assistant_tool_calls(Vec::new()));
+                    messages.push(Message::user(
+                        "You must respond with a tool call; call finish when done.",
+                    ));
                 }
                 Ok(ProviderResponse::ToolCalls(calls)) => {
-                    messages.push(Message {
-                        role: Role::Assistant,
-                        content: String::new(),
-                        tool_calls: calls.clone(),
-                        tool_call_id: None,
-                    });
+                    messages.push(Message::assistant_tool_calls(calls.clone()));
                     for call in &calls {
                         if call.name == "finish" {
                             match parse_finish(&call.arguments_json) {
                                 Ok(result) => return Ok(result),
                                 Err(reason) => {
-                                    messages.push(Message {
-                                        role: Role::Tool,
-                                        content: format!(
+                                    messages.push(Message::tool(
+                                        call.id.clone(),
+                                        format!(
                                             "finish rejected: {reason}; fix the arguments and call finish again"
                                         ),
-                                        tool_calls: Vec::new(),
-                                        tool_call_id: Some(call.id.clone()),
-                                    });
+                                    ));
                                 }
                             }
                         } else {
@@ -153,19 +127,10 @@ where
                     }
                 }
                 Ok(ProviderResponse::Text(text)) => {
-                    messages.push(Message {
-                        role: Role::Assistant,
-                        content: text,
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                    });
-                    messages.push(Message {
-                        role: Role::User,
-                        content: "You must respond with a tool call; call finish when done."
-                            .to_string(),
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                    });
+                    messages.push(Message::assistant_text(text));
+                    messages.push(Message::user(
+                        "You must respond with a tool call; call finish when done.",
+                    ));
                 }
                 Err(router_err) => {
                     return Err(AgentLoopError::Provider(router_err.to_string()));
