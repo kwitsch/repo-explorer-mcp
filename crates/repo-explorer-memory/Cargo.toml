@@ -1,0 +1,7 @@
+[package]
+name = "repo-explorer-memory"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+repo-explorer-core = { version = "0.1.0", path = "../repo-explorer-core" }
