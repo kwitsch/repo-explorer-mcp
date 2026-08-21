@@ -24,6 +24,13 @@ impl MemoryClient {
     /// a `endpoint` config yields `MemoryError::UnsupportedTransport`.
     /// Config validation guarantees exactly one of `command`/`endpoint` is set.
     pub(crate) async fn connect(config: &CodebaseMemoryConfig) -> Result<Self, MemoryError> {
+        if config.command.is_some() && config.endpoint.is_some() {
+            return Err(MemoryError::Transport(
+                "codebase_memory config sets both `command` and `endpoint`; \
+                 exactly one is required (Config::validate should have rejected this)"
+                    .to_string(),
+            ));
+        }
         match &config.command {
             Some(cmd) => {
                 let mut command = tokio::process::Command::new(cmd);
@@ -104,9 +111,13 @@ pub(crate) fn decode_result(
 /// Derive the project name from the repo root's final path component (matching
 /// `index_repository`'s documented default of the directory name). Root or
 /// non-UTF-8 paths error as `Transport`.
+///
+/// Canonicalizes `repo_root` first — same normalization `run_index` applies
+/// before calling `index_repository` — so a relative value like `.` resolves
+/// to its real directory name instead of erroring out immediately.
 pub(crate) fn project_name(repo_root: &Path) -> Result<String, MemoryError> {
-    repo_root
-        .file_name()
+    let abs = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    abs.file_name()
         .and_then(|n| n.to_str())
         .map(|s| s.to_string())
         .ok_or_else(|| {

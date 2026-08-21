@@ -46,27 +46,36 @@ impl MemoryClientBackend {
         match self.client.call("index_status", args).await {
             Ok(result) => {
                 let json = decode_result("index_status", &result)?;
+                // An unrecognized/empty response must NOT be optimistically
+                // treated as "already indexed" — default to `false` so an
+                // unknown shape forces a (safe) reindex instead of skipping one.
                 let exists = json
                     .get("indexed")
                     .and_then(Value::as_bool)
                     .or_else(|| json.get("exists").and_then(Value::as_bool))
-                    .unwrap_or(true);
+                    .unwrap_or(false);
                 let last_indexed_at = json
                     .get("last_indexed_at")
                     .and_then(Value::as_i64)
-                    .map(|secs| UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64));
+                    .and_then(|secs| u64::try_from(secs).ok())
+                    .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
                 Ok(IndexProbe {
                     exists,
                     last_indexed_at,
                     changed_files: 0,
                 })
             }
-            // A tool-level error is interpreted as "project not indexed yet".
-            Err(MemoryError::ToolFailed { .. }) => Ok(IndexProbe {
-                exists: false,
-                last_indexed_at: None,
-                changed_files: 0,
-            }),
+            // Only a tool error that explicitly indicates the project is
+            // unknown/not-yet-indexed is downgraded to "not indexed"; any other
+            // tool failure (permission error, malformed input, internal fault)
+            // is surfaced to the caller instead of being silently reinterpreted.
+            Err(MemoryError::ToolFailed { message, .. }) if is_not_indexed_error(&message) => {
+                Ok(IndexProbe {
+                    exists: false,
+                    last_indexed_at: None,
+                    changed_files: 0,
+                })
+            }
             Err(e) => Err(e),
         }
     }
@@ -75,19 +84,29 @@ impl MemoryClientBackend {
     async fn probe_changes(&self, project: &str) -> Result<usize, MemoryError> {
         let mut args = Map::new();
         args.insert("project".to_string(), Value::String(project.to_string()));
-        let result = self.client.call("detect_changes", args).await?;
-        let json = decode_result("detect_changes", &result)?;
-        let changed = json
-            .get("changed_files")
-            .and_then(Value::as_array)
-            .map(|a| a.len())
-            .or_else(|| {
-                json.get("changed_count")
-                    .and_then(Value::as_u64)
-                    .map(|n| n as usize)
-            })
-            .unwrap_or(0);
-        Ok(changed)
+        match self.client.call("detect_changes", args).await {
+            Ok(result) => {
+                let json = decode_result("detect_changes", &result)?;
+                let changed = json
+                    .get("changed_files")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .or_else(|| {
+                        json.get("changed_count")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize)
+                    })
+                    .unwrap_or(0);
+                Ok(changed)
+            }
+            // Per the `MemoryBackend::ensure_fresh_index` contract, a soft tool
+            // failure must not abort exploration outright. We cannot confirm
+            // freshness, so report an (arbitrary, nonzero) unknown change count
+            // that forces `decide_freshness` toward a reindex attempt rather
+            // than returning `Err` for a recoverable hiccup.
+            Err(MemoryError::ToolFailed { .. }) => Ok(1),
+            Err(e) => Err(e),
+        }
     }
 
     /// Run `index_repository` against the absolute repo root. Soft tool failure
@@ -109,6 +128,15 @@ impl MemoryClientBackend {
     }
 }
 
+/// Does a tool-failure message indicate "this project is not indexed yet"
+/// (as opposed to some other recoverable-or-not failure)? Matches the
+/// observed `codebase-memory-mcp` phrasing ("project not found or not
+/// indexed") case-insensitively so close variants still match.
+fn is_not_indexed_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("not indexed") || lower.contains("not found")
+}
+
 /// Build a `FileLocation` from a JSON row's `file`/`line_start`/`line_end`,
 /// tolerating missing line fields (defaulting to 0).
 fn location_from(json: &Value) -> Option<FileLocation> {
@@ -116,11 +144,18 @@ fn location_from(json: &Value) -> Option<FileLocation> {
         .get("file")
         .or_else(|| json.get("path"))
         .and_then(Value::as_str)?;
-    let line_start = json.get("line_start").and_then(Value::as_u64).unwrap_or(0) as u32;
+    // Saturate rather than `as`-truncate: a line number beyond `u32::MAX` (or a
+    // malformed huge value) must not silently wrap around to a small, wrong one.
+    let line_start = json
+        .get("line_start")
+        .and_then(Value::as_u64)
+        .map(|n| n.min(u32::MAX as u64) as u32)
+        .unwrap_or(0);
     let line_end = json
         .get("line_end")
         .and_then(Value::as_u64)
-        .unwrap_or(line_start as u64) as u32;
+        .map(|n| n.min(u32::MAX as u64) as u32)
+        .unwrap_or(line_start);
     Some(FileLocation {
         path: std::path::PathBuf::from(file),
         line_start,
