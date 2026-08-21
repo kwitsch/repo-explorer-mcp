@@ -76,6 +76,10 @@ impl SearchBackend for CliSearchBackend {
             Tool::Rtk => {
                 let mut args = vec!["rg".to_string(), "-H".to_string(), "-n".to_string()];
                 push_flags(&mut args, options);
+                // `--` ends option parsing so a pattern/target starting with
+                // `-` (e.g. `-\d+` or a leading-dash file name) is never
+                // misread as a flag by the underlying rg passthrough.
+                args.push("--".to_string());
                 args.push(pattern.to_string());
                 args.push(target);
                 ("rtk", args)
@@ -83,6 +87,7 @@ impl SearchBackend for CliSearchBackend {
             Tool::Ripgrep => {
                 let mut args = vec!["--json".to_string(), "-H".to_string()];
                 push_flags(&mut args, options);
+                args.push("--".to_string());
                 args.push(pattern.to_string());
                 args.push(target);
                 ("ripgrep", args)

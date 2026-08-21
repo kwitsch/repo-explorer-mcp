@@ -86,7 +86,12 @@ impl MemoryClientBackend {
                 let changed = first_field(&json, &["changed_files", "changed_count"])
                     .map(|v| match v {
                         Value::Array(a) => a.len(),
-                        Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+                        // Saturate rather than `as`-truncate: on a platform
+                        // where `usize` is narrower than `u64`, a huge/
+                        // malformed count must clamp, not wrap to a small,
+                        // wrong value (matches the `line_start`/`line_end`
+                        // saturating casts elsewhere in this module).
+                        Value::Number(n) => n.as_u64().unwrap_or(0).min(usize::MAX as u64) as usize,
                         _ => 0,
                     })
                     .unwrap_or(0);

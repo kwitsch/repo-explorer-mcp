@@ -24,18 +24,28 @@ fn saturate_u32(n: u64) -> u32 {
 
 /// Split one grep-style line into `(path, line, content, is_match)`.
 ///
-/// The path itself may contain both `:` and `-` (e.g. `repo-explorer-core`), so
-/// we cannot split on the first separator. Instead we scan for the first
-/// occurrence of `<sep><digits><sep>` where both separators are the same char
-/// (`:` for a match line, `-` for a context line): that middle run is the line
-/// number, everything before is the path, everything after is the content.
+/// The path itself may contain both `:` and `-` (e.g. `repo-explorer-core`, or
+/// a date-like file name such as `2024-01-01.rs`), so we cannot scan for
+/// whichever separator (`:` or `-`) shows up first in byte order — a `-`
+/// buried inside the path could be mistaken for the context separator before
+/// the real `:line:` match separator further right is ever reached. Instead
+/// we scan for each separator kind independently, over the *whole* line, and
+/// prefer `:` (match lines) over `-` (context lines): a match line's path
+/// never legitimately contains a `:NN:` run, so this can't misfire the other
+/// way.
 #[allow(dead_code)]
 fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
+    scan_for_separator(line, b':').or_else(|| scan_for_separator(line, b'-'))
+}
+
+/// Scan `line` for the first `<sep><digits><sep>` run using exactly `sep` as
+/// both delimiters: that middle run is the line number, everything before is
+/// the path, everything after is the content.
+fn scan_for_separator(line: &str, sep: u8) -> Option<(&str, u32, &str, bool)> {
     let bytes = line.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        let sep = bytes[i];
-        if (sep == b':' || sep == b'-') && i > 0 {
+        if bytes[i] == sep && i > 0 {
             let mut j = i + 1;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
                 j += 1;
