@@ -118,6 +118,15 @@ pub(crate) fn decode_result(
 /// to its real directory name instead of erroring out immediately.
 pub(crate) fn project_name(repo_root: &Path) -> Result<String, MemoryError> {
     let abs = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    project_name_from_abs(repo_root, &abs)
+}
+
+/// Derive the project name from an already-canonicalized path, without
+/// canonicalizing again. Shared by `project_name` and by call sites (like
+/// `ensure_fresh_index`) that need both the project name and the
+/// canonicalized path itself and must not `canonicalize` twice for one
+/// logical resolution.
+pub(crate) fn project_name_from_abs(repo_root: &Path, abs: &Path) -> Result<String, MemoryError> {
     abs.file_name()
         .and_then(|n| n.to_str())
         .map(|s| s.to_string())
@@ -127,6 +136,20 @@ pub(crate) fn project_name(repo_root: &Path) -> Result<String, MemoryError> {
                 repo_root.display()
             ))
         })
+}
+
+/// Canonicalize `repo_root` off the async runtime thread (the blocking
+/// `std::fs::canonicalize` syscall runs via `spawn_blocking`), falling back
+/// to the original path unchanged if canonicalization fails for any reason
+/// (missing path, non-UTF8 quirks, or the blocking task itself failing).
+pub(crate) async fn canonicalize_repo_root(repo_root: &Path) -> std::path::PathBuf {
+    let owned = repo_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let fallback = owned.clone();
+        std::fs::canonicalize(&owned).unwrap_or(fallback)
+    })
+    .await
+    .unwrap_or_else(|_| repo_root.to_path_buf())
 }
 
 #[cfg(test)]

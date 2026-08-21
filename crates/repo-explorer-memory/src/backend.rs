@@ -2,11 +2,13 @@
 //! each of the six query methods onto an upstream `codebase-memory-mcp` tool,
 //! decoding every response into the uniform `ExplorationResult`.
 
-use crate::client::{MemoryClient, decode_result, project_name};
-use crate::freshness::{FreshnessDecision, IndexProbe, decide_freshness};
+use crate::client::{
+    MemoryClient, canonicalize_repo_root, decode_result, project_name, project_name_from_abs,
+};
+use crate::freshness::{ChangeCount, FreshnessDecision, IndexProbe, decide_freshness};
 use repo_explorer_core::config::CodebaseMemoryConfig;
 use repo_explorer_core::domain::{
-    ExplorationFinding, ExplorationQuery, ExplorationResult, FileLocation,
+    ExplorationFinding, ExplorationQuery, ExplorationResult, FileLocation, saturate_u32,
 };
 use repo_explorer_core::memory::{
     GraphQuery, IndexStatus, MemoryBackend, MemoryError, SnippetTarget,
@@ -59,7 +61,7 @@ impl MemoryClientBackend {
                 Ok(IndexProbe {
                     exists,
                     last_indexed_at,
-                    changed_files: 0,
+                    changed_files: ChangeCount::Known(0),
                 })
             }
             // Only a tool error that explicitly indicates the project is
@@ -70,7 +72,7 @@ impl MemoryClientBackend {
                 Ok(IndexProbe {
                     exists: false,
                     last_indexed_at: None,
-                    changed_files: 0,
+                    changed_files: ChangeCount::Known(0),
                 })
             }
             Err(e) => Err(e),
@@ -78,7 +80,7 @@ impl MemoryClientBackend {
     }
 
     /// Fill `changed_files` from `detect_changes` for an existing project.
-    async fn probe_changes(&self, project: &str) -> Result<usize, MemoryError> {
+    async fn probe_changes(&self, project: &str) -> Result<ChangeCount, MemoryError> {
         let args = base_args(project.to_string());
         match self.client.call("detect_changes", args).await {
             Ok(result) => {
@@ -95,26 +97,31 @@ impl MemoryClientBackend {
                         _ => 0,
                     })
                     .unwrap_or(0);
-                Ok(changed)
+                Ok(ChangeCount::Known(changed))
             }
             // Per the `MemoryBackend::ensure_fresh_index` contract, a soft tool
             // failure must not abort exploration outright. We cannot confirm
-            // freshness, so report an (arbitrary, nonzero) unknown change count
-            // that forces `decide_freshness` toward a reindex attempt rather
-            // than returning `Err` for a recoverable hiccup.
-            Err(MemoryError::ToolFailed { .. }) => Ok(1),
+            // freshness, so report `Unknown` explicitly (rather than an
+            // arbitrary nonzero count) — `decide_freshness` treats it as
+            // forcing a reindex attempt, same as a real change, without
+            // pretending to know how many files changed.
+            Err(MemoryError::ToolFailed { .. }) => Ok(ChangeCount::Unknown),
             Err(e) => Err(e),
         }
     }
 
-    /// Run `index_repository` against the absolute repo root. Soft tool failure
-    /// -> `IndexingFailed`; transport failure -> `Err`.
-    async fn run_index(&self, repo_root: &Path) -> Result<IndexStatus, MemoryError> {
-        let abs = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    /// Run `index_repository` against the given, already-canonicalized repo
+    /// root. Soft tool failure -> `IndexingFailed`; transport failure -> `Err`.
+    ///
+    /// Takes the canonicalized path directly (rather than re-canonicalizing a
+    /// raw `repo_root`) because `ensure_fresh_index` already resolved it once
+    /// for `project_name_from_abs`; canonicalizing twice per reindex would
+    /// duplicate a blocking filesystem syscall for no benefit.
+    async fn run_index(&self, abs_repo_root: &Path) -> Result<IndexStatus, MemoryError> {
         let mut args = Map::new();
         args.insert(
             "path".to_string(),
-            Value::String(abs.to_string_lossy().into_owned()),
+            Value::String(abs_repo_root.to_string_lossy().into_owned()),
         );
         match self.client.call("index_repository", args).await {
             Ok(_) => Ok(IndexStatus::Reindexed),
@@ -159,12 +166,12 @@ fn location_from(json: &Value) -> Option<FileLocation> {
     let line_start = json
         .get("line_start")
         .and_then(Value::as_u64)
-        .map(|n| n.min(u32::MAX as u64) as u32)
+        .map(saturate_u32)
         .unwrap_or(0);
     let line_end = json
         .get("line_end")
         .and_then(Value::as_u64)
-        .map(|n| n.min(u32::MAX as u64) as u32)
+        .map(saturate_u32)
         .unwrap_or(line_start);
     Some(FileLocation {
         path: std::path::PathBuf::from(file),
@@ -202,14 +209,19 @@ fn findings_and_summary(tool: &'static str, json: &Value) -> ExplorationResult {
 
 impl MemoryBackend for MemoryClientBackend {
     async fn ensure_fresh_index(&self, repo_root: &Path) -> Result<IndexStatus, MemoryError> {
-        let project = project_name(repo_root)?;
+        // Canonicalize once and derive the project name from that same
+        // resolved path, instead of calling `project_name` (which
+        // canonicalizes again internally) and then re-canonicalizing a
+        // second time inside `run_index`.
+        let abs = canonicalize_repo_root(repo_root).await;
+        let project = project_name_from_abs(repo_root, &abs)?;
         let mut probe = self.probe_status(&project).await?;
         if probe.exists {
             probe.changed_files = self.probe_changes(&project).await?;
         }
         match decide_freshness(&probe, self.staleness, SystemTime::now()) {
             FreshnessDecision::UpToDate => Ok(IndexStatus::UpToDate),
-            FreshnessDecision::Reindex => self.run_index(repo_root).await,
+            FreshnessDecision::Reindex => self.run_index(&abs).await,
         }
     }
 

@@ -5,7 +5,7 @@
 //! `rg --json` JSON-lines. Both are tolerant of malformed individual rows (skip,
 //! not fatal) and saturate `u64`->`u32` line numbers (never a bare `as` cast).
 
-use repo_explorer_core::domain::{ExplorationFinding, FileLocation};
+use repo_explorer_core::domain::{ExplorationFinding, FileLocation, saturate_u32};
 use repo_explorer_core::search::SearchError;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -14,13 +14,6 @@ use std::path::PathBuf;
 // own (fixture-tested in isolation), before `backend` (a later task in this
 // stage) wires them into `CliSearchBackend`. Non-test builds have no caller
 // yet, which `-D warnings` would otherwise reject as dead code.
-
-/// Saturating `u64` -> `u32`: a line number beyond `u32::MAX` clamps rather than
-/// wrapping to a small wrong value.
-#[allow(dead_code)]
-fn saturate_u32(n: u64) -> u32 {
-    n.min(u32::MAX as u64) as u32
-}
 
 /// Split one grep-style line into `(path, line, content, is_match)`.
 ///
@@ -63,6 +56,20 @@ fn scan_for_separator(line: &str, sep: u8) -> Option<(&str, u32, &str, bool)> {
     None
 }
 
+/// Append a context line's text to the previous finding's snippet (joined by
+/// `\n`), or start a fresh snippet if there is none yet; on a best-effort
+/// basis, dropped if there is no previous finding. Shared by `parse_rtk` and
+/// `parse_rg_json`, whose context-line handling is otherwise identical.
+fn append_context(findings: &mut [ExplorationFinding], text: &str) {
+    if let Some(last) = findings.last_mut() {
+        let combined = match last.snippet.take() {
+            Some(s) => format!("{s}\n{text}"),
+            None => text.to_string(),
+        };
+        last.snippet = Some(combined);
+    }
+}
+
 /// Parse `rtk rg -H -n` output. Each match line becomes one finding; a context
 /// line appends its content to the previous finding's snippet on a best-effort
 /// basis (dropped if there is no previous finding).
@@ -86,13 +93,7 @@ pub(crate) fn parse_rtk(stdout: &str) -> Vec<ExplorationFinding> {
                 });
             }
             Some((_, _, content, false)) => {
-                if let Some(last) = findings.last_mut() {
-                    let combined = match last.snippet.take() {
-                        Some(s) => format!("{s}\n{content}"),
-                        None => content.to_string(),
-                    };
-                    last.snippet = Some(combined);
-                }
+                append_context(&mut findings, content);
             }
             None => {}
         }
@@ -158,13 +159,7 @@ pub(crate) fn parse_rg_json(stdout: &str) -> Result<Vec<ExplorationFinding>, Sea
                     .and_then(Value::as_str)
                 {
                     let text = text.strip_suffix('\n').unwrap_or(text);
-                    if let Some(last) = findings.last_mut() {
-                        let combined = match last.snippet.take() {
-                            Some(s) => format!("{s}\n{text}"),
-                            None => text.to_string(),
-                        };
-                        last.snippet = Some(combined);
-                    }
+                    append_context(&mut findings, text);
                 }
             }
             _ => {} // begin / end / summary / unknown: ignored, not a decode error
