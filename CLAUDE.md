@@ -6,6 +6,7 @@ Rust MCP server, shipped for Linux and Windows. Currently scaffolding only — n
 
 - `crates/repo-explorer-core/` — domain logic (lib), no MCP/transport concerns.
 - `crates/repo-explorer-mcp/` — server binary, depends on `repo-explorer-core` and `rmcp` (the official MCP Rust SDK).
+- `crates/repo-explorer-memory/` — `MemoryBackend` implementation backed by an `rmcp` client to `codebase-memory-mcp`; owns the `rmcp` dependency (core does not).
 - `.claude/rules/` — path-scoped rules Claude Code loads automatically when editing matching files.
 
 ## Build & test
