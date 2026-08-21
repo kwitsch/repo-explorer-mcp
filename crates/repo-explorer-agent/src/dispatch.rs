@@ -7,7 +7,7 @@
 use repo_explorer_core::domain::{ExplorationFinding, ExplorationQuery, ExplorationResult};
 use repo_explorer_core::llm::{Message, ToolCall};
 use repo_explorer_core::memory::{GraphQuery, MemoryBackend, SnippetTarget};
-use repo_explorer_core::search::{SearchBackend, SearchMode, SearchOptions};
+use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
 
@@ -92,8 +92,8 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
         "grep" => {
             let args: GrepArgs = parse_args(&call.arguments_json)?;
             let opts = SearchOptions {
-                mode: SearchMode::Content,
                 max_results: args.max_results,
+                ..SearchOptions::default()
             };
             let scope = validate_scope(args.scope.as_deref())?;
             let findings = search
@@ -104,13 +104,17 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
         }
         "find" => {
             let args: FindArgs = parse_args(&call.arguments_json)?;
+            // The real `SearchBackend` only exposes a content search; a
+            // filename search is approximated by matching any non-empty line
+            // (pattern `.`) restricted to files matching `pattern` as a glob.
             let opts = SearchOptions {
-                mode: SearchMode::FileName,
                 max_results: args.max_results,
+                file_glob: Some(args.pattern.clone()),
+                ..SearchOptions::default()
             };
             let scope = validate_scope(args.scope.as_deref())?;
             let findings = search
-                .search(repo_root, &args.pattern, scope.as_deref(), &opts)
+                .search(repo_root, ".", scope.as_deref(), &opts)
                 .await
                 .map_err(|e| format!("find failed: {e}"))?;
             Ok(render_findings(findings))
@@ -353,22 +357,28 @@ mod tests {
                 pattern: "fn main".to_string(),
                 scope: Some(PathBuf::from("src")),
                 options: SearchOptions {
-                    mode: SearchMode::Content,
                     max_results: None,
+                    ..SearchOptions::default()
                 },
             }
         );
     }
 
     #[tokio::test]
-    async fn find_routes_to_search_with_filename_mode() {
+    async fn find_routes_to_search_with_file_glob() {
         let search = MockSearchBackend::new();
         let root = PathBuf::from("/repo");
         let c = call("c3", "find", r#"{"pattern":"*.rs"}"#);
         let _ = dispatch_call(&MockMemoryBackend::new(), &search, &root, &c).await;
         match &search.calls()[0] {
-            SearchCall::Search { options, scope, .. } => {
-                assert_eq!(options.mode, SearchMode::FileName);
+            SearchCall::Search {
+                pattern,
+                options,
+                scope,
+                ..
+            } => {
+                assert_eq!(pattern, ".");
+                assert_eq!(options.file_glob.as_deref(), Some("*.rs"));
                 assert_eq!(scope, &None);
             }
         }

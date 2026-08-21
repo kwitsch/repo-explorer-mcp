@@ -11,7 +11,7 @@ use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use serde_json::{Map, Value};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// A connected `rmcp` client to `codebase-memory-mcp`.
 #[derive(Debug)]
@@ -116,16 +116,17 @@ pub(crate) fn decode_result(
 /// Canonicalizes `repo_root` first — same normalization `run_index` applies
 /// before calling `index_repository` — so a relative value like `.` resolves
 /// to its real directory name instead of erroring out immediately.
-/// Canonicalize `path`, falling back to it unchanged if canonicalization
-/// fails (e.g. it doesn't exist yet) — the one place this normalize-or-keep
-/// pattern lives, shared by `project_name` and `run_index`'s absolute-path
-/// argument.
-pub(crate) fn canonicalize_or_self(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+pub(crate) fn project_name(repo_root: &Path) -> Result<String, MemoryError> {
+    let abs = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    project_name_from_abs(repo_root, &abs)
 }
 
-pub(crate) fn project_name(repo_root: &Path) -> Result<String, MemoryError> {
-    let abs = canonicalize_or_self(repo_root);
+/// Derive the project name from an already-canonicalized path, without
+/// canonicalizing again. Shared by `project_name` and by call sites (like
+/// `ensure_fresh_index`) that need both the project name and the
+/// canonicalized path itself and must not `canonicalize` twice for one
+/// logical resolution.
+pub(crate) fn project_name_from_abs(repo_root: &Path, abs: &Path) -> Result<String, MemoryError> {
     abs.file_name()
         .and_then(|n| n.to_str())
         .map(|s| s.to_string())
@@ -135,6 +136,20 @@ pub(crate) fn project_name(repo_root: &Path) -> Result<String, MemoryError> {
                 repo_root.display()
             ))
         })
+}
+
+/// Canonicalize `repo_root` off the async runtime thread (the blocking
+/// `std::fs::canonicalize` syscall runs via `spawn_blocking`), falling back
+/// to the original path unchanged if canonicalization fails for any reason
+/// (missing path, non-UTF8 quirks, or the blocking task itself failing).
+pub(crate) async fn canonicalize_repo_root(repo_root: &Path) -> std::path::PathBuf {
+    let owned = repo_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let fallback = owned.clone();
+        std::fs::canonicalize(&owned).unwrap_or(fallback)
+    })
+    .await
+    .unwrap_or_else(|_| repo_root.to_path_buf())
 }
 
 #[cfg(test)]

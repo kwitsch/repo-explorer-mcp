@@ -18,4 +18,13 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build --workspace
       - run: cargo test --workspace
+
+  test-gate:
+    name: Test gate
+    needs: test
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - run: ${{ needs.test.result == 'success' && 'exit 0' || 'exit 1' }}

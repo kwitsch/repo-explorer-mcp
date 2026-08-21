@@ -1,52 +1,73 @@
-//! The `SearchBackend` contract: an async trait plus its typed error and option
-//! value types, defining the boundary the Stage 3 rtk/ripgrep implementation
-//! fills. Only the contract and a test mock live here; no subprocess code.
+//! The `SearchBackend` contract: an async trait plus its typed error and
+//! options value type. This module defines the boundary that the
+//! `repo-explorer-search` crate implements against `rtk`/`ripgrep`.
 //!
-//! Mirrors `memory.rs`: serde-free, fully comparable value types; native AFIT;
-//! a `mock` module gated for downstream `test-support`. `repo_root` leads the
-//! call for consistency with every `MemoryBackend` method; the LLM never
-//! supplies it.
+//! Core stays free of subprocess/transport concerns: the spawn/IO cause of any
+//! failure is formatted into a `String`/message field at the search-crate
+//! boundary, so every type here is serde-free and fully comparable. This module
+//! is a structural clone of [`crate::memory`].
 
 use crate::domain::ExplorationFinding;
 use std::path::Path;
-#[cfg(any(test, feature = "test-support"))]
-use std::path::PathBuf;
 
-/// Whether a search matches file contents or file names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchMode {
-    Content,
-    FileName,
-}
-
-/// Options controlling a single search.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Options narrowing a search. A serde-free options bag with all-public fields
+/// for struct-update construction; `Default` is all-`None`/`false`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SearchOptions {
-    pub mode: SearchMode,
+    /// Cap on findings returned (applied as a post-parse truncation for uniform
+    /// behavior across both tools).
     pub max_results: Option<u32>,
+    /// Case-sensitive match. `false` (default) lets the tool use its own
+    /// smart/insensitive default; `true` forces `-s`.
+    pub case_sensitive: bool,
+    /// Lines of surrounding context to include in the snippet (rg `-C`).
+    pub context_lines: Option<u32>,
+    /// Restrict to files matching this glob (rg `-g`).
+    pub file_glob: Option<String>,
 }
 
-/// Search-tool failures. Fully comparable so mock-based tests can `assert_eq!`
-/// on error values (mirrors `MemoryError`).
+/// Search-backend failures. Fully comparable so mock-based tests can
+/// `assert_eq!` on error values (mirrors [`crate::memory::MemoryError`]).
+/// Spawn/IO causes are formatted to `String`, never stored as `std::io::Error`
+/// (which is not `Eq`).
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum SearchError {
-    #[error("search transport error: {0}")]
-    Transport(String),
-    #[error("failed to decode search output: {message}")]
-    Decode { message: String },
-    #[error("search tool unavailable: {0}")]
-    NotAvailable(String),
+    /// No usable search binary was found (rtk and ripgrep both absent/unresolvable).
+    #[error("no search backend available: {0}")]
+    BackendNotFound(String),
+    /// The chosen backend failed to spawn or exited with a real error code.
+    #[error("search backend `{backend}` failed: {message}")]
+    BackendFailed {
+        backend: &'static str,
+        message: String,
+    },
+    /// The backend's output could not be parsed into findings.
+    #[error("failed to decode `{backend}` output: {message}")]
+    Decode {
+        backend: &'static str,
+        message: String,
+    },
+    /// The search exceeded the configured timeout.
+    #[error("search backend `{backend}` timed out after {seconds}s")]
+    Timeout { backend: &'static str, seconds: u64 },
+    /// The request itself was invalid (e.g. an empty pattern).
     #[error("invalid search input: {0}")]
     InvalidInput(String),
 }
 
-/// The text/file search contract implemented by a concrete search backend.
+/// The text-search contract implemented by a concrete CLI backend.
 ///
 /// Native `async fn` in trait (AFIT) — no `async-trait` dependency in core,
-/// mirroring `MemoryBackend`/`LlmProvider`. The `allow` silences the
+/// mirroring [`crate::memory::MemoryBackend`]. The `allow` silences the
 /// warn-by-default `async_fn_in_trait` lint that `-D warnings` would reject.
 #[allow(async_fn_in_trait)]
 pub trait SearchBackend {
+    /// Search `pattern` under `repo_root`, optionally narrowed to `scope`.
+    ///
+    /// `repo_root` is the working directory / search base the subprocess runs
+    /// against; `scope`, when set, narrows the search to a sub-path (absolute,
+    /// or relative to `repo_root`). `pattern` is treated as a literal-capable
+    /// regex passed straight to rtk/rg.
     async fn search(
         &self,
         repo_root: &Path,
@@ -56,15 +77,16 @@ pub trait SearchBackend {
     ) -> Result<Vec<ExplorationFinding>, SearchError>;
 }
 
-/// In-memory `SearchBackend` for tests: returns a canned result and records each
-/// call for assertion. Gated so it compiles for core's own tests and for
+/// In-memory `SearchBackend` for tests: returns a canned result and records
+/// each call for assertion. Gated so it compiles for core's own tests and for
 /// downstream crates that enable `features = ["test-support"]`.
 #[cfg(any(test, feature = "test-support"))]
 pub mod mock {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
-    /// One recorded `search` invocation.
+    /// One recorded invocation, capturing the method and its key arguments.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Call {
         Search {
@@ -78,14 +100,14 @@ pub mod mock {
     /// Programmable, call-recording `SearchBackend`.
     #[derive(Clone)]
     pub struct MockSearchBackend {
-        search_result: Arc<Result<Vec<ExplorationFinding>, SearchError>>,
+        search_result: Result<Vec<ExplorationFinding>, SearchError>,
         calls: Arc<Mutex<Vec<Call>>>,
     }
 
     impl Default for MockSearchBackend {
         fn default() -> Self {
             Self {
-                search_result: Arc::new(Ok(Vec::new())),
+                search_result: Ok(Vec::new()),
                 calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -96,17 +118,24 @@ pub mod mock {
             Self::default()
         }
 
-        /// Set the canned result returned by every `search` call.
-        pub fn with_search_result(self, r: Result<Vec<ExplorationFinding>, SearchError>) -> Self {
-            Self {
-                search_result: Arc::new(r),
-                ..self
-            }
+        pub fn with_search_result(
+            mut self,
+            r: Result<Vec<ExplorationFinding>, SearchError>,
+        ) -> Self {
+            self.search_result = r;
+            self
         }
 
         /// Snapshot of recorded calls, in order.
         pub fn calls(&self) -> Vec<Call> {
             self.calls.lock().expect("mock call log poisoned").clone()
+        }
+
+        fn record(&self, call: Call) {
+            self.calls
+                .lock()
+                .expect("mock call log poisoned")
+                .push(call);
         }
     }
 
@@ -118,16 +147,13 @@ pub mod mock {
             scope: Option<&Path>,
             options: &SearchOptions,
         ) -> Result<Vec<ExplorationFinding>, SearchError> {
-            self.calls
-                .lock()
-                .expect("mock call log poisoned")
-                .push(Call::Search {
-                    repo_root: repo_root.to_path_buf(),
-                    pattern: pattern.to_string(),
-                    scope: scope.map(|p| p.to_path_buf()),
-                    options: options.clone(),
-                });
-            (*self.search_result).clone()
+            self.record(Call::Search {
+                repo_root: repo_root.to_path_buf(),
+                pattern: pattern.to_string(),
+                scope: scope.map(|p| p.to_path_buf()),
+                options: options.clone(),
+            });
+            self.search_result.clone()
         }
     }
 }
@@ -135,75 +161,87 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::FileLocation;
     use mock::{Call, MockSearchBackend};
+    use std::path::PathBuf;
 
-    fn finding() -> ExplorationFinding {
-        ExplorationFinding {
-            location: FileLocation {
-                path: PathBuf::from("src/lib.rs"),
-                line_start: 1,
-                line_end: 2,
-            },
-            snippet: Some("x".to_string()),
-            note: None,
-        }
+    #[test]
+    fn search_options_default_is_all_none_false() {
+        let o = SearchOptions::default();
+        assert_eq!(o.max_results, None);
+        assert!(!o.case_sensitive);
+        assert_eq!(o.context_lines, None);
+        assert_eq!(o.file_glob, None);
+        assert_eq!(o, SearchOptions::default());
     }
 
     #[test]
     fn search_error_display_and_eq() {
-        let t = SearchError::Transport("boom".to_string());
-        assert_eq!(t, SearchError::Transport("boom".to_string()));
-        assert_eq!(t.to_string(), "search transport error: boom");
+        let nf = SearchError::BackendNotFound("none".to_string());
+        assert_eq!(nf, SearchError::BackendNotFound("none".to_string()));
+        assert_eq!(nf.to_string(), "no search backend available: none");
+
+        let bf = SearchError::BackendFailed {
+            backend: "rtk",
+            message: "boom".to_string(),
+        };
+        assert_eq!(bf.to_string(), "search backend `rtk` failed: boom");
 
         let d = SearchError::Decode {
-            message: "bad".to_string(),
+            backend: "ripgrep",
+            message: "bad json".to_string(),
         };
-        assert_eq!(d.to_string(), "failed to decode search output: bad");
+        assert_eq!(d.to_string(), "failed to decode `ripgrep` output: bad json");
 
-        let n = SearchError::NotAvailable("rtk".to_string());
-        assert_eq!(n.to_string(), "search tool unavailable: rtk");
+        let t = SearchError::Timeout {
+            backend: "rtk",
+            seconds: 30,
+        };
+        assert_eq!(t.to_string(), "search backend `rtk` timed out after 30s");
 
-        let i = SearchError::InvalidInput("empty".to_string());
-        assert_eq!(i.to_string(), "invalid search input: empty");
-
-        assert_ne!(t, n);
+        let ii = SearchError::InvalidInput("empty".to_string());
+        assert_eq!(ii.to_string(), "invalid search input: empty");
+        assert_ne!(nf, ii);
     }
 
     #[tokio::test]
-    async fn mock_records_call_and_returns_canned() {
-        let backend = MockSearchBackend::new().with_search_result(Ok(vec![finding()]));
+    async fn mock_default_returns_empty_and_records_call() {
+        let backend = MockSearchBackend::new();
         let root = PathBuf::from("/repo");
-        let scope = PathBuf::from("src");
-        let opts = SearchOptions {
-            mode: SearchMode::Content,
-            max_results: Some(10),
-        };
-        let got = backend.search(&root, "needle", Some(&scope), &opts).await;
-        assert_eq!(got, Ok(vec![finding()]));
+        let opts = SearchOptions::default();
+        let got = backend.search(&root, "needle", None, &opts).await;
+        assert_eq!(got, Ok(Vec::new()));
         assert_eq!(
             backend.calls(),
             vec![Call::Search {
                 repo_root: PathBuf::from("/repo"),
                 pattern: "needle".to_string(),
-                scope: Some(PathBuf::from("src")),
-                options: SearchOptions {
-                    mode: SearchMode::Content,
-                    max_results: Some(10),
-                },
+                scope: None,
+                options: SearchOptions::default(),
             }]
         );
     }
 
     #[tokio::test]
-    async fn mock_default_returns_empty() {
-        let backend = MockSearchBackend::new();
+    async fn mock_returns_canned_error() {
+        let backend = MockSearchBackend::new()
+            .with_search_result(Err(SearchError::BackendNotFound("nothing".to_string())));
         let root = PathBuf::from("/repo");
-        let opts = SearchOptions {
-            mode: SearchMode::FileName,
-            max_results: None,
-        };
-        let got = backend.search(&root, "p", None, &opts).await.unwrap();
-        assert!(got.is_empty());
+        let opts = SearchOptions::default();
+        let got = backend
+            .search(&root, "x", Some(std::path::Path::new("src")), &opts)
+            .await;
+        assert_eq!(
+            got,
+            Err(SearchError::BackendNotFound("nothing".to_string()))
+        );
+        assert_eq!(
+            backend.calls()[0],
+            Call::Search {
+                repo_root: PathBuf::from("/repo"),
+                pattern: "x".to_string(),
+                scope: Some(PathBuf::from("src")),
+                options: SearchOptions::default(),
+            }
+        );
     }
 }

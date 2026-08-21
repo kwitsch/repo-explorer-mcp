@@ -9,7 +9,6 @@ use repo_explorer_core::domain::{
 use repo_explorer_core::llm::mock::{FakeClock, MockLlmProvider};
 use repo_explorer_core::llm::{ProviderError, ProviderResponse, ProviderRouter, Role, ToolCall};
 use repo_explorer_core::memory::mock::{Call as MemCall, MockMemoryBackend};
-use repo_explorer_core::search::SearchMode;
 use repo_explorer_core::search::mock::{Call as SearchCall, MockSearchBackend};
 use std::path::PathBuf;
 
@@ -104,7 +103,7 @@ async fn fake_provider_dispatch_and_assembly() {
                 && query.max_results == Some(5)
     )));
 
-    // Search dispatch: repo_root supplied by the loop, Content mode.
+    // Search dispatch: repo_root supplied by the loop, content search.
     let search_calls = search_probe.calls();
     assert_eq!(search_calls.len(), 1);
     match &search_calls[0] {
@@ -112,12 +111,11 @@ async fn fake_provider_dispatch_and_assembly() {
             repo_root,
             pattern,
             scope,
-            options,
+            ..
         } => {
             assert_eq!(repo_root, &PathBuf::from("/repo"));
             assert_eq!(pattern, "fn main");
             assert_eq!(scope, &Some(PathBuf::from("src")));
-            assert_eq!(options.mode, SearchMode::Content);
         }
     }
 
