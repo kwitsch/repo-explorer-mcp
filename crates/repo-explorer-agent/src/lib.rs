@@ -6,6 +6,7 @@
 //! continuing the one-impure-dependency-per-crate convention that keeps `rmcp`
 //! in `repo-explorer-memory` and `genai` in `repo-explorer-llm`.
 
+mod dispatch;
 mod tools;
 
 pub use tools::tool_catalog;
