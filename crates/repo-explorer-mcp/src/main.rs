@@ -1,14 +1,21 @@
 //! `repo-explorer-mcp` binary entrypoint (Stage 6 bootstrap).
 //!
 //! Resolves the config path, loads config, initializes `tracing` to stderr, and
-//! (completed in a later task) wires the exploration pipeline over rmcp stdio.
-//! stdout is reserved for the MCP protocol stream; every diagnostic goes to
-//! stderr.
+//! wires the exploration pipeline over rmcp stdio. stdout is reserved for the
+//! MCP protocol stream; every diagnostic goes to stderr.
+
+mod server;
 
 use anyhow::Context;
+use repo_explorer_agent::{AgentConfig, AgentLoop};
 use repo_explorer_core::config::LogLevel;
+use repo_explorer_memory::MemoryClientBackend;
+use repo_explorer_search::CliSearchBackend;
+use rmcp::ServiceExt;
+use server::RepoExplorerServer;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -31,7 +38,28 @@ async fn run() -> anyhow::Result<()> {
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
 
     init_tracing(config.logging.level);
-    tracing::info!("repo-explorer-mcp configuration loaded");
+
+    // The directory the server is launched in = the project root to explore.
+    let repo_root = std::env::current_dir().context("failed to determine current directory")?;
+
+    let memory = MemoryClientBackend::connect(&config.codebase_memory)
+        .await
+        .context("failed to connect to codebase-memory-mcp")?;
+    let search = CliSearchBackend::new(&config.search);
+    let router = repo_explorer_llm::build_router(&config.llm)
+        .context("failed to build LLM provider router")?;
+    let agent = AgentLoop::new(memory, search, router, AgentConfig::default());
+
+    let server = RepoExplorerServer::new(Arc::new(agent), repo_root);
+    tracing::info!("repo-explorer-mcp serving on stdio");
+    let service = server
+        .serve(rmcp::transport::stdio())
+        .await
+        .context("failed to start MCP server on stdio")?;
+    service
+        .waiting()
+        .await
+        .context("MCP server terminated with an error")?;
     Ok(())
 }
 
