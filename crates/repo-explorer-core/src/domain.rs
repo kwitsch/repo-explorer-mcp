@@ -6,6 +6,16 @@
 
 use std::path::PathBuf;
 
+/// Saturating `u64` -> `u32`: a value beyond `u32::MAX` (e.g. a malformed or
+/// huge line number reported by an upstream tool) clamps to `u32::MAX` rather
+/// than silently wrapping to a small, wrong value via a bare `as` cast.
+/// Shared by every backend that builds a [`FileLocation`] from externally
+/// reported line numbers (`repo-explorer-search`'s parsers,
+/// `repo-explorer-memory`'s response mapping).
+pub fn saturate_u32(n: u64) -> u32 {
+    n.min(u32::MAX as u64) as u32
+}
+
 /// A span of lines within a single file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileLocation {
