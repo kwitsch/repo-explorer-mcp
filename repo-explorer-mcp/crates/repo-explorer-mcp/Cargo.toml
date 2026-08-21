@@ -1,0 +1,8 @@
+[package]
+name = "repo-explorer-mcp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+repo-explorer-core = { version = "0.1.0", path = "../repo-explorer-core" }
+rmcp = "3.1.4"
