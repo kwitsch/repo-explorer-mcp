@@ -14,13 +14,11 @@ use serde_json::{Map, Value};
 use std::path::Path;
 
 /// A connected `rmcp` client to `codebase-memory-mcp`.
-#[allow(dead_code)] // removed in Task 5 when backend.rs consumes these
 #[derive(Debug)]
 pub(crate) struct MemoryClient {
     service: RunningService<RoleClient, ()>,
 }
 
-#[allow(dead_code)] // removed in Task 5 when backend.rs consumes these
 impl MemoryClient {
     /// Connect over the configured transport. Stdio (`command`) only in Stage 2;
     /// a `endpoint` config yields `MemoryError::UnsupportedTransport`.
@@ -86,7 +84,6 @@ fn text_of(result: &CallToolResult) -> String {
 /// Decode a successful tool result into a JSON value: prefer `structured_content`
 /// (typed JSON); otherwise parse the concatenated text blocks as JSON. Any
 /// failure becomes `MemoryError::Decode`.
-#[allow(dead_code)] // removed in Task 5 when backend.rs consumes these
 pub(crate) fn decode_result(
     tool: &'static str,
     result: &CallToolResult,
@@ -107,7 +104,6 @@ pub(crate) fn decode_result(
 /// Derive the project name from the repo root's final path component (matching
 /// `index_repository`'s documented default of the directory name). Root or
 /// non-UTF-8 paths error as `Transport`.
-#[allow(dead_code)] // removed in Task 5 when backend.rs consumes these
 pub(crate) fn project_name(repo_root: &Path) -> Result<String, MemoryError> {
     repo_root
         .file_name()
