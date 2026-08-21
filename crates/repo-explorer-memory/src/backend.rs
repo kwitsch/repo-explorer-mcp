@@ -41,18 +41,15 @@ impl MemoryClientBackend {
     /// Probe `index_status` for the project; a tool error meaning "not indexed"
     /// is reported as `exists = false` rather than an `Err`.
     async fn probe_status(&self, project: &str) -> Result<IndexProbe, MemoryError> {
-        let mut args = Map::new();
-        args.insert("project".to_string(), Value::String(project.to_string()));
+        let args = base_args(project.to_string());
         match self.client.call("index_status", args).await {
             Ok(result) => {
                 let json = decode_result("index_status", &result)?;
                 // An unrecognized/empty response must NOT be optimistically
                 // treated as "already indexed" — default to `false` so an
                 // unknown shape forces a (safe) reindex instead of skipping one.
-                let exists = json
-                    .get("indexed")
+                let exists = first_field(&json, &["indexed", "exists"])
                     .and_then(Value::as_bool)
-                    .or_else(|| json.get("exists").and_then(Value::as_bool))
                     .unwrap_or(false);
                 let last_indexed_at = json
                     .get("last_indexed_at")
@@ -82,19 +79,15 @@ impl MemoryClientBackend {
 
     /// Fill `changed_files` from `detect_changes` for an existing project.
     async fn probe_changes(&self, project: &str) -> Result<usize, MemoryError> {
-        let mut args = Map::new();
-        args.insert("project".to_string(), Value::String(project.to_string()));
+        let args = base_args(project.to_string());
         match self.client.call("detect_changes", args).await {
             Ok(result) => {
                 let json = decode_result("detect_changes", &result)?;
-                let changed = json
-                    .get("changed_files")
-                    .and_then(Value::as_array)
-                    .map(|a| a.len())
-                    .or_else(|| {
-                        json.get("changed_count")
-                            .and_then(Value::as_u64)
-                            .map(|n| n as usize)
+                let changed = first_field(&json, &["changed_files", "changed_count"])
+                    .map(|v| match v {
+                        Value::Array(a) => a.len(),
+                        Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+                        _ => 0,
                     })
                     .unwrap_or(0);
                 Ok(changed)
@@ -128,6 +121,21 @@ impl MemoryClientBackend {
     }
 }
 
+/// Build the `{"project": ...}` argument map every tool call site starts
+/// from — the one place the upstream `project` key name/encoding lives.
+fn base_args(project: String) -> Map<String, Value> {
+    let mut args = Map::new();
+    args.insert("project".to_string(), Value::String(project));
+    args
+}
+
+/// Read the first present field among `keys`, in order — the single place
+/// every "which key name did the upstream tool use this time" guess goes
+/// through, instead of a separate `.or_else()` chain per call site.
+fn first_field<'a>(json: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter().find_map(|k| json.get(*k))
+}
+
 /// Does a tool-failure message indicate "this project is not indexed yet"
 /// (as opposed to some other recoverable-or-not failure)? Matches the
 /// observed `codebase-memory-mcp` phrasing ("project not found or not
@@ -140,10 +148,7 @@ fn is_not_indexed_error(message: &str) -> bool {
 /// Build a `FileLocation` from a JSON row's `file`/`line_start`/`line_end`,
 /// tolerating missing line fields (defaulting to 0).
 fn location_from(json: &Value) -> Option<FileLocation> {
-    let file = json
-        .get("file")
-        .or_else(|| json.get("path"))
-        .and_then(Value::as_str)?;
+    let file = first_field(json, &["file", "path"]).and_then(Value::as_str)?;
     // Saturate rather than `as`-truncate: a line number beyond `u32::MAX` (or a
     // malformed huge value) must not silently wrap around to a small, wrong one.
     let line_start = json
@@ -165,19 +170,14 @@ fn location_from(json: &Value) -> Option<FileLocation> {
 
 /// Turn a JSON array of hit rows into findings, plus a compact summary string.
 fn findings_and_summary(tool: &'static str, json: &Value) -> ExplorationResult {
-    let rows = json
-        .get("results")
-        .or_else(|| json.get("rows"))
-        .or_else(|| json.get("hits"))
+    let rows = first_field(json, &["results", "rows", "hits"])
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     let mut findings = Vec::new();
-    for row in &rows {
+    for row in rows {
         if let Some(location) = location_from(row) {
-            let snippet = row
-                .get("snippet")
-                .or_else(|| row.get("text"))
+            let snippet = first_field(row, &["snippet", "text"])
                 .and_then(Value::as_str)
                 .map(|s| s.to_string());
             findings.push(ExplorationFinding {
@@ -214,8 +214,7 @@ impl MemoryBackend for MemoryClientBackend {
         query: &ExplorationQuery,
     ) -> Result<ExplorationResult, MemoryError> {
         let project = project_name(repo_root)?;
-        let mut args = Map::new();
-        args.insert("project".to_string(), Value::String(project));
+        let mut args = base_args(project);
         args.insert("pattern".to_string(), Value::String(query.text.clone()));
         if let Some(scope) = &query.scope_hint {
             args.insert(
@@ -237,8 +236,7 @@ impl MemoryBackend for MemoryClientBackend {
         query: &GraphQuery,
     ) -> Result<ExplorationResult, MemoryError> {
         let project = project_name(repo_root)?;
-        let mut args = Map::new();
-        args.insert("project".to_string(), Value::String(project));
+        let mut args = base_args(project);
         args.insert("format".to_string(), Value::String("json".to_string()));
         if let Some(v) = &query.name_pattern {
             args.insert("name_pattern".to_string(), Value::String(v.clone()));
@@ -264,8 +262,7 @@ impl MemoryBackend for MemoryClientBackend {
         max_results: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
         let project = project_name(repo_root)?;
-        let mut args = Map::new();
-        args.insert("project".to_string(), Value::String(project));
+        let mut args = base_args(project);
         args.insert("query".to_string(), Value::String(query.to_string()));
         if let Some(limit) = max_results {
             args.insert("limit".to_string(), Value::Number(limit.into()));
@@ -283,8 +280,7 @@ impl MemoryBackend for MemoryClientBackend {
         max_depth: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
         let project = project_name(repo_root)?;
-        let mut args = Map::new();
-        args.insert("project".to_string(), Value::String(project));
+        let mut args = base_args(project);
         args.insert("from".to_string(), Value::String(from.to_string()));
         args.insert("to".to_string(), Value::String(to.to_string()));
         if let Some(depth) = max_depth {
@@ -301,8 +297,7 @@ impl MemoryBackend for MemoryClientBackend {
         depth: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
         let project = project_name(repo_root)?;
-        let mut args = Map::new();
-        args.insert("project".to_string(), Value::String(project));
+        let mut args = base_args(project);
         if let Some(d) = depth {
             args.insert("depth".to_string(), Value::Number(d.into()));
         }
@@ -317,8 +312,7 @@ impl MemoryBackend for MemoryClientBackend {
         target: &SnippetTarget,
     ) -> Result<ExplorationResult, MemoryError> {
         let project = project_name(repo_root)?;
-        let mut args = Map::new();
-        args.insert("project".to_string(), Value::String(project));
+        let mut args = base_args(project);
         match target {
             SnippetTarget::QualifiedName(name) => {
                 args.insert("qualified_name".to_string(), Value::String(name.clone()));
@@ -345,10 +339,7 @@ impl MemoryBackend for MemoryClientBackend {
         // 0 or 1 finding: reuse the row shape if a location resolves.
         let mut findings = Vec::new();
         if let Some(location) = location_from(&json) {
-            let snippet = json
-                .get("snippet")
-                .or_else(|| json.get("code"))
-                .or_else(|| json.get("text"))
+            let snippet = first_field(&json, &["snippet", "code", "text"])
                 .and_then(Value::as_str)
                 .map(|s| s.to_string());
             findings.push(ExplorationFinding {

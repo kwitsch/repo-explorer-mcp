@@ -4,9 +4,6 @@ use std::time::{Duration, SystemTime};
 
 /// A snapshot of the project's index state, assembled from `index_status` and
 /// `detect_changes` before deciding whether to re-index.
-// Consumed by `backend.rs` in a later task; only exercised by this module's
-// own tests for now, so `-D warnings` would otherwise flag it as dead code.
-#[allow(dead_code)]
 pub(crate) struct IndexProbe {
     /// Is the project indexed at all?
     pub exists: bool,
@@ -17,7 +14,6 @@ pub(crate) struct IndexProbe {
 }
 
 /// The re-index decision.
-#[allow(dead_code)]
 pub(crate) enum FreshnessDecision {
     Reindex,
     UpToDate,
@@ -27,7 +23,6 @@ pub(crate) enum FreshnessDecision {
 /// file changed, OR the index age exceeds `staleness`, OR the last-index time is
 /// unknown; otherwise up-to-date. `age == staleness` counts as up-to-date; a
 /// last-index time in the future (clock skew) is treated as up-to-date.
-#[allow(dead_code)]
 pub(crate) fn decide_freshness(
     probe: &IndexProbe,
     staleness: Duration,
