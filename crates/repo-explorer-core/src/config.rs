@@ -33,13 +33,40 @@ pub struct LlmConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
-    /// Open string (anthropic | openai | google | …) — kept extensible for Stage 4.
+    /// Open string (anthropic | openai | google | …) — kept extensible.
     pub kind: String,
-    /// Name of the environment variable holding the API key (never the key itself).
-    pub api_key_env: String,
-    pub model: String,
+    /// Name of the env var holding the API key (never the key itself).
+    /// When omitted, derived from `kind` via `default_api_key_env`.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Ordered model list. First model = first tried; on a usage-limit error
+    /// the router advances to the next model, then to the next provider entry.
+    pub models: Vec<String>,
     #[serde(default)]
     pub base_url: Option<String>,
+}
+
+/// Default API-key env var name for a known provider kind, mirroring the
+/// `genai` crate's own adapter defaults. `None` for unrecognized kinds.
+/// Keyed on the same `kind` strings as `adapter_kind_for` in repo-explorer-llm.
+pub fn default_api_key_env(kind: &str) -> Option<&'static str> {
+    match kind {
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "openai" => Some("OPENAI_API_KEY"),
+        "gemini" | "google" => Some("GEMINI_API_KEY"),
+        _ => None,
+    }
+}
+
+impl ProviderConfig {
+    /// Effective API-key env var name: the explicit `api_key_env` when set,
+    /// otherwise the default derived from `kind`. `None` when neither is
+    /// available (unknown kind and no explicit override).
+    pub fn resolve_api_key_env(&self) -> Option<String> {
+        self.api_key_env
+            .clone()
+            .or_else(|| default_api_key_env(&self.kind).map(str::to_owned))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -136,6 +163,13 @@ pub enum ValidationError {
     MissingCodebaseMemoryConnection,
     #[error("codebase_memory sets both `command` and `endpoint`; exactly one is allowed")]
     ConflictingCodebaseMemoryConnection,
+    #[error("provider `{provider}` must list at least one model in `models`")]
+    EmptyModelList { provider: String },
+    #[error(
+        "provider `{provider}`: cannot derive an API key environment variable \
+         for unknown kind `{kind}`; set `api_key_env` explicitly"
+    )]
+    UnknownProviderKind { provider: String, kind: String },
 }
 
 /// Read, parse, and validate a config file. The single public entry point.
@@ -167,10 +201,21 @@ impl Config {
         }
 
         for provider in &self.llm.providers {
-            if std::env::var(&provider.api_key_env).is_err() {
+            if provider.models.is_empty() {
+                return Err(ValidationError::EmptyModelList {
+                    provider: provider.name.clone(),
+                });
+            }
+            let var = provider.resolve_api_key_env().ok_or_else(|| {
+                ValidationError::UnknownProviderKind {
+                    provider: provider.name.clone(),
+                    kind: provider.kind.clone(),
+                }
+            })?;
+            if std::env::var(&var).is_err() {
                 return Err(ValidationError::MissingEnvVar {
                     provider: provider.name.clone(),
-                    var: provider.api_key_env.clone(),
+                    var,
                 });
             }
         }
@@ -208,8 +253,8 @@ mod tests {
                 providers: vec![ProviderConfig {
                     name: name.to_string(),
                     kind: "anthropic".to_string(),
-                    api_key_env: env_var.to_string(),
-                    model: "m".to_string(),
+                    api_key_env: Some(env_var.to_string()),
+                    models: vec!["m".to_string()],
                     base_url: None,
                 }],
                 cooldown_seconds: 60,
@@ -240,6 +285,11 @@ mod tests {
         assert_eq!(config.llm.providers[0].name, "primary");
         assert_eq!(config.llm.providers[0].kind, "anthropic");
         assert_eq!(config.llm.providers[1].name, "secondary");
+        assert_eq!(
+            config.llm.providers[0].models,
+            vec!["claude-sonnet-4".to_string(), "claude-haiku-4".to_string()]
+        );
+        assert_eq!(config.llm.providers[1].models, vec!["gpt-4o".to_string()]);
         assert_eq!(config.llm.cooldown_seconds, 90);
 
         // Explicit values from the fixture.
@@ -340,5 +390,74 @@ mod tests {
     fn missing_file_is_read_error() {
         let err = load(Path::new("does-not-exist-42.toml")).unwrap_err();
         assert!(matches!(err, ConfigError::Read { .. }));
+    }
+
+    #[test]
+    fn default_api_key_env_maps_known_kinds() {
+        assert_eq!(default_api_key_env("anthropic"), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(default_api_key_env("openai"), Some("OPENAI_API_KEY"));
+        assert_eq!(default_api_key_env("gemini"), Some("GEMINI_API_KEY"));
+        assert_eq!(default_api_key_env("google"), Some("GEMINI_API_KEY"));
+        assert_eq!(default_api_key_env("mystery"), None);
+    }
+
+    #[test]
+    fn resolve_api_key_env_prefers_explicit_then_kind_default() {
+        let mut config = config_with_provider("p", "EXPLICIT_VAR");
+        let p = &mut config.llm.providers[0];
+        // Explicit `api_key_env` wins.
+        assert_eq!(p.resolve_api_key_env(), Some("EXPLICIT_VAR".to_string()));
+        // None + known kind -> derived default.
+        p.api_key_env = None;
+        p.kind = "openai".to_string();
+        assert_eq!(p.resolve_api_key_env(), Some("OPENAI_API_KEY".to_string()));
+        // None + unknown kind -> None.
+        p.kind = "mystery".to_string();
+        assert_eq!(p.resolve_api_key_env(), None);
+    }
+
+    #[test]
+    fn empty_model_list_fails() {
+        let mut config = config_with_provider("p", "REPO_EXPLORER_TEST_KEY_EMPTY_MODELS");
+        config.llm.providers[0].models.clear();
+        assert_eq!(
+            config.validate(),
+            Err(ValidationError::EmptyModelList {
+                provider: "p".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_kind_without_env_fails() {
+        let mut config = config_with_provider("p", "unused");
+        config.llm.providers[0].api_key_env = None;
+        config.llm.providers[0].kind = "mystery".to_string();
+        assert_eq!(
+            config.validate(),
+            Err(ValidationError::UnknownProviderKind {
+                provider: "p".to_string(),
+                kind: "mystery".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn derives_env_var_and_reports_missing() {
+        let mut config = config_with_provider("primary", "unused");
+        config.llm.providers[0].api_key_env = None;
+        config.llm.providers[0].kind = "anthropic".to_string();
+        // No other test reads/writes ANTHROPIC_API_KEY.
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+        let err = config.validate().unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::MissingEnvVar {
+                provider: "primary".to_string(),
+                var: "ANTHROPIC_API_KEY".to_string(),
+            }
+        );
     }
 }

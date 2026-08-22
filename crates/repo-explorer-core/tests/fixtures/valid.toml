@@ -5,13 +5,13 @@ cooldown_seconds = 90
 name = "primary"
 kind = "anthropic"
 api_key_env = "REPO_EXPLORER_TEST_KEY_VALID"
-model = "claude-sonnet-4"
+models = ["claude-sonnet-4", "claude-haiku-4"]
 
 [[llm.providers]]
 name = "secondary"
 kind = "openai"
 api_key_env = "REPO_EXPLORER_TEST_KEY_VALID"
-model = "gpt-4o"
+models = ["gpt-4o"]
 
 [codebase_memory]
 command = "codebase-memory-mcp"
