@@ -1,0 +1,16 @@
+{
+  "name": "repo-explorer-mcp-setup",
+  "version": "0.1.0",
+  "description": "Installer for the repo-explorer-mcp MCP server (downloads the release binary and its runtime dependencies).",
+  "type": "module",
+  "bin": {
+    "repo-explorer-mcp-setup": "./setup/index.mjs"
+  },
+  "files": [
+    "setup/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
