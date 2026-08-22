@@ -151,6 +151,23 @@ impl GenaiProvider {
     /// unrecognized `kind`, or a missing key var at call-time (distinct from
     /// config-load validation), yields `ProviderError::Configuration`.
     pub fn from_config(provider: &ProviderConfig, model: &str) -> Result<Self, ProviderError> {
+        let (name, kind, client) = Self::build_shared(provider)?;
+        Ok(Self {
+            name,
+            kind,
+            model: model.to_string(),
+            client,
+        })
+    }
+
+    /// Validate `provider` and build its `genai::Client` once. `genai::Client`
+    /// wraps an `Arc` internally (cheap to clone), so callers with multiple
+    /// models per entry (e.g. `build_router`) build this a single time per
+    /// entry and clone the client for each `ModelSlot` instead of repeating
+    /// the adapter-kind/env-var resolution and client construction per model.
+    fn build_shared(
+        provider: &ProviderConfig,
+    ) -> Result<(String, String, genai::Client), ProviderError> {
         let name = provider.name.clone();
 
         let adapter_kind =
@@ -182,12 +199,7 @@ impl GenaiProvider {
 
         let client = build_genai_client(adapter_kind, provider, &env_name);
 
-        Ok(Self {
-            name,
-            kind: provider.kind.clone(),
-            model: model.to_string(),
-            client,
-        })
+        Ok((name, provider.kind.clone(), client))
     }
 }
 
@@ -366,9 +378,15 @@ impl LlmProvider for GenaiProvider {
 pub fn build_router(cfg: &LlmConfig) -> Result<ProviderRouter<GenaiProvider>, ProviderError> {
     let mut providers = Vec::with_capacity(cfg.providers.len());
     for entry in &cfg.providers {
+        let (name, kind, client) = GenaiProvider::build_shared(entry)?;
         let mut models = Vec::with_capacity(entry.models.len());
         for model in &entry.models {
-            let provider = GenaiProvider::from_config(entry, model)?;
+            let provider = GenaiProvider {
+                name: name.clone(),
+                kind: kind.clone(),
+                model: model.clone(),
+                client: client.clone(),
+            };
             models.push((model.clone(), provider));
         }
         providers.push((entry.name.clone(), models));

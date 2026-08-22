@@ -22,13 +22,13 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    if wants_version(argv.iter().cloned()) {
+    if wants_version(&argv) {
         // stdout: a one-shot CLI query that exits before the MCP transport starts.
         println!("repo-explorer-mcp {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
     let config_path = resolve_config_path(
-        argv.iter().cloned(),
+        &argv,
         std::env::var("REPO_EXPLORER_CONFIG").ok(),
         xdg_default_config_path(),
     );
@@ -92,11 +92,11 @@ async fn run(config_path: PathBuf) -> anyhow::Result<()> {
 /// CLI arg -> `REPO_EXPLORER_CONFIG` env var -> XDG default (when resolvable)
 /// -> `./repo-explorer.toml`.
 fn resolve_config_path(
-    args: impl Iterator<Item = String>,
+    args: &[String],
     env_var: Option<String>,
     xdg_default: Option<PathBuf>,
 ) -> PathBuf {
-    let mut args = args;
+    let mut args = args.iter();
     while let Some(arg) = args.next() {
         if let Some(rest) = arg.strip_prefix("--config=") {
             return PathBuf::from(rest);
@@ -183,8 +183,8 @@ fn print_report(report: &ConfigTestReport<'_>) {
 }
 
 /// Return true if any CLI arg requests the version (`--version` or `-V`).
-fn wants_version(args: impl Iterator<Item = String>) -> bool {
-    args.into_iter().any(|a| a == "--version" || a == "-V")
+fn wants_version(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--version" || a == "-V")
 }
 
 /// Map a config `LogLevel` onto a `tracing` `LevelFilter`.
@@ -215,17 +215,14 @@ mod tests {
     use repo_explorer_core::config::LogLevel;
     use tracing::level_filters::LevelFilter;
 
-    fn args(v: &[&str]) -> impl Iterator<Item = String> {
-        v.iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-            .into_iter()
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
     fn config_flag_space_form_wins() {
         let p = resolve_config_path(
-            args(&["--config", "custom.toml"]),
+            &args(&["--config", "custom.toml"]),
             Some("env.toml".into()),
             None,
         );
@@ -234,47 +231,47 @@ mod tests {
 
     #[test]
     fn config_flag_equals_form() {
-        let p = resolve_config_path(args(&["--config=eq.toml"]), None, None);
+        let p = resolve_config_path(&args(&["--config=eq.toml"]), None, None);
         assert_eq!(p, PathBuf::from("eq.toml"));
     }
 
     #[test]
     fn env_var_used_when_no_flag() {
-        let p = resolve_config_path(args(&["--other", "x"]), Some("env.toml".into()), None);
+        let p = resolve_config_path(&args(&["--other", "x"]), Some("env.toml".into()), None);
         assert_eq!(p, PathBuf::from("env.toml"));
     }
 
     #[test]
     fn default_when_neither() {
-        let p = resolve_config_path(args(&[]), None, None);
+        let p = resolve_config_path(&args(&[]), None, None);
         assert_eq!(p, PathBuf::from("./repo-explorer.toml"));
     }
 
     #[test]
     fn version_long_flag_detected() {
-        assert!(wants_version(args(&["--version"])));
+        assert!(wants_version(&args(&["--version"])));
     }
 
     #[test]
     fn version_short_flag_detected() {
-        assert!(wants_version(args(&["-V"])));
+        assert!(wants_version(&args(&["-V"])));
     }
 
     #[test]
     fn version_flag_detected_among_others() {
-        assert!(wants_version(args(&["--config", "x.toml", "--version"])));
+        assert!(wants_version(&args(&["--config", "x.toml", "--version"])));
     }
 
     #[test]
     fn no_version_flag() {
-        assert!(!wants_version(args(&["--config", "x.toml"])));
-        assert!(!wants_version(args(&[])));
+        assert!(!wants_version(&args(&["--config", "x.toml"])));
+        assert!(!wants_version(&args(&[])));
     }
 
     #[test]
     fn cli_arg_precedence_over_env() {
         let p = resolve_config_path(
-            args(&["--config", "cli.toml"]),
+            &args(&["--config", "cli.toml"]),
             Some("env.toml".into()),
             None,
         );
@@ -284,20 +281,20 @@ mod tests {
     #[test]
     fn xdg_default_used_when_no_flag_or_env() {
         let xdg = PathBuf::from("/x/.config/repo-explorer/repo-explorer.toml");
-        let p = resolve_config_path(args(&[]), None, Some(xdg.clone()));
+        let p = resolve_config_path(&args(&[]), None, Some(xdg.clone()));
         assert_eq!(p, xdg);
     }
 
     #[test]
     fn cwd_fallback_when_no_xdg() {
-        let p = resolve_config_path(args(&[]), None, None);
+        let p = resolve_config_path(&args(&[]), None, None);
         assert_eq!(p, PathBuf::from("./repo-explorer.toml"));
     }
 
     #[test]
     fn env_var_beats_xdg_default() {
         let xdg = PathBuf::from("/x/.config/repo-explorer/repo-explorer.toml");
-        let p = resolve_config_path(args(&[]), Some("env.toml".into()), Some(xdg));
+        let p = resolve_config_path(&args(&[]), Some("env.toml".into()), Some(xdg));
         assert_eq!(p, PathBuf::from("env.toml"));
     }
 

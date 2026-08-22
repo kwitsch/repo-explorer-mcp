@@ -10,7 +10,7 @@
 use anyhow::Context;
 use repo_explorer_core::config::{
     self, CodebaseMemoryConfig, Config, LlmConfig, LoggingConfig, ProviderConfig, SearchConfig,
-    default_api_key_env,
+    default_api_key_env, default_cooldown_seconds, default_staleness_seconds,
 };
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -40,6 +40,14 @@ const CANDIDATE_ENV_VARS: &[(&str, &str)] = &[
     ("GOOGLE_API_KEY", "gemini"),
 ];
 
+/// The single definition of "is this env var actually set": present and
+/// non-blank once trimmed. Shared by `detect_providers` and any other check
+/// that needs to ask the same question about a specific var (e.g. the
+/// both-Gemini-vars-set notice in `run_setup_inner`).
+fn env_var_is_set(get: &impl Fn(&str) -> Option<String>, var: &str) -> bool {
+    get(var).map(|v| !v.trim().is_empty()).unwrap_or(false)
+}
+
 /// Scan candidate env vars via the injected accessor and return deduped
 /// detected providers, at most one per `kind`, in order of first detection.
 /// A var counts as set only when the accessor returns `Some(non-blank)`.
@@ -47,7 +55,7 @@ const CANDIDATE_ENV_VARS: &[(&str, &str)] = &[
 fn detect_providers(get: impl Fn(&str) -> Option<String>) -> Vec<DetectedProvider> {
     let mut out: Vec<DetectedProvider> = Vec::new();
     for &(var, kind) in CANDIDATE_ENV_VARS {
-        let present = get(var).map(|v| !v.trim().is_empty()).unwrap_or(false);
+        let present = env_var_is_set(&get, var);
         if !present {
             continue;
         }
@@ -171,17 +179,12 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
     eprintln!("repo-explorer-mcp interactive setup");
     eprintln!("Detecting provider API-key environment variables...");
 
-    let detected = detect_providers(|k| std::env::var(k).ok());
+    let get_env = |k: &str| std::env::var(k).ok();
+    let detected = detect_providers(get_env);
 
     // If both Gemini vars are set, note that GEMINI_API_KEY was preferred.
-    let gemini_set = std::env::var("GEMINI_API_KEY")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .is_some();
-    let google_set = std::env::var("GOOGLE_API_KEY")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .is_some();
+    let gemini_set = env_var_is_set(&get_env, "GEMINI_API_KEY");
+    let google_set = env_var_is_set(&get_env, "GOOGLE_API_KEY");
     if gemini_set && google_set {
         eprintln!("  note: both GEMINI_API_KEY and GOOGLE_API_KEY are set; using GEMINI_API_KEY.");
     }
@@ -263,8 +266,6 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
     eprintln!("  1) stdio: launch `codebase-memory-mcp --stdio` (default)");
     eprintln!("  2) network endpoint (URL)");
     let choice = prompt_default("  choose 1 or 2", "1")?;
-    // staleness_seconds mirrors core's default_staleness_seconds() (3600); that
-    // helper is private in core, so the value is set explicitly here.
     let codebase_memory = if choice == "2" {
         let endpoint = loop {
             let e = prompt_raw("  endpoint URL")?;
@@ -277,14 +278,14 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
             command: None,
             args: Vec::new(),
             endpoint: Some(endpoint),
-            staleness_seconds: 3600,
+            staleness_seconds: default_staleness_seconds(),
         }
     } else {
         CodebaseMemoryConfig {
             command: Some("codebase-memory-mcp".to_string()),
             args: vec!["--stdio".to_string()],
             endpoint: None,
-            staleness_seconds: 3600,
+            staleness_seconds: default_staleness_seconds(),
         }
     };
 
@@ -292,7 +293,7 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
     let cfg = Config {
         llm: LlmConfig {
             providers,
-            cooldown_seconds: 60, // mirrors core's default_cooldown_seconds()
+            cooldown_seconds: default_cooldown_seconds(),
         },
         codebase_memory,
         search: SearchConfig::default(),

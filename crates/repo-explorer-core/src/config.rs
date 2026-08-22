@@ -115,11 +115,16 @@ pub enum LogLevel {
     Error,
 }
 
-fn default_cooldown_seconds() -> u64 {
+/// Default `llm.cooldown_seconds` (also the serde default for that field).
+/// Public so callers building a `Config` programmatically (e.g. the setup
+/// wizard) can reuse the same value instead of duplicating the literal.
+pub fn default_cooldown_seconds() -> u64 {
     60
 }
 
-fn default_staleness_seconds() -> u64 {
+/// Default `codebase_memory.staleness_seconds` (also the serde default for
+/// that field). Public for the same reason as `default_cooldown_seconds`.
+pub fn default_staleness_seconds() -> u64 {
     3600
 }
 

@@ -232,8 +232,9 @@ function recheckRg(plat) {
 }
 
 async function ensureRipgrep(plat, opts) {
-  if (onPathTool("rg", plat.osKind)) {
-    return (probeVersion("rg") ?? "present").split("\n")[0];
+  const already = recheckRg(plat);
+  if (already !== "missing") {
+    return already;
   }
   if (plat.osKind === "linux") {
     const pm = detectLinuxPkgManager();
@@ -399,15 +400,17 @@ async function main() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "repo-explorer-mcp-"));
   const archiveFile = path.join(tmp, archiveName);
   try {
-    const sumRes = await fetch(sha256Url, {
-      headers: { "User-Agent": "repo-explorer-mcp-setup" },
-    });
+    const [sumRes, buf] = await Promise.all([
+      fetch(sha256Url, {
+        headers: { "User-Agent": "repo-explorer-mcp-setup" },
+      }),
+      downloadTo(archiveUrl, archiveFile),
+    ]);
     if (!sumRes.ok)
       throw new Error(
         `Checksum download failed: ${sha256Url} (HTTP ${sumRes.status}).`,
       );
     const expected = parseSha256Line(await sumRes.text());
-    const buf = await downloadTo(archiveUrl, archiveFile);
     const actual = sha256Hex(buf);
     if (!hexEqual(actual, expected)) {
       fs.rmSync(archiveFile, { force: true });
