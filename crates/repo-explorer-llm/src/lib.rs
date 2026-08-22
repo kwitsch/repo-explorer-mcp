@@ -124,6 +124,12 @@ fn webc_status(err: &genai::webc::Error) -> Option<u16> {
 
 /// Map a config `kind` string to a `genai` adapter. `google` is accepted as an
 /// alias for the Gemini adapter. Returns `None` for unrecognized kinds.
+///
+/// Must recognize exactly the kinds in
+/// `repo_explorer_core::config::KNOWN_PROVIDER_KINDS` — core can't depend on
+/// `genai` to express that set as adapters directly, so this match is
+/// re-declared here; `tests::adapter_kind_for_matches_known_provider_kinds`
+/// guards the two lists against drifting apart.
 fn adapter_kind_for(kind: &str) -> Option<genai::adapter::AdapterKind> {
     use genai::adapter::AdapterKind;
     match kind {
@@ -397,6 +403,18 @@ pub fn build_router(cfg: &LlmConfig) -> Result<ProviderRouter<GenaiProvider>, Pr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_kind_for_matches_known_provider_kinds() {
+        for &kind in repo_explorer_core::config::KNOWN_PROVIDER_KINDS {
+            assert!(
+                adapter_kind_for(kind).is_some(),
+                "kind `{kind}` is in KNOWN_PROVIDER_KINDS but adapter_kind_for returns None \
+                 — the two lists have drifted apart"
+            );
+        }
+        assert!(adapter_kind_for("not-a-real-kind").is_none());
+    }
 
     fn facts(status: Option<u16>, code: Option<&str>, message: &str) -> GenaiErrorFacts {
         GenaiErrorFacts {

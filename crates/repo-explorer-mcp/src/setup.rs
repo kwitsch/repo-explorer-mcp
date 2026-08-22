@@ -9,8 +9,9 @@
 
 use anyhow::Context;
 use repo_explorer_core::config::{
-    self, CodebaseMemoryConfig, Config, LlmConfig, LoggingConfig, ProviderConfig, SearchConfig,
-    default_api_key_env, default_cooldown_seconds, default_staleness_seconds,
+    self, CodebaseMemoryConfig, Config, KNOWN_PROVIDER_KINDS, LlmConfig, LoggingConfig,
+    ProviderConfig, SearchConfig, default_api_key_env, default_cooldown_seconds,
+    default_staleness_seconds,
 };
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -29,16 +30,29 @@ struct DetectedProvider {
 }
 
 /// Candidate `(env var, kind)` table. Iteration order defines both detection
-/// order and the emitted provider (failover) order. Distinct from core's
-/// `default_api_key_env`: it additionally recognizes `GOOGLE_API_KEY` (kind
-/// `gemini`). Canonical `GEMINI_API_KEY` precedes `GOOGLE_API_KEY` so it wins
+/// order and the emitted provider (failover) order.
+///
+/// Derived from core's `KNOWN_PROVIDER_KINDS`/`default_api_key_env` — the
+/// single source of truth for which kinds exist and their canonical env var —
+/// plus one wizard-specific extra alias (`GOOGLE_API_KEY`) that core has no
+/// reason to know about. `GEMINI_API_KEY` precedes `GOOGLE_API_KEY` so it wins
 /// the per-kind dedup when both are set.
-const CANDIDATE_ENV_VARS: &[(&str, &str)] = &[
-    ("ANTHROPIC_API_KEY", "anthropic"),
-    ("OPENAI_API_KEY", "openai"),
-    ("GEMINI_API_KEY", "gemini"),
-    ("GOOGLE_API_KEY", "gemini"),
-];
+fn candidate_env_vars() -> Vec<(&'static str, &'static str)> {
+    let mut out: Vec<(&'static str, &'static str)> = Vec::new();
+    let mut seen_vars = std::collections::HashSet::new();
+    for &kind in KNOWN_PROVIDER_KINDS {
+        // `KNOWN_PROVIDER_KINDS` lists `gemini` and `google` as distinct kind
+        // strings that both resolve to `GEMINI_API_KEY` — keep only the first
+        // (canonical `gemini`) so `google` doesn't surface as a detectable kind.
+        if let Some(var) = default_api_key_env(kind)
+            && seen_vars.insert(var)
+        {
+            out.push((var, kind));
+        }
+    }
+    out.push(("GOOGLE_API_KEY", "gemini"));
+    out
+}
 
 /// The single definition of "is this env var actually set": present and
 /// non-blank once trimmed. Shared by `detect_providers` and any other check
@@ -54,7 +68,7 @@ fn env_var_is_set(get: &impl Fn(&str) -> Option<String>, var: &str) -> bool {
 /// Injecting the accessor keeps this pure and unit-testable.
 fn detect_providers(get: impl Fn(&str) -> Option<String>) -> Vec<DetectedProvider> {
     let mut out: Vec<DetectedProvider> = Vec::new();
-    for &(var, kind) in CANDIDATE_ENV_VARS {
+    for &(var, kind) in &candidate_env_vars() {
         let present = env_var_is_set(&get, var);
         if !present {
             continue;
