@@ -150,7 +150,7 @@ impl GenaiProvider {
     /// message. `base_url`, when `Some`, overrides the adapter's endpoint. An
     /// unrecognized `kind`, or a missing key var at call-time (distinct from
     /// config-load validation), yields `ProviderError::Configuration`.
-    pub fn from_config(provider: &ProviderConfig) -> Result<Self, ProviderError> {
+    pub fn from_config(provider: &ProviderConfig, model: &str) -> Result<Self, ProviderError> {
         let name = provider.name.clone();
 
         let adapter_kind =
@@ -159,22 +159,33 @@ impl GenaiProvider {
                 message: format!("unrecognized provider kind `{}`", provider.kind),
             })?;
 
+        let env_name =
+            provider
+                .resolve_api_key_env()
+                .ok_or_else(|| ProviderError::Configuration {
+                    provider: name.clone(),
+                    message: format!(
+                        "no `api_key_env` set and no default env var for kind `{}`",
+                        provider.kind
+                    ),
+                })?;
+
         // Fail with Configuration (never panic) if the key var is missing at
         // call-time, distinct from config-load validation. The value is read to
         // confirm presence; it is NEVER placed into any error message.
-        if std::env::var(&provider.api_key_env).is_err() {
+        if std::env::var(&env_name).is_err() {
             return Err(ProviderError::Configuration {
                 provider: name,
-                message: format!("environment variable `{}` is not set", provider.api_key_env),
+                message: format!("environment variable `{env_name}` is not set"),
             });
         }
 
-        let client = build_genai_client(adapter_kind, provider);
+        let client = build_genai_client(adapter_kind, provider, &env_name);
 
         Ok(Self {
             name,
             kind: provider.kind.clone(),
-            model: provider.model.clone(),
+            model: model.to_string(),
             client,
         })
     }
@@ -186,10 +197,11 @@ impl GenaiProvider {
 fn build_genai_client(
     adapter_kind: genai::adapter::AdapterKind,
     provider: &ProviderConfig,
+    env_name: &str,
 ) -> genai::Client {
     use genai::resolver::{AuthData, Endpoint};
 
-    let env_name = provider.api_key_env.clone();
+    let env_name = env_name.to_string();
     let mut builder = genai::Client::builder()
         .with_adapter_kind(adapter_kind)
         .with_auth_resolver_fn(move |_model_iden: genai::ModelIden| {
@@ -354,8 +366,12 @@ impl LlmProvider for GenaiProvider {
 pub fn build_router(cfg: &LlmConfig) -> Result<ProviderRouter<GenaiProvider>, ProviderError> {
     let mut providers = Vec::with_capacity(cfg.providers.len());
     for entry in &cfg.providers {
-        let provider = GenaiProvider::from_config(entry)?;
-        providers.push((entry.name.clone(), provider));
+        let mut models = Vec::with_capacity(entry.models.len());
+        for model in &entry.models {
+            let provider = GenaiProvider::from_config(entry, model)?;
+            models.push((model.clone(), provider));
+        }
+        providers.push((entry.name.clone(), models));
     }
     Ok(ProviderRouter::new(providers, cfg.cooldown_seconds))
 }
@@ -478,11 +494,11 @@ mod tests {
         let cfg = ProviderConfig {
             name: "live".to_string(),
             kind: "openai".to_string(),
-            api_key_env: "OPENAI_API_KEY".to_string(),
-            model: "gpt-4o-mini".to_string(),
+            api_key_env: Some("OPENAI_API_KEY".to_string()),
+            models: vec!["gpt-4o-mini".to_string()],
             base_url: None,
         };
-        let provider = GenaiProvider::from_config(&cfg).expect("build provider");
+        let provider = GenaiProvider::from_config(&cfg, &cfg.models[0]).expect("build provider");
         let msgs = vec![Message {
             role: Role::User,
             content: "Say hello.".to_string(),
