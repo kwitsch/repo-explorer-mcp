@@ -4,14 +4,14 @@
 //! TOML into a [`Config`], and runs [`Config::validate`]. Validation is also
 //! public so it can be unit-tested on hand-built `Config` values.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Top-level configuration.
 ///
 /// `#[serde(deny_unknown_fields)]` is intentionally NOT used so later stages can
 /// add fields without breaking existing configs.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub llm: LlmConfig,
     pub codebase_memory: CodebaseMemoryConfig,
@@ -21,7 +21,7 @@ pub struct Config {
     pub logging: LoggingConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LlmConfig {
     /// Order in the file = failover order. Preserved by using `Vec`.
     #[serde(default)]
@@ -30,19 +30,19 @@ pub struct LlmConfig {
     pub cooldown_seconds: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProviderConfig {
     pub name: String,
     /// Open string (anthropic | openai | google | …) — kept extensible.
     pub kind: String,
     /// Name of the env var holding the API key (never the key itself).
     /// When omitted, derived from `kind` via `default_api_key_env`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
     /// Ordered model list. First model = first tried; on a usage-limit error
     /// the router advances to the next model, then to the next provider entry.
     pub models: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
 }
 
@@ -69,28 +69,28 @@ impl ProviderConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CodebaseMemoryConfig {
     /// Stdio transport: process command to launch.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     /// Network transport: endpoint URL. Mutually exclusive with `command`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     /// Index considered stale after this many seconds (consumed by Stage 2).
     #[serde(default = "default_staleness_seconds")]
     pub staleness_seconds: u64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SearchConfig {
     /// Explicit path to the `rtk` binary; `None` → auto-detect in Stage 3.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtk_path: Option<PathBuf>,
     /// Explicit path to the `ripgrep` binary; `None` → auto-detect in Stage 3.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ripgrep_path: Option<PathBuf>,
     #[serde(default = "default_search_timeout_seconds")]
     pub timeout_seconds: u64,
@@ -98,13 +98,13 @@ pub struct SearchConfig {
     pub prefer_rtk: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct LoggingConfig {
     #[serde(default)]
     pub level: LogLevel,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Trace,
@@ -115,11 +115,16 @@ pub enum LogLevel {
     Error,
 }
 
-fn default_cooldown_seconds() -> u64 {
+/// Default `llm.cooldown_seconds` (also the serde default for that field).
+/// Public so callers building a `Config` programmatically (e.g. the setup
+/// wizard) can reuse the same value instead of duplicating the literal.
+pub fn default_cooldown_seconds() -> u64 {
     60
 }
 
-fn default_staleness_seconds() -> u64 {
+/// Default `codebase_memory.staleness_seconds` (also the serde default for
+/// that field). Public for the same reason as `default_cooldown_seconds`.
+pub fn default_staleness_seconds() -> u64 {
     3600
 }
 
@@ -153,6 +158,11 @@ pub enum ConfigError {
     },
     #[error(transparent)]
     Validation(#[from] ValidationError),
+    #[error("failed to serialize config as TOML: {source}")]
+    Serialize {
+        #[source]
+        source: toml::ser::Error,
+    },
 }
 
 impl ConfigError {
@@ -163,6 +173,7 @@ impl ConfigError {
             ConfigError::Read { .. } => None,
             ConfigError::Parse { location, .. } => location.clone(),
             ConfigError::Validation(v) => Some(v.toml_path()),
+            ConfigError::Serialize { .. } => None,
         }
     }
 
@@ -182,11 +193,16 @@ pub enum ValidationError {
     EmptyProviderList,
     #[error("duplicate provider name `{name}` in llm.providers")]
     DuplicateProviderName { index: usize, name: String },
+    #[error("provider `{provider}` has an empty `models` list; at least one model is required")]
+    EmptyModelsList { index: usize, provider: String },
     #[error("provider `{provider}` references environment variable `{var}`, which is not set")]
     MissingEnvVar {
         index: usize,
         provider: String,
         var: String,
+        /// Whether `var` came from an explicit `api_key_env` in the file
+        /// (vs. the kind-derived default, which has no literal TOML key).
+        explicit: bool,
     },
     #[error(
         "provider `{provider}` has unknown kind `{kind}` (expected one of: anthropic, openai, gemini, google)"
@@ -212,8 +228,17 @@ impl ValidationError {
             ValidationError::DuplicateProviderName { index, .. } => {
                 format!("llm.providers[{index}].name")
             }
-            ValidationError::MissingEnvVar { index, .. } => {
-                format!("llm.providers[{index}].api_key_env")
+            ValidationError::EmptyModelsList { index, .. } => {
+                format!("llm.providers[{index}].models")
+            }
+            ValidationError::MissingEnvVar {
+                index, explicit, ..
+            } => {
+                if *explicit {
+                    format!("llm.providers[{index}].api_key_env")
+                } else {
+                    format!("llm.providers[{index}].kind")
+                }
             }
             ValidationError::UnknownProviderKind { index, .. } => {
                 format!("llm.providers[{index}].kind")
@@ -257,6 +282,12 @@ fn line_col(text: &str, byte: usize) -> String {
     format!("line {line}, column {col}")
 }
 
+/// Serialize a `Config` to a pretty TOML string. Inverse of `load`'s parse
+/// step; the single serialization entry point (core owns the schema).
+pub fn to_toml_string(config: &Config) -> Result<String, ConfigError> {
+    toml::to_string_pretty(config).map_err(|source| ConfigError::Serialize { source })
+}
+
 impl Config {
     /// Semantic validation, independent of parsing. Public so it is unit-testable
     /// on hand-built `Config` values.
@@ -271,6 +302,15 @@ impl Config {
                 return Err(ValidationError::DuplicateProviderName {
                     index,
                     name: provider.name.clone(),
+                });
+            }
+        }
+
+        for (index, provider) in self.llm.providers.iter().enumerate() {
+            if provider.models.is_empty() {
+                return Err(ValidationError::EmptyModelsList {
+                    index,
+                    provider: provider.name.clone(),
                 });
             }
         }
@@ -292,6 +332,7 @@ impl Config {
                     index,
                     provider: provider.name.clone(),
                     var,
+                    explicit: provider.api_key_env.is_some(),
                 });
             }
         }
@@ -427,6 +468,7 @@ mod tests {
                 index: 0,
                 provider: "primary".to_string(),
                 var: var.to_string(),
+                explicit: true,
             }
         );
         // The message names the variable and provider but no secret value.
@@ -435,6 +477,33 @@ mod tests {
         assert!(msg.contains("primary"));
         assert!(!msg.contains("not-a-real-key"));
         assert_eq!(err.toml_path(), "llm.providers[0].api_key_env");
+    }
+
+    #[test]
+    fn missing_env_var_implicit_default_points_at_kind() {
+        let var = "ANTHROPIC_API_KEY";
+        let had = std::env::var(var).ok();
+        unsafe {
+            std::env::remove_var(var);
+        }
+        let mut config = config_with_provider("primary", var);
+        config.llm.providers[0].api_key_env = None; // rely on kind-derived default
+        let err = config.validate().unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::MissingEnvVar {
+                index: 0,
+                provider: "primary".to_string(),
+                var: var.to_string(),
+                explicit: false,
+            }
+        );
+        assert_eq!(err.toml_path(), "llm.providers[0].kind");
+        if let Some(v) = had {
+            unsafe {
+                std::env::set_var(var, v);
+            }
+        }
     }
 
     #[test]
@@ -523,10 +592,29 @@ mod tests {
             ValidationError::MissingEnvVar {
                 index: 1,
                 provider: "p".to_string(),
-                var: "V".to_string()
+                var: "V".to_string(),
+                explicit: true,
             }
             .toml_path(),
             "llm.providers[1].api_key_env"
+        );
+        assert_eq!(
+            ValidationError::MissingEnvVar {
+                index: 1,
+                provider: "p".to_string(),
+                var: "V".to_string(),
+                explicit: false,
+            }
+            .toml_path(),
+            "llm.providers[1].kind"
+        );
+        assert_eq!(
+            ValidationError::EmptyModelsList {
+                index: 3,
+                provider: "p".to_string(),
+            }
+            .toml_path(),
+            "llm.providers[3].models"
         );
         assert_eq!(
             ValidationError::UnknownProviderKind {
@@ -566,5 +654,77 @@ mod tests {
         let err = load(Path::new("does-not-exist-99.toml")).unwrap_err();
         assert!(err.is_not_found());
         assert_eq!(err.toml_path(), None);
+    }
+
+    #[test]
+    fn to_toml_string_round_trips_and_skips_none() {
+        let var = "REPO_EXPLORER_TEST_KEY_ROUNDTRIP";
+        unsafe {
+            std::env::set_var(var, "x");
+        }
+        let config = config_with_provider("primary", var);
+        let toml = to_toml_string(&config).expect("serialize should succeed");
+
+        // None fields must be omitted (no `key = ` line) — guards skip_serializing_if.
+        assert!(
+            !toml.contains("base_url"),
+            "None base_url must be skipped, got:\n{toml}"
+        );
+        assert!(
+            !toml.contains("endpoint"),
+            "None endpoint must be skipped, got:\n{toml}"
+        );
+
+        // Round-trips back into an equivalent, valid Config.
+        let parsed: Config = toml::from_str(&toml).expect("serialized TOML should parse");
+        parsed
+            .validate()
+            .expect("round-tripped config should validate");
+        assert_eq!(parsed.llm.providers[0].name, "primary");
+        assert_eq!(parsed.llm.providers[0].api_key_env.as_deref(), Some(var));
+        assert_eq!(parsed.llm.providers[0].models, vec!["m".to_string()]);
+        assert_eq!(parsed.codebase_memory.command.as_deref(), Some("cmd"));
+
+        unsafe {
+            std::env::remove_var(var);
+        }
+    }
+
+    #[test]
+    fn to_toml_string_omits_implicit_default_api_key_env() {
+        // A wizard-shaped gemini config: api_key_env = None (implicit default).
+        unsafe {
+            std::env::set_var("GEMINI_API_KEY", "x");
+        }
+        let config = Config {
+            llm: LlmConfig {
+                providers: vec![ProviderConfig {
+                    name: "gemini".to_string(),
+                    kind: "gemini".to_string(),
+                    api_key_env: None,
+                    models: vec!["gemini-2.5-flash".to_string()],
+                    base_url: None,
+                }],
+                cooldown_seconds: 60,
+            },
+            codebase_memory: CodebaseMemoryConfig {
+                command: Some("codebase-memory-mcp".to_string()),
+                args: vec!["--stdio".to_string()],
+                endpoint: None,
+                staleness_seconds: 3600,
+            },
+            search: SearchConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+        let toml = to_toml_string(&config).expect("serialize should succeed");
+        assert!(
+            !toml.contains("api_key_env"),
+            "implicit-default api_key_env must be omitted, got:\n{toml}"
+        );
+        let parsed: Config = toml::from_str(&toml).expect("parse back");
+        parsed.validate().expect("validate");
+        unsafe {
+            std::env::remove_var("GEMINI_API_KEY");
+        }
     }
 }

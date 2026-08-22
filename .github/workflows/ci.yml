@@ -36,4 +36,4 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     steps:
-      - run: ${{ needs.test.result == 'success' && needs.test-setup.result == 'success' && 'exit 0' || 'exit 1' }}
+      - run: ${{ needs.test.result == 'success' && needs['test-setup'].result == 'success' && 'exit 0' || 'exit 1' }}
