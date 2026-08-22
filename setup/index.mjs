@@ -9,6 +9,7 @@ import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { pathToFileURL } from "node:url";
 
 const OWNER = "kwitsch";
 const REPO = "repo-explorer-mcp";
@@ -24,7 +25,9 @@ export function parseArgs(argv) {
     else if (a === "--force") out.force = true;
     else if (a === "--help" || a === "-h") out.help = true;
     else if (a === "--version") {
-      out.version = argv[++i] ?? null;
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("-")) {
+        out.version = argv[++i];
+      }
     } else if (a.startsWith("--version=")) {
       out.version = a.slice("--version=".length);
     }
@@ -83,9 +86,12 @@ export function installDir(osKind, env, homedir) {
   return path.join(homedir, ".local", "bin");
 }
 
-export function isDirOnPath(dir, pathEnv, delimiter) {
+export function isDirOnPath(dir, pathEnv, delimiter, caseInsensitive = false) {
   if (!pathEnv) return false;
-  const norm = (p) => path.normalize(p).replace(/[\\/]+$/, "");
+  const norm = (p) => {
+    const n = path.normalize(p).replace(/[\\/]+$/, "");
+    return caseInsensitive ? n.toLowerCase() : n;
+  };
   const want = norm(dir);
   return pathEnv.split(delimiter).some((p) => p && norm(p) === want);
 }
@@ -94,13 +100,19 @@ export function isDirOnPath(dir, pathEnv, delimiter) {
 
 function onPathTool(bin, osKind) {
   const finder = osKind === "win32" ? "where" : "which";
-  const r = spawnSync(finder, [bin], { encoding: "utf8" });
+  const r = spawnSync(finder, [bin], { encoding: "utf8", timeout: 3000 });
   return r.status === 0;
 }
 
-function probeVersion(bin, args = ["--version"]) {
-  const r = spawnSync(bin, args, { encoding: "utf8", timeout: 5000 });
-  if (r.status === 0 && typeof r.stdout === "string") return r.stdout.trim();
+function probeVersion(bin, args = ["--version"], timeout = 1500) {
+  const r = spawnSync(bin, args, { encoding: "utf8", timeout });
+  if (
+    r.status === 0 &&
+    typeof r.stdout === "string" &&
+    r.stdout.trim() !== ""
+  ) {
+    return r.stdout.trim();
+  }
   return null;
 }
 
@@ -120,8 +132,15 @@ async function prompt(question, { yes }) {
   }
 }
 
-async function resolveVersion(pinned) {
-  if (pinned) return pinned.replace(/^v/, "");
+export async function resolveVersion(pinned) {
+  if (pinned === "") {
+    throw new Error(
+      "--version requires a non-empty value, e.g. --version 1.2.3.",
+    );
+  }
+  if (pinned != null) {
+    return pinned.replace(/^v/, "");
+  }
   const url = `https://api.github.com/repos/${OWNER}/${REPO}/releases/latest`;
   const res = await fetch(url, {
     headers: {
@@ -154,6 +173,10 @@ function sha256Hex(buf) {
   return crypto.createHash("sha256").update(buf).digest("hex");
 }
 
+function psQuote(s) {
+  return `'${s.replace(/'/g, "''")}'`;
+}
+
 function extractArchive(osKind, archiveFile, destDir) {
   if (osKind === "win32") {
     const r = spawnSync(
@@ -161,7 +184,7 @@ function extractArchive(osKind, archiveFile, destDir) {
       [
         "-NoProfile",
         "-Command",
-        `Expand-Archive -LiteralPath '${archiveFile}' -DestinationPath '${destDir}' -Force`,
+        `Expand-Archive -LiteralPath ${psQuote(archiveFile)} -DestinationPath ${psQuote(destDir)} -Force`,
       ],
       { stdio: "inherit" },
     );
@@ -188,7 +211,11 @@ function detectLinuxPkgManager() {
 function installCommandFor(pm) {
   switch (pm) {
     case "apt-get":
-      return ["sudo", ["apt-get", "install", "-y", "ripgrep"]];
+      // A fresh/minimal system's apt index can be empty; refresh it first.
+      return [
+        "sudo",
+        ["sh", "-c", "apt-get update && apt-get install -y ripgrep"],
+      ];
     case "dnf":
       return ["sudo", ["dnf", "install", "-y", "ripgrep"]];
     case "pacman":
@@ -198,9 +225,15 @@ function installCommandFor(pm) {
   }
 }
 
+function recheckRg(plat) {
+  return onPathTool("rg", plat.osKind)
+    ? (probeVersion("rg") ?? "present").split("\n")[0]
+    : "missing";
+}
+
 async function ensureRipgrep(plat, opts) {
   if (onPathTool("rg", plat.osKind)) {
-    return probeVersion("rg") ?? "present";
+    return (probeVersion("rg") ?? "present").split("\n")[0];
   }
   if (plat.osKind === "linux") {
     const pm = detectLinuxPkgManager();
@@ -213,12 +246,10 @@ async function ensureRipgrep(plat, opts) {
         const r = spawnSync(cmd, args, { stdio: "inherit" });
         if (r.status !== 0)
           console.warn(
-            "ripgrep install failed; continuing (search still works via rtk if present).",
+            "ripgrep install failed; continuing (repo-explorer-mcp will try rtk instead if it's installed, though rtk's `rg` subcommand may itself require ripgrep).",
           );
       }
-      return onPathTool("rg", plat.osKind)
-        ? (probeVersion("rg") ?? "present")
-        : "missing";
+      return recheckRg(plat);
     }
     console.warn(
       "ripgrep is missing and no supported package manager (apt-get/dnf/pacman) was found. Install ripgrep manually: https://github.com/BurntSushi/ripgrep#installation",
@@ -242,11 +273,16 @@ async function ensureRipgrep(plat, opts) {
         ],
         { stdio: "inherit" },
       );
-      if (r.status !== 0) console.warn("ripgrep install failed; continuing.");
+      if (r.status !== 0) {
+        console.warn("ripgrep install failed; continuing.");
+      } else {
+        // winget updates the persistent PATH, but this already-running
+        // process keeps the PATH it inherited at startup, so a live re-check
+        // here would wrongly report "missing" right after a successful install.
+        return "installed (restart your terminal to use)";
+      }
     }
-    return onPathTool("rg", plat.osKind)
-      ? (probeVersion("rg") ?? "present")
-      : "missing";
+    return recheckRg(plat);
   }
   console.warn(
     "ripgrep is missing and winget was not found. Install ripgrep manually: https://github.com/BurntSushi/ripgrep#installation",
@@ -254,9 +290,12 @@ async function ensureRipgrep(plat, opts) {
   return "missing";
 }
 
-function reportReportOnlyDep(name, plat, pointer) {
+function reportOnlyDep(name, plat, pointer) {
   if (onPathTool(name, plat.osKind)) {
-    const v = probeVersion(name) ?? probeVersion(name, ["--help"]) ?? "present";
+    // Short, single-attempt probe: these binaries aren't guaranteed to be
+    // --version-aware CLIs (e.g. codebase-memory-mcp is an MCP stdio server),
+    // so don't risk stacking multiple multi-second hangs on a best-effort check.
+    const v = probeVersion(name, ["--version"], 1500) ?? "present";
     return v.split("\n")[0];
   }
   console.warn(
@@ -265,12 +304,11 @@ function reportReportOnlyDep(name, plat, pointer) {
   return "missing";
 }
 
-function mcpSnippet(osKind, binPath) {
-  const cmd = binPath.replace(/\\/g, "\\\\");
+export function mcpSnippet(binPath) {
   return JSON.stringify(
     {
       mcpServers: {
-        "repo-explorer": { command: cmd, args: [], env: {} },
+        "repo-explorer": { command: binPath, args: [], env: {} },
       },
     },
     null,
@@ -306,13 +344,13 @@ async function main() {
   console.log("\nDependency status:");
   const rgVer = await ensureRipgrep(plat, opts);
   console.log(`  ripgrep: ${rgVer}`);
-  const rtkVer = reportReportOnlyDep(
+  const rtkVer = reportOnlyDep(
     "rtk",
     plat,
     "Install rtk from its upstream distribution; it is optional (search falls back to plain ripgrep).",
   );
   console.log(`  rtk: ${rtkVer}`);
-  const cmVer = reportReportOnlyDep(
+  const cmVer = reportOnlyDep(
     "codebase-memory-mcp",
     plat,
     "Install codebase-memory-mcp from its upstream distribution; it is required at runtime.",
@@ -326,15 +364,20 @@ async function main() {
   const binName = binaryName(plat.osKind);
   const binPath = path.join(dir, binName);
 
+  const deps = { rgVer, rtkVer, cmVer };
+
   // Idempotency check.
   if (!opts.force && fs.existsSync(binPath)) {
     const installed = probeVersion(binPath); // e.g. "repo-explorer-mcp 0.1.0"
     const installedVer = installed ? installed.split(/\s+/).pop() : null;
-    if (installedVer && hexEqual(installedVer, version)) {
+    if (
+      installedVer &&
+      installedVer.trim().toLowerCase() === version.trim().toLowerCase()
+    ) {
       console.log(
         `\nrepo-explorer-mcp ${version} already installed at ${binPath} — already up to date.`,
       );
-      printSummary(plat, binPath, version, { rgVer, rtkVer, cmVer });
+      printSummary(binPath, version, deps);
       return;
     }
   }
@@ -356,7 +399,6 @@ async function main() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "repo-explorer-mcp-"));
   const archiveFile = path.join(tmp, archiveName);
   try {
-    const buf = await downloadTo(archiveUrl, archiveFile);
     const sumRes = await fetch(sha256Url, {
       headers: { "User-Agent": "repo-explorer-mcp-setup" },
     });
@@ -365,6 +407,7 @@ async function main() {
         `Checksum download failed: ${sha256Url} (HTTP ${sumRes.status}).`,
       );
     const expected = parseSha256Line(await sumRes.text());
+    const buf = await downloadTo(archiveUrl, archiveFile);
     const actual = sha256Hex(buf);
     if (!hexEqual(actual, expected)) {
       fs.rmSync(archiveFile, { force: true });
@@ -375,7 +418,14 @@ async function main() {
     console.log("Checksum verified.");
     extractArchive(plat.osKind, archiveFile, tmp);
     const extracted = path.join(tmp, binName);
-    fs.copyFileSync(extracted, binPath);
+    try {
+      fs.copyFileSync(extracted, binPath);
+    } catch (e) {
+      throw new Error(
+        `Failed to install the binary to ${binPath}: ${e.message}\n` +
+          "If repo-explorer-mcp is currently running, stop it and re-run this installer.",
+      );
+    }
     if (plat.osKind !== "win32") fs.chmodSync(binPath, 0o755);
     console.log(`Installed ${binName} -> ${binPath}`);
   } finally {
@@ -383,7 +433,9 @@ async function main() {
   }
 
   // PATH reporting (detect, never modify).
-  if (!isDirOnPath(dir, process.env.PATH, path.delimiter)) {
+  if (
+    !isDirOnPath(dir, process.env.PATH, path.delimiter, plat.osKind === "win32")
+  ) {
     if (plat.osKind === "win32") {
       console.warn(
         `\nWARNING: ${dir} is not on your PATH. Add it via System Properties > Environment Variables, or: setx PATH "%PATH%;${dir}"`,
@@ -395,10 +447,10 @@ async function main() {
     }
   }
 
-  printSummary(plat, binPath, version, { rgVer, rtkVer, cmVer });
+  printSummary(binPath, version, deps);
 }
 
-function printSummary(plat, binPath, version, deps) {
+function printSummary(binPath, version, deps) {
   console.log("\n=== Summary ===");
   console.log(`repo-explorer-mcp ${version} -> ${binPath}`);
   console.log(
@@ -407,11 +459,14 @@ function printSummary(plat, binPath, version, deps) {
   console.log(
     '\nAdd this to your .mcp.json (adjust args, e.g. add "--config <path>" if your repo-explorer.toml is not at the launch cwd):',
   );
-  console.log(mcpSnippet(plat.osKind, binPath));
+  console.log(mcpSnippet(binPath));
 }
 
 // Run main only when executed directly (not when imported by tests).
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
   main().catch((e) => {
     console.error(`repo-explorer-mcp-setup: ${e.message}`);
     process.exit(1);

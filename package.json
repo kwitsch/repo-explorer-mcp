@@ -6,6 +6,9 @@
   "bin": {
     "repo-explorer-mcp-setup": "./setup/index.mjs"
   },
+  "scripts": {
+    "test": "node --test setup/index.test.mjs"
+  },
   "files": [
     "setup/"
   ],

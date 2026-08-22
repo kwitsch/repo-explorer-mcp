@@ -27,8 +27,9 @@ Flags:
 The script installs into `~/.local/bin` (Linux) or
 `%LOCALAPPDATA%\repo-explorer-mcp` (Windows). It never edits your shell profile
 or system PATH — it only reports whether the install directory is on PATH.
-`ripgrep` is installed automatically (via `apt`/`dnf`/`pacman` on Linux or
-`winget` on Windows, with an upstream-binary fallback). `rtk` and
+`ripgrep` is installed automatically via `apt`/`dnf`/`pacman` on Linux or
+`winget` on Windows; if none of those is available, the script warns and
+points at ripgrep's own install docs instead of installing it itself. `rtk` and
 `codebase-memory-mcp` are report-only: if missing, the script tells you and
 points at their upstream install docs (`rtk` is optional; search falls back to
 plain ripgrep).

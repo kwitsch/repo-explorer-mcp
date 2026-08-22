@@ -21,10 +21,19 @@ jobs:
       - run: cargo build --workspace
       - run: cargo test --workspace
 
+  test-setup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - run: npm test
+
   test-gate:
     name: Test gate
-    needs: test
+    needs: [test, test-setup]
     runs-on: ubuntu-latest
     if: always()
     steps:
-      - run: ${{ needs.test.result == 'success' && 'exit 0' || 'exit 1' }}
+      - run: ${{ needs.test.result == 'success' && needs.test-setup.result == 'success' && 'exit 0' || 'exit 1' }}

@@ -31,8 +31,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c "import sys,json; m=json.load(sys.stdin); print(next(p['version'] for p in m['packages'] if p['name']=='repo-explorer-mcp'))")"
+          PKGID="$(cargo pkgid -p repo-explorer-mcp)"
+          VERSION="${PKGID##*#}"
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           echo "Workspace version: $VERSION"
           echo "Tag version:       $TAG_VERSION"
@@ -53,6 +53,12 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.bin }}"
 
+      - name: Verify binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          "./dist/${{ matrix.bin }}" --version
+
       - name: Package (Linux tar.gz)
         if: runner.os == 'Linux'
         shell: bash
@@ -66,6 +72,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $archive = "repo-explorer-mcp-$env:VERSION-${{ matrix.target }}.${{ matrix.ext }}"
           Compress-Archive -Path "dist/${{ matrix.bin }}" -DestinationPath "dist/$archive" -Force
           "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8

@@ -11,6 +11,8 @@ import {
   isDirOnPath,
   binaryName,
   installDir,
+  mcpSnippet,
+  resolveVersion,
 } from "./index.mjs";
 
 test("parseArgs reads all flags", () => {
@@ -33,6 +35,21 @@ test("parseArgs reads all flags", () => {
     help: true,
   });
   assert.deepEqual(parseArgs([]), {
+    yes: false,
+    force: false,
+    version: null,
+    help: false,
+  });
+});
+
+test("parseArgs does not swallow a following flag as --version's value", () => {
+  assert.deepEqual(parseArgs(["--version", "--yes"]), {
+    yes: true,
+    force: false,
+    version: null,
+    help: false,
+  });
+  assert.deepEqual(parseArgs(["--version"]), {
     yes: false,
     force: false,
     version: null,
@@ -129,4 +146,32 @@ test("isDirOnPath normalizes membership", () => {
   );
   assert.ok(isDirOnPath("/home/u/.local/bin/", "/home/u/.local/bin", sep));
   assert.ok(!isDirOnPath("/opt/bin", "/usr/bin:/home/u/.local/bin", sep));
+});
+
+test("isDirOnPath is case-insensitive only when asked (Windows)", () => {
+  const dir = "C:\\Users\\me\\AppData\\Local\\repo-explorer-mcp";
+  const pathEnv =
+    "C:\\Windows;c:\\users\\me\\appdata\\local\\repo-explorer-mcp";
+  assert.ok(!isDirOnPath(dir, pathEnv, ";"));
+  assert.ok(isDirOnPath(dir, pathEnv, ";", true));
+});
+
+test("mcpSnippet round-trips a path without double-escaping backslashes", () => {
+  const winPath =
+    "C:\\Users\\test\\AppData\\Local\\repo-explorer-mcp\\repo-explorer-mcp.exe";
+  const parsed = JSON.parse(mcpSnippet(winPath));
+  assert.equal(parsed.mcpServers["repo-explorer"].command, winPath);
+
+  const posixPath = "/home/user/.local/bin/repo-explorer-mcp";
+  const parsedPosix = JSON.parse(mcpSnippet(posixPath));
+  assert.equal(parsedPosix.mcpServers["repo-explorer"].command, posixPath);
+});
+
+test("resolveVersion rejects an explicitly empty pinned version", async () => {
+  await assert.rejects(() => resolveVersion(""), /non-empty value/);
+});
+
+test("resolveVersion strips a leading v from a pinned version", async () => {
+  assert.equal(await resolveVersion("v1.2.3"), "1.2.3");
+  assert.equal(await resolveVersion("1.2.3"), "1.2.3");
 });
