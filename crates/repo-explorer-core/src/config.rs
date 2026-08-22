@@ -104,6 +104,11 @@ fn default_prefer_rtk() -> bool {
     true
 }
 
+/// Provider `kind` strings the LLM boundary can map to a genai adapter.
+/// Kept in sync with `repo_explorer_llm::adapter_kind_for`; core cannot depend
+/// on genai, so the set is re-declared here as plain strings.
+pub const KNOWN_PROVIDER_KINDS: &[&str] = &["anthropic", "openai", "gemini", "google"];
+
 /// Errors returned by [`load`].
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -113,10 +118,32 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to parse config as TOML: {0}")]
-    Parse(#[from] toml::de::Error),
+    #[error("failed to parse config as TOML: {source}")]
+    Parse {
+        #[source]
+        source: toml::de::Error,
+        location: Option<String>,
+    },
     #[error(transparent)]
     Validation(#[from] ValidationError),
+}
+
+impl ConfigError {
+    /// TOML location of the error, when one is known.
+    /// `None` for whole-file read errors.
+    pub fn toml_path(&self) -> Option<String> {
+        match self {
+            ConfigError::Read { .. } => None,
+            ConfigError::Parse { location, .. } => location.clone(),
+            ConfigError::Validation(v) => Some(v.toml_path()),
+        }
+    }
+
+    /// True when the underlying cause is a missing config file.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, ConfigError::Read { source, .. }
+            if source.kind() == std::io::ErrorKind::NotFound)
+    }
 }
 
 /// Semantic validation failures, independent of parsing.
@@ -127,9 +154,21 @@ pub enum ValidationError {
     #[error("llm.providers must contain at least one provider")]
     EmptyProviderList,
     #[error("duplicate provider name `{name}` in llm.providers")]
-    DuplicateProviderName { name: String },
+    DuplicateProviderName { index: usize, name: String },
     #[error("provider `{provider}` references environment variable `{var}`, which is not set")]
-    MissingEnvVar { provider: String, var: String },
+    MissingEnvVar {
+        index: usize,
+        provider: String,
+        var: String,
+    },
+    #[error(
+        "provider `{provider}` has unknown kind `{kind}` (expected one of: anthropic, openai, gemini, google)"
+    )]
+    UnknownProviderKind {
+        index: usize,
+        provider: String,
+        kind: String,
+    },
     #[error(
         "codebase_memory must set either `command` (stdio) or `endpoint` (network), but neither is present"
     )]
@@ -138,15 +177,57 @@ pub enum ValidationError {
     ConflictingCodebaseMemoryConnection,
 }
 
+impl ValidationError {
+    /// Dotted TOML key path where this error occurred.
+    pub fn toml_path(&self) -> String {
+        match self {
+            ValidationError::EmptyProviderList => "llm.providers".to_string(),
+            ValidationError::DuplicateProviderName { index, .. } => {
+                format!("llm.providers[{index}].name")
+            }
+            ValidationError::MissingEnvVar { index, .. } => {
+                format!("llm.providers[{index}].api_key_env")
+            }
+            ValidationError::UnknownProviderKind { index, .. } => {
+                format!("llm.providers[{index}].kind")
+            }
+            ValidationError::MissingCodebaseMemoryConnection
+            | ValidationError::ConflictingCodebaseMemoryConnection => "codebase_memory".to_string(),
+        }
+    }
+}
+
 /// Read, parse, and validate a config file. The single public entry point.
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
     let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.to_path_buf(),
         source,
     })?;
-    let config: Config = toml::from_str(&contents)?;
+    let config: Config = toml::from_str(&contents).map_err(|source| {
+        let location = source.span().map(|span| line_col(&contents, span.start));
+        ConfigError::Parse { source, location }
+    })?;
     config.validate()?;
     Ok(config)
+}
+
+/// Render a byte offset into `text` as a `line N, column M` string (1-based).
+fn line_col(text: &str, byte: usize) -> String {
+    let byte = byte.min(text.len());
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for (i, ch) in text.char_indices() {
+        if i >= byte {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    format!("line {line}, column {col}")
 }
 
 impl Config {
@@ -158,17 +239,29 @@ impl Config {
         }
 
         let mut seen = std::collections::HashSet::new();
-        for provider in &self.llm.providers {
+        for (index, provider) in self.llm.providers.iter().enumerate() {
             if !seen.insert(provider.name.as_str()) {
                 return Err(ValidationError::DuplicateProviderName {
+                    index,
                     name: provider.name.clone(),
                 });
             }
         }
 
-        for provider in &self.llm.providers {
+        for (index, provider) in self.llm.providers.iter().enumerate() {
+            if !KNOWN_PROVIDER_KINDS.contains(&provider.kind.as_str()) {
+                return Err(ValidationError::UnknownProviderKind {
+                    index,
+                    provider: provider.name.clone(),
+                    kind: provider.kind.clone(),
+                });
+            }
+        }
+
+        for (index, provider) in self.llm.providers.iter().enumerate() {
             if std::env::var(&provider.api_key_env).is_err() {
                 return Err(ValidationError::MissingEnvVar {
+                    index,
                     provider: provider.name.clone(),
                     var: provider.api_key_env.clone(),
                 });
@@ -270,14 +363,21 @@ mod tests {
     #[test]
     fn duplicate_provider_names_fail() {
         let mut config = config_with_provider("dup", "REPO_EXPLORER_TEST_KEY_DUP");
+        unsafe {
+            std::env::set_var("REPO_EXPLORER_TEST_KEY_DUP", "x");
+        }
         let second = config.llm.providers[0].clone();
         config.llm.providers.push(second);
         assert_eq!(
             config.validate(),
             Err(ValidationError::DuplicateProviderName {
+                index: 1,
                 name: "dup".to_string()
             })
         );
+        unsafe {
+            std::env::remove_var("REPO_EXPLORER_TEST_KEY_DUP");
+        }
     }
 
     #[test]
@@ -291,6 +391,7 @@ mod tests {
         assert_eq!(
             err,
             ValidationError::MissingEnvVar {
+                index: 0,
                 provider: "primary".to_string(),
                 var: var.to_string(),
             }
@@ -300,6 +401,7 @@ mod tests {
         assert!(msg.contains(var));
         assert!(msg.contains("primary"));
         assert!(!msg.contains("not-a-real-key"));
+        assert_eq!(err.toml_path(), "llm.providers[0].api_key_env");
     }
 
     #[test]
@@ -332,13 +434,104 @@ mod tests {
     fn parse_error_is_reported() {
         let malformed = "this is = = not valid toml";
         let err = toml::from_str::<Config>(malformed).unwrap_err();
-        let config_err: ConfigError = err.into();
-        assert!(matches!(config_err, ConfigError::Parse(_)));
+        let config_err = ConfigError::Parse {
+            source: err,
+            location: None,
+        };
+        assert!(matches!(config_err, ConfigError::Parse { .. }));
     }
 
     #[test]
     fn missing_file_is_read_error() {
         let err = load(Path::new("does-not-exist-42.toml")).unwrap_err();
         assert!(matches!(err, ConfigError::Read { .. }));
+    }
+
+    #[test]
+    fn unknown_provider_kind_fails() {
+        let var = "REPO_EXPLORER_TEST_KEY_UNKNOWN_KIND";
+        unsafe {
+            std::env::set_var(var, "x");
+        }
+        let err = load(&fixture_path("unknown_kind.toml")).unwrap_err();
+        match &err {
+            ConfigError::Validation(ValidationError::UnknownProviderKind {
+                index,
+                provider,
+                kind,
+            }) => {
+                assert_eq!(*index, 0);
+                assert_eq!(provider, "primary");
+                assert_eq!(kind, "bogus");
+            }
+            other => panic!("expected UnknownProviderKind, got {other:?}"),
+        }
+        assert_eq!(err.toml_path(), Some("llm.providers[0].kind".to_string()));
+        unsafe {
+            std::env::remove_var(var);
+        }
+    }
+
+    #[test]
+    fn toml_path_for_each_variant() {
+        assert_eq!(
+            ValidationError::EmptyProviderList.toml_path(),
+            "llm.providers"
+        );
+        assert_eq!(
+            ValidationError::DuplicateProviderName {
+                index: 2,
+                name: "d".to_string()
+            }
+            .toml_path(),
+            "llm.providers[2].name"
+        );
+        assert_eq!(
+            ValidationError::MissingEnvVar {
+                index: 1,
+                provider: "p".to_string(),
+                var: "V".to_string()
+            }
+            .toml_path(),
+            "llm.providers[1].api_key_env"
+        );
+        assert_eq!(
+            ValidationError::UnknownProviderKind {
+                index: 0,
+                provider: "p".to_string(),
+                kind: "k".to_string()
+            }
+            .toml_path(),
+            "llm.providers[0].kind"
+        );
+        assert_eq!(
+            ValidationError::MissingCodebaseMemoryConnection.toml_path(),
+            "codebase_memory"
+        );
+        assert_eq!(
+            ValidationError::ConflictingCodebaseMemoryConnection.toml_path(),
+            "codebase_memory"
+        );
+    }
+
+    #[test]
+    fn parse_error_has_location() {
+        let err = load(&fixture_path("malformed.toml")).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }));
+        let path = err.toml_path();
+        assert!(path.is_some());
+        let s = path.unwrap();
+        assert!(s.contains("line"), "expected a line/column string, got {s}");
+        assert!(
+            s.contains("column"),
+            "expected a line/column string, got {s}"
+        );
+    }
+
+    #[test]
+    fn not_found_is_detected() {
+        let err = load(Path::new("does-not-exist-99.toml")).unwrap_err();
+        assert!(err.is_not_found());
+        assert_eq!(err.toml_path(), None);
     }
 }
