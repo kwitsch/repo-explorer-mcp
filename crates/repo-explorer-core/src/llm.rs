@@ -193,11 +193,17 @@ impl Clock for SystemClock {
     }
 }
 
-/// One provider slot plus its interior-mutable cooldown deadline.
-struct Entry<P> {
-    name: String,
+/// One model within a provider entry, plus its interior-mutable cooldown.
+struct ModelSlot<P> {
+    model: String,
     provider: P,
     cooling_until: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+/// One provider entry: a name plus its ordered model slots.
+struct Entry<P> {
+    name: String,
+    models: Vec<ModelSlot<P>>,
 }
 
 /// Failover router over an ordered set of providers of one concrete type.
@@ -212,22 +218,33 @@ pub struct ProviderRouter<P: LlmProvider, C: Clock = SystemClock> {
 }
 
 impl<P: LlmProvider> ProviderRouter<P, SystemClock> {
-    /// Pair each ordered `(name, provider)` with the shared cooldown window and
-    /// the real system clock. File (= config) order is failover order.
-    pub fn new(providers: Vec<(String, P)>, cooldown_seconds: u64) -> Self {
+    /// Pair each ordered `(name, models)` group with the shared cooldown window
+    /// and the real system clock. File (= config) order is failover order for
+    /// entries; list order is failover order for models within an entry.
+    pub fn new(providers: Vec<(String, Vec<(String, P)>)>, cooldown_seconds: u64) -> Self {
         Self::with_clock(providers, cooldown_seconds, SystemClock)
     }
 }
 
 impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
     /// Construct with an explicit clock (tests inject a `FakeClock`).
-    pub fn with_clock(providers: Vec<(String, P)>, cooldown_seconds: u64, clock: C) -> Self {
+    pub fn with_clock(
+        providers: Vec<(String, Vec<(String, P)>)>,
+        cooldown_seconds: u64,
+        clock: C,
+    ) -> Self {
         let entries = providers
             .into_iter()
-            .map(|(name, provider)| Entry {
+            .map(|(name, models)| Entry {
                 name,
-                provider,
-                cooling_until: std::sync::Mutex::new(None),
+                models: models
+                    .into_iter()
+                    .map(|(model, provider)| ModelSlot {
+                        model,
+                        provider,
+                        cooling_until: std::sync::Mutex::new(None),
+                    })
+                    .collect(),
             })
             .collect();
         Self {
@@ -251,43 +268,45 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
         }
 
         let now = self.clock.now();
-        let mut cooling: Vec<&str> = Vec::new();
-        let mut limited: Vec<&str> = Vec::new();
+        let mut cooling: Vec<String> = Vec::new();
+        let mut limited: Vec<String> = Vec::new();
 
         for entry in &self.entries {
-            {
-                // Recover from a poisoned lock instead of propagating the panic:
-                // a prior panic while holding this entry's cooldown state must
-                // not turn into a permanent, unrecoverable failure of the whole
-                // failover router for the rest of the process lifetime.
-                let mut guard = entry
-                    .cooling_until
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                match *guard {
-                    Some(until) if now < until => {
-                        cooling.push(&entry.name);
-                        continue;
-                    }
-                    _ => {
-                        // Expired (or never set): clear and proceed to call.
-                        *guard = None;
-                    }
-                }
-            }
-
-            match entry.provider.complete_with_tools(messages, tools).await {
-                Ok(resp) => return Ok(resp),
-                Err(e) if e.is_failover_trigger() => {
-                    let mut guard = entry
+            for slot in &entry.models {
+                {
+                    // Recover from a poisoned lock at the read site instead of
+                    // propagating the panic: a prior panic while holding this
+                    // slot's cooldown state must not permanently break the
+                    // whole failover router.
+                    let mut guard = slot
                         .cooling_until
                         .lock()
-                        .expect("router cooldown mutex poisoned");
-                    *guard = Some(now + self.cooldown);
-                    limited.push(&entry.name);
-                    continue;
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match *guard {
+                        Some(until) if now < until => {
+                            cooling.push(format!("{}/{}", entry.name, slot.model));
+                            continue;
+                        }
+                        _ => {
+                            // Expired (or never set): clear and proceed to call.
+                            *guard = None;
+                        }
+                    }
                 }
-                Err(e) => return Err(RouterError::Provider(e)),
+
+                match slot.provider.complete_with_tools(messages, tools).await {
+                    Ok(resp) => return Ok(resp),
+                    Err(e) if e.is_failover_trigger() => {
+                        let mut guard = slot
+                            .cooling_until
+                            .lock()
+                            .expect("router cooldown mutex poisoned");
+                        *guard = Some(now + self.cooldown);
+                        limited.push(format!("{}/{}", entry.name, slot.model));
+                        continue;
+                    }
+                    Err(e) => return Err(RouterError::Provider(e)),
+                }
             }
         }
 
@@ -612,8 +631,11 @@ mod tests {
         let p2 = MockLlmProvider::new().with_fallback(Ok(text("from p2")));
         let router = ProviderRouter::new(
             vec![
-                ("primary".to_string(), p1.clone()),
-                ("secondary".to_string(), p2.clone()),
+                ("primary".to_string(), vec![("m1".to_string(), p1.clone())]),
+                (
+                    "secondary".to_string(),
+                    vec![("m2".to_string(), p2.clone())],
+                ),
             ],
             60,
         );
@@ -625,7 +647,6 @@ mod tests {
         }];
         let got = router.complete_with_tools(&msgs, &[]).await;
         assert_eq!(got, Ok(text("from p2")));
-        // Provider 1 recorded the attempt.
         assert_eq!(
             p1.calls(),
             vec![MockCall {
@@ -644,7 +665,10 @@ mod tests {
             message: "no credit".to_string(),
         }));
         let router = ProviderRouter::new(
-            vec![("primary".to_string(), p1), ("secondary".to_string(), p2)],
+            vec![
+                ("primary".to_string(), vec![("m1".to_string(), p1)]),
+                ("secondary".to_string(), vec![("m2".to_string(), p2)]),
+            ],
             60,
         );
         let got = router.complete_with_tools(&[], &[]).await;
@@ -666,8 +690,11 @@ mod tests {
         let p2 = MockLlmProvider::new().with_fallback(Ok(text("unused")));
         let router = ProviderRouter::new(
             vec![
-                ("primary".to_string(), p1),
-                ("secondary".to_string(), p2.clone()),
+                ("primary".to_string(), vec![("m1".to_string(), p1)]),
+                (
+                    "secondary".to_string(),
+                    vec![("m2".to_string(), p2.clone())],
+                ),
             ],
             60,
         );
@@ -679,40 +706,146 @@ mod tests {
                 message: "bad key".to_string(),
             }))
         );
-        // Fail fast: the second provider was never called.
         assert_eq!(p2.calls().len(), 0);
     }
 
     #[tokio::test]
     async fn cooldown_skips_then_retries_after_window() {
-        // p1 scripted: limit on first call, success on the second (post-cooldown).
         let p1 = MockLlmProvider::new()
             .with_responses(vec![Err(rate_limited("primary")), Ok(text("p1 recovered"))]);
         let p2 = MockLlmProvider::new().with_fallback(Err(rate_limited("secondary")));
         let clock = FakeClock::new();
         let router = ProviderRouter::with_clock(
             vec![
-                ("primary".to_string(), p1.clone()),
-                ("secondary".to_string(), p2.clone()),
+                ("primary".to_string(), vec![("m1".to_string(), p1.clone())]),
+                (
+                    "secondary".to_string(),
+                    vec![("m2".to_string(), p2.clone())],
+                ),
             ],
             60,
             clock.clone(),
         );
 
-        // Pass 1: p1 limited, p2 limited -> AllExhausted; p1 now cooling.
         let first = router.complete_with_tools(&[], &[]).await;
         assert!(matches!(first, Err(RouterError::AllExhausted(_))));
 
-        // Within cooldown (30s < 60s): p1 is skipped (not called again), p2 limited.
         clock.advance(Duration::from_secs(30));
         let second = router.complete_with_tools(&[], &[]).await;
         assert!(matches!(second, Err(RouterError::AllExhausted(_))));
         assert_eq!(p1.calls().len(), 1, "p1 must be skipped while cooling");
 
-        // Past cooldown (total 90s > 60s): p1 retried and succeeds.
         clock.advance(Duration::from_secs(60));
         let third = router.complete_with_tools(&[], &[]).await;
         assert_eq!(third, Ok(text("p1 recovered")));
         assert_eq!(p1.calls().len(), 2, "p1 retried after cooldown elapsed");
+    }
+
+    #[tokio::test]
+    async fn model_limit_falls_over_within_entry() {
+        // Entry `primary` has two model slots: `a` limited, `b` ok. Entry
+        // `secondary` (model `c`) must never be reached.
+        let a = MockLlmProvider::new().with_fallback(Err(rate_limited("primary")));
+        let b = MockLlmProvider::new().with_fallback(Ok(text("from b")));
+        let c = MockLlmProvider::new().with_fallback(Ok(text("from c")));
+        let router = ProviderRouter::new(
+            vec![
+                (
+                    "primary".to_string(),
+                    vec![("a".to_string(), a.clone()), ("b".to_string(), b.clone())],
+                ),
+                ("secondary".to_string(), vec![("c".to_string(), c.clone())]),
+            ],
+            60,
+        );
+        let got = router.complete_with_tools(&[], &[]).await;
+        assert_eq!(got, Ok(text("from b")));
+        assert_eq!(a.calls().len(), 1);
+        assert_eq!(b.calls().len(), 1);
+        assert_eq!(c.calls().len(), 0, "next entry must not be reached");
+    }
+
+    #[tokio::test]
+    async fn entry_exhausted_falls_over_to_next_entry() {
+        // Both models of `primary` are limited; `secondary` succeeds.
+        let a = MockLlmProvider::new().with_fallback(Err(rate_limited("primary")));
+        let b = MockLlmProvider::new().with_fallback(Err(rate_limited("primary")));
+        let c = MockLlmProvider::new().with_fallback(Ok(text("from c")));
+        let router = ProviderRouter::new(
+            vec![
+                (
+                    "primary".to_string(),
+                    vec![("a".to_string(), a.clone()), ("b".to_string(), b.clone())],
+                ),
+                ("secondary".to_string(), vec![("c".to_string(), c.clone())]),
+            ],
+            60,
+        );
+        let got = router.complete_with_tools(&[], &[]).await;
+        assert_eq!(got, Ok(text("from c")));
+        assert_eq!(a.calls().len(), 1);
+        assert_eq!(b.calls().len(), 1);
+        assert_eq!(c.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_models_all_entries_exhausted() {
+        let a = MockLlmProvider::new().with_fallback(Err(rate_limited("primary")));
+        let b = MockLlmProvider::new().with_fallback(Err(rate_limited("primary")));
+        let c = MockLlmProvider::new().with_fallback(Err(rate_limited("secondary")));
+        let router = ProviderRouter::new(
+            vec![
+                (
+                    "primary".to_string(),
+                    vec![("a".to_string(), a), ("b".to_string(), b)],
+                ),
+                ("secondary".to_string(), vec![("c".to_string(), c)]),
+            ],
+            60,
+        );
+        let got = router.complete_with_tools(&[], &[]).await;
+        match got {
+            Err(RouterError::AllExhausted(summary)) => {
+                assert!(summary.contains("primary/a"));
+                assert!(summary.contains("primary/b"));
+                assert!(summary.contains("secondary/c"));
+            }
+            other => panic!("expected AllExhausted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn per_model_cooldown_recovers() {
+        // Model `a` limited on first call, ok on the second (post-cooldown);
+        // model `b` always limited so the router falls through to AllExhausted
+        // on the first pass and re-reaches `a` after the window.
+        let a = MockLlmProvider::new()
+            .with_responses(vec![Err(rate_limited("primary")), Ok(text("a recovered"))]);
+        let b = MockLlmProvider::new().with_fallback(Err(rate_limited("primary")));
+        let clock = FakeClock::new();
+        let router = ProviderRouter::with_clock(
+            vec![(
+                "primary".to_string(),
+                vec![("a".to_string(), a.clone()), ("b".to_string(), b.clone())],
+            )],
+            60,
+            clock.clone(),
+        );
+
+        let first = router.complete_with_tools(&[], &[]).await;
+        assert!(matches!(first, Err(RouterError::AllExhausted(_))));
+        assert_eq!(a.calls().len(), 1);
+
+        // Within cooldown: `a` skipped, `b` still limited.
+        clock.advance(Duration::from_secs(30));
+        let second = router.complete_with_tools(&[], &[]).await;
+        assert!(matches!(second, Err(RouterError::AllExhausted(_))));
+        assert_eq!(a.calls().len(), 1, "a must be skipped while cooling");
+
+        // Past cooldown: `a` retried and succeeds.
+        clock.advance(Duration::from_secs(60));
+        let third = router.complete_with_tools(&[], &[]).await;
+        assert_eq!(third, Ok(text("a recovered")));
+        assert_eq!(a.calls().len(), 2, "a retried after cooldown elapsed");
     }
 }
