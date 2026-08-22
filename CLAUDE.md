@@ -24,4 +24,4 @@ cargo fmt --check
 ## Conventions
 
 - Conventions for Rust code live in `.claude/rules/rust-conventions.md`.
-- `.mcp.json` registers `repo-explorer-mcp` (launched via `cargo run --release --quiet`); it reads config from `./repo-explorer.toml` (override with `--config <path>` or the `REPO_EXPLORER_CONFIG` env var) and requires a reachable `codebase-memory-mcp`.
+- `.mcp.json` registers `repo-explorer-mcp` (launched via `cargo run --release --quiet`); config path precedence is `--config <path>` CLI arg -> `REPO_EXPLORER_CONFIG` env var -> XDG default (`$XDG_CONFIG_HOME/repo-explorer/repo-explorer.toml` on Linux, `%APPDATA%\repo-explorer\repo-explorer.toml` on Windows) -> `./repo-explorer.toml` fallback, and it requires a reachable `codebase-memory-mcp`. `repo-explorer-mcp config test` (or `--config-test`) validates the resolved config only — parse + semantic checks, no server/memory/LLM/search connections — printing a structured JSON report to stdout and exiting non-zero on failure. `repo-explorer-mcp` owns the `dirs` dependency used for XDG resolution; core and the other crates stay free of it.
