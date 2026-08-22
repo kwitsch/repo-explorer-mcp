@@ -188,11 +188,16 @@ pub enum ValidationError {
     EmptyProviderList,
     #[error("duplicate provider name `{name}` in llm.providers")]
     DuplicateProviderName { index: usize, name: String },
+    #[error("provider `{provider}` has an empty `models` list; at least one model is required")]
+    EmptyModelsList { index: usize, provider: String },
     #[error("provider `{provider}` references environment variable `{var}`, which is not set")]
     MissingEnvVar {
         index: usize,
         provider: String,
         var: String,
+        /// Whether `var` came from an explicit `api_key_env` in the file
+        /// (vs. the kind-derived default, which has no literal TOML key).
+        explicit: bool,
     },
     #[error(
         "provider `{provider}` has unknown kind `{kind}` (expected one of: anthropic, openai, gemini, google)"
@@ -218,8 +223,17 @@ impl ValidationError {
             ValidationError::DuplicateProviderName { index, .. } => {
                 format!("llm.providers[{index}].name")
             }
-            ValidationError::MissingEnvVar { index, .. } => {
-                format!("llm.providers[{index}].api_key_env")
+            ValidationError::EmptyModelsList { index, .. } => {
+                format!("llm.providers[{index}].models")
+            }
+            ValidationError::MissingEnvVar {
+                index, explicit, ..
+            } => {
+                if *explicit {
+                    format!("llm.providers[{index}].api_key_env")
+                } else {
+                    format!("llm.providers[{index}].kind")
+                }
             }
             ValidationError::UnknownProviderKind { index, .. } => {
                 format!("llm.providers[{index}].kind")
@@ -288,6 +302,15 @@ impl Config {
         }
 
         for (index, provider) in self.llm.providers.iter().enumerate() {
+            if provider.models.is_empty() {
+                return Err(ValidationError::EmptyModelsList {
+                    index,
+                    provider: provider.name.clone(),
+                });
+            }
+        }
+
+        for (index, provider) in self.llm.providers.iter().enumerate() {
             if !KNOWN_PROVIDER_KINDS.contains(&provider.kind.as_str()) {
                 return Err(ValidationError::UnknownProviderKind {
                     index,
@@ -304,6 +327,7 @@ impl Config {
                     index,
                     provider: provider.name.clone(),
                     var,
+                    explicit: provider.api_key_env.is_some(),
                 });
             }
         }
@@ -439,6 +463,7 @@ mod tests {
                 index: 0,
                 provider: "primary".to_string(),
                 var: var.to_string(),
+                explicit: true,
             }
         );
         // The message names the variable and provider but no secret value.
@@ -447,6 +472,33 @@ mod tests {
         assert!(msg.contains("primary"));
         assert!(!msg.contains("not-a-real-key"));
         assert_eq!(err.toml_path(), "llm.providers[0].api_key_env");
+    }
+
+    #[test]
+    fn missing_env_var_implicit_default_points_at_kind() {
+        let var = "ANTHROPIC_API_KEY";
+        let had = std::env::var(var).ok();
+        unsafe {
+            std::env::remove_var(var);
+        }
+        let mut config = config_with_provider("primary", var);
+        config.llm.providers[0].api_key_env = None; // rely on kind-derived default
+        let err = config.validate().unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::MissingEnvVar {
+                index: 0,
+                provider: "primary".to_string(),
+                var: var.to_string(),
+                explicit: false,
+            }
+        );
+        assert_eq!(err.toml_path(), "llm.providers[0].kind");
+        if let Some(v) = had {
+            unsafe {
+                std::env::set_var(var, v);
+            }
+        }
     }
 
     #[test]
@@ -535,10 +587,29 @@ mod tests {
             ValidationError::MissingEnvVar {
                 index: 1,
                 provider: "p".to_string(),
-                var: "V".to_string()
+                var: "V".to_string(),
+                explicit: true,
             }
             .toml_path(),
             "llm.providers[1].api_key_env"
+        );
+        assert_eq!(
+            ValidationError::MissingEnvVar {
+                index: 1,
+                provider: "p".to_string(),
+                var: "V".to_string(),
+                explicit: false,
+            }
+            .toml_path(),
+            "llm.providers[1].kind"
+        );
+        assert_eq!(
+            ValidationError::EmptyModelsList {
+                index: 3,
+                provider: "p".to_string(),
+            }
+            .toml_path(),
+            "llm.providers[3].models"
         );
         assert_eq!(
             ValidationError::UnknownProviderKind {

@@ -159,6 +159,15 @@ pub fn run_setup(config_path: &Path) -> ExitCode {
 }
 
 fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
+    if config_path.exists() {
+        eprintln!("A config already exists at {}.", config_path.display());
+        let answer = prompt_default("Overwrite it? (y/N)", "n")?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            eprintln!("Aborted; existing config left unchanged.");
+            return Ok(());
+        }
+    }
+
     eprintln!("repo-explorer-mcp interactive setup");
     eprintln!("Detecting provider API-key environment variables...");
 
