@@ -202,13 +202,6 @@ pub enum ValidationError {
     MissingCodebaseMemoryConnection,
     #[error("codebase_memory sets both `command` and `endpoint`; exactly one is allowed")]
     ConflictingCodebaseMemoryConnection,
-    #[error("provider `{provider}` must list at least one model in `models`")]
-    EmptyModelList { provider: String },
-    #[error(
-        "provider `{provider}`: cannot derive an API key environment variable \
-         for unknown kind `{kind}`; set `api_key_env` explicitly"
-    )]
-    UnknownProviderKind { provider: String, kind: String },
 }
 
 impl ValidationError {
@@ -293,7 +286,8 @@ impl Config {
         }
 
         for (index, provider) in self.llm.providers.iter().enumerate() {
-            if std::env::var(&provider.api_key_env).is_err() {
+            let var = provider.resolve_api_key_env().unwrap_or_default();
+            if std::env::var(&var).is_err() {
                 return Err(ValidationError::MissingEnvVar {
                     index,
                     provider: provider.name.clone(),

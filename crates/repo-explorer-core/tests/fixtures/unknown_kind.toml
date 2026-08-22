@@ -4,7 +4,7 @@
 name = "primary"
 kind = "bogus"
 api_key_env = "REPO_EXPLORER_TEST_KEY_UNKNOWN_KIND"
-model = "m"
+models = ["m"]
 
 [codebase_memory]
 command = "codebase-memory-mcp"

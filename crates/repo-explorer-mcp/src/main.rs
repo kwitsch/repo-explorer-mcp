@@ -20,6 +20,11 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if wants_version(argv.iter().cloned()) {
+        // stdout: a one-shot CLI query that exits before the MCP transport starts.
+        println!("repo-explorer-mcp {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     let config_path = resolve_config_path(
         argv.iter().cloned(),
         std::env::var("REPO_EXPLORER_CONFIG").ok(),
