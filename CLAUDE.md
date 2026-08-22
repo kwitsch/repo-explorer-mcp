@@ -25,3 +25,4 @@ cargo fmt --check
 
 - Conventions for Rust code live in `.claude/rules/rust-conventions.md`.
 - `.mcp.json` registers `repo-explorer-mcp` (launched via `cargo run --release --quiet`); it reads config from `./repo-explorer.toml` (override with `--config <path>` or the `REPO_EXPLORER_CONFIG` env var) and requires a reachable `codebase-memory-mcp`.
+- Error handling: `repo-explorer-core` uses `thiserror` for typed errors (`ConfigError`, `ValidationError`) and must not depend on `anyhow`; `repo-explorer-mcp` uses anyhow at the binary boundary to consume core's typed errors via `?`/`.context(...)`.
