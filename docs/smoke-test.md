@@ -11,7 +11,7 @@ GitHub Release, then verify:
 Linux:
 
 ```bash
-sha256sum -c repo-explorer-mcp- < version > -x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c repo-explorer-mcp-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
 Windows (PowerShell):

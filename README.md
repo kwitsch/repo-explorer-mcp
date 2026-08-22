@@ -46,7 +46,7 @@ Or download a release archive and its checksum, verify, and place the binary on
 PATH (see `docs/smoke-test.md` for the verification commands). Release assets
 follow the frozen naming contract:
 
-```
+```text
 repo-explorer-mcp-<version>-x86_64-unknown-linux-gnu.tar.gz (+ .sha256)
 repo-explorer-mcp-<version>-x86_64-pc-windows-msvc.zip       (+ .sha256)
 ```
