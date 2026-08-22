@@ -209,7 +209,7 @@ mod tests {
         let provider = MockLlmProvider::new()
             .with_responses(vec![Ok(ProviderResponse::ToolCalls(vec![finish_call()]))]);
         let router = ProviderRouter::with_clock(
-            vec![("primary".to_string(), provider)],
+            vec![("primary".to_string(), vec![("m".to_string(), provider)])],
             60,
             FakeClock::new(),
         );
