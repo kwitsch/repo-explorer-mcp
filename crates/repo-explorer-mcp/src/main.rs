@@ -19,6 +19,11 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if wants_version(std::env::args().skip(1)) {
+        // stdout: a one-shot CLI query that exits before the MCP transport starts.
+        println!("repo-explorer-mcp {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -83,6 +88,11 @@ fn resolve_config_path(args: impl Iterator<Item = String>, env_var: Option<Strin
     }
 }
 
+/// Return true if any CLI arg requests the version (`--version` or `-V`).
+fn wants_version(args: impl Iterator<Item = String>) -> bool {
+    args.into_iter().any(|a| a == "--version" || a == "-V")
+}
+
 /// Map a config `LogLevel` onto a `tracing` `LevelFilter`.
 fn tracing_level_filter(level: LogLevel) -> tracing::level_filters::LevelFilter {
     use tracing::level_filters::LevelFilter;
@@ -140,6 +150,27 @@ mod tests {
     fn default_when_neither() {
         let p = resolve_config_path(args(&[]), None);
         assert_eq!(p, PathBuf::from("./repo-explorer.toml"));
+    }
+
+    #[test]
+    fn version_long_flag_detected() {
+        assert!(wants_version(args(&["--version"])));
+    }
+
+    #[test]
+    fn version_short_flag_detected() {
+        assert!(wants_version(args(&["-V"])));
+    }
+
+    #[test]
+    fn version_flag_detected_among_others() {
+        assert!(wants_version(args(&["--config", "x.toml", "--version"])));
+    }
+
+    #[test]
+    fn no_version_flag() {
+        assert!(!wants_version(args(&["--config", "x.toml"])));
+        assert!(!wants_version(args(&[])));
     }
 
     #[test]
