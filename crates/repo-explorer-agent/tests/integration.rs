@@ -53,7 +53,7 @@ async fn fake_provider_dispatch_and_assembly() {
     ]);
     let provider_probe = provider.clone();
     let router = ProviderRouter::with_clock(
-        vec![("primary".to_string(), provider)],
+        vec![("primary".to_string(), vec![("m".to_string(), provider)])],
         60,
         FakeClock::new(),
     );
@@ -148,7 +148,7 @@ async fn iteration_limit_degrades_gracefully() {
     )])));
     let provider_probe = provider.clone();
     let router = ProviderRouter::with_clock(
-        vec![("primary".to_string(), provider)],
+        vec![("primary".to_string(), vec![("m".to_string(), provider)])],
         60,
         FakeClock::new(),
     );
@@ -201,8 +201,8 @@ async fn mid_exploration_failover_across_providers() {
     let secondary_probe = secondary.clone();
     let router = ProviderRouter::with_clock(
         vec![
-            ("primary".to_string(), primary),
-            ("secondary".to_string(), secondary),
+            ("primary".to_string(), vec![("m1".to_string(), primary)]),
+            ("secondary".to_string(), vec![("m2".to_string(), secondary)]),
         ],
         60,
         FakeClock::new(),

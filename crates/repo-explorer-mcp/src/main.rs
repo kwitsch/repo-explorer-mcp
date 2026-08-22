@@ -162,6 +162,11 @@ fn print_report(report: &ConfigTestReport<'_>) {
     }
 }
 
+/// Return true if any CLI arg requests the version (`--version` or `-V`).
+fn wants_version(args: impl Iterator<Item = String>) -> bool {
+    args.into_iter().any(|a| a == "--version" || a == "-V")
+}
+
 /// Map a config `LogLevel` onto a `tracing` `LevelFilter`.
 fn tracing_level_filter(level: LogLevel) -> tracing::level_filters::LevelFilter {
     use tracing::level_filters::LevelFilter;
@@ -223,6 +228,27 @@ mod tests {
     fn default_when_neither() {
         let p = resolve_config_path(args(&[]), None, None);
         assert_eq!(p, PathBuf::from("./repo-explorer.toml"));
+    }
+
+    #[test]
+    fn version_long_flag_detected() {
+        assert!(wants_version(args(&["--version"])));
+    }
+
+    #[test]
+    fn version_short_flag_detected() {
+        assert!(wants_version(args(&["-V"])));
+    }
+
+    #[test]
+    fn version_flag_detected_among_others() {
+        assert!(wants_version(args(&["--config", "x.toml", "--version"])));
+    }
+
+    #[test]
+    fn no_version_flag() {
+        assert!(!wants_version(args(&["--config", "x.toml"])));
+        assert!(!wants_version(args(&[])));
     }
 
     #[test]
