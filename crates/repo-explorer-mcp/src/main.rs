@@ -5,6 +5,7 @@
 //! MCP protocol stream; every diagnostic goes to stderr.
 
 mod server;
+mod setup;
 
 use anyhow::Context;
 use repo_explorer_agent::{AgentConfig, AgentLoop};
@@ -13,6 +14,7 @@ use repo_explorer_memory::MemoryClientBackend;
 use repo_explorer_search::CliSearchBackend;
 use rmcp::ServiceExt;
 use server::RepoExplorerServer;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -32,6 +34,19 @@ async fn main() -> ExitCode {
     );
     if wants_config_test(&argv) {
         return run_config_test(&config_path);
+    }
+    if setup::wants_setup(&argv) {
+        return setup::run_setup(&config_path);
+    }
+    if !config_path.exists() {
+        if std::io::stdin().is_terminal() {
+            return setup::run_setup(&config_path);
+        }
+        eprintln!(
+            "repo-explorer-mcp: no config at {}. Run `repo-explorer-mcp setup` in a terminal to create one.",
+            config_path.display()
+        );
+        return ExitCode::FAILURE;
     }
     match run(config_path).await {
         Ok(()) => ExitCode::SUCCESS,
