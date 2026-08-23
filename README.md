@@ -72,6 +72,8 @@ Example `repo-explorer.toml`:
 [llm]
 # Failover cooldown after a provider errors, in seconds.
 cooldown_seconds = 90
+# Optional HTTPS proxy for all model upstream requests; omit for none.
+# https_proxy = "https://proxy.example.com:8443"
 
 # Providers are tried in file order (= failover order).
 [[llm.providers]]

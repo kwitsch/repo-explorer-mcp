@@ -156,8 +156,12 @@ impl GenaiProvider {
     /// message. `base_url`, when `Some`, overrides the adapter's endpoint. An
     /// unrecognized `kind`, or a missing key var at call-time (distinct from
     /// config-load validation), yields `ProviderError::Configuration`.
-    pub fn from_config(provider: &ProviderConfig, model: &str) -> Result<Self, ProviderError> {
-        let (name, kind, client) = Self::build_shared(provider)?;
+    pub fn from_config(
+        provider: &ProviderConfig,
+        model: &str,
+        https_proxy: Option<&str>,
+    ) -> Result<Self, ProviderError> {
+        let (name, kind, client) = Self::build_shared(provider, https_proxy)?;
         Ok(Self {
             name,
             kind,
@@ -171,8 +175,12 @@ impl GenaiProvider {
     /// models per entry (e.g. `build_router`) build this a single time per
     /// entry and clone the client for each `ModelSlot` instead of repeating
     /// the adapter-kind/env-var resolution and client construction per model.
+    /// `https_proxy`, when set, routes this provider's upstream requests
+    /// through it (mirrors `llm.https_proxy` in config, applied to every
+    /// provider uniformly).
     fn build_shared(
         provider: &ProviderConfig,
+        https_proxy: Option<&str>,
     ) -> Result<(String, String, genai::Client), ProviderError> {
         let name = provider.name.clone();
 
@@ -203,20 +211,27 @@ impl GenaiProvider {
             });
         }
 
-        let client = build_genai_client(adapter_kind, provider, &env_name);
+        let client = build_genai_client(adapter_kind, provider, &env_name, https_proxy)?;
 
         Ok((name, provider.kind.clone(), client))
     }
 }
 
 /// Construct a `genai::Client` bound to `adapter_kind`, authenticating from the
-/// entry's custom `api_key_env` and overriding the endpoint when `base_url` is
-/// set. This is the only place that names client-builder symbols.
+/// entry's custom `api_key_env`, overriding the endpoint when `base_url` is
+/// set, and routing through `https_proxy` when set. This is the only place
+/// that names client-builder symbols.
+///
+/// `https_proxy` is applied via `reqwest::Proxy::https` (conventional
+/// `HTTPS_PROXY` semantics): only requests to an `https://` destination are
+/// proxied. A provider entry whose `base_url` is `http://` is not covered.
 fn build_genai_client(
     adapter_kind: genai::adapter::AdapterKind,
     provider: &ProviderConfig,
     env_name: &str,
-) -> genai::Client {
+    https_proxy: Option<&str>,
+) -> Result<genai::Client, ProviderError> {
+    use genai::WebConfig;
     use genai::resolver::{AuthData, Endpoint};
 
     let env_name = env_name.to_string();
@@ -234,7 +249,24 @@ fn build_genai_client(
             });
     }
 
-    builder.build()
+    if let Some(proxy_url) = https_proxy {
+        // Never interpolate `proxy_url` (or the underlying parse error, which
+        // may itself echo the URL) into this message: a proxy URL commonly
+        // embeds basic-auth credentials, and `ProviderError`'s contract is
+        // that `message` is never a secret (see the doc comment on
+        // `ProviderError` in repo-explorer-core).
+        let web_config = WebConfig::default()
+            .with_https_proxy_url(proxy_url)
+            .map_err(|_| ProviderError::Configuration {
+                provider: provider.name.clone(),
+                message: "llm.https_proxy is not a usable proxy URL (check scheme, host, \
+                              and port); its value is withheld here in case it embeds credentials"
+                    .to_string(),
+            })?;
+        builder = builder.with_web_config(web_config);
+    }
+
+    Ok(builder.build())
 }
 
 /// Map domain `Message`s onto genai chat messages, preserving role, content,
@@ -384,7 +416,7 @@ impl LlmProvider for GenaiProvider {
 pub fn build_router(cfg: &LlmConfig) -> Result<ProviderRouter<GenaiProvider>, ProviderError> {
     let mut providers = Vec::with_capacity(cfg.providers.len());
     for entry in &cfg.providers {
-        let (name, kind, client) = GenaiProvider::build_shared(entry)?;
+        let (name, kind, client) = GenaiProvider::build_shared(entry, cfg.https_proxy.as_deref())?;
         let mut models = Vec::with_capacity(entry.models.len());
         for model in &entry.models {
             let provider = GenaiProvider {
@@ -534,7 +566,8 @@ mod tests {
             models: vec!["gpt-4o-mini".to_string()],
             base_url: None,
         };
-        let provider = GenaiProvider::from_config(&cfg, &cfg.models[0]).expect("build provider");
+        let provider =
+            GenaiProvider::from_config(&cfg, &cfg.models[0], None).expect("build provider");
         let msgs = vec![Message {
             role: Role::User,
             content: "Say hello.".to_string(),
