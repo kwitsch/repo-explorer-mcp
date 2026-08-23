@@ -80,19 +80,26 @@ impl MemoryClientBackend {
         match self.client.call("detect_changes", args).await {
             Ok(result) => {
                 let json = decode_result("detect_changes", result)?;
-                let changed = first_field(&json, &["changed_files", "changed_count"])
-                    .map(|v| match v {
-                        Value::Array(a) => a.len(),
-                        // Saturate rather than `as`-truncate: on a platform
-                        // where `usize` is narrower than `u64`, a huge/
-                        // malformed count must clamp, not wrap to a small,
-                        // wrong value (matches the `line_start`/`line_end`
-                        // saturating casts elsewhere in this module).
-                        Value::Number(n) => n.as_u64().unwrap_or(0).min(usize::MAX as u64) as usize,
-                        _ => 0,
-                    })
-                    .unwrap_or(0);
-                Ok(ChangeCount::Known(changed))
+                // Only a shape we actually understand yields a `Known` count.
+                // An absent field, an unexpected type, or a number that is not
+                // a plain non-negative integer is `Unknown` — never `Known(0)`,
+                // which `decide_freshness` reads as "confirmed no changes" and
+                // would optimistically skip a needed reindex (same rule as
+                // `probe_status`: an unrecognized response must not be treated
+                // as "already indexed").
+                let changed = match first_field(&json, &["changed_files", "changed_count"]) {
+                    Some(Value::Array(a)) => ChangeCount::Known(a.len()),
+                    // Saturate rather than `as`-truncate: on a platform where
+                    // `usize` is narrower than `u64`, a huge count must clamp,
+                    // not wrap to a small, wrong value (matches the
+                    // `line_start`/`line_end` saturating casts in this module).
+                    Some(Value::Number(n)) => match n.as_u64() {
+                        Some(n) => ChangeCount::Known(n.min(usize::MAX as u64) as usize),
+                        None => ChangeCount::Unknown,
+                    },
+                    _ => ChangeCount::Unknown,
+                };
+                Ok(changed)
             }
             // Per the `MemoryBackend::ensure_fresh_index` contract, a soft tool
             // failure must not abort exploration outright. We cannot confirm

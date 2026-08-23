@@ -193,17 +193,23 @@ fn read_file(
 }
 
 /// Slice `contents` to the 1-based inclusive `[start_line, end_line]` window.
-/// With neither bound, return the whole file unchanged.
+/// With neither bound, return the whole file unchanged. An empty window
+/// (`end_line` before `start_line`) yields an empty string — `saturating_sub`
+/// alone would clamp the negative span to 0 and then `+1` it back into a
+/// bogus single line.
 fn slice_lines(contents: String, start_line: Option<u32>, end_line: Option<u32>) -> String {
     if start_line.is_none() && end_line.is_none() {
         return contents;
     }
     let start = start_line.unwrap_or(1).max(1) as usize;
     let end = end_line.unwrap_or(u32::MAX) as usize;
+    if end < start {
+        return String::new();
+    }
     contents
         .lines()
         .skip(start - 1)
-        .take(end.saturating_sub(start).saturating_add(1))
+        .take(end - start + 1)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -461,6 +467,25 @@ mod tests {
         assert_eq!(message.content, "l2\nl3");
         assert!(findings.is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn slice_lines_windows() {
+        let body = || "l1\nl2\nl3\nl4\nl5".to_string();
+        // No bounds: the file, unchanged.
+        assert_eq!(slice_lines(body(), None, None), "l1\nl2\nl3\nl4\nl5");
+        // Inclusive window.
+        assert_eq!(slice_lines(body(), Some(2), Some(4)), "l2\nl3\nl4");
+        // Single line.
+        assert_eq!(slice_lines(body(), Some(3), Some(3)), "l3");
+        // Open-ended start / end.
+        assert_eq!(slice_lines(body(), Some(4), None), "l4\nl5");
+        assert_eq!(slice_lines(body(), None, Some(2)), "l1\nl2");
+        // Empty windows must stay empty, not collapse to one line.
+        assert_eq!(slice_lines(body(), Some(5), Some(2)), "");
+        assert_eq!(slice_lines(body(), None, Some(0)), "");
+        // Start past EOF.
+        assert_eq!(slice_lines(body(), Some(99), Some(120)), "");
     }
 
     #[tokio::test]

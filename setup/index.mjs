@@ -14,6 +14,21 @@ import { pathToFileURL } from "node:url";
 const OWNER = "kwitsch";
 const REPO = "repo-explorer-mcp";
 const BINARY_BASE = "repo-explorer-mcp";
+const USER_AGENT = "repo-explorer-mcp-setup";
+// Sentinel reported for a dependency that is not on PATH.
+const MISSING = "missing";
+const RIPGREP_MANUAL_INSTALL_HINT =
+  "Install ripgrep manually: https://github.com/BurntSushi/ripgrep#installation";
+// Every network call is bounded: an unbounded `fetch` on a stalled connection
+// would hang the installer forever with no output and skip temp-dir cleanup.
+const NETWORK_TIMEOUT_MS = 60_000;
+
+function fetchOptions(extraHeaders = {}) {
+  return {
+    headers: { "User-Agent": USER_AGENT, ...extraHeaders },
+    signal: AbortSignal.timeout(NETWORK_TIMEOUT_MS),
+  };
+}
 
 // ---- pure helpers (exported for tests) ----
 
@@ -70,6 +85,16 @@ export function hexEqual(a, b) {
   return a.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
+// Pull the semver out of `repo-explorer-mcp --version` output. Matching the
+// version *shape* rather than taking the last whitespace token keeps the
+// idempotency check working if the binary ever appends a suffix such as a
+// commit hash ("repo-explorer-mcp 0.1.0 (abc1234)").
+export function parseInstalledVersion(text) {
+  if (typeof text !== "string") return null;
+  const m = text.match(/\b\d+\.\d+\.\d+[0-9A-Za-z.+-]*/);
+  return m ? m[0] : null;
+}
+
 export function binaryName(osKind) {
   return osKind === "win32" ? `${BINARY_BASE}.exe` : BINARY_BASE;
 }
@@ -116,6 +141,16 @@ function probeVersion(bin, args = ["--version"], timeout = 1500) {
   return null;
 }
 
+// One "is it there, and what does it say" probe, shared by the auto-installed
+// dependency (ripgrep) and the report-only ones.
+function probeBinary(name, osKind) {
+  if (!onPathTool(name, osKind)) return MISSING;
+  // Short, single-attempt probe: these binaries aren't guaranteed to be
+  // --version-aware CLIs (e.g. codebase-memory-mcp is an MCP stdio server),
+  // so don't risk stacking multiple multi-second hangs on a best-effort check.
+  return (probeVersion(name) ?? "present").split("\n")[0];
+}
+
 async function prompt(question, { yes }) {
   if (yes) return true;
   if (!input.isTTY) {
@@ -142,12 +177,10 @@ export async function resolveVersion(pinned) {
     return pinned.replace(/^v/, "");
   }
   const url = `https://api.github.com/repos/${OWNER}/${REPO}/releases/latest`;
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": "repo-explorer-mcp-setup",
-      Accept: "application/vnd.github+json",
-    },
-  });
+  const res = await fetch(
+    url,
+    fetchOptions({ Accept: "application/vnd.github+json" }),
+  );
   if (!res.ok) {
     throw new Error(
       `Failed to resolve latest release from ${url} (HTTP ${res.status}). Pin a version with --version <x.y.z>.`,
@@ -160,9 +193,7 @@ export async function resolveVersion(pinned) {
 }
 
 async function downloadTo(url, destFile) {
-  const res = await fetch(url, {
-    headers: { "User-Agent": "repo-explorer-mcp-setup" },
-  });
+  const res = await fetch(url, fetchOptions());
   if (!res.ok) throw new Error(`Download failed: ${url} (HTTP ${res.status}).`);
   const buf = Buffer.from(await res.arrayBuffer());
   fs.writeFileSync(destFile, buf);
@@ -201,45 +232,32 @@ function extractArchive(osKind, archiveFile, destDir) {
   }
 }
 
+// One ordered table: detection and the install command for each supported
+// Linux package manager, so the two can never fall out of sync.
+const LINUX_PKG_MANAGERS = [
+  // A fresh/minimal system's apt index can be empty; refresh it first.
+  [
+    "apt-get",
+    "sudo",
+    ["sh", "-c", "apt-get update && apt-get install -y ripgrep"],
+  ],
+  ["dnf", "sudo", ["dnf", "install", "-y", "ripgrep"]],
+  ["pacman", "sudo", ["pacman", "-S", "--noconfirm", "ripgrep"]],
+];
+
 function detectLinuxPkgManager() {
-  for (const pm of ["apt-get", "dnf", "pacman"]) {
-    if (onPathTool(pm, "linux")) return pm;
-  }
-  return null;
-}
-
-function installCommandFor(pm) {
-  switch (pm) {
-    case "apt-get":
-      // A fresh/minimal system's apt index can be empty; refresh it first.
-      return [
-        "sudo",
-        ["sh", "-c", "apt-get update && apt-get install -y ripgrep"],
-      ];
-    case "dnf":
-      return ["sudo", ["dnf", "install", "-y", "ripgrep"]];
-    case "pacman":
-      return ["sudo", ["pacman", "-S", "--noconfirm", "ripgrep"]];
-    default:
-      return null;
-  }
-}
-
-function recheckRg(plat) {
-  return onPathTool("rg", plat.osKind)
-    ? (probeVersion("rg") ?? "present").split("\n")[0]
-    : "missing";
+  return LINUX_PKG_MANAGERS.find(([pm]) => onPathTool(pm, "linux")) ?? null;
 }
 
 async function ensureRipgrep(plat, opts) {
-  const already = recheckRg(plat);
-  if (already !== "missing") {
+  const already = probeBinary("rg", plat.osKind);
+  if (already !== MISSING) {
     return already;
   }
   if (plat.osKind === "linux") {
-    const pm = detectLinuxPkgManager();
-    if (pm) {
-      const [cmd, args] = installCommandFor(pm);
+    const found = detectLinuxPkgManager();
+    if (found) {
+      const [, cmd, args] = found;
       console.log(
         `ripgrep is missing. Proposed install: ${cmd} ${args.join(" ")}`,
       );
@@ -250,12 +268,12 @@ async function ensureRipgrep(plat, opts) {
             "ripgrep install failed; continuing (repo-explorer-mcp will try rtk instead if it's installed, though rtk's `rg` subcommand may itself require ripgrep).",
           );
       }
-      return recheckRg(plat);
+      return probeBinary("rg", plat.osKind);
     }
     console.warn(
-      "ripgrep is missing and no supported package manager (apt-get/dnf/pacman) was found. Install ripgrep manually: https://github.com/BurntSushi/ripgrep#installation",
+      `ripgrep is missing and no supported package manager (${LINUX_PKG_MANAGERS.map(([pm]) => pm).join("/")}) was found. ${RIPGREP_MANUAL_INSTALL_HINT}`,
     );
-    return "missing";
+    return MISSING;
   }
   // win32
   if (onPathTool("winget", plat.osKind)) {
@@ -283,26 +301,21 @@ async function ensureRipgrep(plat, opts) {
         return "installed (restart your terminal to use)";
       }
     }
-    return recheckRg(plat);
+    return probeBinary("rg", plat.osKind);
   }
   console.warn(
-    "ripgrep is missing and winget was not found. Install ripgrep manually: https://github.com/BurntSushi/ripgrep#installation",
+    `ripgrep is missing and winget was not found. ${RIPGREP_MANUAL_INSTALL_HINT}`,
   );
-  return "missing";
+  return MISSING;
 }
 
 function reportOnlyDep(name, plat, pointer) {
-  if (onPathTool(name, plat.osKind)) {
-    // Short, single-attempt probe: these binaries aren't guaranteed to be
-    // --version-aware CLIs (e.g. codebase-memory-mcp is an MCP stdio server),
-    // so don't risk stacking multiple multi-second hangs on a best-effort check.
-    const v = probeVersion(name, ["--version"], 1500) ?? "present";
-    return v.split("\n")[0];
-  }
+  const found = probeBinary(name, plat.osKind);
+  if (found !== MISSING) return found;
   console.warn(
     `${name} is missing. This installer does not auto-install it. ${pointer}`,
   );
-  return "missing";
+  return MISSING;
 }
 
 export function mcpSnippet(binPath) {
@@ -370,14 +383,17 @@ async function main() {
   // Idempotency check.
   if (!opts.force && fs.existsSync(binPath)) {
     const installed = probeVersion(binPath); // e.g. "repo-explorer-mcp 0.1.0"
-    const installedVer = installed ? installed.split(/\s+/).pop() : null;
+    const installedVer = parseInstalledVersion(installed);
     if (
       installedVer &&
-      installedVer.trim().toLowerCase() === version.trim().toLowerCase()
+      installedVer.toLowerCase() === version.trim().toLowerCase()
     ) {
       console.log(
         `\nrepo-explorer-mcp ${version} already installed at ${binPath} — already up to date.`,
       );
+      // PATH status is reported on every run, including this one: the install
+      // dir can drop off PATH long after the binary was installed.
+      reportPathStatus(dir, plat.osKind);
       printSummary(binPath, version, deps);
       return;
     }
@@ -401,9 +417,7 @@ async function main() {
   const archiveFile = path.join(tmp, archiveName);
   try {
     const [sumRes, buf] = await Promise.all([
-      fetch(sha256Url, {
-        headers: { "User-Agent": "repo-explorer-mcp-setup" },
-      }),
+      fetch(sha256Url, fetchOptions()),
       downloadTo(archiveUrl, archiveFile),
     ]);
     if (!sumRes.ok)
@@ -435,22 +449,24 @@ async function main() {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 
-  // PATH reporting (detect, never modify).
-  if (
-    !isDirOnPath(dir, process.env.PATH, path.delimiter, plat.osKind === "win32")
-  ) {
-    if (plat.osKind === "win32") {
-      console.warn(
-        `\nWARNING: ${dir} is not on your PATH. Add it via System Properties > Environment Variables, or: setx PATH "%PATH%;${dir}"`,
-      );
-    } else {
-      console.warn(
-        `\nWARNING: ${dir} is not on your PATH. Add this to ~/.bashrc or ~/.profile:\n  export PATH="$PATH:${dir}"`,
-      );
-    }
-  }
-
+  reportPathStatus(dir, plat.osKind);
   printSummary(binPath, version, deps);
+}
+
+// PATH reporting (detect, never modify).
+function reportPathStatus(dir, osKind) {
+  if (isDirOnPath(dir, process.env.PATH, path.delimiter, osKind === "win32")) {
+    return;
+  }
+  if (osKind === "win32") {
+    console.warn(
+      `\nWARNING: ${dir} is not on your PATH. Add it via System Properties > Environment Variables, or: setx PATH "%PATH%;${dir}"`,
+    );
+  } else {
+    console.warn(
+      `\nWARNING: ${dir} is not on your PATH. Add this to ~/.bashrc or ~/.profile:\n  export PATH="$PATH:${dir}"`,
+    );
+  }
 }
 
 function printSummary(binPath, version, deps) {

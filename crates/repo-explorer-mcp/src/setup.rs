@@ -16,6 +16,7 @@ use repo_explorer_core::config::{
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
 /// True for the single-token subcommand `setup` (mirrors `wants_config_test`).
 pub fn wants_setup(args: &[String]) -> bool {
@@ -37,21 +38,26 @@ struct DetectedProvider {
 /// plus one wizard-specific extra alias (`GOOGLE_API_KEY`) that core has no
 /// reason to know about. `GEMINI_API_KEY` precedes `GOOGLE_API_KEY` so it wins
 /// the per-kind dedup when both are set.
-fn candidate_env_vars() -> Vec<(&'static str, &'static str)> {
-    let mut out: Vec<(&'static str, &'static str)> = Vec::new();
-    let mut seen_vars = std::collections::HashSet::new();
-    for &kind in KNOWN_PROVIDER_KINDS {
-        // `KNOWN_PROVIDER_KINDS` lists `gemini` and `google` as distinct kind
-        // strings that both resolve to `GEMINI_API_KEY` — keep only the first
-        // (canonical `gemini`) so `google` doesn't surface as a detectable kind.
-        if let Some(var) = default_api_key_env(kind)
-            && seen_vars.insert(var)
-        {
-            out.push((var, kind));
+/// Derived from `KNOWN_PROVIDER_KINDS` once per process, not per call.
+fn candidate_env_vars() -> &'static [(&'static str, &'static str)] {
+    static TABLE: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
+        let mut out: Vec<(&'static str, &'static str)> = Vec::new();
+        let mut seen_vars = std::collections::HashSet::new();
+        for &kind in KNOWN_PROVIDER_KINDS {
+            // `KNOWN_PROVIDER_KINDS` lists `gemini` and `google` as distinct
+            // kind strings that both resolve to `GEMINI_API_KEY` — keep only
+            // the first (canonical `gemini`) so `google` doesn't surface as a
+            // detectable kind.
+            if let Some(var) = default_api_key_env(kind)
+                && seen_vars.insert(var)
+            {
+                out.push((var, kind));
+            }
         }
-    }
-    out.push(("GOOGLE_API_KEY", "gemini"));
-    out
+        out.push(("GOOGLE_API_KEY", "gemini"));
+        out
+    });
+    &TABLE
 }
 
 /// Scan candidate env vars via the injected accessor and return deduped
@@ -60,7 +66,7 @@ fn candidate_env_vars() -> Vec<(&'static str, &'static str)> {
 /// Injecting the accessor keeps this pure and unit-testable.
 fn detect_providers(get: impl Fn(&str) -> Option<String>) -> Vec<DetectedProvider> {
     let mut out: Vec<DetectedProvider> = Vec::new();
-    for &(var, kind) in &candidate_env_vars() {
+    for &(var, kind) in candidate_env_vars() {
         let present = env_var_is_set(&get, var);
         if !present {
             continue;
@@ -96,8 +102,8 @@ fn detect_providers(get: impl Fn(&str) -> Option<String>) -> Vec<DetectedProvide
 fn free_tier_models(kind: &str) -> &'static [&'static str] {
     match kind {
         "gemini" | "google" => &["gemini-2.5-flash", "gemini-2.5-flash-lite"],
-        "anthropic" => &[],
-        "openai" => &[],
+        // Every other kind (anthropic, openai, and anything unrecognized) has
+        // no standing free tier, so one arm covers them all.
         _ => &[],
     }
 }
@@ -213,9 +219,10 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
         eprintln!();
         eprintln!("Configuring `{}` provider:", dp.kind);
 
-        // Provider name (kept unique for DuplicateProviderName).
-        let default_name = unique_name(dp.kind, &used_names);
-        let mut name = prompt_default("  provider name", &default_name)?;
+        // Provider name (kept unique for DuplicateProviderName). `detected` is
+        // already one entry per kind, so the kind itself is a free default;
+        // only a name the user types can collide.
+        let mut name = prompt_default("  provider name", dp.kind)?;
         if used_names.contains(&name) {
             let deduped = unique_name(&name, &used_names);
             eprintln!("  name `{name}` already used; using `{deduped}`.");

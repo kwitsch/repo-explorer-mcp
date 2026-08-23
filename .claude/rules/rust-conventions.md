@@ -1,3 +1,7 @@
+---
+paths: ["**/*.rs", "**/Cargo.toml"]
+---
+
 # Rust conventions
 
 - Format with `cargo fmt` (default rustfmt settings, no `rustfmt.toml` overrides).

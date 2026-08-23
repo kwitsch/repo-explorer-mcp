@@ -153,11 +153,18 @@ impl GenaiProvider {
         https_proxy: Option<&str>,
     ) -> Result<Self, ProviderError> {
         let (name, client) = Self::build_shared(provider, https_proxy)?;
-        Ok(Self {
+        Ok(Self::bind_model(name, model, client))
+    }
+
+    /// The one place a `GenaiProvider` is assembled from its parts, so
+    /// `from_config` and `build_router` (which reuses one client across an
+    /// entry's models) cannot drift as fields are added.
+    fn bind_model(name: String, model: &str, client: genai::Client) -> Self {
+        Self {
             name,
             model: model.to_string(),
             client,
-        })
+        }
     }
 
     /// Validate `provider` and build its `genai::Client` once. `genai::Client`
@@ -409,11 +416,7 @@ pub fn build_router(cfg: &LlmConfig) -> Result<ProviderRouter<GenaiProvider>, Pr
         let (name, client) = GenaiProvider::build_shared(entry, cfg.https_proxy.as_deref())?;
         let mut models = Vec::with_capacity(entry.models.len());
         for model in &entry.models {
-            let provider = GenaiProvider {
-                name: name.clone(),
-                model: model.clone(),
-                client: client.clone(),
-            };
+            let provider = GenaiProvider::bind_model(name.clone(), model, client.clone());
             models.push((model.clone(), provider));
         }
         providers.push((entry.name.clone(), models));

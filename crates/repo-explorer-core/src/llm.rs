@@ -263,7 +263,11 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<ProviderResponse, RouterError> {
-        if self.entries.is_empty() {
+        // Emptiness can live one level down now: an entry with no model slots
+        // is skipped by the loop below and contributes nothing to `cooling`/
+        // `limited`, which would surface as `AllExhausted("")`. Treat "no slot
+        // to call at all" as `NoProviders` instead.
+        if !self.entries.iter().any(|e| !e.models.is_empty()) {
             return Err(RouterError::NoProviders);
         }
 
