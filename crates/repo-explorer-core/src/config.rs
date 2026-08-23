@@ -18,6 +18,10 @@ pub struct Config {
     #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
+    pub agent: AgentSettings,
+    #[serde(default)]
+    pub cache: CacheSettings,
+    #[serde(default)]
     pub logging: LoggingConfig,
 }
 
@@ -151,6 +155,74 @@ impl Default for SearchConfig {
     }
 }
 
+/// Knobs for the exploration pipeline: retrieval pre-stage, LLM verification
+/// stage, and the explorative fallback loop.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AgentSettings {
+    /// Turn limit for the explorative fallback loop.
+    #[serde(default = "default_max_fallback_iterations")]
+    pub max_fallback_iterations: u32,
+    /// Turn limit for the verification stage (turn 2 forces `finish`).
+    #[serde(default = "default_max_verify_iterations")]
+    pub max_verify_iterations: u32,
+    /// Total token budget per exploration across all LLM calls. `0` means
+    /// "no budget" — the explicit opt-out, not a stand-in for the default.
+    #[serde(default = "default_token_budget")]
+    pub token_budget: u64,
+    /// How many ranked candidates the pre-stage hands to the LLM.
+    #[serde(default = "default_top_k")]
+    pub top_k: u32,
+    /// Retrieval confidence (0-100) at or above which the pre-stage answers
+    /// directly, with no LLM call.
+    #[serde(default = "default_early_exit_confidence")]
+    pub early_exit_confidence: u32,
+    /// Retrieval confidence (0-100) below which verification is skipped and
+    /// the explorative fallback loop runs instead.
+    #[serde(default = "default_fallback_confidence")]
+    pub fallback_confidence: u32,
+    /// Cap applied to snippets rendered into LLM prompts and tool results.
+    #[serde(default = "default_snippet_max_chars")]
+    pub snippet_max_chars: u32,
+}
+
+/// Hand-written for the same reason as `SearchConfig`: `Default` and the serde
+/// field defaults must be the same values.
+impl Default for AgentSettings {
+    fn default() -> Self {
+        Self {
+            max_fallback_iterations: default_max_fallback_iterations(),
+            max_verify_iterations: default_max_verify_iterations(),
+            token_budget: default_token_budget(),
+            top_k: default_top_k(),
+            early_exit_confidence: default_early_exit_confidence(),
+            fallback_confidence: default_fallback_confidence(),
+            snippet_max_chars: default_snippet_max_chars(),
+        }
+    }
+}
+
+/// In-memory result caching (tool-result memoization and query→result cache),
+/// keyed by the repository's git state.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CacheSettings {
+    #[serde(default = "default_cache_enabled")]
+    pub enabled: bool,
+    /// Entry cap per cache map (oldest evicted first).
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: usize,
+}
+
+/// Hand-written for the same reason as `SearchConfig`: `Default` and the serde
+/// field defaults must be the same values.
+impl Default for CacheSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_cache_enabled(),
+            max_entries: default_cache_max_entries(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct LoggingConfig {
     #[serde(default)]
@@ -187,6 +259,42 @@ fn default_search_timeout_seconds() -> u64 {
 
 fn default_prefer_rtk() -> bool {
     true
+}
+
+fn default_max_fallback_iterations() -> u32 {
+    12
+}
+
+fn default_max_verify_iterations() -> u32 {
+    2
+}
+
+fn default_token_budget() -> u64 {
+    60_000
+}
+
+fn default_top_k() -> u32 {
+    12
+}
+
+fn default_early_exit_confidence() -> u32 {
+    90
+}
+
+fn default_fallback_confidence() -> u32 {
+    30
+}
+
+fn default_snippet_max_chars() -> u32 {
+    400
+}
+
+fn default_cache_enabled() -> bool {
+    true
+}
+
+fn default_cache_max_entries() -> usize {
+    256
 }
 
 /// Provider `kind` strings the LLM boundary can map to a genai adapter.
@@ -470,6 +578,8 @@ mod tests {
                 staleness_seconds: default_staleness_seconds(),
             },
             search: SearchConfig::default(),
+            agent: AgentSettings::default(),
+            cache: CacheSettings::default(),
             logging: LoggingConfig::default(),
         }
     }

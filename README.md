@@ -124,6 +124,21 @@ prefer_rtk = false        # true prefers `rtk rg`; false uses plain ripgrep
 timeout_seconds = 45
 # rtk_path / ripgrep_path may be set explicitly; omitted => auto-detected on PATH.
 
+# Exploration pipeline knobs (all optional; shown with their defaults).
+[agent]
+max_fallback_iterations = 12  # turn limit for the explorative fallback loop
+max_verify_iterations = 2     # turns for the LLM verification stage
+token_budget = 60000          # total tokens per exploration; 0 = unlimited
+top_k = 12                    # candidates handed from retrieval to the LLM
+early_exit_confidence = 90    # >= this (0-100): answer without any LLM call
+fallback_confidence = 30      # < this: skip verification, run the full loop
+snippet_max_chars = 400       # snippet cap in prompts and tool results
+
+# In-memory result caching, keyed by git state (HEAD + dirty digest).
+[cache]
+enabled = true
+max_entries = 256
+
 [logging]
 level = "info"            # trace | debug | info | warn | error
 ```

@@ -8,9 +8,9 @@ use repo_explorer_core::domain::{ExplorationFinding, ExplorationQuery, Explorati
 use repo_explorer_core::llm::{Message, ToolCall};
 use repo_explorer_core::memory::{GraphQuery, MemoryBackend, SnippetTarget};
 use repo_explorer_core::search::{SearchBackend, SearchOptions};
-use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
 
+use crate::render::{RenderCaps, cap_file_lines, render_findings, render_result};
 use crate::tools::{
     GetArchitectureArgs, GetCodeSnippetArgs, PatternArgs, QueryGraphArgs, ReadFileArgs,
     SearchCodeArgs, SearchGraphArgs, TracePathArgs,
@@ -23,8 +23,9 @@ pub(crate) async fn dispatch_call<M: MemoryBackend, S: SearchBackend>(
     search: &S,
     repo_root: &Path,
     call: &ToolCall,
+    caps: &RenderCaps,
 ) -> (Message, Vec<ExplorationFinding>) {
-    match dispatch_inner(memory, search, repo_root, call).await {
+    match dispatch_inner(memory, search, repo_root, call, caps).await {
         Ok((content, findings)) => (Message::tool(&call.id, content), findings),
         Err(msg) => (Message::tool(&call.id, msg), Vec::new()),
     }
@@ -35,6 +36,7 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
     search: &S,
     repo_root: &Path,
     call: &ToolCall,
+    caps: &RenderCaps,
 ) -> Result<(String, Vec<ExplorationFinding>), String> {
     match call.name.as_str() {
         "search_code" => {
@@ -44,7 +46,7 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
                 scope_hint: args.scope_hint.map(PathBuf::from),
                 max_results: args.max_results,
             };
-            call_and_render("search_code", memory.search_code(repo_root, &query)).await
+            call_and_render("search_code", memory.search_code(repo_root, &query), caps).await
         }
         "search_graph" => {
             let args: SearchGraphArgs = parse_args(&call.arguments_json)?;
@@ -54,13 +56,14 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
                 label: args.label,
                 max_results: args.max_results,
             };
-            call_and_render("search_graph", memory.search_graph(repo_root, &query)).await
+            call_and_render("search_graph", memory.search_graph(repo_root, &query), caps).await
         }
         "query_graph" => {
             let args: QueryGraphArgs = parse_args(&call.arguments_json)?;
             call_and_render(
                 "query_graph",
                 memory.query_graph(repo_root, &args.query, args.max_results),
+                caps,
             )
             .await
         }
@@ -69,6 +72,7 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
             call_and_render(
                 "trace_path",
                 memory.trace_path(repo_root, &args.from, &args.to, args.max_depth),
+                caps,
             )
             .await
         }
@@ -77,6 +81,7 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
             call_and_render(
                 "get_architecture",
                 memory.get_architecture(repo_root, args.depth),
+                caps,
             )
             .await
         }
@@ -86,6 +91,7 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
             call_and_render(
                 "get_code_snippet",
                 memory.get_code_snippet(repo_root, &target),
+                caps,
             )
             .await
         }
@@ -110,12 +116,15 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
                 .search(repo_root, pattern, scope.as_deref(), &opts)
                 .await
                 .map_err(|e| format!("{name} failed: {e}"))?;
-            Ok(render_findings(findings))
+            Ok(render_findings(findings, caps))
         }
         "read_file" => {
             let args: ReadFileArgs = parse_args(&call.arguments_json)?;
             let content = read_file(repo_root, &args.path, args.start_line, args.end_line)?;
-            Ok((content, Vec::new()))
+            Ok((
+                cap_file_lines(content, caps.read_file_max_lines),
+                Vec::new(),
+            ))
         }
         other => Err(format!("unknown tool: {other}")),
     }
@@ -128,9 +137,10 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
 async fn call_and_render<E: std::fmt::Display>(
     name: &str,
     fut: impl std::future::Future<Output = Result<ExplorationResult, E>>,
+    caps: &RenderCaps,
 ) -> Result<(String, Vec<ExplorationFinding>), String> {
     let res = fut.await.map_err(|e| format!("{name} failed: {e}"))?;
-    Ok(render_result(res))
+    Ok(render_result(res, caps))
 }
 
 fn parse_args<T: serde::de::DeserializeOwned>(json: &str) -> Result<T, String> {
@@ -170,7 +180,8 @@ fn validate_scope(scope: Option<&str>) -> Result<Option<PathBuf>, String> {
     scope.map(|s| reject_escaping_path("scope", s)).transpose()
 }
 
-fn read_file(
+/// Also used directly by the verification stage's `expand` handler.
+pub(crate) fn read_file(
     repo_root: &Path,
     path: &str,
     start_line: Option<u32>,
@@ -212,57 +223,6 @@ fn slice_lines(contents: String, start_line: Option<u32>, end_line: Option<u32>)
         .take(end - start + 1)
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-#[derive(Serialize)]
-struct FindingDto<'a> {
-    path: String,
-    line_start: u32,
-    line_end: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    snippet: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    note: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-struct ResultDto<'a> {
-    findings: Vec<FindingDto<'a>>,
-    summary: &'a str,
-}
-
-fn finding_dto(f: &ExplorationFinding) -> FindingDto<'_> {
-    FindingDto {
-        path: f.location.path.display().to_string(),
-        line_start: f.location.line_start,
-        line_end: f.location.line_end,
-        snippet: f.snippet.as_deref(),
-        note: f.note.as_deref(),
-    }
-}
-
-/// Serialize `value`, falling back to `fallback` (a literal empty-JSON shape,
-/// e.g. `"{}"`/`"[]"`) on the practically-unreachable serialize failure — the
-/// one place that serialize-or-empty-fallback pattern lives.
-fn serialize_or_empty<T: Serialize>(value: &T, fallback: &str) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| fallback.to_string())
-}
-
-fn render_result(res: ExplorationResult) -> (String, Vec<ExplorationFinding>) {
-    let content = serialize_or_empty(
-        &ResultDto {
-            findings: res.findings.iter().map(finding_dto).collect(),
-            summary: &res.summary,
-        },
-        "{}",
-    );
-    (content, res.findings)
-}
-
-fn render_findings(findings: Vec<ExplorationFinding>) -> (String, Vec<ExplorationFinding>) {
-    let dtos: Vec<FindingDto> = findings.iter().map(finding_dto).collect();
-    let content = serialize_or_empty(&dtos, "[]");
-    (content, findings)
 }
 
 #[cfg(test)]
@@ -307,7 +267,8 @@ mod tests {
             "search_code",
             r#"{"query":"main","scope_hint":"src","max_results":7}"#,
         );
-        let (message, findings) = dispatch_call(&memory, &search, &root, &c).await;
+        let (message, findings) =
+            dispatch_call(&memory, &search, &root, &c, &RenderCaps::default()).await;
 
         assert_eq!(message.role, Role::Tool);
         assert_eq!(message.tool_call_id.as_deref(), Some("c1"));
@@ -335,7 +296,8 @@ mod tests {
         let search = MockSearchBackend::new().with_search_result(Ok(vec![finding("src/b.rs")]));
         let root = PathBuf::from("/repo");
         let c = call("c2", "grep", r#"{"pattern":"fn main","scope":"src"}"#);
-        let (message, findings) = dispatch_call(&memory, &search, &root, &c).await;
+        let (message, findings) =
+            dispatch_call(&memory, &search, &root, &c, &RenderCaps::default()).await;
 
         assert_eq!(message.tool_call_id.as_deref(), Some("c2"));
         assert_eq!(findings, vec![finding("src/b.rs")]);
@@ -357,7 +319,14 @@ mod tests {
         let search = MockSearchBackend::new();
         let root = PathBuf::from("/repo");
         let c = call("c3", "find", r#"{"pattern":"*.rs"}"#);
-        let _ = dispatch_call(&MockMemoryBackend::new(), &search, &root, &c).await;
+        let _ = dispatch_call(
+            &MockMemoryBackend::new(),
+            &search,
+            &root,
+            &c,
+            &RenderCaps::default(),
+        )
+        .await;
         match &search.calls()[0] {
             SearchCall::Search {
                 pattern,
@@ -381,7 +350,14 @@ mod tests {
             "get_code_snippet",
             r#"{"qualified_name":"a::b","file":"x.rs"}"#,
         );
-        let _ = dispatch_call(&memory, &MockSearchBackend::new(), &root, &c).await;
+        let _ = dispatch_call(
+            &memory,
+            &MockSearchBackend::new(),
+            &root,
+            &c,
+            &RenderCaps::default(),
+        )
+        .await;
         assert_eq!(
             memory.calls()[0],
             MemCall::GetCodeSnippet {
@@ -396,8 +372,14 @@ mod tests {
         let memory = MockMemoryBackend::new();
         let root = PathBuf::from("/repo");
         let c = call("c5", "get_code_snippet", r#"{}"#);
-        let (message, findings) =
-            dispatch_call(&memory, &MockSearchBackend::new(), &root, &c).await;
+        let (message, findings) = dispatch_call(
+            &memory,
+            &MockSearchBackend::new(),
+            &root,
+            &c,
+            &RenderCaps::default(),
+        )
+        .await;
         assert_eq!(message.role, Role::Tool);
         assert!(message.content.contains("qualified_name") || message.content.contains("file"));
         assert!(findings.is_empty());
@@ -410,8 +392,14 @@ mod tests {
         let memory = MockMemoryBackend::new();
         let root = PathBuf::from("/repo");
         let c = call("c6", "search_code", r#"{"not_query":1}"#);
-        let (message, findings) =
-            dispatch_call(&memory, &MockSearchBackend::new(), &root, &c).await;
+        let (message, findings) = dispatch_call(
+            &memory,
+            &MockSearchBackend::new(),
+            &root,
+            &c,
+            &RenderCaps::default(),
+        )
+        .await;
         assert_eq!(message.tool_call_id.as_deref(), Some("c6"));
         assert!(message.content.contains("invalid arguments"));
         assert!(findings.is_empty());
@@ -425,6 +413,7 @@ mod tests {
             &MockSearchBackend::new(),
             &PathBuf::from("/repo"),
             &call("c7", "nonesuch", r#"{}"#),
+            &RenderCaps::default(),
         )
         .await;
         assert!(message.content.contains("unknown tool: nonesuch"));
@@ -440,8 +429,14 @@ mod tests {
         ));
         let root = PathBuf::from("/repo");
         let c = call("c8", "search_code", r#"{"query":"x"}"#);
-        let (message, findings) =
-            dispatch_call(&memory, &MockSearchBackend::new(), &root, &c).await;
+        let (message, findings) = dispatch_call(
+            &memory,
+            &MockSearchBackend::new(),
+            &root,
+            &c,
+            &RenderCaps::default(),
+        )
+        .await;
         assert!(message.content.contains("search_code failed"));
         assert!(message.content.contains("boom"));
         assert!(findings.is_empty());
@@ -462,6 +457,7 @@ mod tests {
             &MockSearchBackend::new(),
             &dir,
             &c,
+            &RenderCaps::default(),
         )
         .await;
         assert_eq!(message.content, "l2\nl3");
@@ -496,6 +492,7 @@ mod tests {
             &MockSearchBackend::new(),
             &PathBuf::from("/repo"),
             &c,
+            &RenderCaps::default(),
         )
         .await;
         assert!(message.content.contains("escapes the repository root"));

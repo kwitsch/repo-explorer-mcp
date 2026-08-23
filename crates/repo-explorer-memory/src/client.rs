@@ -89,10 +89,11 @@ fn text_of(result: &CallToolResult) -> String {
 }
 
 /// Decode a successful tool result into a JSON value: prefer `structured_content`
-/// (typed JSON); otherwise parse the concatenated text blocks as JSON. Any
-/// failure becomes `MemoryError::Decode`.
+/// (typed JSON); otherwise parse the concatenated text blocks as JSON; a
+/// non-JSON text response is returned as `Value::String` so per-tool mappers
+/// can parse plain-text table formats (`search_code` answers in one).
 pub(crate) fn decode_result(
-    tool: &'static str,
+    _tool: &'static str,
     result: CallToolResult,
 ) -> Result<Value, MemoryError> {
     if let Some(sc) = result.structured_content {
@@ -102,10 +103,7 @@ pub(crate) fn decode_result(
     if text.trim().is_empty() {
         return Ok(Value::Null);
     }
-    serde_json::from_str(&text).map_err(|e| MemoryError::Decode {
-        tool,
-        message: format!("response was neither structured nor valid JSON text: {e}"),
-    })
+    Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
 }
 
 /// Derive the project name from the repo root's final path component (matching

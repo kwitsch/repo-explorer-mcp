@@ -9,10 +9,10 @@ mod setup;
 mod update;
 
 use anyhow::Context;
-use repo_explorer_agent::{AgentConfig, AgentLoop};
+use repo_explorer_agent::AgentLoop;
 use repo_explorer_core::config::LogLevel;
 use repo_explorer_memory::MemoryClientBackend;
-use repo_explorer_search::CliSearchBackend;
+use repo_explorer_search::{CliSearchBackend, GitStateProbe};
 use rmcp::ServiceExt;
 use server::RepoExplorerServer;
 use std::io::IsTerminal;
@@ -111,7 +111,8 @@ async fn run(config: repo_explorer_core::config::Config) -> anyhow::Result<()> {
     let search = CliSearchBackend::new(&config.search);
     let router = repo_explorer_llm::build_router(&config.llm)
         .context("failed to build LLM provider router")?;
-    let agent = AgentLoop::new(memory, search, router, AgentConfig::default());
+    let probe = GitStateProbe::new(config.search.timeout_seconds);
+    let agent = AgentLoop::new(memory, search, router, probe, config.agent, config.cache);
 
     let server = RepoExplorerServer::new(Arc::new(agent), repo_root);
     tracing::info!("repo-explorer-mcp serving on stdio");

@@ -317,7 +317,8 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
         eprintln!("  proxy URL must be a valid http:// or https:// URL with a host.");
     };
 
-    // search / logging left at defaults (fully defaulted in core); not prompted.
+    // search / agent / cache / logging left at defaults (fully defaulted in
+    // core); not prompted.
     let cfg = Config {
         llm: LlmConfig {
             providers,
@@ -326,6 +327,8 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
         },
         codebase_memory,
         search: SearchConfig::default(),
+        agent: Default::default(),
+        cache: Default::default(),
         logging: LoggingConfig::default(),
     };
 

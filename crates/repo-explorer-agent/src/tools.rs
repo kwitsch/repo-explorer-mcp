@@ -9,10 +9,20 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
+/// Appended to every non-`finish` tool description: the loop rejects
+/// single-call turns (2-strike), so the demand must also live where the model
+/// reads tool contracts.
+const BATCH_SUFFIX: &str = " Batch all independent tool calls of a turn into ONE response with multiple tool calls; single-call turns are rejected.";
+
 fn tool(name: &str, description: &str, schema: serde_json::Value) -> Tool {
+    let description = if name == "finish" {
+        description.to_string()
+    } else {
+        format!("{description}{BATCH_SUFFIX}")
+    };
     Tool {
         name: name.to_string(),
-        description: description.to_string(),
+        description,
         parameters_schema_json: schema.to_string(),
     }
 }
@@ -23,6 +33,38 @@ fn tool(name: &str, description: &str, schema: serde_json::Value) -> Tool {
 pub fn tool_catalog() -> &'static [Tool] {
     static CATALOG: LazyLock<Vec<Tool>> = LazyLock::new(build_catalog);
     &CATALOG
+}
+
+/// The verification-stage catalog: `expand` plus `finish`. Built once per
+/// process, like `tool_catalog`.
+pub(crate) fn verify_catalog() -> &'static [Tool] {
+    static CATALOG: LazyLock<Vec<Tool>> = LazyLock::new(|| vec![expand_tool(), finish_tool()]);
+    &CATALOG
+}
+
+/// Only `finish` — offered together with a forced tool choice for the final
+/// budget-exhausted turn.
+pub(crate) fn finish_only_catalog() -> &'static [Tool] {
+    static CATALOG: LazyLock<Vec<Tool>> = LazyLock::new(|| vec![finish_tool()]);
+    &CATALOG
+}
+
+fn expand_tool() -> Tool {
+    tool(
+        "expand",
+        "Fetch the full bodies of the numbered candidates you cannot judge from their skeletons alone. Args: candidate_ids (required, 1-based ids from the candidate list).",
+        json!({
+            "type": "object",
+            "properties": {
+                "candidate_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"}
+                }
+            },
+            "required": ["candidate_ids"],
+            "additionalProperties": false
+        }),
+    )
 }
 
 fn build_catalog() -> Vec<Tool> {
@@ -152,41 +194,47 @@ fn build_catalog() -> Vec<Tool> {
                 "additionalProperties": false
             }),
         ),
-        tool(
-            "finish",
-            "REQUIRED to conclude: report the located findings and a summary. Call this once you have gathered enough information.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "findings": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "location": {
-                                    "type": "object",
-                                    "properties": {
-                                        "path": {"type": "string"},
-                                        "line_start": {"type": "integer"},
-                                        "line_end": {"type": "integer"}
-                                    },
-                                    "required": ["path", "line_start", "line_end"],
-                                    "additionalProperties": false
-                                },
-                                "snippet": {"type": "string"},
-                                "note": {"type": "string"}
-                            },
-                            "required": ["location"],
-                            "additionalProperties": false
-                        }
-                    },
-                    "summary": {"type": "string"}
-                },
-                "required": ["summary"],
-                "additionalProperties": false
-            }),
-        ),
+        finish_tool(),
     ]
+}
+
+/// The `finish` tool, shared by the exploration, verification, and
+/// finish-only catalogs.
+fn finish_tool() -> Tool {
+    tool(
+        "finish",
+        "REQUIRED to conclude: report the located findings and a summary. Call this once you have gathered enough information.",
+        json!({
+            "type": "object",
+            "properties": {
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string"},
+                                    "line_start": {"type": "integer"},
+                                    "line_end": {"type": "integer"}
+                                },
+                                "required": ["path", "line_start", "line_end"],
+                                "additionalProperties": false
+                            },
+                            "snippet": {"type": "string"},
+                            "note": {"type": "string"}
+                        },
+                        "required": ["location"],
+                        "additionalProperties": false
+                    }
+                },
+                "summary": {"type": "string"}
+            },
+            "required": ["summary"],
+            "additionalProperties": false
+        }),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -269,6 +317,14 @@ pub(crate) struct ReadFileArgs {
     pub start_line: Option<u32>,
     #[serde(default)]
     pub end_line: Option<u32>,
+}
+
+/// Arguments of the verification stage's `expand` tool: 1-based ids into the
+/// numbered candidate list.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExpandArgs {
+    pub candidate_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

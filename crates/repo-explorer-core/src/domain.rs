@@ -47,6 +47,35 @@ pub struct ExplorationResult {
     pub summary: String,
 }
 
+/// How a retrieval candidate was found, ordered by intrinsic strength
+/// (strongest first). The ranking in `retrieval` keys base scores off this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CandidateKind {
+    /// A symbol whose name equals a query token exactly.
+    SymbolExact,
+    /// A symbol whose name merely contains a query token.
+    SymbolFuzzy,
+    /// A file whose name/path matches a query path token.
+    FileNameHit,
+    /// A semantic-search hit from the memory backend.
+    SemanticHit,
+    /// A plain text (grep) content match.
+    ContentHit,
+}
+
+/// One location produced by the deterministic retrieval pre-stage, before
+/// ranking has selected the top-k. `score` is an integer (0-1000 scale) so the
+/// type stays `Eq`/`Hash` like the rest of the domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub location: FileLocation,
+    /// Qualified symbol name, when the source knows one.
+    pub symbol: Option<String>,
+    pub kind: CandidateKind,
+    pub score: u32,
+    pub snippet: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

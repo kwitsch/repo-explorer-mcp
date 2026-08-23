@@ -193,19 +193,18 @@ fn is_not_indexed_error(message: &str) -> bool {
     lower.contains("not indexed") || (lower.contains("project") && lower.contains("not found"))
 }
 
-/// Build a `FileLocation` from a JSON row's `file`/`line_start`/`line_end`,
-/// tolerating missing line fields (defaulting to 0).
+/// Build a `FileLocation` from a JSON row's `file`/`path`/`file_path` plus
+/// `line_start`/`start_line` (and end variants), tolerating missing line
+/// fields (defaulting to 0).
 fn location_from(json: &Value) -> Option<FileLocation> {
-    let file = first_field(json, &["file", "path"]).and_then(Value::as_str)?;
+    let file = first_field(json, &["file", "path", "file_path"]).and_then(Value::as_str)?;
     // Saturate rather than `as`-truncate: a line number beyond `u32::MAX` (or a
     // malformed huge value) must not silently wrap around to a small, wrong one.
-    let line_start = json
-        .get("line_start")
+    let line_start = first_field(json, &["line_start", "start_line"])
         .and_then(Value::as_u64)
         .map(saturate_u32)
         .unwrap_or(0);
-    let line_end = json
-        .get("line_end")
+    let line_end = first_field(json, &["line_end", "end_line"])
         .and_then(Value::as_u64)
         .map(saturate_u32)
         .unwrap_or(line_start);
@@ -221,13 +220,13 @@ fn location_from(json: &Value) -> Option<FileLocation> {
 fn single_snippet(tool: &'static str, json: &Value) -> ExplorationResult {
     let mut findings = Vec::new();
     if let Some(location) = location_from(json) {
-        let snippet = first_field(json, &["snippet", "code", "text"])
+        let snippet = first_field(json, &["snippet", "code", "source", "text"])
             .and_then(Value::as_str)
             .map(|s| s.to_string());
         findings.push(ExplorationFinding {
             location,
             snippet,
-            note: None,
+            note: symbol_note(json),
         });
     }
     let summary = if findings.is_empty() {
@@ -238,30 +237,169 @@ fn single_snippet(tool: &'static str, json: &Value) -> ExplorationResult {
     ExplorationResult { findings, summary }
 }
 
-/// Turn a JSON array of hit rows into findings, plus a compact summary string.
-fn findings_and_summary(tool: &'static str, json: &Value) -> ExplorationResult {
-    let rows = first_field(json, &["results", "rows", "hits"])
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
+/// The row's symbol identity, when the upstream tool reported one. Carried on
+/// `ExplorationFinding.note` (the domain type has no symbol field) so
+/// downstream consumers — the retrieval pre-stage's exact/fuzzy symbol
+/// classification and the skeleton renderer — can use it.
+fn symbol_note(row: &Value) -> Option<String> {
+    first_field(row, &["qualified_name", "name", "symbol"])
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Parse a `"start-end"` / `"start"` line-range cell (tolerating quotes) into
+/// a `(line_start, line_end)` pair; anything unparseable defaults to 0.
+fn parse_line_range(cell: &str) -> (u32, u32) {
+    let cell = cell.trim().trim_matches('"');
+    let mut parts = cell.splitn(2, '-');
+    let start = parts
+        .next()
+        .and_then(|p| p.parse::<u64>().ok())
+        .map(saturate_u32)
+        .unwrap_or(0);
+    let end = parts
+        .next()
+        .and_then(|p| p.parse::<u64>().ok())
+        .map(saturate_u32)
+        .unwrap_or(start);
+    (start, end)
+}
+
+/// Decode `codebase-memory-mcp`'s columnar graph payload
+/// `{cols, groups: [{qn_prefix?, file, rows: [[cell, ...], ...]}, ...]}`
+/// (what `search_graph` with `format: "json"` actually returns). `None` when
+/// the value has no such shape.
+fn columnar_findings(json: &Value) -> Option<Vec<ExplorationFinding>> {
+    let cols = json.get("cols")?.as_array()?;
+    let col = |name: &str| cols.iter().position(|c| c.as_str() == Some(name));
+    let name_col = col("name");
+    let lines_col = col("lines");
+    let groups = json.get("groups")?.as_array()?;
     let mut findings = Vec::new();
-    for row in rows {
-        if let Some(location) = location_from(row) {
-            let snippet = first_field(row, &["snippet", "text"])
-                .and_then(Value::as_str)
-                .map(|s| s.to_string());
+    for group in groups {
+        let Some(file) = group.get("file").and_then(Value::as_str) else {
+            continue;
+        };
+        let qn_prefix = group.get("qn_prefix").and_then(Value::as_str).unwrap_or("");
+        let rows = group
+            .get("rows")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for row in rows {
+            let Some(cells) = row.as_array() else {
+                continue;
+            };
+            let cell = |i: Option<usize>| i.and_then(|i| cells.get(i)).and_then(Value::as_str);
+            let (line_start, line_end) = cell(lines_col).map(parse_line_range).unwrap_or((0, 0));
+            let note = cell(name_col).map(|name| {
+                if qn_prefix.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{qn_prefix}.{name}")
+                }
+            });
             findings.push(ExplorationFinding {
-                location,
-                snippet,
-                note: None,
+                location: FileLocation {
+                    path: std::path::PathBuf::from(file),
+                    line_start,
+                    line_end,
+                },
+                snippet: None,
+                note,
             });
         }
     }
-    let summary = format!(
-        "{tool}: {} row(s), {} locatable finding(s)",
-        rows.len(),
-        findings.len()
-    );
+    Some(findings)
+}
+
+/// Parse the plain-text table `search_code` answers with:
+///
+/// ```text
+/// results: 3  (cols: qn label file lines matches in out)
+///   crates.x.src.a.foo Method crates/x/src/a.rs 78-113 86;107 1 4
+/// dirs: 1  (cols: dir hits)
+/// ```
+///
+/// Only the indented rows under the `results:` header are findings; the
+/// column order comes from the header's `(cols: …)` list.
+fn text_table_findings(text: &str) -> Vec<ExplorationFinding> {
+    let mut findings = Vec::new();
+    let mut cols: Option<Vec<String>> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("results:") {
+            cols = rest.split_once("(cols:").map(|(_, tail)| {
+                tail.trim_end_matches(')')
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect()
+            });
+            continue;
+        }
+        let Some(col_names) = &cols else { continue };
+        if !line.starts_with(' ') {
+            break; // next section (dirs/totals) ends the results table
+        }
+        let cells: Vec<&str> = line.split_whitespace().collect();
+        if cells.len() != col_names.len() {
+            continue;
+        }
+        let cell = |name: &str| {
+            col_names
+                .iter()
+                .position(|c| c == name)
+                .and_then(|i| cells.get(i).copied())
+        };
+        let Some(file) = cell("file") else { continue };
+        let (line_start, line_end) = cell("lines").map(parse_line_range).unwrap_or((0, 0));
+        let note = cell("qn").or_else(|| cell("name")).map(str::to_string);
+        findings.push(ExplorationFinding {
+            location: FileLocation {
+                path: std::path::PathBuf::from(file),
+                line_start,
+                line_end,
+            },
+            snippet: None,
+            note,
+        });
+    }
+    findings
+}
+
+/// Turn a tool response into findings plus a compact summary string. Handles
+/// the three shapes `codebase-memory-mcp` actually produces: an array of
+/// object rows (`results`/`rows`/`hits`), the columnar `{cols, groups}` JSON,
+/// and the plain-text table (reaching here as `Value::String`).
+fn findings_and_summary(tool: &'static str, json: &Value) -> ExplorationResult {
+    if let Value::String(text) = json {
+        let findings = text_table_findings(text);
+        let summary = format!("{tool}: {} locatable finding(s)", findings.len());
+        return ExplorationResult { findings, summary };
+    }
+    let mut findings = Vec::new();
+    if let Some(rows) = first_field(json, &["results", "rows", "hits"]).and_then(Value::as_array) {
+        for row in rows {
+            if let Some(location) = location_from(row) {
+                let snippet = first_field(row, &["snippet", "text"])
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string());
+                findings.push(ExplorationFinding {
+                    location,
+                    snippet,
+                    note: symbol_note(row),
+                });
+            }
+        }
+        let summary = format!(
+            "{tool}: {} row(s), {} locatable finding(s)",
+            rows.len(),
+            findings.len()
+        );
+        return ExplorationResult { findings, summary };
+    }
+    let findings = columnar_findings(json).unwrap_or_default();
+    let summary = format!("{tool}: {} locatable finding(s)", findings.len());
     ExplorationResult { findings, summary }
 }
 
@@ -417,5 +555,125 @@ impl MemoryBackend for MemoryClientBackend {
             single_snippet,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Real `search_graph format:"json"` payload shape (columnar).
+    #[test]
+    fn columnar_search_graph_payload_decodes() {
+        let payload = json!({
+            "total": 1,
+            "count": 1,
+            "cols": ["name", "label", "lines", "in", "out"],
+            "groups": [{
+                "qn_prefix": "repo.crates.repo-explorer-memory.src.freshness",
+                "file": "crates/repo-explorer-memory/src/freshness.rs",
+                "rows": [["decide_freshness", "Function", "40-60", 9, 6]]
+            }],
+            "has_more": false
+        });
+        let res = findings_and_summary("search_graph", &payload);
+        assert_eq!(res.findings.len(), 1);
+        let f = &res.findings[0];
+        assert_eq!(
+            f.location.path,
+            std::path::PathBuf::from("crates/repo-explorer-memory/src/freshness.rs")
+        );
+        assert_eq!((f.location.line_start, f.location.line_end), (40, 60));
+        assert_eq!(
+            f.note.as_deref(),
+            Some("repo.crates.repo-explorer-memory.src.freshness.decide_freshness")
+        );
+        assert!(res.summary.contains("1 locatable finding"));
+    }
+
+    /// Real `search_code` payload shape (plain-text table via `Value::String`).
+    #[test]
+    fn text_table_search_code_payload_decodes() {
+        let text = "results: 3  (cols: qn label file lines matches in out)\n  \
+repo.crates.a.src.b.MemoryClientBackend.probe_changes Method crates/a/src/b.rs 78-113 86;107 1 4\n  \
+repo.crates.a.src.b.MemoryClientBackend.ensure_fresh_index Method crates/a/src/b.rs 280-303 \"299\" 1 7\n  \
+repo.crates.a.src.f.decide_freshness Function crates/a/src/f.rs 40-60 \"40\" 1 0\n\
+dirs: 1  (cols: dir hits)\n  crates/ 28\ntotal_grep_matches: 44\n";
+        let res = findings_and_summary("search_code", &Value::String(text.to_string()));
+        assert_eq!(res.findings.len(), 3);
+        assert_eq!(
+            res.findings[2].location.path,
+            std::path::PathBuf::from("crates/a/src/f.rs")
+        );
+        assert_eq!(
+            (
+                res.findings[2].location.line_start,
+                res.findings[2].location.line_end
+            ),
+            (40, 60)
+        );
+        assert_eq!(
+            res.findings[0].note.as_deref(),
+            Some("repo.crates.a.src.b.MemoryClientBackend.probe_changes")
+        );
+        // The dirs section must not leak into findings.
+        assert!(
+            res.findings
+                .iter()
+                .all(|f| f.location.path != std::path::Path::new("crates/"))
+        );
+    }
+
+    /// Real `get_code_snippet` payload shape (file_path/start_line/source).
+    #[test]
+    fn get_code_snippet_payload_decodes() {
+        let payload = json!({
+            "name": "decide_freshness",
+            "qualified_name": "repo.crates.a.src.f.decide_freshness",
+            "label": "Function",
+            "file_path": "/repo/crates/a/src/f.rs",
+            "start_line": 40,
+            "end_line": 60,
+            "source": "pub(crate) fn decide_freshness() {}",
+            "callers": 1,
+            "callees": 0
+        });
+        let res = single_snippet("get_code_snippet", &payload);
+        assert_eq!(res.findings.len(), 1);
+        let f = &res.findings[0];
+        assert_eq!((f.location.line_start, f.location.line_end), (40, 60));
+        assert_eq!(
+            f.snippet.as_deref(),
+            Some("pub(crate) fn decide_freshness() {}")
+        );
+        assert_eq!(
+            f.note.as_deref(),
+            Some("repo.crates.a.src.f.decide_freshness")
+        );
+    }
+
+    /// Object-row arrays (the previously supported shape) still decode.
+    #[test]
+    fn object_rows_still_decode() {
+        let payload = json!({
+            "results": [
+                {"file": "src/a.rs", "line_start": 1, "line_end": 2, "snippet": "x", "name": "foo"},
+                {"no_file": true}
+            ]
+        });
+        let res = findings_and_summary("search_graph", &payload);
+        assert_eq!(res.findings.len(), 1);
+        assert_eq!(res.findings[0].note.as_deref(), Some("foo"));
+        assert!(res.summary.contains("2 row(s), 1 locatable finding(s)"));
+    }
+
+    #[test]
+    fn parse_line_range_boundaries() {
+        assert_eq!(parse_line_range("40-60"), (40, 60));
+        assert_eq!(parse_line_range("\"40\""), (40, 40));
+        assert_eq!(parse_line_range("7"), (7, 7));
+        assert_eq!(parse_line_range("garbage"), (0, 0));
+        assert_eq!(parse_line_range("5-x"), (5, 5));
     }
 }

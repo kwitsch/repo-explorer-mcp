@@ -8,7 +8,7 @@ use repo_explorer_core::domain::{ExplorationQuery, ExplorationResult};
 use repo_explorer_core::llm::SystemClock;
 use repo_explorer_llm::GenaiProvider;
 use repo_explorer_memory::MemoryClientBackend;
-use repo_explorer_search::CliSearchBackend;
+use repo_explorer_search::{CliSearchBackend, GitStateProbe};
 use rmcp::{
     Json, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -22,7 +22,8 @@ use std::sync::Arc;
 /// The concrete agent type wired to the production backends. All backend trait
 /// methods and `AgentLoop::run` take `&self`, so a shared `Arc<Agent>` (no
 /// `Mutex`) supports concurrent tool calls.
-pub type Agent = AgentLoop<MemoryClientBackend, CliSearchBackend, GenaiProvider, SystemClock>;
+pub type Agent =
+    AgentLoop<MemoryClientBackend, CliSearchBackend, GenaiProvider, GitStateProbe, SystemClock>;
 
 /// Input schema for `explore_repository`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
