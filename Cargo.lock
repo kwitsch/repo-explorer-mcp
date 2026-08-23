@@ -1614,6 +1614,7 @@ name = "repo-explorer-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "dirs",
  "flate2",
  "hex",

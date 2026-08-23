@@ -127,10 +127,7 @@ pub async fn run_update() -> ExitCode {
         status: if had_error { "error" } else { "ok" },
         components,
     };
-    match serde_json::to_string_pretty(&report) {
-        Ok(s) => println!("{s}"),
-        Err(e) => eprintln!("repo-explorer-mcp: failed to serialize update report: {e}"),
-    }
+    crate::print_report(&report, "update");
 
     if had_error {
         ExitCode::FAILURE
@@ -253,7 +250,7 @@ async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> 
         }
     };
 
-    let current_version = read_installed_version(&path);
+    let current_version = read_installed_version_blocking(path.clone()).await;
 
     let release = match fetch_latest_release(client, dep.owner, dep.repo).await {
         Ok(r) => r,
@@ -353,6 +350,17 @@ fn read_installed_version(path: &Path) -> Option<semver::Version> {
     let output = run_with_timeout(command, SUBPROCESS_TIMEOUT)?;
     extract_semver(&String::from_utf8_lossy(&output.stdout))
         .or_else(|| extract_semver(&String::from_utf8_lossy(&output.stderr)))
+}
+
+/// [`read_installed_version`] off the async runtime's worker thread: it
+/// blocks the calling thread for up to [`SUBPROCESS_TIMEOUT`] via
+/// [`run_with_timeout`]'s synchronous polling loop, and `run_update` now
+/// checks every component concurrently, so leaving it on a worker thread
+/// could starve other tasks on a runtime with few of them.
+async fn read_installed_version_blocking(path: std::path::PathBuf) -> Option<semver::Version> {
+    tokio::task::spawn_blocking(move || read_installed_version(&path))
+        .await
+        .unwrap_or(None)
 }
 
 /// Find the first substring made of digits and `.` that parses as semver,
@@ -468,10 +476,29 @@ fn current_os_keyword() -> &'static str {
     }
 }
 
-const ARCHIVE_EXTENSIONS: &[&str] = &[".tar.gz", ".tgz", ".zip"];
+/// The archive formats a release asset may be packaged in. A single source
+/// of truth for "is this name an archive, and if so which kind" — shared by
+/// `pick_asset` (which assets are even eligible) and `extract_binary` (how to
+/// unpack the one that was picked), so a newly-supported format only needs
+/// to be added here once.
+enum ArchiveFormat {
+    TarGz,
+    Zip,
+}
+
+fn archive_format(name: &str) -> Option<ArchiveFormat> {
+    let lower = name.to_lowercase();
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        Some(ArchiveFormat::TarGz)
+    } else if lower.ends_with(".zip") {
+        Some(ArchiveFormat::Zip)
+    } else {
+        None
+    }
+}
 
 fn is_archive(name: &str) -> bool {
-    ARCHIVE_EXTENSIONS.iter().any(|ext| name.ends_with(ext))
+    archive_format(name).is_some()
 }
 
 /// Release-asset architecture keywords for the host this binary is actually
@@ -533,24 +560,38 @@ async fn install_from_asset(
 
     let note = if let Some(checksum_asset) = find_checksum_asset(assets, asset) {
         let checksum_bytes = download(client, &checksum_asset.browser_download_url).await?;
-        let checksum_text = String::from_utf8(checksum_bytes)
+        let checksum_text = std::str::from_utf8(&checksum_bytes)
             .context("checksum sidecar file is not valid UTF-8")?;
-        verify_sha256(&data, &checksum_text, &asset.name)?;
+        verify_sha256(&data, checksum_text, &asset.name)?;
         None
     } else {
         Some("no checksum sidecar asset found; integrity not verified")
     };
 
     let binary = extract_binary(&asset.name, &data, command)?;
+    // install_self/install_dependency_binary block the calling thread (temp
+    // file I/O, a `--version` verification subprocess bounded by
+    // SUBPROCESS_TIMEOUT, then a rename/self-replace); run_update now checks
+    // every component concurrently via tokio::spawn, so keep this off the
+    // async worker threads.
     match target {
-        InstallTarget::SelfExe => install_self(&binary)?,
-        InstallTarget::Path(p) => install_dependency_binary(p, &binary)?,
+        InstallTarget::SelfExe => {
+            tokio::task::spawn_blocking(move || install_self(&binary))
+                .await
+                .context("install task panicked")??;
+        }
+        InstallTarget::Path(p) => {
+            let dest = p.to_path_buf();
+            tokio::task::spawn_blocking(move || install_dependency_binary(&dest, &binary))
+                .await
+                .context("install task panicked")??;
+        }
     }
     Ok(note)
 }
 
-async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
-    let bytes = client
+async fn download(client: &reqwest::Client, url: &str) -> Result<bytes::Bytes> {
+    client
         .get(url)
         .send()
         .await
@@ -559,8 +600,7 @@ async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
         .with_context(|| format!("download failed for {url}"))?
         .bytes()
         .await
-        .with_context(|| format!("failed to read response body for {url}"))?;
-    Ok(bytes.to_vec())
+        .with_context(|| format!("failed to read response body for {url}"))
 }
 
 fn verify_sha256(data: &[u8], checksum_text: &str, asset_name: &str) -> Result<()> {
@@ -589,14 +629,11 @@ fn matches_binary_name(entry_name: &str, command: &str) -> bool {
 }
 
 fn extract_binary(asset_name: &str, data: &[u8], command: &str) -> Result<Vec<u8>> {
-    let lower = asset_name.to_lowercase();
-    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
-        extract_from_tar_gz(data, command)
-    } else if lower.ends_with(".zip") {
-        extract_from_zip(data, command)
-    } else {
+    match archive_format(asset_name) {
+        Some(ArchiveFormat::TarGz) => extract_from_tar_gz(data, command),
+        Some(ArchiveFormat::Zip) => extract_from_zip(data, command),
         // Not archived — the whole payload is the binary itself.
-        Ok(data.to_vec())
+        None => Ok(data.to_vec()),
     }
 }
 
@@ -683,11 +720,7 @@ fn verify_executable(path: &Path) -> Result<()> {
 /// Atomically replace the currently running executable, after confirming the
 /// downloaded file actually runs.
 fn install_self(data: &[u8]) -> Result<()> {
-    let tmp = write_temp_executable(
-        &std::env::temp_dir(),
-        &format!("repo-explorer-mcp-update-{}", std::process::id()),
-        data,
-    )?;
+    let tmp = write_temp_executable(&std::env::temp_dir(), "repo-explorer-mcp-update", data)?;
     let result = verify_executable(&tmp).and_then(|()| {
         self_replace::self_replace(&tmp)
             .context("failed to install the downloaded update over the running executable")

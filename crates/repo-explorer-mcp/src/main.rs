@@ -160,7 +160,7 @@ fn run_config_test(config_path: &Path) -> ExitCode {
                 config_path: config_path.display().to_string(),
                 error: None,
             };
-            print_report(&report);
+            print_report(&report, "config-test");
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -172,17 +172,19 @@ fn run_config_test(config_path: &Path) -> ExitCode {
                     toml_path: e.toml_path(),
                 }),
             };
-            print_report(&report);
+            print_report(&report, "config-test");
             ExitCode::FAILURE
         }
     }
 }
 
-/// Print a config-test report as a single pretty-printed JSON object to stdout.
-fn print_report(report: &ConfigTestReport<'_>) {
+/// Print any of this binary's one-shot CLI reports (config-test, update) as a
+/// single pretty-printed JSON object to stdout. `kind` names the report in
+/// the error message printed on the (rare) serialization failure.
+pub(crate) fn print_report(report: &impl serde::Serialize, kind: &str) {
     match serde_json::to_string_pretty(report) {
         Ok(s) => println!("{s}"),
-        Err(e) => eprintln!("repo-explorer-mcp: failed to serialize config-test report: {e}"),
+        Err(e) => eprintln!("repo-explorer-mcp: failed to serialize {kind} report: {e}"),
     }
 }
 

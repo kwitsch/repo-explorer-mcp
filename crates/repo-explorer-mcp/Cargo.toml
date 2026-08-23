@@ -19,6 +19,7 @@ schemars = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+bytes = "1"
 semver = "1"
 sha2 = "0.11"
 hex = "0.4"
