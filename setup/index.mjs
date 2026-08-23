@@ -482,10 +482,24 @@ function printSummary(binPath, version, deps) {
 }
 
 // Run main only when executed directly (not when imported by tests).
-if (
-  process.argv[1] &&
-  import.meta.url === pathToFileURL(process.argv[1]).href
-) {
+//
+// npm's generated bin (e.g. the shim `npx github:...` runs through, at
+// node_modules/.bin/repo-explorer-mcp-setup) is a symlink to this file.
+// Node resolves symlinks when computing `import.meta.url` for an ES module
+// but does not resolve them in `process.argv[1]`, so the two must be
+// compared via their realpaths or this guard silently never fires.
+function isMainModule() {
+  if (!process.argv[1]) return false;
+  try {
+    return (
+      import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href
+    );
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
   main().catch((e) => {
     console.error(`repo-explorer-mcp-setup: ${e.message}`);
     process.exit(1);

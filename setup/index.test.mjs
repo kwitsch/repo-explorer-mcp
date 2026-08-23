@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { sep } from "node:path";
+import { sep, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { mkdtempSync, symlinkSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import {
   parseArgs,
   detectPlatform,
@@ -190,4 +194,25 @@ test("resolveVersion rejects an explicitly empty pinned version", async () => {
 test("resolveVersion strips a leading v from a pinned version", async () => {
   assert.equal(await resolveVersion("v1.2.3"), "1.2.3");
   assert.equal(await resolveVersion("1.2.3"), "1.2.3");
+});
+
+test("entry point runs when invoked through a symlink (npm bin shim)", () => {
+  // npm's generated bin (what `npx github:...` actually runs) is a symlink
+  // to this file, e.g. node_modules/.bin/repo-explorer-mcp-setup -> ../..
+  // /setup/index.mjs. Node resolves symlinks for `import.meta.url` but not
+  // for `process.argv[1]`, so a naive `argv[1] === import.meta.url` guard
+  // never fires when run this way and the installer silently does nothing.
+  const realIndex = fileURLToPath(new URL("./index.mjs", import.meta.url));
+  const dir = mkdtempSync(join(tmpdir(), "repo-explorer-mcp-setup-test-"));
+  const shim = join(dir, "repo-explorer-mcp-setup");
+  try {
+    symlinkSync(realIndex, shim);
+    const r = spawnSync(process.execPath, [shim, "--help"], {
+      encoding: "utf8",
+    });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /repo-explorer-mcp-setup — install/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
