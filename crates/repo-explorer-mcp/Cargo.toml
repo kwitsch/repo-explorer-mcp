@@ -18,3 +18,13 @@ dirs = "6"
 schemars = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+bytes = "1"
+semver = "1"
+sha2 = "0.11"
+hex = "0.4"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+self-replace = "1"
+which = "8"
