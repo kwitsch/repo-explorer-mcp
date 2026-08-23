@@ -28,8 +28,11 @@ pub struct LlmConfig {
     pub providers: Vec<ProviderConfig>,
     #[serde(default = "default_cooldown_seconds")]
     pub cooldown_seconds: u64,
-    /// HTTPS proxy URL used for all model upstream requests when set.
-    /// Applies uniformly to every provider entry; unset means "no proxy".
+    /// HTTPS proxy URL used for model upstream requests when set. Applied to
+    /// every provider entry uniformly, but — matching the conventional
+    /// `HTTPS_PROXY` env var semantics — only requests to an `https://`
+    /// destination are routed through it; a provider entry whose `base_url`
+    /// is `http://` is not covered. Unset means "no proxy".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub https_proxy: Option<String>,
 }
@@ -70,6 +73,25 @@ impl ProviderConfig {
         self.api_key_env
             .clone()
             .or_else(|| default_api_key_env(&self.kind).map(str::to_owned))
+    }
+}
+
+/// True when `url` looks like a usable http(s) proxy URL: a (case-insensitive)
+/// `http://`/`https://` scheme followed by a non-empty host. Shallow — no full
+/// RFC 3986 parse, matching the validation depth already applied to
+/// `base_url`/`endpoint` elsewhere in this module — but it catches the two
+/// mistakes users actually make: wrong/missing scheme, and a scheme with
+/// nothing after it (e.g. `"https://"`). The single source of truth for this
+/// rule: both [`Config::validate`] and the setup wizard call this instead of
+/// each re-implementing the scheme check.
+pub fn is_valid_https_proxy_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    let host_and_rest = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"));
+    match host_and_rest {
+        Some(rest) => !rest.is_empty() && !rest.starts_with('/'),
+        None => false,
     }
 }
 
@@ -354,7 +376,7 @@ impl Config {
         }
 
         if let Some(proxy) = &self.llm.https_proxy
-            && !(proxy.starts_with("http://") || proxy.starts_with("https://"))
+            && !is_valid_https_proxy_url(proxy)
         {
             return Err(ValidationError::InvalidHttpsProxyUrl { url: proxy.clone() });
         }
@@ -686,6 +708,54 @@ mod tests {
         );
         unsafe {
             std::env::remove_var("REPO_EXPLORER_TEST_KEY_PROXY_BAD");
+        }
+    }
+
+    #[test]
+    fn is_valid_https_proxy_url_accepts_uppercase_scheme() {
+        // URL schemes are case-insensitive (RFC 3986); the check must not
+        // reject a proxy URL just because its scheme isn't lowercase.
+        assert!(is_valid_https_proxy_url("HTTPS://proxy.example.com:8443"));
+        assert!(is_valid_https_proxy_url("Http://proxy.example.com"));
+    }
+
+    #[test]
+    fn is_valid_https_proxy_url_rejects_empty_host() {
+        // A bare scheme with no host must not pass as "a valid http(s) URL" —
+        // it will fail later at client-build time regardless.
+        assert!(!is_valid_https_proxy_url("https://"));
+        assert!(!is_valid_https_proxy_url("http://"));
+        assert!(!is_valid_https_proxy_url("https:///path"));
+    }
+
+    #[test]
+    fn https_proxy_case_insensitive_scheme_validates() {
+        let mut config = config_with_provider("p", "REPO_EXPLORER_TEST_KEY_PROXY_CASE");
+        unsafe {
+            std::env::set_var("REPO_EXPLORER_TEST_KEY_PROXY_CASE", "x");
+        }
+        config.llm.https_proxy = Some("HTTPS://proxy.example.com:8443".to_string());
+        assert!(config.validate().is_ok());
+        unsafe {
+            std::env::remove_var("REPO_EXPLORER_TEST_KEY_PROXY_CASE");
+        }
+    }
+
+    #[test]
+    fn https_proxy_empty_host_fails_validation() {
+        let mut config = config_with_provider("p", "REPO_EXPLORER_TEST_KEY_PROXY_EMPTY");
+        unsafe {
+            std::env::set_var("REPO_EXPLORER_TEST_KEY_PROXY_EMPTY", "x");
+        }
+        config.llm.https_proxy = Some("https://".to_string());
+        assert_eq!(
+            config.validate(),
+            Err(ValidationError::InvalidHttpsProxyUrl {
+                url: "https://".to_string()
+            })
+        );
+        unsafe {
+            std::env::remove_var("REPO_EXPLORER_TEST_KEY_PROXY_EMPTY");
         }
     }
 

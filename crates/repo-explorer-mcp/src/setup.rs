@@ -311,10 +311,10 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
         if raw.is_empty() {
             break None;
         }
-        if raw.starts_with("http://") || raw.starts_with("https://") {
+        if config::is_valid_https_proxy_url(&raw) {
             break Some(raw);
         }
-        eprintln!("  proxy URL must start with http:// or https://.");
+        eprintln!("  proxy URL must be a valid http:// or https:// URL with a host.");
     };
 
     // search / logging left at defaults (fully defaulted in core); not prompted.

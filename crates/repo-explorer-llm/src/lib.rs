@@ -221,6 +221,10 @@ impl GenaiProvider {
 /// entry's custom `api_key_env`, overriding the endpoint when `base_url` is
 /// set, and routing through `https_proxy` when set. This is the only place
 /// that names client-builder symbols.
+///
+/// `https_proxy` is applied via `reqwest::Proxy::https` (conventional
+/// `HTTPS_PROXY` semantics): only requests to an `https://` destination are
+/// proxied. A provider entry whose `base_url` is `http://` is not covered.
 fn build_genai_client(
     adapter_kind: genai::adapter::AdapterKind,
     provider: &ProviderConfig,
@@ -246,11 +250,18 @@ fn build_genai_client(
     }
 
     if let Some(proxy_url) = https_proxy {
+        // Never interpolate `proxy_url` (or the underlying parse error, which
+        // may itself echo the URL) into this message: a proxy URL commonly
+        // embeds basic-auth credentials, and `ProviderError`'s contract is
+        // that `message` is never a secret (see the doc comment on
+        // `ProviderError` in repo-explorer-core).
         let web_config = WebConfig::default()
             .with_https_proxy_url(proxy_url)
-            .map_err(|e| ProviderError::Configuration {
+            .map_err(|_| ProviderError::Configuration {
                 provider: provider.name.clone(),
-                message: format!("invalid llm.https_proxy `{proxy_url}`: {e}"),
+                message: "llm.https_proxy is not a usable proxy URL (check scheme, host, \
+                              and port); its value is withheld here in case it embeds credentials"
+                    .to_string(),
             })?;
         builder = builder.with_web_config(web_config);
     }
