@@ -7,6 +7,7 @@ use repo_explorer_core::llm::Tool;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 fn tool(name: &str, description: &str, schema: serde_json::Value) -> Tool {
     Tool {
@@ -16,9 +17,15 @@ fn tool(name: &str, description: &str, schema: serde_json::Value) -> Tool {
     }
 }
 
-/// Build the 10-tool catalog. `finish` is always included; the loop re-offers the
-/// whole catalog on every turn, which is what makes `finish` "forced".
-pub fn tool_catalog() -> Vec<Tool> {
+/// The 10-tool catalog, built once per process. `finish` is always included;
+/// the loop re-offers the whole catalog on every turn, which is what makes
+/// `finish` "forced".
+pub fn tool_catalog() -> &'static [Tool] {
+    static CATALOG: LazyLock<Vec<Tool>> = LazyLock::new(build_catalog);
+    &CATALOG
+}
+
+fn build_catalog() -> Vec<Tool> {
     vec![
         tool(
             "search_code",
@@ -242,19 +249,11 @@ pub(crate) struct GetCodeSnippetArgs {
     pub end_line: Option<u32>,
 }
 
+/// Arguments of both `grep` (content pattern) and `find` (file-name glob) —
+/// one shape, so one type.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GrepArgs {
-    pub pattern: String,
-    #[serde(default)]
-    pub scope: Option<String>,
-    #[serde(default)]
-    pub max_results: Option<u32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct FindArgs {
+pub(crate) struct PatternArgs {
     pub pattern: String,
     #[serde(default)]
     pub scope: Option<String>,

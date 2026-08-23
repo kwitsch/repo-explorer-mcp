@@ -11,7 +11,7 @@
 //! (default `codebase-memory-mcp`) and `REPO_EXPLORER_MEMORY_ARGS`
 //! (space-separated, default empty).
 
-use repo_explorer_core::config::CodebaseMemoryConfig;
+use repo_explorer_core::config::{CodebaseMemoryConfig, default_staleness_seconds};
 use repo_explorer_core::domain::ExplorationQuery;
 use repo_explorer_core::memory::MemoryBackend;
 use repo_explorer_memory::MemoryClientBackend;
@@ -28,7 +28,7 @@ fn live_config() -> CodebaseMemoryConfig {
         command: Some(command),
         args,
         endpoint: None,
-        staleness_seconds: 3600,
+        staleness_seconds: default_staleness_seconds(),
     }
 }
 
@@ -72,7 +72,7 @@ async fn endpoint_config_is_unsupported_without_server() {
         command: None,
         args: vec![],
         endpoint: Some("http://localhost:1234".to_string()),
-        staleness_seconds: 3600,
+        staleness_seconds: default_staleness_seconds(),
     };
     let err = MemoryClientBackend::connect(&cfg).await.unwrap_err();
     assert_eq!(

@@ -17,7 +17,7 @@ pub fn saturate_u32(n: u64) -> u32 {
 }
 
 /// A span of lines within a single file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FileLocation {
     pub path: PathBuf,
     pub line_start: u32,

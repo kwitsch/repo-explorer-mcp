@@ -6,7 +6,7 @@
 //! comparable `ProviderError`, mirroring how `repo-explorer-memory` keeps `rmcp`
 //! out of `repo-explorer-core`.
 
-use repo_explorer_core::config::{LlmConfig, ProviderConfig};
+use repo_explorer_core::config::{LlmConfig, ProviderConfig, env_var_is_set};
 use repo_explorer_core::llm::{
     LlmProvider, Message, ProviderError, ProviderResponse, ProviderRouter, Role, Tool, ToolCall,
 };
@@ -36,14 +36,10 @@ fn message_indicates_quota(message: &str) -> bool {
         || m.contains("billing")
 }
 
-/// Pure classification of error facts into a `ProviderError`. Best-effort and
-/// `kind`-aware per the source plan; both `RateLimited` and `QuotaExceeded` are
-/// failover triggers, so the finer split need not be exact for correctness.
-pub(crate) fn classify_error_facts(
-    provider: &str,
-    _kind: &str,
-    facts: &GenaiErrorFacts,
-) -> ProviderError {
+/// Pure classification of error facts into a `ProviderError`. Best-effort:
+/// both `RateLimited` and `QuotaExceeded` are failover triggers, so the finer
+/// split need not be exact for correctness.
+pub(crate) fn classify_error_facts(provider: &str, facts: &GenaiErrorFacts) -> ProviderError {
     let provider = provider.to_string();
     let message = facts.message.clone();
     let code = facts.code.as_deref().unwrap_or("");
@@ -89,17 +85,13 @@ pub(crate) fn classify_error_facts(
 /// `None` and classification relies on status plus substring matching. The
 /// flattened `message` is the SDK's `Display`, which contains provider error
 /// bodies but never our API key.
-pub(crate) fn classify_genai_error(
-    provider: &str,
-    kind: &str,
-    err: &genai::Error,
-) -> ProviderError {
+pub(crate) fn classify_genai_error(provider: &str, err: &genai::Error) -> ProviderError {
     let facts = GenaiErrorFacts {
         status: extract_status(err),
         code: None,
         message: err.to_string(),
     };
-    classify_error_facts(provider, kind, &facts)
+    classify_error_facts(provider, &facts)
 }
 
 /// Return the HTTP status if the `genai::Error` (or its nested web error)
@@ -141,10 +133,9 @@ fn adapter_kind_for(kind: &str) -> Option<genai::adapter::AdapterKind> {
 }
 
 /// The single production `LlmProvider`, backed by one `genai` client bound to a
-/// specific model. `name`/`kind`/`model` come from one `ProviderConfig` entry.
+/// specific model. `name`/`model` come from one `ProviderConfig` entry.
 pub struct GenaiProvider {
     name: String,
-    kind: String,
     model: String,
     client: genai::Client,
 }
@@ -161,10 +152,9 @@ impl GenaiProvider {
         model: &str,
         https_proxy: Option<&str>,
     ) -> Result<Self, ProviderError> {
-        let (name, kind, client) = Self::build_shared(provider, https_proxy)?;
+        let (name, client) = Self::build_shared(provider, https_proxy)?;
         Ok(Self {
             name,
-            kind,
             model: model.to_string(),
             client,
         })
@@ -181,7 +171,7 @@ impl GenaiProvider {
     fn build_shared(
         provider: &ProviderConfig,
         https_proxy: Option<&str>,
-    ) -> Result<(String, String, genai::Client), ProviderError> {
+    ) -> Result<(String, genai::Client), ProviderError> {
         let name = provider.name.clone();
 
         let adapter_kind =
@@ -204,7 +194,7 @@ impl GenaiProvider {
         // Fail with Configuration (never panic) if the key var is missing at
         // call-time, distinct from config-load validation. The value is read to
         // confirm presence; it is NEVER placed into any error message.
-        if std::env::var(&env_name).is_err() {
+        if !env_var_is_set(|v| std::env::var(v).ok(), &env_name) {
             return Err(ProviderError::Configuration {
                 provider: name,
                 message: format!("environment variable `{env_name}` is not set"),
@@ -213,7 +203,7 @@ impl GenaiProvider {
 
         let client = build_genai_client(adapter_kind, provider, &env_name, https_proxy)?;
 
-        Ok((name, provider.kind.clone(), client))
+        Ok((name, client))
     }
 }
 
@@ -404,7 +394,7 @@ impl LlmProvider for GenaiProvider {
             .await
         {
             Ok(response) => from_genai_response(&self.name, response),
-            Err(err) => Err(classify_genai_error(&self.name, &self.kind, &err)),
+            Err(err) => Err(classify_genai_error(&self.name, &err)),
         }
     }
 }
@@ -416,12 +406,11 @@ impl LlmProvider for GenaiProvider {
 pub fn build_router(cfg: &LlmConfig) -> Result<ProviderRouter<GenaiProvider>, ProviderError> {
     let mut providers = Vec::with_capacity(cfg.providers.len());
     for entry in &cfg.providers {
-        let (name, kind, client) = GenaiProvider::build_shared(entry, cfg.https_proxy.as_deref())?;
+        let (name, client) = GenaiProvider::build_shared(entry, cfg.https_proxy.as_deref())?;
         let mut models = Vec::with_capacity(entry.models.len());
         for model in &entry.models {
             let provider = GenaiProvider {
                 name: name.clone(),
-                kind: kind.clone(),
                 model: model.clone(),
                 client: client.clone(),
             };
@@ -458,7 +447,7 @@ mod tests {
 
     #[test]
     fn http_429_classifies_as_rate_limited() {
-        let e = classify_error_facts("primary", "anthropic", &facts(Some(429), None, "slow down"));
+        let e = classify_error_facts("primary", &facts(Some(429), None, "slow down"));
         assert_eq!(
             e,
             ProviderError::RateLimited {
@@ -473,7 +462,6 @@ mod tests {
     fn openai_insufficient_quota_classifies_as_quota() {
         let e = classify_error_facts(
             "p",
-            "openai",
             &facts(Some(429), Some("insufficient_quota"), "no credit"),
         );
         assert_eq!(
@@ -487,7 +475,7 @@ mod tests {
 
     #[test]
     fn http_401_classifies_as_authentication_and_is_not_failover() {
-        let e = classify_error_facts("p", "openai", &facts(Some(401), None, "bad key"));
+        let e = classify_error_facts("p", &facts(Some(401), None, "bad key"));
         assert_eq!(
             e,
             ProviderError::Authentication {
@@ -500,7 +488,7 @@ mod tests {
 
     #[test]
     fn http_400_classifies_as_invalid_request() {
-        let e = classify_error_facts("p", "openai", &facts(Some(400), None, "bad body"));
+        let e = classify_error_facts("p", &facts(Some(400), None, "bad body"));
         assert_eq!(
             e,
             ProviderError::InvalidRequest {
@@ -512,7 +500,7 @@ mod tests {
 
     #[test]
     fn no_status_falls_back_to_transport() {
-        let e = classify_error_facts("p", "anthropic", &facts(None, None, "connection reset"));
+        let e = classify_error_facts("p", &facts(None, None, "connection reset"));
         assert_eq!(
             e,
             ProviderError::Transport {
@@ -525,11 +513,7 @@ mod tests {
     #[test]
     fn quota_via_substring_when_status_only_429() {
         // Anthropic billing/overloaded phrasing without a structured code.
-        let e = classify_error_facts(
-            "p",
-            "anthropic",
-            &facts(Some(429), None, "credit balance is too low"),
-        );
+        let e = classify_error_facts("p", &facts(Some(429), None, "credit balance is too low"));
         assert_eq!(
             e,
             ProviderError::QuotaExceeded {
@@ -543,7 +527,7 @@ mod tests {
     fn error_message_never_echoes_a_key() {
         // The classifier only ever copies the provided message; assert it does
         // not fabricate secrets and preserves the given text verbatim.
-        let e = classify_error_facts("p", "openai", &facts(Some(500), None, "server error"));
+        let e = classify_error_facts("p", &facts(Some(500), None, "server error"));
         assert_eq!(
             e,
             ProviderError::Transport {

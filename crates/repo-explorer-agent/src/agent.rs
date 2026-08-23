@@ -3,12 +3,15 @@
 //! Tool/backend failures and malformed model output degrade into `Role::Tool`
 //! messages fed back to the model; only a `RouterError` is a hard failure.
 
-use repo_explorer_core::domain::{ExplorationFinding, ExplorationQuery, ExplorationResult};
+use repo_explorer_core::domain::{
+    ExplorationFinding, ExplorationQuery, ExplorationResult, FileLocation,
+};
 use repo_explorer_core::llm::{
     Clock, LlmProvider, Message, ProviderResponse, ProviderRouter, SystemClock,
 };
 use repo_explorer_core::memory::{IndexStatus, MemoryBackend};
 use repo_explorer_core::search::SearchBackend;
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::dispatch::dispatch_call;
@@ -91,10 +94,11 @@ where
         ];
 
         let mut findings: Vec<ExplorationFinding> = Vec::new();
+        let mut seen: HashSet<FileLocation> = HashSet::new();
 
         // Step 3: turn loop.
         for _turn in 0..self.config.max_iterations {
-            match self.router.complete_with_tools(&messages, &tools).await {
+            match self.router.complete_with_tools(&messages, tools).await {
                 Ok(ProviderResponse::ToolCalls(calls)) if calls.is_empty() => {
                     messages.push(Message::assistant_tool_calls(Vec::new()));
                     messages.push(Message::user(
@@ -121,7 +125,7 @@ where
                                 dispatch_call(&self.memory, &self.search, repo_root, call).await;
                             messages.push(message);
                             for f in new_findings {
-                                accumulate(&mut findings, f);
+                                accumulate(&mut findings, &mut seen, f);
                             }
                         }
                     }
@@ -150,12 +154,15 @@ where
 }
 
 /// Push `f` unless a finding with the same `FileLocation` is already present
-/// (dedupe by location; first-seen snippet/note wins).
-fn accumulate(findings: &mut Vec<ExplorationFinding>, f: ExplorationFinding) {
-    if !findings
-        .iter()
-        .any(|existing| existing.location == f.location)
-    {
+/// (dedupe by location; first-seen snippet/note wins). `seen` mirrors the
+/// locations already in `findings`, so the check is O(1) rather than a linear
+/// scan per incoming finding.
+fn accumulate(
+    findings: &mut Vec<ExplorationFinding>,
+    seen: &mut HashSet<FileLocation>,
+    f: ExplorationFinding,
+) {
+    if seen.insert(f.location.clone()) {
         findings.push(f);
     }
 }

@@ -65,6 +65,16 @@ pub fn default_api_key_env(kind: &str) -> Option<&'static str> {
     }
 }
 
+/// The single definition of "is this API-key env var actually set": present
+/// and non-blank once trimmed. A blank value is worse than a missing one — it
+/// would pass a bare `env::var(..).is_ok()` check and then fail as a 401 at
+/// call time — so every layer that asks this question must ask it the same
+/// way. The accessor is injected so callers can supply a test double instead
+/// of mutating the process environment.
+pub fn env_var_is_set(get: impl Fn(&str) -> Option<String>, var: &str) -> bool {
+    get(var).is_some_and(|v| !v.trim().is_empty())
+}
+
 impl ProviderConfig {
     /// Effective API-key env var name: the explicit `api_key_env` when set,
     /// otherwise the default derived from `kind`. `None` when neither is
@@ -110,7 +120,7 @@ pub struct CodebaseMemoryConfig {
     pub staleness_seconds: u64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SearchConfig {
     /// Explicit path to the `rtk` binary; `None` → auto-detect in Stage 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -118,10 +128,27 @@ pub struct SearchConfig {
     /// Explicit path to the `ripgrep` binary; `None` → auto-detect in Stage 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ripgrep_path: Option<PathBuf>,
+    /// Per-search subprocess timeout. `0` means "no timeout" — the explicit
+    /// opt-out, not a stand-in for the default.
     #[serde(default = "default_search_timeout_seconds")]
     pub timeout_seconds: u64,
     #[serde(default = "default_prefer_rtk")]
     pub prefer_rtk: bool,
+}
+
+/// Hand-written (not derived) so that `SearchConfig::default()` and the serde
+/// field defaults are the *same* values: a derived `Default` would yield
+/// `timeout_seconds: 0` / `prefer_rtk: false`, silently disagreeing with what
+/// loading an empty `[search]` section produces.
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            rtk_path: None,
+            ripgrep_path: None,
+            timeout_seconds: default_search_timeout_seconds(),
+            prefer_rtk: default_prefer_rtk(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -231,7 +258,8 @@ pub enum ValidationError {
         explicit: bool,
     },
     #[error(
-        "provider `{provider}` has unknown kind `{kind}` (expected one of: anthropic, openai, gemini, google)"
+        "provider `{provider}` has unknown kind `{kind}` (expected one of: {})",
+        KNOWN_PROVIDER_KINDS.join(", ")
     )]
     UnknownProviderKind {
         index: usize,
@@ -325,6 +353,8 @@ impl Config {
             return Err(ValidationError::EmptyProviderList);
         }
 
+        // One pass per provider: name uniqueness, then the per-entry checks in
+        // increasing order of specificity.
         let mut seen = std::collections::HashSet::new();
         for (index, provider) in self.llm.providers.iter().enumerate() {
             if !seen.insert(provider.name.as_str()) {
@@ -333,18 +363,12 @@ impl Config {
                     name: provider.name.clone(),
                 });
             }
-        }
-
-        for (index, provider) in self.llm.providers.iter().enumerate() {
             if provider.models.is_empty() {
                 return Err(ValidationError::EmptyModelsList {
                     index,
                     provider: provider.name.clone(),
                 });
             }
-        }
-
-        for (index, provider) in self.llm.providers.iter().enumerate() {
             if !KNOWN_PROVIDER_KINDS.contains(&provider.kind.as_str()) {
                 return Err(ValidationError::UnknownProviderKind {
                     index,
@@ -352,11 +376,8 @@ impl Config {
                     kind: provider.kind.clone(),
                 });
             }
-        }
-
-        for (index, provider) in self.llm.providers.iter().enumerate() {
             let var = provider.resolve_api_key_env().unwrap_or_default();
-            if std::env::var(&var).is_err() {
+            if !env_var_is_set(|v| std::env::var(v).ok(), &var) {
                 return Err(ValidationError::MissingEnvVar {
                     index,
                     provider: provider.name.clone(),
@@ -409,14 +430,14 @@ mod tests {
                     models: vec!["m".to_string()],
                     base_url: None,
                 }],
-                cooldown_seconds: 60,
+                cooldown_seconds: default_cooldown_seconds(),
                 https_proxy: None,
             },
             codebase_memory: CodebaseMemoryConfig {
                 command: Some("cmd".to_string()),
                 args: vec![],
                 endpoint: None,
-                staleness_seconds: 3600,
+                staleness_seconds: default_staleness_seconds(),
             },
             search: SearchConfig::default(),
             logging: LoggingConfig::default(),
@@ -451,7 +472,10 @@ mod tests {
         assert_eq!(config.logging.level, LogLevel::Debug);
 
         // Defaults for values omitted in the fixture.
-        assert_eq!(config.codebase_memory.staleness_seconds, 3600);
+        assert_eq!(
+            config.codebase_memory.staleness_seconds,
+            default_staleness_seconds()
+        );
         assert_eq!(
             config.codebase_memory.command.as_deref(),
             Some("codebase-memory-mcp")
@@ -815,32 +839,35 @@ mod tests {
     }
 
     #[test]
+    fn search_config_default_matches_serde_defaults() {
+        // A derived `Default` would silently disagree with the serde field
+        // defaults, and the setup wizard writes `SearchConfig::default()` —
+        // producing configs with no search timeout and rtk preference off.
+        let from_default = SearchConfig::default();
+        let from_empty_section: SearchConfig =
+            toml::from_str("").expect("an empty [search] section must parse");
+        assert_eq!(
+            from_default.timeout_seconds,
+            from_empty_section.timeout_seconds
+        );
+        assert_eq!(from_default.prefer_rtk, from_empty_section.prefer_rtk);
+        assert_eq!(
+            from_default.timeout_seconds,
+            default_search_timeout_seconds()
+        );
+        assert!(from_default.prefer_rtk);
+    }
+
+    #[test]
     fn to_toml_string_omits_implicit_default_api_key_env() {
         // A wizard-shaped gemini config: api_key_env = None (implicit default).
         unsafe {
             std::env::set_var("GEMINI_API_KEY", "x");
         }
-        let config = Config {
-            llm: LlmConfig {
-                providers: vec![ProviderConfig {
-                    name: "gemini".to_string(),
-                    kind: "gemini".to_string(),
-                    api_key_env: None,
-                    models: vec!["gemini-2.5-flash".to_string()],
-                    base_url: None,
-                }],
-                cooldown_seconds: 60,
-                https_proxy: None,
-            },
-            codebase_memory: CodebaseMemoryConfig {
-                command: Some("codebase-memory-mcp".to_string()),
-                args: vec!["--stdio".to_string()],
-                endpoint: None,
-                staleness_seconds: 3600,
-            },
-            search: SearchConfig::default(),
-            logging: LoggingConfig::default(),
-        };
+        let mut config = config_with_provider("gemini", "GEMINI_API_KEY");
+        config.llm.providers[0].kind = "gemini".to_string();
+        config.llm.providers[0].api_key_env = None;
+        config.llm.providers[0].models = vec!["gemini-2.5-flash".to_string()];
         let toml = to_toml_string(&config).expect("serialize should succeed");
         assert!(
             !toml.contains("api_key_env"),

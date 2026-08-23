@@ -12,7 +12,7 @@ use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
 
 use crate::tools::{
-    FindArgs, GetArchitectureArgs, GetCodeSnippetArgs, GrepArgs, QueryGraphArgs, ReadFileArgs,
+    GetArchitectureArgs, GetCodeSnippetArgs, PatternArgs, QueryGraphArgs, ReadFileArgs,
     SearchCodeArgs, SearchGraphArgs, TracePathArgs,
 };
 
@@ -25,8 +25,8 @@ pub(crate) async fn dispatch_call<M: MemoryBackend, S: SearchBackend>(
     call: &ToolCall,
 ) -> (Message, Vec<ExplorationFinding>) {
     match dispatch_inner(memory, search, repo_root, call).await {
-        Ok((content, findings)) => (tool_message(&call.id, content), findings),
-        Err(msg) => (tool_message(&call.id, msg), Vec::new()),
+        Ok((content, findings)) => (Message::tool(&call.id, content), findings),
+        Err(msg) => (Message::tool(&call.id, msg), Vec::new()),
     }
 }
 
@@ -89,34 +89,27 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
             )
             .await
         }
-        "grep" => {
-            let args: GrepArgs = parse_args(&call.arguments_json)?;
+        name @ ("grep" | "find") => {
+            let args: PatternArgs = parse_args(&call.arguments_json)?;
+            // `find` has no dedicated backend capability: the real
+            // `SearchBackend` only exposes a content search, so a filename
+            // search is approximated by matching any non-empty line (pattern
+            // `.`) restricted to files matching `pattern` as a glob.
+            let (pattern, file_glob) = if name == "find" {
+                (".", Some(args.pattern.clone()))
+            } else {
+                (args.pattern.as_str(), None)
+            };
             let opts = SearchOptions {
                 max_results: args.max_results,
+                file_glob,
                 ..SearchOptions::default()
             };
             let scope = validate_scope(args.scope.as_deref())?;
             let findings = search
-                .search(repo_root, &args.pattern, scope.as_deref(), &opts)
+                .search(repo_root, pattern, scope.as_deref(), &opts)
                 .await
-                .map_err(|e| format!("grep failed: {e}"))?;
-            Ok(render_findings(findings))
-        }
-        "find" => {
-            let args: FindArgs = parse_args(&call.arguments_json)?;
-            // The real `SearchBackend` only exposes a content search; a
-            // filename search is approximated by matching any non-empty line
-            // (pattern `.`) restricted to files matching `pattern` as a glob.
-            let opts = SearchOptions {
-                max_results: args.max_results,
-                file_glob: Some(args.pattern.clone()),
-                ..SearchOptions::default()
-            };
-            let scope = validate_scope(args.scope.as_deref())?;
-            let findings = search
-                .search(repo_root, ".", scope.as_deref(), &opts)
-                .await
-                .map_err(|e| format!("find failed: {e}"))?;
+                .map_err(|e| format!("{name} failed: {e}"))?;
             Ok(render_findings(findings))
         }
         "read_file" => {
@@ -158,19 +151,23 @@ fn snippet_target(args: GetCodeSnippetArgs) -> Result<SnippetTarget, String> {
     }
 }
 
-/// Reject a model-supplied `scope` that is absolute or escapes the repository
-/// root via a `..` component, mirroring `read_file`'s guard below — a
-/// filesystem-backed `SearchBackend` must not be handed a path that walks
-/// outside `repo_root`.
-fn validate_scope(scope: Option<&str>) -> Result<Option<PathBuf>, String> {
-    let Some(scope) = scope else {
-        return Ok(None);
-    };
-    let rel = Path::new(scope);
+/// The one lexical "stays inside the repository" check: reject a
+/// model-supplied path that is absolute or walks out via a `..` component.
+/// `label` names the offending input in the error (`scope`, `read_file path`).
+/// `read_file` additionally verifies the *resolved* path; a `SearchBackend`
+/// scope is only checked lexically because it need not exist yet.
+fn reject_escaping_path(label: &str, raw: &str) -> Result<PathBuf, String> {
+    let rel = Path::new(raw);
     if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(format!("scope `{scope}` escapes the repository root"));
+        return Err(format!("{label} `{raw}` escapes the repository root"));
     }
-    Ok(Some(rel.to_path_buf()))
+    Ok(rel.to_path_buf())
+}
+
+/// [`reject_escaping_path`] for the optional `scope` argument shared by `grep`
+/// and `find`.
+fn validate_scope(scope: Option<&str>) -> Result<Option<PathBuf>, String> {
+    scope.map(|s| reject_escaping_path("scope", s)).transpose()
 }
 
 fn read_file(
@@ -179,12 +176,7 @@ fn read_file(
     start_line: Option<u32>,
     end_line: Option<u32>,
 ) -> Result<String, String> {
-    let rel = Path::new(path);
-    if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(format!(
-            "read_file path `{path}` escapes the repository root"
-        ));
-    }
+    let rel = reject_escaping_path("read_file path", path)?;
     let full = repo_root.join(rel);
     let canonical_full =
         std::fs::canonicalize(&full).map_err(|e| format!("read_file failed for `{path}`: {e}"))?;
@@ -197,53 +189,49 @@ fn read_file(
     }
     let contents = std::fs::read_to_string(&canonical_full)
         .map_err(|e| format!("read_file failed for `{path}`: {e}"))?;
-    Ok(slice_lines(&contents, start_line, end_line))
+    Ok(slice_lines(contents, start_line, end_line))
 }
 
 /// Slice `contents` to the 1-based inclusive `[start_line, end_line]` window.
 /// With neither bound, return the whole file unchanged.
-fn slice_lines(contents: &str, start_line: Option<u32>, end_line: Option<u32>) -> String {
+fn slice_lines(contents: String, start_line: Option<u32>, end_line: Option<u32>) -> String {
     if start_line.is_none() && end_line.is_none() {
-        return contents.to_string();
+        return contents;
     }
-    let start = start_line.unwrap_or(1).max(1);
-    let end = end_line.unwrap_or(u32::MAX);
+    let start = start_line.unwrap_or(1).max(1) as usize;
+    let end = end_line.unwrap_or(u32::MAX) as usize;
     contents
         .lines()
-        .enumerate()
-        .filter(|(i, _)| {
-            let ln = (*i as u32) + 1;
-            ln >= start && ln <= end
-        })
-        .map(|(_, l)| l)
+        .skip(start - 1)
+        .take(end.saturating_sub(start).saturating_add(1))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
 #[derive(Serialize)]
-struct FindingDto {
+struct FindingDto<'a> {
     path: String,
     line_start: u32,
     line_end: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    snippet: Option<String>,
+    snippet: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    note: Option<String>,
+    note: Option<&'a str>,
 }
 
 #[derive(Serialize)]
-struct ResultDto {
-    findings: Vec<FindingDto>,
-    summary: String,
+struct ResultDto<'a> {
+    findings: Vec<FindingDto<'a>>,
+    summary: &'a str,
 }
 
-fn finding_dto(f: &ExplorationFinding) -> FindingDto {
+fn finding_dto(f: &ExplorationFinding) -> FindingDto<'_> {
     FindingDto {
         path: f.location.path.display().to_string(),
         line_start: f.location.line_start,
         line_end: f.location.line_end,
-        snippet: f.snippet.clone(),
-        note: f.note.clone(),
+        snippet: f.snippet.as_deref(),
+        note: f.note.as_deref(),
     }
 }
 
@@ -255,11 +243,13 @@ fn serialize_or_empty<T: Serialize>(value: &T, fallback: &str) -> String {
 }
 
 fn render_result(res: ExplorationResult) -> (String, Vec<ExplorationFinding>) {
-    let dto = ResultDto {
-        findings: res.findings.iter().map(finding_dto).collect(),
-        summary: res.summary,
-    };
-    let content = serialize_or_empty(&dto, "{}");
+    let content = serialize_or_empty(
+        &ResultDto {
+            findings: res.findings.iter().map(finding_dto).collect(),
+            summary: &res.summary,
+        },
+        "{}",
+    );
     (content, res.findings)
 }
 
@@ -269,16 +259,11 @@ fn render_findings(findings: Vec<ExplorationFinding>) -> (String, Vec<Exploratio
     (content, findings)
 }
 
-fn tool_message(call_id: &str, content: String) -> Message {
-    Message::tool(call_id, content)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use repo_explorer_core::domain::FileLocation;
     use repo_explorer_core::llm::Role;
-    use repo_explorer_core::memory::IndexStatus;
     use repo_explorer_core::memory::mock::{Call as MemCall, MockMemoryBackend};
     use repo_explorer_core::search::mock::{Call as SearchCall, MockSearchBackend};
     use std::path::PathBuf;
@@ -356,10 +341,7 @@ mod tests {
                 repo_root: PathBuf::from("/repo"),
                 pattern: "fn main".to_string(),
                 scope: Some(PathBuf::from("src")),
-                options: SearchOptions {
-                    max_results: None,
-                    ..SearchOptions::default()
-                },
+                options: SearchOptions::default(),
             }
         );
     }
@@ -493,8 +475,4 @@ mod tests {
         .await;
         assert!(message.content.contains("escapes the repository root"));
     }
-
-    // Silence unused-import warnings for items only used in some cfgs.
-    #[allow(unused_imports)]
-    use IndexStatus as _IndexStatus;
 }

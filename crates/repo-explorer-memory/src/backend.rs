@@ -40,13 +40,16 @@ impl MemoryClientBackend {
         self.client.close().await;
     }
 
-    /// Probe `index_status` for the project; a tool error meaning "not indexed"
-    /// is reported as `exists = false` rather than an `Err`.
-    async fn probe_status(&self, project: &str) -> Result<IndexProbe, MemoryError> {
+    /// Probe `index_status` for the project, returning `(exists,
+    /// last_indexed_at)`; a tool error meaning "not indexed" is reported as
+    /// `exists = false` rather than an `Err`. The changed-file count is not
+    /// this call's to know, so the full `IndexProbe` is assembled by
+    /// `ensure_fresh_index` instead of being returned half-filled here.
+    async fn probe_status(&self, project: &str) -> Result<(bool, Option<SystemTime>), MemoryError> {
         let args = base_args(project.to_string());
         match self.client.call("index_status", args).await {
             Ok(result) => {
-                let json = decode_result("index_status", &result)?;
+                let json = decode_result("index_status", result)?;
                 // An unrecognized/empty response must NOT be optimistically
                 // treated as "already indexed" — default to `false` so an
                 // unknown shape forces a (safe) reindex instead of skipping one.
@@ -58,22 +61,14 @@ impl MemoryClientBackend {
                     .and_then(Value::as_i64)
                     .and_then(|secs| u64::try_from(secs).ok())
                     .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
-                Ok(IndexProbe {
-                    exists,
-                    last_indexed_at,
-                    changed_files: ChangeCount::Known(0),
-                })
+                Ok((exists, last_indexed_at))
             }
             // Only a tool error that explicitly indicates the project is
             // unknown/not-yet-indexed is downgraded to "not indexed"; any other
             // tool failure (permission error, malformed input, internal fault)
             // is surfaced to the caller instead of being silently reinterpreted.
             Err(MemoryError::ToolFailed { message, .. }) if is_not_indexed_error(&message) => {
-                Ok(IndexProbe {
-                    exists: false,
-                    last_indexed_at: None,
-                    changed_files: ChangeCount::Known(0),
-                })
+                Ok((false, None))
             }
             Err(e) => Err(e),
         }
@@ -84,7 +79,7 @@ impl MemoryClientBackend {
         let args = base_args(project.to_string());
         match self.client.call("detect_changes", args).await {
             Ok(result) => {
-                let json = decode_result("detect_changes", &result)?;
+                let json = decode_result("detect_changes", result)?;
                 let changed = first_field(&json, &["changed_files", "changed_count"])
                     .map(|v| match v {
                         Value::Array(a) => a.len(),
@@ -135,18 +130,33 @@ impl MemoryClientBackend {
     /// Shared tail of every read-only memory-query method: build `{"project":
     /// ...}` plus whatever `build_args` inserts, call `tool`, decode, and turn
     /// the response into an `ExplorationResult` — the one place that
-    /// call/decode/summarize sequence lives.
+    /// call/decode sequence lives. `map` is the only per-tool difference
+    /// (row-array responses use [`findings_and_summary`]; `get_code_snippet`
+    /// decodes a single row).
+    async fn call_memory_tool_with(
+        &self,
+        tool: &'static str,
+        project: String,
+        build_args: impl FnOnce(&mut Map<String, Value>),
+        map: impl FnOnce(&'static str, &Value) -> ExplorationResult,
+    ) -> Result<ExplorationResult, MemoryError> {
+        let mut args = base_args(project);
+        build_args(&mut args);
+        let result = self.client.call(tool, args).await?;
+        let json = decode_result(tool, result)?;
+        Ok(map(tool, &json))
+    }
+
+    /// [`call_memory_tool_with`] for the common case: a response holding an
+    /// array of hit rows.
     async fn call_memory_tool(
         &self,
         tool: &'static str,
         project: String,
         build_args: impl FnOnce(&mut Map<String, Value>),
     ) -> Result<ExplorationResult, MemoryError> {
-        let mut args = base_args(project);
-        build_args(&mut args);
-        let result = self.client.call(tool, args).await?;
-        let json = decode_result(tool, &result)?;
-        Ok(findings_and_summary(tool, &json))
+        self.call_memory_tool_with(tool, project, build_args, findings_and_summary)
+            .await
     }
 }
 
@@ -199,6 +209,28 @@ fn location_from(json: &Value) -> Option<FileLocation> {
     })
 }
 
+/// Decode a `get_code_snippet` response: 0 or 1 finding, reusing the same row
+/// shape as [`findings_and_summary`] if a location resolves.
+fn single_snippet(tool: &'static str, json: &Value) -> ExplorationResult {
+    let mut findings = Vec::new();
+    if let Some(location) = location_from(json) {
+        let snippet = first_field(json, &["snippet", "code", "text"])
+            .and_then(Value::as_str)
+            .map(|s| s.to_string());
+        findings.push(ExplorationFinding {
+            location,
+            snippet,
+            note: None,
+        });
+    }
+    let summary = if findings.is_empty() {
+        format!("{tool}: no snippet resolved")
+    } else {
+        format!("{tool}: 1 snippet")
+    };
+    ExplorationResult { findings, summary }
+}
+
 /// Turn a JSON array of hit rows into findings, plus a compact summary string.
 fn findings_and_summary(tool: &'static str, json: &Value) -> ExplorationResult {
     let rows = first_field(json, &["results", "rows", "hits"])
@@ -234,10 +266,18 @@ impl MemoryBackend for MemoryClientBackend {
         // second time inside `run_index`.
         let abs = canonicalize_repo_root(repo_root).await;
         let project = project_name_from_abs(repo_root, &abs)?;
-        let mut probe = self.probe_status(&project).await?;
-        if probe.exists {
-            probe.changed_files = self.probe_changes(&project).await?;
-        }
+        let (exists, last_indexed_at) = self.probe_status(&project).await?;
+        // `detect_changes` is only meaningful for a project that exists.
+        let changed_files = if exists {
+            self.probe_changes(&project).await?
+        } else {
+            ChangeCount::Known(0)
+        };
+        let probe = IndexProbe {
+            exists,
+            last_indexed_at,
+            changed_files,
+        };
         match decide_freshness(&probe, self.staleness, SystemTime::now()) {
             FreshnessDecision::UpToDate => Ok(IndexStatus::UpToDate),
             FreshnessDecision::Reindex => self.run_index(&abs).await,
@@ -249,7 +289,7 @@ impl MemoryBackend for MemoryClientBackend {
         repo_root: &Path,
         query: &ExplorationQuery,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root)?;
+        let project = project_name(repo_root).await?;
         self.call_memory_tool("search_code", project, |args| {
             args.insert("pattern".to_string(), Value::String(query.text.clone()));
             if let Some(scope) = &query.scope_hint {
@@ -270,7 +310,7 @@ impl MemoryBackend for MemoryClientBackend {
         repo_root: &Path,
         query: &GraphQuery,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root)?;
+        let project = project_name(repo_root).await?;
         self.call_memory_tool("search_graph", project, |args| {
             args.insert("format".to_string(), Value::String("json".to_string()));
             if let Some(v) = &query.name_pattern {
@@ -295,7 +335,7 @@ impl MemoryBackend for MemoryClientBackend {
         query: &str,
         max_results: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root)?;
+        let project = project_name(repo_root).await?;
         self.call_memory_tool("query_graph", project, |args| {
             args.insert("query".to_string(), Value::String(query.to_string()));
             if let Some(limit) = max_results {
@@ -312,7 +352,7 @@ impl MemoryBackend for MemoryClientBackend {
         to: &str,
         max_depth: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root)?;
+        let project = project_name(repo_root).await?;
         self.call_memory_tool("trace_path", project, |args| {
             args.insert("from".to_string(), Value::String(from.to_string()));
             args.insert("to".to_string(), Value::String(to.to_string()));
@@ -328,7 +368,7 @@ impl MemoryBackend for MemoryClientBackend {
         repo_root: &Path,
         depth: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root)?;
+        let project = project_name(repo_root).await?;
         self.call_memory_tool("get_architecture", project, |args| {
             if let Some(d) = depth {
                 args.insert("depth".to_string(), Value::Number(d.into()));
@@ -342,48 +382,33 @@ impl MemoryBackend for MemoryClientBackend {
         repo_root: &Path,
         target: &SnippetTarget,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root)?;
-        let mut args = base_args(project);
-        match target {
-            SnippetTarget::QualifiedName(name) => {
-                args.insert("qualified_name".to_string(), Value::String(name.clone()));
-            }
-            SnippetTarget::FileRange {
-                file,
-                start_line,
-                end_line,
-            } => {
-                args.insert(
-                    "file".to_string(),
-                    Value::String(file.to_string_lossy().into_owned()),
-                );
-                if let Some(s) = start_line {
-                    args.insert("start_line".to_string(), Value::Number((*s).into()));
+        let project = project_name(repo_root).await?;
+        self.call_memory_tool_with(
+            "get_code_snippet",
+            project,
+            |args| match target {
+                SnippetTarget::QualifiedName(name) => {
+                    args.insert("qualified_name".to_string(), Value::String(name.clone()));
                 }
-                if let Some(e) = end_line {
-                    args.insert("end_line".to_string(), Value::Number((*e).into()));
+                SnippetTarget::FileRange {
+                    file,
+                    start_line,
+                    end_line,
+                } => {
+                    args.insert(
+                        "file".to_string(),
+                        Value::String(file.to_string_lossy().into_owned()),
+                    );
+                    if let Some(s) = start_line {
+                        args.insert("start_line".to_string(), Value::Number((*s).into()));
+                    }
+                    if let Some(e) = end_line {
+                        args.insert("end_line".to_string(), Value::Number((*e).into()));
+                    }
                 }
-            }
-        }
-        let result = self.client.call("get_code_snippet", args).await?;
-        let json = decode_result("get_code_snippet", &result)?;
-        // 0 or 1 finding: reuse the row shape if a location resolves.
-        let mut findings = Vec::new();
-        if let Some(location) = location_from(&json) {
-            let snippet = first_field(&json, &["snippet", "code", "text"])
-                .and_then(Value::as_str)
-                .map(|s| s.to_string());
-            findings.push(ExplorationFinding {
-                location,
-                snippet,
-                note: None,
-            });
-        }
-        let summary = if findings.is_empty() {
-            "get_code_snippet: no snippet resolved".to_string()
-        } else {
-            "get_code_snippet: 1 snippet".to_string()
-        };
-        Ok(ExplorationResult { findings, summary })
+            },
+            single_snippet,
+        )
+        .await
     }
 }

@@ -297,10 +297,12 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
                 match slot.provider.complete_with_tools(messages, tools).await {
                     Ok(resp) => return Ok(resp),
                     Err(e) if e.is_failover_trigger() => {
+                        // Same poison recovery as the read site above: one
+                        // panicked call must not permanently break the router.
                         let mut guard = slot
                             .cooling_until
                             .lock()
-                            .expect("router cooldown mutex poisoned");
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
                         *guard = Some(now + self.cooldown);
                         limited.push(format!("{}/{}", entry.name, slot.model));
                         continue;
@@ -600,9 +602,11 @@ mod tests {
 
     #[test]
     fn llm_provider_trait_is_object_usable_via_generics() {
-        // Compile-time check that the trait exists with the intended signature.
-        fn _assert_impl<P: LlmProvider>() {}
-        // no runtime assertion needed
+        // Compile-time check that the trait is usable as a generic bound.
+        // Instantiating the generic fn is what makes this an assertion (the
+        // trait uses `async fn`, so it is deliberately not dyn-compatible).
+        fn assert_generic<P: LlmProvider>() {}
+        assert_generic::<mock::MockLlmProvider>();
     }
 
     use mock::{FakeClock, MockCall, MockLlmProvider};

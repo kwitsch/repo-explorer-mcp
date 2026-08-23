@@ -11,7 +11,7 @@ use anyhow::Context;
 use repo_explorer_core::config::{
     self, CodebaseMemoryConfig, Config, KNOWN_PROVIDER_KINDS, LlmConfig, LoggingConfig,
     ProviderConfig, SearchConfig, default_api_key_env, default_cooldown_seconds,
-    default_staleness_seconds,
+    default_staleness_seconds, env_var_is_set,
 };
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -52,14 +52,6 @@ fn candidate_env_vars() -> Vec<(&'static str, &'static str)> {
     }
     out.push(("GOOGLE_API_KEY", "gemini"));
     out
-}
-
-/// The single definition of "is this env var actually set": present and
-/// non-blank once trimmed. Shared by `detect_providers` and any other check
-/// that needs to ask the same question about a specific var (e.g. the
-/// both-Gemini-vars-set notice in `run_setup_inner`).
-fn env_var_is_set(get: &impl Fn(&str) -> Option<String>, var: &str) -> bool {
-    get(var).map(|v| !v.trim().is_empty()).unwrap_or(false)
 }
 
 /// Scan candidate env vars via the injected accessor and return deduped
@@ -197,17 +189,18 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
     let detected = detect_providers(get_env);
 
     // If both Gemini vars are set, note that GEMINI_API_KEY was preferred.
-    let gemini_set = env_var_is_set(&get_env, "GEMINI_API_KEY");
-    let google_set = env_var_is_set(&get_env, "GOOGLE_API_KEY");
+    let gemini_set = env_var_is_set(get_env, "GEMINI_API_KEY");
+    let google_set = env_var_is_set(get_env, "GOOGLE_API_KEY");
     if gemini_set && google_set {
         eprintln!("  note: both GEMINI_API_KEY and GOOGLE_API_KEY are set; using GEMINI_API_KEY.");
     }
 
     if detected.is_empty() {
+        let vars: Vec<&str> = candidate_env_vars().iter().map(|(var, _)| *var).collect();
         anyhow::bail!(
-            "no provider API-key environment variable detected. Set one of \
-             ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or GOOGLE_API_KEY \
-             and re-run `repo-explorer-mcp setup`."
+            "no provider API-key environment variable detected. Set one of {} \
+             and re-run `repo-explorer-mcp setup`.",
+            vars.join(", ")
         );
     }
     for p in &detected {

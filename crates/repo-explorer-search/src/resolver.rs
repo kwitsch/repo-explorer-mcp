@@ -5,18 +5,12 @@
 
 use std::path::{Path, PathBuf};
 
-// `#[allow(dead_code)]` on these items: this task lands the resolver on its
-// own (unit-tested in isolation), before `parser`/`backend` (a later task in
-// this stage) wires it into `CliSearchBackend`. Non-test builds have no
-// caller yet, which `-D warnings` would otherwise reject as dead code.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tool {
     Rtk,
     Ripgrep,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedBackend {
     pub tool: Tool,
@@ -28,7 +22,6 @@ pub(crate) struct ResolvedBackend {
 /// is trusted as-is and surfaces as a spawn failure at run time, not here.
 /// `prefer_rtk == true` tries rtk then rg; `false` tries rg then rtk. Returns
 /// `None` when neither tool resolves.
-#[allow(dead_code)]
 pub(crate) fn resolve_backend(
     rtk_path: Option<&Path>,
     ripgrep_path: Option<&Path>,
