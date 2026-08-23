@@ -1616,6 +1616,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "flate2",
+ "hex",
  "repo-explorer-agent",
  "repo-explorer-core",
  "repo-explorer-llm",

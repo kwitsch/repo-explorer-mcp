@@ -571,22 +571,13 @@ fn verify_sha256(data: &[u8], checksum_text: &str, asset_name: &str) -> Result<(
         .ok_or_else(|| anyhow!("checksum file for {asset_name} is empty"))?;
     let mut hasher = Sha256::new();
     hasher.update(data);
-    let actual = hex_encode(&hasher.finalize());
+    let actual = hex::encode(hasher.finalize());
     if !expected.eq_ignore_ascii_case(&actual) {
         return Err(anyhow!(
             "checksum mismatch for {asset_name}: expected {expected}, got {actual}"
         ));
     }
     Ok(())
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
 
 /// True when `entry_name`'s base filename is `command` (optionally with a
@@ -884,7 +875,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(data);
-        let real = hex_encode(&hasher.finalize());
+        let real = hex::encode(hasher.finalize());
         assert!(verify_sha256(data, &real, "asset").is_ok());
     }
 
