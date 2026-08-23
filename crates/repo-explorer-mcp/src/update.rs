@@ -9,6 +9,13 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
+
+/// Upper bound on how long a network request or a `--version` subprocess
+/// check may run before it's treated as failed, so a stalled connection or a
+/// hung/misbehaving binary can't make `--update` block forever.
+const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// GitHub owner/repo for `repo-explorer-mcp` itself.
 const SELF_OWNER: &str = "kwitsch";
@@ -74,30 +81,10 @@ struct ComponentReport {
     detail: Option<String>,
 }
 
-struct Outcome {
-    name: String,
-    current_version: Option<semver::Version>,
-    latest_version: Option<semver::Version>,
-    action: &'static str,
-    detail: Option<String>,
-}
-
-impl Outcome {
-    fn into_report(self) -> ComponentReport {
-        ComponentReport {
-            name: self.name,
-            current_version: self.current_version.map(|v| v.to_string()),
-            latest_version: self.latest_version.map(|v| v.to_string()),
-            action: self.action,
-            detail: self.detail,
-        }
-    }
-}
-
-/// Run the update flow: check + install `repo-explorer-mcp` itself, then each
-/// dependency binary. Prints a structured JSON report to stdout (stdout is
-/// otherwise reserved for the MCP protocol stream, but no MCP session exists
-/// in this mode) and returns non-zero if any component failed.
+/// Run the update flow: check + install `repo-explorer-mcp` itself and each
+/// dependency binary concurrently. Prints a structured JSON report to stdout
+/// (stdout is otherwise reserved for the MCP protocol stream, but no MCP
+/// session exists in this mode) and returns non-zero if any component failed.
 pub async fn run_update() -> ExitCode {
     let client = match build_http_client() {
         Ok(c) => c,
@@ -107,15 +94,38 @@ pub async fn run_update() -> ExitCode {
         }
     };
 
-    let mut outcomes = vec![update_self(&client).await];
+    let mut handles = Vec::with_capacity(1 + DEPENDENCY_BINARIES.len());
+    let self_client = client.clone();
+    handles.push((
+        SELF_REPO.to_string(),
+        tokio::spawn(async move { update_self(&self_client).await }),
+    ));
     for dep in DEPENDENCY_BINARIES {
-        outcomes.push(update_dependency(&client, dep).await);
+        let client = client.clone();
+        handles.push((
+            dep.command.to_string(),
+            tokio::spawn(async move { update_dependency(&client, dep).await }),
+        ));
     }
 
-    let had_error = outcomes.iter().any(|o| o.action == "error");
+    let mut components = Vec::with_capacity(handles.len());
+    for (name, handle) in handles {
+        components.push(match handle.await {
+            Ok(report) => report,
+            Err(e) => ComponentReport {
+                name,
+                current_version: None,
+                latest_version: None,
+                action: "error",
+                detail: Some(format!("update task panicked: {e}")),
+            },
+        });
+    }
+
+    let had_error = components.iter().any(|c| c.action == "error");
     let report = UpdateReport {
         status: if had_error { "error" } else { "ok" },
-        components: outcomes.into_iter().map(Outcome::into_report).collect(),
+        components,
     };
     match serde_json::to_string_pretty(&report) {
         Ok(s) => println!("{s}"),
@@ -132,16 +142,17 @@ pub async fn run_update() -> ExitCode {
 fn build_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent("repo-explorer-mcp-updater")
+        .timeout(HTTP_TIMEOUT)
         .build()
         .context("failed to construct reqwest client")
 }
 
-async fn update_self(client: &reqwest::Client) -> Outcome {
+async fn update_self(client: &reqwest::Client) -> ComponentReport {
     let name = SELF_REPO.to_string();
     let current = match semver::Version::parse(env!("CARGO_PKG_VERSION")) {
         Ok(v) => v,
         Err(e) => {
-            return Outcome {
+            return ComponentReport {
                 name,
                 current_version: None,
                 latest_version: None,
@@ -154,9 +165,9 @@ async fn update_self(client: &reqwest::Client) -> Outcome {
     let release = match fetch_latest_release(client, SELF_OWNER, SELF_REPO).await {
         Ok(r) => r,
         Err(e) => {
-            return Outcome {
+            return ComponentReport {
                 name,
-                current_version: Some(current),
+                current_version: Some(current.to_string()),
                 latest_version: None,
                 action: "error",
                 detail: Some(e.to_string()),
@@ -167,9 +178,9 @@ async fn update_self(client: &reqwest::Client) -> Outcome {
     let latest = match parse_tag_version(&release.tag_name) {
         Ok(v) => v,
         Err(e) => {
-            return Outcome {
+            return ComponentReport {
                 name,
-                current_version: Some(current),
+                current_version: Some(current.to_string()),
                 latest_version: None,
                 action: "error",
                 detail: Some(e.to_string()),
@@ -178,20 +189,20 @@ async fn update_self(client: &reqwest::Client) -> Outcome {
     };
 
     if latest <= current {
-        return Outcome {
+        return ComponentReport {
             name,
-            current_version: Some(current),
-            latest_version: Some(latest),
+            current_version: Some(current.to_string()),
+            latest_version: Some(latest.to_string()),
             action: "up-to-date",
             detail: None,
         };
     }
 
     let Some(asset) = pick_asset(&release.assets) else {
-        return Outcome {
+        return ComponentReport {
             name,
-            current_version: Some(current),
-            latest_version: Some(latest),
+            current_version: Some(current.to_string()),
+            latest_version: Some(latest.to_string()),
             action: "error",
             detail: Some(format!(
                 "no release asset matched this platform ({})",
@@ -209,30 +220,30 @@ async fn update_self(client: &reqwest::Client) -> Outcome {
     )
     .await
     {
-        Ok(note) => Outcome {
+        Ok(note) => ComponentReport {
             name,
-            current_version: Some(current),
-            latest_version: Some(latest),
+            current_version: Some(current.to_string()),
+            latest_version: Some(latest.to_string()),
             action: "updated",
             detail: note.map(str::to_string),
         },
-        Err(e) => Outcome {
+        Err(e) => ComponentReport {
             name,
-            current_version: Some(current),
-            latest_version: Some(latest),
+            current_version: Some(current.to_string()),
+            latest_version: Some(latest.to_string()),
             action: "error",
             detail: Some(e.to_string()),
         },
     }
 }
 
-async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> Outcome {
+async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> ComponentReport {
     let name = dep.command.to_string();
 
     let path = match which::which(dep.command) {
         Ok(p) => p,
         Err(_) => {
-            return Outcome {
+            return ComponentReport {
                 name,
                 current_version: None,
                 latest_version: None,
@@ -247,9 +258,9 @@ async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> 
     let release = match fetch_latest_release(client, dep.owner, dep.repo).await {
         Ok(r) => r,
         Err(e) => {
-            return Outcome {
+            return ComponentReport {
                 name,
-                current_version,
+                current_version: current_version.map(|v| v.to_string()),
                 latest_version: None,
                 action: "error",
                 detail: Some(e.to_string()),
@@ -260,9 +271,9 @@ async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> 
     let latest = match parse_tag_version(&release.tag_name) {
         Ok(v) => v,
         Err(e) => {
-            return Outcome {
+            return ComponentReport {
                 name,
-                current_version,
+                current_version: current_version.map(|v| v.to_string()),
                 latest_version: None,
                 action: "error",
                 detail: Some(e.to_string()),
@@ -270,11 +281,11 @@ async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> 
         }
     };
 
-    let Some(current) = current_version.clone() else {
-        return Outcome {
+    let Some(current) = current_version else {
+        return ComponentReport {
             name,
             current_version: None,
-            latest_version: Some(latest),
+            latest_version: Some(latest.to_string()),
             action: "skipped",
             detail: Some(
                 "could not determine the installed version; skipping to avoid overwriting an \
@@ -285,20 +296,20 @@ async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> 
     };
 
     if latest <= current {
-        return Outcome {
+        return ComponentReport {
             name,
-            current_version: Some(current),
-            latest_version: Some(latest),
+            current_version: Some(current.to_string()),
+            latest_version: Some(latest.to_string()),
             action: "up-to-date",
             detail: None,
         };
     }
 
     let Some(asset) = pick_asset(&release.assets) else {
-        return Outcome {
+        return ComponentReport {
             name,
-            current_version: Some(current),
-            latest_version: Some(latest),
+            current_version: Some(current.to_string()),
+            latest_version: Some(latest.to_string()),
             action: "error",
             detail: Some(format!(
                 "no release asset matched this platform ({})",
@@ -316,38 +327,45 @@ async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> 
     )
     .await
     {
-        Ok(note) => Outcome {
+        Ok(note) => ComponentReport {
             name,
-            current_version: Some(current),
-            latest_version: Some(latest),
+            current_version: Some(current.to_string()),
+            latest_version: Some(latest.to_string()),
             action: "updated",
             detail: note.map(str::to_string),
         },
-        Err(e) => Outcome {
+        Err(e) => ComponentReport {
             name,
-            current_version: Some(current),
-            latest_version: Some(latest),
+            current_version: Some(current.to_string()),
+            latest_version: Some(latest.to_string()),
             action: "error",
             detail: Some(e.to_string()),
         },
     }
 }
 
-/// Run `<path> --version` and pull the first semver-looking substring out of
-/// its output (checked on stdout, then stderr, since CLIs disagree on which
-/// stream `--version` writes to).
+/// Run `<path> --version` (bounded by [`SUBPROCESS_TIMEOUT`]) and pull the
+/// first semver-looking substring out of its output (checked on stdout, then
+/// stderr, since CLIs disagree on which stream `--version` writes to).
 fn read_installed_version(path: &Path) -> Option<semver::Version> {
-    let output = std::process::Command::new(path)
-        .arg("--version")
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new(path);
+    command.arg("--version");
+    let output = run_with_timeout(command, SUBPROCESS_TIMEOUT)?;
     extract_semver(&String::from_utf8_lossy(&output.stdout))
         .or_else(|| extract_semver(&String::from_utf8_lossy(&output.stderr)))
 }
 
-/// Find the first substring made of digits and `.` that parses as semver.
+/// Find the first substring made of digits and `.` that parses as semver,
+/// preferring a match on the first line — a tool's own version conventionally
+/// leads its `--version` banner, ahead of any bundled library versions it
+/// might also print — and falling back to the rest of the text otherwise.
 /// A bare `MAJOR.MINOR` is accepted too, treated as `MAJOR.MINOR.0`.
 fn extract_semver(text: &str) -> Option<semver::Version> {
+    let first_line = text.lines().next().unwrap_or("");
+    scan_for_semver(first_line).or_else(|| scan_for_semver(text))
+}
+
+fn scan_for_semver(text: &str) -> Option<semver::Version> {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -370,6 +388,51 @@ fn extract_semver(text: &str) -> Option<semver::Version> {
         }
     }
     None
+}
+
+/// Run `command` to completion, killing it and returning `None` if it hasn't
+/// exited within `timeout`. Assumes small output (a `--version` banner is at
+/// most a few lines) — output isn't drained until the process exits, so a
+/// process that blocks on a full stdout/stderr pipe before exiting would
+/// still hang until the timeout.
+fn run_with_timeout(
+    mut command: std::process::Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    use std::io::Read;
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().ok()?;
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => return None,
+        }
+    };
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_end(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_end(&mut stderr);
+    }
+    Some(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn parse_tag_version(tag: &str) -> Result<semver::Version> {
@@ -405,11 +468,21 @@ fn current_os_keyword() -> &'static str {
     }
 }
 
-const ARCH_KEYWORDS: &[&str] = &["x86_64", "amd64"];
 const ARCHIVE_EXTENSIONS: &[&str] = &[".tar.gz", ".tgz", ".zip"];
 
 fn is_archive(name: &str) -> bool {
     ARCHIVE_EXTENSIONS.iter().any(|ext| name.ends_with(ext))
+}
+
+/// Release-asset architecture keywords for the host this binary is actually
+/// running on (`std::env::consts::ARCH`), not a hardcoded guess — a build
+/// running on e.g. `aarch64` must never match an `x86_64` asset.
+fn arch_keywords() -> Vec<&'static str> {
+    match std::env::consts::ARCH {
+        "x86_64" => vec!["x86_64", "amd64"],
+        "aarch64" => vec!["aarch64", "arm64"],
+        other => vec![other],
+    }
 }
 
 /// Pick the release asset matching the current OS/arch. Restricted to known
@@ -419,12 +492,13 @@ fn is_archive(name: &str) -> bool {
 /// non-`portable` build when both are offered for the same platform.
 fn pick_asset(assets: &[Asset]) -> Option<&Asset> {
     let os = current_os_keyword();
+    let arch_keywords = arch_keywords();
     let mut candidates: Vec<&Asset> = assets
         .iter()
         .filter(|a| {
             let name = a.name.to_lowercase();
             name.contains(os)
-                && ARCH_KEYWORDS.iter().any(|k| name.contains(k))
+                && arch_keywords.iter().any(|k| name.contains(k))
                 && is_archive(&name)
                 && !name.contains("-ui-")
         })
@@ -597,10 +671,14 @@ fn write_temp_executable(dir: &Path, prefix: &str, data: &[u8]) -> Result<std::p
 /// replaces anything already installed: run `<path> --version` and require a
 /// clean exit.
 fn verify_executable(path: &Path) -> Result<()> {
-    let output = std::process::Command::new(path)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("downloaded update at {} failed to execute", path.display()))?;
+    let mut command = std::process::Command::new(path);
+    command.arg("--version");
+    let output = run_with_timeout(command, SUBPROCESS_TIMEOUT).with_context(|| {
+        format!(
+            "downloaded update at {} failed to execute (or didn't exit within {SUBPROCESS_TIMEOUT:?})",
+            path.display()
+        )
+    })?;
     if !output.status.success() {
         return Err(anyhow!(
             "downloaded update at {} exited with {} on `--version`",
@@ -681,6 +759,17 @@ mod tests {
     }
 
     #[test]
+    fn extract_semver_prefers_first_line_over_a_later_bundled_version() {
+        // Regression: a multi-line `--version` banner that mentions a bundled
+        // library's version on a later line must not have that version
+        // mistaken for the tool's own.
+        assert_eq!(
+            extract_semver("ripgrep 14.1.1\nPCRE2 version: 10.42 2022-12-11").unwrap(),
+            semver::Version::parse("14.1.1").unwrap()
+        );
+    }
+
+    #[test]
     fn extract_semver_accepts_two_component_version() {
         assert_eq!(
             extract_semver("tool 2.5").unwrap(),
@@ -711,6 +800,19 @@ mod tests {
             name: name.to_string(),
             browser_download_url: format!("https://example.invalid/{name}"),
         }
+    }
+
+    #[test]
+    fn arch_keywords_never_match_a_foreign_architecture() {
+        // Regression: keywords must be derived from the actual host arch, not
+        // hardcoded to x86_64 — a foreign-arch asset must never match.
+        let keywords = arch_keywords();
+        let foreign = if std::env::consts::ARCH == "aarch64" {
+            "x86_64"
+        } else {
+            "aarch64"
+        };
+        assert!(!keywords.contains(&foreign));
     }
 
     #[test]
