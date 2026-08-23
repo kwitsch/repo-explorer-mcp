@@ -6,6 +6,7 @@
 
 mod server;
 mod setup;
+mod update;
 
 use anyhow::Context;
 use repo_explorer_agent::{AgentConfig, AgentLoop};
@@ -26,6 +27,9 @@ async fn main() -> ExitCode {
         // stdout: a one-shot CLI query that exits before the MCP transport starts.
         println!("repo-explorer-mcp {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
+    }
+    if update::wants_update(&argv) {
+        return update::run_update().await;
     }
     let config_path = resolve_config_path(
         &argv,
