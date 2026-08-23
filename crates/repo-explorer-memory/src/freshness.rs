@@ -45,10 +45,10 @@ pub(crate) fn decide_freshness(
     if !probe.exists {
         return FreshnessDecision::Reindex;
     }
-    match probe.changed_files {
-        ChangeCount::Unknown => return FreshnessDecision::Reindex,
-        ChangeCount::Known(n) if n > 0 => return FreshnessDecision::Reindex,
-        ChangeCount::Known(_) => {}
+    // Anything but a confirmed zero — a real change, or a soft probe failure
+    // we cannot distinguish from one — forces a reindex.
+    if !matches!(probe.changed_files, ChangeCount::Known(0)) {
+        return FreshnessDecision::Reindex;
     }
     match probe.last_indexed_at {
         Some(t) => match now.duration_since(t) {

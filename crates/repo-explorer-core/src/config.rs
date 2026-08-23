@@ -65,6 +65,16 @@ pub fn default_api_key_env(kind: &str) -> Option<&'static str> {
     }
 }
 
+/// The single definition of "is this API-key env var actually set": present
+/// and non-blank once trimmed. A blank value is worse than a missing one — it
+/// would pass a bare `env::var(..).is_ok()` check and then fail as a 401 at
+/// call time — so every layer that asks this question must ask it the same
+/// way. The accessor is injected so callers can supply a test double instead
+/// of mutating the process environment.
+pub fn env_var_is_set(get: impl Fn(&str) -> Option<String>, var: &str) -> bool {
+    get(var).is_some_and(|v| !v.trim().is_empty())
+}
+
 impl ProviderConfig {
     /// Effective API-key env var name: the explicit `api_key_env` when set,
     /// otherwise the default derived from `kind`. `None` when neither is
@@ -110,7 +120,7 @@ pub struct CodebaseMemoryConfig {
     pub staleness_seconds: u64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SearchConfig {
     /// Explicit path to the `rtk` binary; `None` → auto-detect in Stage 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -118,10 +128,27 @@ pub struct SearchConfig {
     /// Explicit path to the `ripgrep` binary; `None` → auto-detect in Stage 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ripgrep_path: Option<PathBuf>,
+    /// Per-search subprocess timeout. `0` means "no timeout" — the explicit
+    /// opt-out, not a stand-in for the default.
     #[serde(default = "default_search_timeout_seconds")]
     pub timeout_seconds: u64,
     #[serde(default = "default_prefer_rtk")]
     pub prefer_rtk: bool,
+}
+
+/// Hand-written (not derived) so that `SearchConfig::default()` and the serde
+/// field defaults are the *same* values: a derived `Default` would yield
+/// `timeout_seconds: 0` / `prefer_rtk: false`, silently disagreeing with what
+/// loading an empty `[search]` section produces.
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            rtk_path: None,
+            ripgrep_path: None,
+            timeout_seconds: default_search_timeout_seconds(),
+            prefer_rtk: default_prefer_rtk(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -231,7 +258,8 @@ pub enum ValidationError {
         explicit: bool,
     },
     #[error(
-        "provider `{provider}` has unknown kind `{kind}` (expected one of: anthropic, openai, gemini, google)"
+        "provider `{provider}` has unknown kind `{kind}` (expected one of: {})",
+        KNOWN_PROVIDER_KINDS.join(", ")
     )]
     UnknownProviderKind {
         index: usize,
@@ -319,12 +347,28 @@ pub fn to_toml_string(config: &Config) -> Result<String, ConfigError> {
 
 impl Config {
     /// Semantic validation, independent of parsing. Public so it is unit-testable
-    /// on hand-built `Config` values.
+    /// on hand-built `Config` values. Reads the process environment; use
+    /// [`Config::validate_with_env`] to supply a test double instead.
     pub fn validate(&self) -> Result<(), ValidationError> {
+        self.validate_with_env(|v| std::env::var(v).ok())
+    }
+
+    /// [`Config::validate`] with the API-key environment lookup injected, so a
+    /// caller (notably a test) can validate against a fixed variable table
+    /// instead of mutating the process environment — which is racy and, under a
+    /// multi-threaded test runner, undefined behaviour.
+    pub fn validate_with_env(
+        &self,
+        get_env: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), ValidationError> {
         if self.llm.providers.is_empty() {
             return Err(ValidationError::EmptyProviderList);
         }
 
+        // Name uniqueness is a whole-list property, so it gets its own pass
+        // first: otherwise an earlier provider's own (env/model/kind) problem
+        // would short-circuit before a later duplicate name is ever seen, and
+        // the user would have to fix one error to discover the next.
         let mut seen = std::collections::HashSet::new();
         for (index, provider) in self.llm.providers.iter().enumerate() {
             if !seen.insert(provider.name.as_str()) {
@@ -335,6 +379,7 @@ impl Config {
             }
         }
 
+        // Then the per-entry checks, in increasing order of specificity.
         for (index, provider) in self.llm.providers.iter().enumerate() {
             if provider.models.is_empty() {
                 return Err(ValidationError::EmptyModelsList {
@@ -342,9 +387,6 @@ impl Config {
                     provider: provider.name.clone(),
                 });
             }
-        }
-
-        for (index, provider) in self.llm.providers.iter().enumerate() {
             if !KNOWN_PROVIDER_KINDS.contains(&provider.kind.as_str()) {
                 return Err(ValidationError::UnknownProviderKind {
                     index,
@@ -352,11 +394,8 @@ impl Config {
                     kind: provider.kind.clone(),
                 });
             }
-        }
-
-        for (index, provider) in self.llm.providers.iter().enumerate() {
             let var = provider.resolve_api_key_env().unwrap_or_default();
-            if std::env::var(&var).is_err() {
+            if !env_var_is_set(&get_env, &var) {
                 return Err(ValidationError::MissingEnvVar {
                     index,
                     provider: provider.name.clone(),
@@ -397,6 +436,18 @@ mod tests {
             .join(name)
     }
 
+    /// `validate_with_env` accessor doubles. Preferred over mutating the real
+    /// process environment: `cargo test` runs these in parallel threads, and
+    /// concurrent `set_var`/`remove_var` is racy (and per `std::env`'s own
+    /// safety docs, undefined behaviour).
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    fn every_env(_: &str) -> Option<String> {
+        Some("not-a-real-key".to_string())
+    }
+
     /// Build a minimal valid `Config` in memory with a single provider whose
     /// `api_key_env` names `env_var`, and a stdio codebase_memory connection.
     fn config_with_provider(name: &str, env_var: &str) -> Config {
@@ -409,14 +460,14 @@ mod tests {
                     models: vec!["m".to_string()],
                     base_url: None,
                 }],
-                cooldown_seconds: 60,
+                cooldown_seconds: default_cooldown_seconds(),
                 https_proxy: None,
             },
             codebase_memory: CodebaseMemoryConfig {
                 command: Some("cmd".to_string()),
                 args: vec![],
                 endpoint: None,
-                staleness_seconds: 3600,
+                staleness_seconds: default_staleness_seconds(),
             },
             search: SearchConfig::default(),
             logging: LoggingConfig::default(),
@@ -451,7 +502,10 @@ mod tests {
         assert_eq!(config.logging.level, LogLevel::Debug);
 
         // Defaults for values omitted in the fixture.
-        assert_eq!(config.codebase_memory.staleness_seconds, 3600);
+        assert_eq!(
+            config.codebase_memory.staleness_seconds,
+            default_staleness_seconds()
+        );
         assert_eq!(
             config.codebase_memory.command.as_deref(),
             Some("codebase-memory-mcp")
@@ -473,31 +527,25 @@ mod tests {
     #[test]
     fn duplicate_provider_names_fail() {
         let mut config = config_with_provider("dup", "REPO_EXPLORER_TEST_KEY_DUP");
-        unsafe {
-            std::env::set_var("REPO_EXPLORER_TEST_KEY_DUP", "x");
-        }
         let second = config.llm.providers[0].clone();
         config.llm.providers.push(second);
+        // Reported even with no API key set anywhere: name uniqueness is a
+        // whole-list property and must not be masked by an earlier provider's
+        // own (env/model/kind) problem.
         assert_eq!(
-            config.validate(),
+            config.validate_with_env(no_env),
             Err(ValidationError::DuplicateProviderName {
                 index: 1,
                 name: "dup".to_string()
             })
         );
-        unsafe {
-            std::env::remove_var("REPO_EXPLORER_TEST_KEY_DUP");
-        }
     }
 
     #[test]
     fn missing_env_var_fails() {
         let var = "REPO_EXPLORER_TEST_KEY_MISSING";
-        unsafe {
-            std::env::remove_var(var);
-        }
         let config = config_with_provider("primary", var);
-        let err = config.validate().unwrap_err();
+        let err = config.validate_with_env(no_env).unwrap_err();
         assert_eq!(
             err,
             ValidationError::MissingEnvVar {
@@ -518,13 +566,9 @@ mod tests {
     #[test]
     fn missing_env_var_implicit_default_points_at_kind() {
         let var = "ANTHROPIC_API_KEY";
-        let had = std::env::var(var).ok();
-        unsafe {
-            std::env::remove_var(var);
-        }
         let mut config = config_with_provider("primary", var);
         config.llm.providers[0].api_key_env = None; // rely on kind-derived default
-        let err = config.validate().unwrap_err();
+        let err = config.validate_with_env(no_env).unwrap_err();
         assert_eq!(
             err,
             ValidationError::MissingEnvVar {
@@ -535,24 +579,26 @@ mod tests {
             }
         );
         assert_eq!(err.toml_path(), "llm.providers[0].kind");
-        if let Some(v) = had {
-            unsafe {
-                std::env::set_var(var, v);
-            }
-        }
+    }
+
+    #[test]
+    fn blank_env_var_counts_as_unset() {
+        let var = "REPO_EXPLORER_TEST_KEY_BLANK";
+        let config = config_with_provider("primary", var);
+        let err = config
+            .validate_with_env(|_| Some("   ".to_string()))
+            .unwrap_err();
+        assert!(matches!(err, ValidationError::MissingEnvVar { .. }));
     }
 
     #[test]
     fn codebase_memory_connection() {
         // Neither command nor endpoint.
         let mut config = config_with_provider("p", "REPO_EXPLORER_TEST_KEY_CM");
-        unsafe {
-            std::env::set_var("REPO_EXPLORER_TEST_KEY_CM", "x");
-        }
         config.codebase_memory.command = None;
         config.codebase_memory.endpoint = None;
         assert_eq!(
-            config.validate(),
+            config.validate_with_env(every_env),
             Err(ValidationError::MissingCodebaseMemoryConnection)
         );
 
@@ -560,23 +606,9 @@ mod tests {
         config.codebase_memory.command = Some("cmd".to_string());
         config.codebase_memory.endpoint = Some("http://localhost:1234".to_string());
         assert_eq!(
-            config.validate(),
+            config.validate_with_env(every_env),
             Err(ValidationError::ConflictingCodebaseMemoryConnection)
         );
-        unsafe {
-            std::env::remove_var("REPO_EXPLORER_TEST_KEY_CM");
-        }
-    }
-
-    #[test]
-    fn parse_error_is_reported() {
-        let malformed = "this is = = not valid toml";
-        let err = toml::from_str::<Config>(malformed).unwrap_err();
-        let config_err = ConfigError::Parse {
-            source: err,
-            location: None,
-        };
-        assert!(matches!(config_err, ConfigError::Parse { .. }));
     }
 
     #[test]
@@ -587,10 +619,7 @@ mod tests {
 
     #[test]
     fn unknown_provider_kind_fails() {
-        let var = "REPO_EXPLORER_TEST_KEY_UNKNOWN_KIND";
-        unsafe {
-            std::env::set_var(var, "x");
-        }
+        // No env var needed: the kind check runs before the API-key check.
         let err = load(&fixture_path("unknown_kind.toml")).unwrap_err();
         match &err {
             ConfigError::Validation(ValidationError::UnknownProviderKind {
@@ -605,9 +634,6 @@ mod tests {
             other => panic!("expected UnknownProviderKind, got {other:?}"),
         }
         assert_eq!(err.toml_path(), Some("llm.providers[0].kind".to_string()));
-        unsafe {
-            std::env::remove_var(var);
-        }
     }
 
     #[test]
@@ -783,9 +809,6 @@ mod tests {
     #[test]
     fn to_toml_string_round_trips_and_skips_none() {
         let var = "REPO_EXPLORER_TEST_KEY_ROUNDTRIP";
-        unsafe {
-            std::env::set_var(var, "x");
-        }
         let config = config_with_provider("primary", var);
         let toml = to_toml_string(&config).expect("serialize should succeed");
 
@@ -802,54 +825,56 @@ mod tests {
         // Round-trips back into an equivalent, valid Config.
         let parsed: Config = toml::from_str(&toml).expect("serialized TOML should parse");
         parsed
-            .validate()
+            .validate_with_env(every_env)
             .expect("round-tripped config should validate");
         assert_eq!(parsed.llm.providers[0].name, "primary");
         assert_eq!(parsed.llm.providers[0].api_key_env.as_deref(), Some(var));
         assert_eq!(parsed.llm.providers[0].models, vec!["m".to_string()]);
         assert_eq!(parsed.codebase_memory.command.as_deref(), Some("cmd"));
+        // Scalars that serde defaults would silently supply must survive the
+        // round trip: a TOML scalar emitted *after* an array-of-tables would
+        // be swallowed by the last `[[llm.providers]]` entry instead.
+        assert_eq!(parsed.llm.cooldown_seconds, config.llm.cooldown_seconds);
+        assert_eq!(
+            parsed.codebase_memory.staleness_seconds,
+            config.codebase_memory.staleness_seconds
+        );
+        assert_eq!(parsed.search.timeout_seconds, config.search.timeout_seconds);
+    }
 
-        unsafe {
-            std::env::remove_var(var);
-        }
+    #[test]
+    fn search_config_default_matches_serde_defaults() {
+        // A derived `Default` would silently disagree with the serde field
+        // defaults, and the setup wizard writes `SearchConfig::default()` —
+        // producing configs with no search timeout and rtk preference off.
+        let from_default = SearchConfig::default();
+        let from_empty_section: SearchConfig =
+            toml::from_str("").expect("an empty [search] section must parse");
+        assert_eq!(
+            from_default.timeout_seconds,
+            from_empty_section.timeout_seconds
+        );
+        assert_eq!(from_default.prefer_rtk, from_empty_section.prefer_rtk);
+        assert_eq!(
+            from_default.timeout_seconds,
+            default_search_timeout_seconds()
+        );
+        assert!(from_default.prefer_rtk);
     }
 
     #[test]
     fn to_toml_string_omits_implicit_default_api_key_env() {
         // A wizard-shaped gemini config: api_key_env = None (implicit default).
-        unsafe {
-            std::env::set_var("GEMINI_API_KEY", "x");
-        }
-        let config = Config {
-            llm: LlmConfig {
-                providers: vec![ProviderConfig {
-                    name: "gemini".to_string(),
-                    kind: "gemini".to_string(),
-                    api_key_env: None,
-                    models: vec!["gemini-2.5-flash".to_string()],
-                    base_url: None,
-                }],
-                cooldown_seconds: 60,
-                https_proxy: None,
-            },
-            codebase_memory: CodebaseMemoryConfig {
-                command: Some("codebase-memory-mcp".to_string()),
-                args: vec!["--stdio".to_string()],
-                endpoint: None,
-                staleness_seconds: 3600,
-            },
-            search: SearchConfig::default(),
-            logging: LoggingConfig::default(),
-        };
+        let mut config = config_with_provider("gemini", "GEMINI_API_KEY");
+        config.llm.providers[0].kind = "gemini".to_string();
+        config.llm.providers[0].api_key_env = None;
+        config.llm.providers[0].models = vec!["gemini-2.5-flash".to_string()];
         let toml = to_toml_string(&config).expect("serialize should succeed");
         assert!(
             !toml.contains("api_key_env"),
             "implicit-default api_key_env must be omitted, got:\n{toml}"
         );
         let parsed: Config = toml::from_str(&toml).expect("parse back");
-        parsed.validate().expect("validate");
-        unsafe {
-            std::env::remove_var("GEMINI_API_KEY");
-        }
+        parsed.validate_with_env(every_env).expect("validate");
     }
 }

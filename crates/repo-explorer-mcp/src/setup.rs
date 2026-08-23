@@ -11,11 +11,12 @@ use anyhow::Context;
 use repo_explorer_core::config::{
     self, CodebaseMemoryConfig, Config, KNOWN_PROVIDER_KINDS, LlmConfig, LoggingConfig,
     ProviderConfig, SearchConfig, default_api_key_env, default_cooldown_seconds,
-    default_staleness_seconds,
+    default_staleness_seconds, env_var_is_set,
 };
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
 /// True for the single-token subcommand `setup` (mirrors `wants_config_test`).
 pub fn wants_setup(args: &[String]) -> bool {
@@ -37,29 +38,26 @@ struct DetectedProvider {
 /// plus one wizard-specific extra alias (`GOOGLE_API_KEY`) that core has no
 /// reason to know about. `GEMINI_API_KEY` precedes `GOOGLE_API_KEY` so it wins
 /// the per-kind dedup when both are set.
-fn candidate_env_vars() -> Vec<(&'static str, &'static str)> {
-    let mut out: Vec<(&'static str, &'static str)> = Vec::new();
-    let mut seen_vars = std::collections::HashSet::new();
-    for &kind in KNOWN_PROVIDER_KINDS {
-        // `KNOWN_PROVIDER_KINDS` lists `gemini` and `google` as distinct kind
-        // strings that both resolve to `GEMINI_API_KEY` — keep only the first
-        // (canonical `gemini`) so `google` doesn't surface as a detectable kind.
-        if let Some(var) = default_api_key_env(kind)
-            && seen_vars.insert(var)
-        {
-            out.push((var, kind));
+/// Derived from `KNOWN_PROVIDER_KINDS` once per process, not per call.
+fn candidate_env_vars() -> &'static [(&'static str, &'static str)] {
+    static TABLE: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
+        let mut out: Vec<(&'static str, &'static str)> = Vec::new();
+        let mut seen_vars = std::collections::HashSet::new();
+        for &kind in KNOWN_PROVIDER_KINDS {
+            // `KNOWN_PROVIDER_KINDS` lists `gemini` and `google` as distinct
+            // kind strings that both resolve to `GEMINI_API_KEY` — keep only
+            // the first (canonical `gemini`) so `google` doesn't surface as a
+            // detectable kind.
+            if let Some(var) = default_api_key_env(kind)
+                && seen_vars.insert(var)
+            {
+                out.push((var, kind));
+            }
         }
-    }
-    out.push(("GOOGLE_API_KEY", "gemini"));
-    out
-}
-
-/// The single definition of "is this env var actually set": present and
-/// non-blank once trimmed. Shared by `detect_providers` and any other check
-/// that needs to ask the same question about a specific var (e.g. the
-/// both-Gemini-vars-set notice in `run_setup_inner`).
-fn env_var_is_set(get: &impl Fn(&str) -> Option<String>, var: &str) -> bool {
-    get(var).map(|v| !v.trim().is_empty()).unwrap_or(false)
+        out.push(("GOOGLE_API_KEY", "gemini"));
+        out
+    });
+    &TABLE
 }
 
 /// Scan candidate env vars via the injected accessor and return deduped
@@ -68,7 +66,7 @@ fn env_var_is_set(get: &impl Fn(&str) -> Option<String>, var: &str) -> bool {
 /// Injecting the accessor keeps this pure and unit-testable.
 fn detect_providers(get: impl Fn(&str) -> Option<String>) -> Vec<DetectedProvider> {
     let mut out: Vec<DetectedProvider> = Vec::new();
-    for &(var, kind) in &candidate_env_vars() {
+    for &(var, kind) in candidate_env_vars() {
         let present = env_var_is_set(&get, var);
         if !present {
             continue;
@@ -104,8 +102,8 @@ fn detect_providers(get: impl Fn(&str) -> Option<String>) -> Vec<DetectedProvide
 fn free_tier_models(kind: &str) -> &'static [&'static str] {
     match kind {
         "gemini" | "google" => &["gemini-2.5-flash", "gemini-2.5-flash-lite"],
-        "anthropic" => &[],
-        "openai" => &[],
+        // Every other kind (anthropic, openai, and anything unrecognized) has
+        // no standing free tier, so one arm covers them all.
         _ => &[],
     }
 }
@@ -197,17 +195,18 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
     let detected = detect_providers(get_env);
 
     // If both Gemini vars are set, note that GEMINI_API_KEY was preferred.
-    let gemini_set = env_var_is_set(&get_env, "GEMINI_API_KEY");
-    let google_set = env_var_is_set(&get_env, "GOOGLE_API_KEY");
+    let gemini_set = env_var_is_set(get_env, "GEMINI_API_KEY");
+    let google_set = env_var_is_set(get_env, "GOOGLE_API_KEY");
     if gemini_set && google_set {
         eprintln!("  note: both GEMINI_API_KEY and GOOGLE_API_KEY are set; using GEMINI_API_KEY.");
     }
 
     if detected.is_empty() {
+        let vars: Vec<&str> = candidate_env_vars().iter().map(|(var, _)| *var).collect();
         anyhow::bail!(
-            "no provider API-key environment variable detected. Set one of \
-             ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or GOOGLE_API_KEY \
-             and re-run `repo-explorer-mcp setup`."
+            "no provider API-key environment variable detected. Set one of {} \
+             and re-run `repo-explorer-mcp setup`.",
+            vars.join(", ")
         );
     }
     for p in &detected {
@@ -220,9 +219,10 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
         eprintln!();
         eprintln!("Configuring `{}` provider:", dp.kind);
 
-        // Provider name (kept unique for DuplicateProviderName).
-        let default_name = unique_name(dp.kind, &used_names);
-        let mut name = prompt_default("  provider name", &default_name)?;
+        // Provider name (kept unique for DuplicateProviderName). `detected` is
+        // already one entry per kind, so the kind itself is a free default;
+        // only a name the user types can collide.
+        let mut name = prompt_default("  provider name", dp.kind)?;
         if used_names.contains(&name) {
             let deduped = unique_name(&name, &used_names);
             eprintln!("  name `{name}` already used; using `{deduped}`.");

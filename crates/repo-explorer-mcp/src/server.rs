@@ -60,12 +60,12 @@ struct ExplorationResultDto {
     summary: String,
 }
 
-impl From<&ExplorationResult> for ExplorationResultDto {
-    fn from(result: &ExplorationResult) -> Self {
+impl From<ExplorationResult> for ExplorationResultDto {
+    fn from(result: ExplorationResult) -> Self {
         Self {
             findings: result
                 .findings
-                .iter()
+                .into_iter()
                 .map(|f| ExplorationFindingDto {
                     location: FileLocationDto {
                         // Deterministic; lossy only for non-UTF-8 path bytes,
@@ -74,11 +74,11 @@ impl From<&ExplorationResult> for ExplorationResultDto {
                         line_start: f.location.line_start,
                         line_end: f.location.line_end,
                     },
-                    snippet: f.snippet.clone(),
-                    note: f.note.clone(),
+                    snippet: f.snippet,
+                    note: f.note,
                 })
                 .collect(),
-            summary: result.summary.clone(),
+            summary: result.summary,
         }
     }
 }
@@ -124,7 +124,7 @@ impl RepoExplorerServer {
             .run(self.repo_root.as_ref(), &query)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(Json(ExplorationResultDto::from(&result)))
+        Ok(Json(ExplorationResultDto::from(result)))
     }
 }
 
@@ -169,7 +169,7 @@ mod tests {
             summary: "two findings".to_string(),
         };
 
-        let dto = ExplorationResultDto::from(&result);
+        let dto = ExplorationResultDto::from(result);
         let value = serde_json::to_value(&dto).expect("serialize dto");
 
         assert_eq!(value["summary"], "two findings");

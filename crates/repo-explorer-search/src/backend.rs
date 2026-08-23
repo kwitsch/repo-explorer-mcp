@@ -72,27 +72,19 @@ impl SearchBackend for CliSearchBackend {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| ".".to_string());
 
-        let (backend_name, args) = match resolved.tool {
-            Tool::Rtk => {
-                let mut args = vec!["rg".to_string(), "-H".to_string(), "-n".to_string()];
-                push_flags(&mut args, options);
-                // `--` ends option parsing so a pattern/target starting with
-                // `-` (e.g. `-\d+` or a leading-dash file name) is never
-                // misread as a flag by the underlying rg passthrough.
-                args.push("--".to_string());
-                args.push(pattern.to_string());
-                args.push(target);
-                ("rtk", args)
-            }
-            Tool::Ripgrep => {
-                let mut args = vec!["--json".to_string(), "-H".to_string()];
-                push_flags(&mut args, options);
-                args.push("--".to_string());
-                args.push(pattern.to_string());
-                args.push(target);
-                ("ripgrep", args)
-            }
+        // Only the leading flags and the reported backend name differ per tool;
+        // everything after them is identical, so it is built exactly once.
+        let (backend_name, leading) = match resolved.tool {
+            Tool::Rtk => ("rtk", ["rg", "-H", "-n"].as_slice()),
+            Tool::Ripgrep => ("ripgrep", ["--json", "-H"].as_slice()),
         };
+        let mut args: Vec<String> = leading.iter().map(|s| s.to_string()).collect();
+        push_flags(&mut args, options);
+        // `--` ends option parsing so a pattern/target starting with `-` (e.g.
+        // `-\d+` or a leading-dash file name) is never misread as a flag.
+        args.push("--".to_string());
+        args.push(pattern.to_string());
+        args.push(target);
 
         let spec = SpawnSpec {
             backend: backend_name,

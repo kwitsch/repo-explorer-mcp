@@ -62,9 +62,32 @@ repo-explorer-mcp --version # prints: repo-explorer-mcp 0.1.0
 
 ## Configuration
 
-The server reads a TOML config. Path precedence: `--config <path>` →
-`REPO_EXPLORER_CONFIG` env var → `./repo-explorer.toml`. The launch working
-directory is treated as the repository root to explore.
+The server reads a TOML config. Path precedence:
+
+1. `--config <path>` / `--config=<path>`
+2. the `REPO_EXPLORER_CONFIG` env var
+3. the per-user config file —
+   `$XDG_CONFIG_HOME/repo-explorer/repo-explorer.toml` (Linux, defaulting to
+   `~/.config`) or `%APPDATA%\repo-explorer\repo-explorer.toml` (Windows) —
+   when it exists
+4. `./repo-explorer.toml` in the launch directory, when it exists
+
+With no config anywhere, the per-user path is where `repo-explorer-mcp setup`
+writes. The launch working directory is treated as the repository root to
+explore.
+
+### First run
+
+```bash
+repo-explorer-mcp setup # interactive wizard: detects provider API-key
+# env vars and writes the per-user config
+repo-explorer-mcp config test # validate the resolved config (JSON report on
+# stdout, non-zero exit on failure)
+```
+
+The wizard runs automatically when no config is found **and** stdin is a TTY.
+Launched non-interactively (as an MCP server is) with no config, the binary
+prints setup guidance to stderr and exits non-zero rather than blocking.
 
 Example `repo-explorer.toml`:
 
@@ -78,15 +101,18 @@ cooldown_seconds = 90
 # Providers are tried in file order (= failover order).
 [[llm.providers]]
 name = "primary"
-kind = "anthropic"
+kind = "anthropic"                  # anthropic | openai | gemini | google
 api_key_env = "ANTHROPIC_API_KEY"   # names an env var; never the key itself
-model = "claude-sonnet-4"
+                                    # omit it to use the kind's default var
+# Ordered model list: the first is tried first; on a usage-limit error the
+# router advances to the next model, then to the next provider entry.
+models = ["claude-sonnet-4", "claude-haiku-4"]
 
 [[llm.providers]]
 name = "secondary"
 kind = "openai"
 api_key_env = "OPENAI_API_KEY"
-model = "gpt-4o"
+models = ["gpt-4o"]
 
 # Exactly one of `command`+`args` (stdio) XOR `endpoint` (network).
 [codebase_memory]
@@ -122,9 +148,11 @@ Installed-binary form (what the setup script prints):
 ```
 
 On Windows the `command` is
-`%LOCALAPPDATA%\\repo-explorer-mcp\\repo-explorer-mcp.exe`. Add
-`"--config", "<path>"` to `args` if your `repo-explorer.toml` is not at the
-launch cwd. The in-repo development form instead launches via
+`%LOCALAPPDATA%\\repo-explorer-mcp\\repo-explorer-mcp.exe`. With no `--config`
+in `args`, the config is resolved by the precedence above (per-user file first,
+then a `repo-explorer.toml` in the launch directory); add
+`"--config", "<path>"` to `args` to point at a specific file. The in-repo
+development form instead launches via
 `cargo run --release --quiet -p repo-explorer-mcp --`.
 
 ## Build & test
@@ -138,14 +166,17 @@ cargo fmt --check
 
 ## Troubleshooting
 
-Config loading fails fast with a named error:
+Config loading fails fast with a named error. `repo-explorer-mcp config test`
+prints the error plus the offending TOML key path as JSON.
 
-| Error                                 | Cause                                    | Fix                                        |
-| ------------------------------------- | ---------------------------------------- | ------------------------------------------ |
-| `EmptyProviderList`                   | `llm.providers` is empty                 | Add at least one `[[llm.providers]]`.      |
-| `DuplicateProviderName`               | Two providers share a `name`             | Make each provider `name` unique.          |
-| `MissingEnvVar`                       | An `api_key_env` names an unset variable | `export` the named variable before launch. |
-| `MissingCodebaseMemoryConnection`     | Neither `command` nor `endpoint` set     | Set exactly one under `[codebase_memory]`. |
-| `ConflictingCodebaseMemoryConnection` | Both `command` and `endpoint` set        | Keep exactly one.                          |
+| Error                                 | Cause                                                | Fix                                        |
+| ------------------------------------- | ---------------------------------------------------- | ------------------------------------------ |
+| `EmptyProviderList`                   | `llm.providers` is empty                             | Add at least one `[[llm.providers]]`.      |
+| `DuplicateProviderName`               | Two providers share a `name`                         | Make each provider `name` unique.          |
+| `EmptyModelsList`                     | A provider's `models` list is empty                  | List at least one model ID.                |
+| `UnknownProviderKind`                 | `kind` is not `anthropic`/`openai`/`gemini`/`google` | Use one of the supported kinds.            |
+| `MissingEnvVar`                       | An `api_key_env` names an unset or blank variable    | `export` the named variable before launch. |
+| `MissingCodebaseMemoryConnection`     | Neither `command` nor `endpoint` set                 | Set exactly one under `[codebase_memory]`. |
+| `ConflictingCodebaseMemoryConnection` | Both `command` and `endpoint` set                    | Keep exactly one.                          |
 
 See `docs/smoke-test.md` for verifying a downloaded release artifact end to end.

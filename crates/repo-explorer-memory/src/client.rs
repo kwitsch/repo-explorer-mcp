@@ -93,12 +93,12 @@ fn text_of(result: &CallToolResult) -> String {
 /// failure becomes `MemoryError::Decode`.
 pub(crate) fn decode_result(
     tool: &'static str,
-    result: &CallToolResult,
+    result: CallToolResult,
 ) -> Result<Value, MemoryError> {
-    if let Some(sc) = &result.structured_content {
-        return Ok(sc.clone());
+    if let Some(sc) = result.structured_content {
+        return Ok(sc);
     }
-    let text = text_of(result);
+    let text = text_of(&result);
     if text.trim().is_empty() {
         return Ok(Value::Null);
     }
@@ -116,8 +116,8 @@ pub(crate) fn decode_result(
 /// Canonicalizes `repo_root` first — same normalization `run_index` applies
 /// before calling `index_repository` — so a relative value like `.` resolves
 /// to its real directory name instead of erroring out immediately.
-pub(crate) fn project_name(repo_root: &Path) -> Result<String, MemoryError> {
-    let abs = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+pub(crate) async fn project_name(repo_root: &Path) -> Result<String, MemoryError> {
+    let abs = canonicalize_repo_root(repo_root).await;
     project_name_from_abs(repo_root, &abs)
 }
 
@@ -144,18 +144,15 @@ pub(crate) fn project_name_from_abs(repo_root: &Path, abs: &Path) -> Result<Stri
 /// (missing path, non-UTF8 quirks, or the blocking task itself failing).
 pub(crate) async fn canonicalize_repo_root(repo_root: &Path) -> std::path::PathBuf {
     let owned = repo_root.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let fallback = owned.clone();
-        std::fs::canonicalize(&owned).unwrap_or(fallback)
-    })
-    .await
-    .unwrap_or_else(|_| repo_root.to_path_buf())
+    tokio::task::spawn_blocking(move || std::fs::canonicalize(&owned).unwrap_or(owned))
+        .await
+        .unwrap_or_else(|_| repo_root.to_path_buf())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use repo_explorer_core::config::CodebaseMemoryConfig;
+    use repo_explorer_core::config::{CodebaseMemoryConfig, default_staleness_seconds};
     use std::path::Path;
 
     fn cfg_endpoint() -> CodebaseMemoryConfig {
@@ -163,7 +160,7 @@ mod tests {
             command: None,
             args: vec![],
             endpoint: Some("http://localhost:9999".to_string()),
-            staleness_seconds: 3600,
+            staleness_seconds: default_staleness_seconds(),
         }
     }
 
@@ -176,17 +173,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn project_name_from_directory() {
+    #[tokio::test]
+    async fn project_name_from_directory() {
         assert_eq!(
-            project_name(Path::new("/home/user/my-repo")).unwrap(),
+            project_name(Path::new("/home/user/my-repo")).await.unwrap(),
             "my-repo".to_string()
         );
     }
 
-    #[test]
-    fn project_name_root_path_errors() {
-        let err = project_name(Path::new("/")).unwrap_err();
+    #[tokio::test]
+    async fn project_name_root_path_errors() {
+        let err = project_name(Path::new("/")).await.unwrap_err();
         assert!(matches!(err, MemoryError::InvalidInput(_)));
     }
 }

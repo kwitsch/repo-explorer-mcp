@@ -35,39 +35,25 @@ pub(crate) async fn run(spec: &SpawnSpec) -> Result<String, SearchError> {
         message: format!("failed to spawn: {e}"),
     })?;
 
-    // A zero timeout means "no timeout" (the value type's derived `Default` is
-    // zero, distinct from the serde-loaded default): await the child directly
-    // rather than firing an instantaneous timeout.
+    // `timeout_seconds = 0` is the explicit "no timeout" opt-out: await the
+    // child directly rather than firing an instantaneous timeout.
     let wait = child.wait_with_output();
     let output = if spec.timeout.is_zero() {
-        match wait.await {
-            Ok(o) => o,
-            Err(e) => {
-                return Err(SearchError::BackendFailed {
-                    backend: spec.backend,
-                    message: format!("process error: {e}"),
-                });
-            }
-        }
+        wait.await
     } else {
-        match tokio::time::timeout(spec.timeout, wait).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                return Err(SearchError::BackendFailed {
-                    backend: spec.backend,
-                    message: format!("process error: {e}"),
-                });
-            }
-            Err(_) => {
-                // Timed out: dropping the future here drops the child, and
-                // kill_on_drop(true) reaps it — no orphan is left behind.
-                return Err(SearchError::Timeout {
-                    backend: spec.backend,
-                    seconds: spec.timeout.as_secs(),
-                });
-            }
-        }
-    };
+        // Timed out: dropping the future here drops the child, and
+        // kill_on_drop(true) reaps it — no orphan is left behind.
+        tokio::time::timeout(spec.timeout, wait)
+            .await
+            .map_err(|_| SearchError::Timeout {
+                backend: spec.backend,
+                seconds: spec.timeout.as_secs(),
+            })?
+    }
+    .map_err(|e| SearchError::BackendFailed {
+        backend: spec.backend,
+        message: format!("process error: {e}"),
+    })?;
 
     match output.status.code() {
         Some(0) | Some(1) => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),

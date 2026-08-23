@@ -13,6 +13,7 @@ import {
   installDir,
   mcpSnippet,
   resolveVersion,
+  parseInstalledVersion,
 } from "./index.mjs";
 
 test("parseArgs reads all flags", () => {
@@ -165,6 +166,21 @@ test("mcpSnippet round-trips a path without double-escaping backslashes", () => 
   const posixPath = "/home/user/.local/bin/repo-explorer-mcp";
   const parsedPosix = JSON.parse(mcpSnippet(posixPath));
   assert.equal(parsedPosix.mcpServers["repo-explorer"].command, posixPath);
+});
+
+test("parseInstalledVersion finds the semver regardless of surrounding text", () => {
+  assert.equal(parseInstalledVersion("repo-explorer-mcp 0.1.0"), "0.1.0");
+  // Survives a suffix, which a last-token split would not.
+  assert.equal(
+    parseInstalledVersion("repo-explorer-mcp 0.1.0 (abc1234)"),
+    "0.1.0",
+  );
+  assert.equal(
+    parseInstalledVersion("repo-explorer-mcp 1.2.3-rc.1"),
+    "1.2.3-rc.1",
+  );
+  assert.equal(parseInstalledVersion(null), null);
+  assert.equal(parseInstalledVersion("no version here"), null);
 });
 
 test("resolveVersion rejects an explicitly empty pinned version", async () => {

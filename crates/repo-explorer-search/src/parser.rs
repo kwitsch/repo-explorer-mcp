@@ -10,11 +10,6 @@ use repo_explorer_core::search::SearchError;
 use serde_json::Value;
 use std::path::PathBuf;
 
-// `#[allow(dead_code)]` on these items: this task lands the parsers on their
-// own (fixture-tested in isolation), before `backend` (a later task in this
-// stage) wires them into `CliSearchBackend`. Non-test builds have no caller
-// yet, which `-D warnings` would otherwise reject as dead code.
-
 /// Split one grep-style line into `(path, line, content, is_match)`.
 ///
 /// The path itself may contain both `:` and `-` (e.g. `repo-explorer-core`, or
@@ -26,7 +21,6 @@ use std::path::PathBuf;
 /// prefer `:` (match lines) over `-` (context lines): a match line's path
 /// never legitimately contains a `:NN:` run, so this can't misfire the other
 /// way.
-#[allow(dead_code)]
 fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
     scan_for_separator(line, b':').or_else(|| scan_for_separator(line, b'-'))
 }
@@ -62,18 +56,19 @@ fn scan_for_separator(line: &str, sep: u8) -> Option<(&str, u32, &str, bool)> {
 /// `parse_rg_json`, whose context-line handling is otherwise identical.
 fn append_context(findings: &mut [ExplorationFinding], text: &str) {
     if let Some(last) = findings.last_mut() {
-        let combined = match last.snippet.take() {
-            Some(s) => format!("{s}\n{text}"),
-            None => text.to_string(),
-        };
-        last.snippet = Some(combined);
+        match last.snippet.as_mut() {
+            Some(s) => {
+                s.push('\n');
+                s.push_str(text);
+            }
+            None => last.snippet = Some(text.to_string()),
+        }
     }
 }
 
 /// Parse `rtk rg -H -n` output. Each match line becomes one finding; a context
 /// line appends its content to the previous finding's snippet on a best-effort
 /// basis (dropped if there is no previous finding).
-#[allow(dead_code)]
 pub(crate) fn parse_rtk(stdout: &str) -> Vec<ExplorationFinding> {
     let mut findings: Vec<ExplorationFinding> = Vec::new();
     for line in stdout.lines() {
@@ -106,7 +101,13 @@ pub(crate) fn parse_rtk(stdout: &str) -> Vec<ExplorationFinding> {
 /// well-formed line missing expected fields (including a `bytes`-only binary
 /// row) is skipped. Only `"match"` produces a finding; `"context"` appends to
 /// the previous finding's snippet; all other event types are ignored.
-#[allow(dead_code)]
+fn row_line_text(data: &Value) -> Option<&str> {
+    data.get("lines")
+        .and_then(|l| l.get("text"))
+        .and_then(Value::as_str)
+        .map(|s| s.strip_suffix('\n').unwrap_or(s))
+}
+
 pub(crate) fn parse_rg_json(stdout: &str) -> Result<Vec<ExplorationFinding>, SearchError> {
     let mut findings: Vec<ExplorationFinding> = Vec::new();
     for line in stdout.lines() {
@@ -118,30 +119,25 @@ pub(crate) fn parse_rg_json(stdout: &str) -> Result<Vec<ExplorationFinding>, Sea
             message: format!("invalid JSON line: {e}"),
         })?;
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
-        let data = match value.get("data") {
-            Some(d) => d,
-            None => continue,
+        let Some(data) = value.get("data") else {
+            continue;
         };
         match kind {
             "match" => {
-                let path = match data
+                // bytes-only / binary row: drop gracefully
+                let Some(path) = data
                     .get("path")
                     .and_then(|p| p.get("text"))
                     .and_then(Value::as_str)
-                {
-                    Some(p) => p,
-                    None => continue, // bytes-only / binary row: drop gracefully
+                else {
+                    continue;
                 };
                 let line_number = data
                     .get("line_number")
                     .and_then(Value::as_u64)
                     .map(saturate_u32)
                     .unwrap_or(0);
-                let snippet = data
-                    .get("lines")
-                    .and_then(|l| l.get("text"))
-                    .and_then(Value::as_str)
-                    .map(|s| s.strip_suffix('\n').unwrap_or(s).to_string());
+                let snippet = row_line_text(data).map(str::to_string);
                 findings.push(ExplorationFinding {
                     location: FileLocation {
                         path: PathBuf::from(path),
@@ -153,12 +149,7 @@ pub(crate) fn parse_rg_json(stdout: &str) -> Result<Vec<ExplorationFinding>, Sea
                 });
             }
             "context" => {
-                if let Some(text) = data
-                    .get("lines")
-                    .and_then(|l| l.get("text"))
-                    .and_then(Value::as_str)
-                {
-                    let text = text.strip_suffix('\n').unwrap_or(text);
+                if let Some(text) = row_line_text(data) {
                     append_context(&mut findings, text);
                 }
             }

@@ -11,7 +11,7 @@ GitHub Release, then verify:
 Linux:
 
 ```bash
-sha256sum -c repo-explorer-mcp-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c repo-explorer-mcp- < version > -x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
 Windows (PowerShell):
@@ -34,15 +34,26 @@ This confirms the versioned build without loading any config.
 ## 3. Prepare a test repo
 
 In a scratch repository, create a minimal `repo-explorer.toml` with a single
-provider (its `api_key_env` variable set in the environment) and a reachable
-`codebase-memory-mcp` (stdio `command` or network `endpoint`). Ensure `rg` is on
-PATH; `rtk` is optional.
+provider (`models = [...]`, and its `api_key_env` variable set in the
+environment) and a reachable `codebase-memory-mcp` (stdio `command` or network
+`endpoint`). Ensure `rg` is on PATH; `rtk` is optional.
+
+Validate it before launching:
+
+```bash
+./repo-explorer-mcp --config ./repo-explorer.toml config test
+```
+
+Expect `"status": "valid"` and exit code 0. (Alternatively run
+`./repo-explorer-mcp setup` to have the wizard write a per-user config.)
 
 ## 4. Launch the binary
 
-Run the binary from the test repo root. Confirm it logs
-`repo-explorer-mcp serving on stdio` to **stderr** and that **stdout** carries
-the JSON-RPC MCP stream (do not expect human-readable logs on stdout).
+Run the binary from the test repo root, passing `--config ./repo-explorer.toml`
+explicitly so the resolution order can't pick up a pre-existing per-user config.
+Confirm it logs `repo-explorer-mcp serving on stdio` to **stderr** and that
+**stdout** carries the JSON-RPC MCP stream (do not expect human-readable logs on
+stdout).
 
 ## 5. Register in Claude Code
 
