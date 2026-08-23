@@ -28,6 +28,10 @@ pub struct LlmConfig {
     pub providers: Vec<ProviderConfig>,
     #[serde(default = "default_cooldown_seconds")]
     pub cooldown_seconds: u64,
+    /// HTTPS proxy URL used for all model upstream requests when set.
+    /// Applies uniformly to every provider entry; unset means "no proxy".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -218,6 +222,8 @@ pub enum ValidationError {
     MissingCodebaseMemoryConnection,
     #[error("codebase_memory sets both `command` and `endpoint`; exactly one is allowed")]
     ConflictingCodebaseMemoryConnection,
+    #[error("llm.https_proxy `{url}` is not a valid http(s):// URL")]
+    InvalidHttpsProxyUrl { url: String },
 }
 
 impl ValidationError {
@@ -245,6 +251,7 @@ impl ValidationError {
             }
             ValidationError::MissingCodebaseMemoryConnection
             | ValidationError::ConflictingCodebaseMemoryConnection => "codebase_memory".to_string(),
+            ValidationError::InvalidHttpsProxyUrl { .. } => "llm.https_proxy".to_string(),
         }
     }
 }
@@ -346,6 +353,12 @@ impl Config {
             _ => {}
         }
 
+        if let Some(proxy) = &self.llm.https_proxy
+            && !(proxy.starts_with("http://") || proxy.starts_with("https://"))
+        {
+            return Err(ValidationError::InvalidHttpsProxyUrl { url: proxy.clone() });
+        }
+
         Ok(())
     }
 }
@@ -375,6 +388,7 @@ mod tests {
                     base_url: None,
                 }],
                 cooldown_seconds: 60,
+                https_proxy: None,
             },
             codebase_memory: CodebaseMemoryConfig {
                 command: Some("cmd".to_string()),
@@ -633,6 +647,46 @@ mod tests {
             ValidationError::ConflictingCodebaseMemoryConnection.toml_path(),
             "codebase_memory"
         );
+        assert_eq!(
+            ValidationError::InvalidHttpsProxyUrl {
+                url: "ftp://x".to_string()
+            }
+            .toml_path(),
+            "llm.https_proxy"
+        );
+    }
+
+    #[test]
+    fn https_proxy_accepts_http_and_https_schemes() {
+        let mut config = config_with_provider("p", "REPO_EXPLORER_TEST_KEY_PROXY_OK");
+        unsafe {
+            std::env::set_var("REPO_EXPLORER_TEST_KEY_PROXY_OK", "x");
+        }
+        config.llm.https_proxy = Some("https://proxy.example.com:8443".to_string());
+        assert!(config.validate().is_ok());
+        config.llm.https_proxy = Some("http://proxy.example.com:8080".to_string());
+        assert!(config.validate().is_ok());
+        unsafe {
+            std::env::remove_var("REPO_EXPLORER_TEST_KEY_PROXY_OK");
+        }
+    }
+
+    #[test]
+    fn https_proxy_rejects_non_http_scheme() {
+        let mut config = config_with_provider("p", "REPO_EXPLORER_TEST_KEY_PROXY_BAD");
+        unsafe {
+            std::env::set_var("REPO_EXPLORER_TEST_KEY_PROXY_BAD", "x");
+        }
+        config.llm.https_proxy = Some("proxy.example.com:8080".to_string());
+        assert_eq!(
+            config.validate(),
+            Err(ValidationError::InvalidHttpsProxyUrl {
+                url: "proxy.example.com:8080".to_string()
+            })
+        );
+        unsafe {
+            std::env::remove_var("REPO_EXPLORER_TEST_KEY_PROXY_BAD");
+        }
     }
 
     #[test]
@@ -706,6 +760,7 @@ mod tests {
                     base_url: None,
                 }],
                 cooldown_seconds: 60,
+                https_proxy: None,
             },
             codebase_memory: CodebaseMemoryConfig {
                 command: Some("codebase-memory-mcp".to_string()),

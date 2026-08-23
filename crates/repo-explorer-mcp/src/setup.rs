@@ -303,11 +303,26 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
         }
     };
 
+    // HTTPS proxy for model upstream requests (optional).
+    eprintln!();
+    eprintln!("HTTPS proxy for model upstream requests (optional; leave blank for none):");
+    let https_proxy = loop {
+        let raw = prompt_default("  proxy URL", "")?;
+        if raw.is_empty() {
+            break None;
+        }
+        if raw.starts_with("http://") || raw.starts_with("https://") {
+            break Some(raw);
+        }
+        eprintln!("  proxy URL must start with http:// or https://.");
+    };
+
     // search / logging left at defaults (fully defaulted in core); not prompted.
     let cfg = Config {
         llm: LlmConfig {
             providers,
             cooldown_seconds: default_cooldown_seconds(),
+            https_proxy,
         },
         codebase_memory,
         search: SearchConfig::default(),
