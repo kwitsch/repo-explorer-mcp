@@ -70,7 +70,7 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
         move || {
             format!(
                 "semantic{}{}{}",
-                encode_field(&query.text.trim().to_lowercase()),
+                encode_field(&query.text),
                 encode_field(&scope_display(scope)),
                 encode_field(&query.max_results.map(|m| m.to_string()).unwrap_or_default())
             )

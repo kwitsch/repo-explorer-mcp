@@ -429,10 +429,11 @@ where
                     budget.add(completion.usage);
                     match completion.response {
                         ProviderResponse::ToolCalls(calls) if calls.is_empty() => {
-                            messages.push(Message::assistant_tool_calls(Vec::new()));
-                            messages.push(Message::user(
+                            push_nudge(
+                                &mut messages,
+                                Message::assistant_tool_calls(Vec::new()),
                                 "You must respond with a tool call; call finish when done.",
-                            ));
+                            );
                         }
                         ProviderResponse::ToolCalls(calls) => {
                             // Deferred: `calls` is only read via `.iter()` below (never
@@ -477,10 +478,11 @@ where
                             }
                         }
                         ProviderResponse::Text(text) => {
-                            messages.push(Message::assistant_text(text));
-                            messages.push(Message::user(
+                            push_nudge(
+                                &mut messages,
+                                Message::assistant_text(text),
                                 "You must respond with a tool call; call finish when done.",
-                            ));
+                            );
                         }
                     }
                 }
@@ -609,6 +611,14 @@ When you have gathered enough information, you MUST conclude by calling the fini
 /// How many retrieval candidates are listed as starting points in the
 /// fallback prompt.
 const SEED_CANDIDATES: usize = 8;
+
+/// Push an assistant turn followed by the user-facing nudge asking it to
+/// retry with a tool call — the shape shared by the fallback loop's and the
+/// verification stage's empty-tool-calls and stray-text arms.
+pub(crate) fn push_nudge(messages: &mut Vec<Message>, assistant: Message, nudge: &str) {
+    messages.push(assistant);
+    messages.push(Message::user(nudge));
+}
 
 /// The 4-part preamble shared by the fallback loop's and the verification
 /// stage's user prompts: query text, scope hint, max_results, index note.

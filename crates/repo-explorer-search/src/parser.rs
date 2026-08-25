@@ -54,22 +54,24 @@ fn find_sep_run(bytes: &[u8], sep: u8) -> Option<(usize, usize)> {
 /// `issue-42-fix.rs:10:the fix` both have a plausible `-` run starting left of
 /// a plausible `:` run, yet the former is genuinely `-`-delimited (dash real)
 /// and the latter is genuinely `:`-delimited (dash is inside the path). What
-/// differs is what sits immediately before the found `:` run: a real
-/// trailing path segment (`fix.rs`, `old.rs`) ends in a non-digit byte, while
-/// a coincidental `:NN:` run inside numeric content is always immediately
-/// preceded by a digit, since it's part of a longer `digit:digit` chain --
-/// whether that chain starts right after the `-NN-` separator (a bare
-/// timestamp `12:30:05`) or only after other text first (a prefixed
-/// timestamp `boot 12:30:05`, a slice `data[10:20:2]`). So when both runs
-/// exist and the `-` run starts first, only trust it if the byte right
-/// before the `:` run is a digit; otherwise the `:` run sits right after a
-/// real path segment and is the genuine separator.
+/// differs is what sits between the two runs: a real trailing path segment
+/// (`fix.rs`, `old.rs`) always carries a file extension, so it contains a
+/// `.`, while a coincidental `:NN:` run inside genuine `-`-delimited content
+/// never does -- whether that content is a bare word (`status`), a bare
+/// timestamp (`12:30:05`), or a word/timestamp mix (`boot 12:30:05`,
+/// `data[10:20:2]`). (Checking only the byte right before the `:` run for a
+/// digit is not enough: that misses the bare-word case, e.g.
+/// `status:42:ok`, where nothing but a `.` distinguishes it from a real
+/// trailing path segment.) So when both runs exist and the `-` run starts
+/// first, only trust it if no `.` appears between the two runs; otherwise
+/// the `:` run sits right after a real path segment and is the genuine
+/// separator.
 fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
     let bytes = line.as_bytes();
     let colon = find_sep_run(bytes, b':');
     let dash = find_sep_run(bytes, b'-');
     let (sep, i, j) = match (colon, dash) {
-        (Some(c), Some(d)) if d.0 < c.0 && bytes[c.0 - 1].is_ascii_digit() => (b'-', d.0, d.1),
+        (Some(c), Some(d)) if d.0 < c.0 && !bytes[d.1 + 1..c.0].contains(&b'.') => (b'-', d.0, d.1),
         (Some(c), _) => (b':', c.0, c.1),
         (None, Some(d)) => (b'-', d.0, d.1),
         (None, None) => return None,
@@ -378,6 +380,17 @@ mod tests {
 
         let result = split_grep_line("src/log.rs-69-data[10:20:2]");
         assert_eq!(result, Some(("src/log.rs", 69, "data[10:20:2]", false)));
+    }
+
+    #[test]
+    fn split_grep_line_handles_context_line_with_bare_word_colon_run_in_content() {
+        // A coincidental `:NN:` run preceded by a bare word (no digit chain,
+        // no space) must still not be mistaken for the real match separator:
+        // unlike a real trailing path segment (`fix.rs`), the word `status`
+        // carries no file extension, so the genuine `-69-` context separator
+        // wins.
+        let result = split_grep_line("src/log.rs-69-status:42:ok");
+        assert_eq!(result, Some(("src/log.rs", 69, "status:42:ok", false)));
     }
 
     #[test]

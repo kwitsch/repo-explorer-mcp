@@ -143,19 +143,21 @@ impl MemoryClientBackend {
         }
     }
 
-    /// Shared tail of every read-only memory-query method: build `{"project":
-    /// ...}` plus whatever `build_args` inserts, call `tool`, decode, and turn
-    /// the response into an `ExplorationResult` — the one place that
-    /// call/decode sequence lives. `map` is the only per-tool difference
-    /// (row-array responses use [`findings_and_summary`]; `get_code_snippet`
-    /// decodes a single row).
+    /// Shared tail of every read-only memory-query method: resolve
+    /// `repo_root` to its project name, build `{"project": ...}` plus
+    /// whatever `build_args` inserts, call `tool`, decode, and turn the
+    /// response into an `ExplorationResult` — the one place that
+    /// resolve/call/decode sequence lives. `map` is the only per-tool
+    /// difference (row-array responses use [`findings_and_summary`];
+    /// `get_code_snippet` decodes a single row).
     async fn call_memory_tool_with(
         &self,
         tool: &'static str,
-        project: String,
+        repo_root: &Path,
         build_args: impl FnOnce(&mut Map<String, Value>),
         map: impl FnOnce(&'static str, &Value) -> ExplorationResult,
     ) -> Result<ExplorationResult, MemoryError> {
+        let project = project_name(repo_root).await?;
         let mut args = base_args(project);
         build_args(&mut args);
         let result = self.client.call(tool, args).await?;
@@ -168,10 +170,10 @@ impl MemoryClientBackend {
     async fn call_memory_tool(
         &self,
         tool: &'static str,
-        project: String,
+        repo_root: &Path,
         build_args: impl FnOnce(&mut Map<String, Value>),
     ) -> Result<ExplorationResult, MemoryError> {
-        self.call_memory_tool_with(tool, project, build_args, findings_and_summary)
+        self.call_memory_tool_with(tool, repo_root, build_args, findings_and_summary)
             .await
     }
 }
@@ -473,8 +475,7 @@ impl MemoryBackend for MemoryClientBackend {
         repo_root: &Path,
         query: &ExplorationQuery,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root).await?;
-        self.call_memory_tool("search_code", project, |args| {
+        self.call_memory_tool("search_code", repo_root, |args| {
             args.insert("pattern".to_string(), Value::String(query.text.clone()));
             if let Some(scope) = &query.scope_hint {
                 args.insert(
@@ -494,8 +495,7 @@ impl MemoryBackend for MemoryClientBackend {
         repo_root: &Path,
         query: &GraphQuery,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root).await?;
-        self.call_memory_tool("search_graph", project, |args| {
+        self.call_memory_tool("search_graph", repo_root, |args| {
             args.insert("format".to_string(), Value::String("json".to_string()));
             if let Some(v) = &query.name_pattern {
                 args.insert("name_pattern".to_string(), Value::String(v.clone()));
@@ -519,8 +519,7 @@ impl MemoryBackend for MemoryClientBackend {
         query: &str,
         max_results: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root).await?;
-        self.call_memory_tool("query_graph", project, |args| {
+        self.call_memory_tool("query_graph", repo_root, |args| {
             args.insert("query".to_string(), Value::String(query.to_string()));
             if let Some(limit) = max_results {
                 args.insert("limit".to_string(), Value::Number(limit.into()));
@@ -536,8 +535,7 @@ impl MemoryBackend for MemoryClientBackend {
         to: &str,
         max_depth: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root).await?;
-        self.call_memory_tool("trace_path", project, |args| {
+        self.call_memory_tool("trace_path", repo_root, |args| {
             args.insert("from".to_string(), Value::String(from.to_string()));
             args.insert("to".to_string(), Value::String(to.to_string()));
             if let Some(depth) = max_depth {
@@ -552,8 +550,7 @@ impl MemoryBackend for MemoryClientBackend {
         repo_root: &Path,
         depth: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root).await?;
-        self.call_memory_tool("get_architecture", project, |args| {
+        self.call_memory_tool("get_architecture", repo_root, |args| {
             if let Some(d) = depth {
                 args.insert("depth".to_string(), Value::Number(d.into()));
             }
@@ -566,10 +563,9 @@ impl MemoryBackend for MemoryClientBackend {
         repo_root: &Path,
         target: &SnippetTarget,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root).await?;
         self.call_memory_tool_with(
             "get_code_snippet",
-            project,
+            repo_root,
             |args| match target {
                 SnippetTarget::QualifiedName(name) => {
                     args.insert("qualified_name".to_string(), Value::String(name.clone()));

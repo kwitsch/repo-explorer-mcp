@@ -14,7 +14,7 @@ use repo_explorer_core::retrieval::kind_label;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::agent::TokenBudget;
+use crate::agent::{TokenBudget, push_nudge};
 use crate::dispatch::{parse_args, read_file};
 use crate::render::{RenderCaps, cap_file_lines, cap_snippet};
 use crate::skeleton::skeleton_for;
@@ -106,12 +106,18 @@ where
                         messages.extend(responses);
                     }
                     ProviderResponse::ToolCalls(_) => {
-                        messages.push(Message::assistant_tool_calls(Vec::new()));
-                        messages.push(Message::user("Respond with a tool call: expand or finish."));
+                        push_nudge(
+                            &mut messages,
+                            Message::assistant_tool_calls(Vec::new()),
+                            "Respond with a tool call: expand or finish.",
+                        );
                     }
                     ProviderResponse::Text(text) => {
-                        messages.push(Message::assistant_text(text));
-                        messages.push(Message::user("Respond with a tool call: expand or finish."));
+                        push_nudge(
+                            &mut messages,
+                            Message::assistant_text(text),
+                            "Respond with a tool call: expand or finish.",
+                        );
                     }
                 }
             }

@@ -386,23 +386,16 @@ pub(crate) fn parse_finish(arguments_json: &str) -> Result<ExplorationResult, St
 /// fallback loop and the verification stage, which otherwise duplicated this
 /// exact resolution logic.
 pub(crate) fn resolve_finish(calls: &[ToolCall]) -> Result<ExplorationResult, Vec<Message>> {
-    let finishes: Vec<&ToolCall> = calls.iter().filter(|c| c.name == "finish").collect();
-    if let Some(result) = finishes
-        .iter()
-        .find_map(|c| parse_finish(&c.arguments_json).ok())
-    {
-        return Ok(result);
-    }
-    let rejections = finishes
-        .iter()
-        .filter_map(|c| {
-            let reason = parse_finish(&c.arguments_json).err()?;
-            Some(Message::tool(
+    let mut rejections = Vec::new();
+    for c in calls.iter().filter(|c| c.name == "finish") {
+        match parse_finish(&c.arguments_json) {
+            Ok(result) => return Ok(result),
+            Err(reason) => rejections.push(Message::tool(
                 &c.id,
                 format!("finish rejected: {reason}; fix the arguments and call finish again"),
-            ))
-        })
-        .collect();
+            )),
+        }
+    }
     Err(rejections)
 }
 

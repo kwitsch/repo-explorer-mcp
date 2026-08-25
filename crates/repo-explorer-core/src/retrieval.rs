@@ -5,7 +5,6 @@
 //! `repo-explorer-memory`'s `freshness.rs`.
 
 use crate::domain::{Candidate, CandidateKind, ExplorationFinding, FileLocation};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Search inputs derived deterministically from a query text.
@@ -249,20 +248,37 @@ pub fn merge_and_rank(raw: Vec<Candidate>, patterns: &QueryPatterns, top_k: u32)
         }
     }
 
-    let mut per_file: HashMap<PathBuf, Vec<Candidate>> = HashMap::new();
-    for mut candidate in raw {
-        candidate.location = normalize_location(candidate.location);
-        per_file
-            .entry(candidate.location.path.clone())
-            .or_default()
-            .push(candidate);
-    }
+    let mut normalized: Vec<Candidate> = raw
+        .into_iter()
+        .map(|mut candidate| {
+            candidate.location = normalize_location(candidate.location);
+            candidate
+        })
+        .collect();
+    // Single sort by (path, line_start, line_end) doubles as the per-file
+    // grouping key (consecutive runs below) and the line ordering merge()
+    // needs, replacing a HashMap groupby (one PathBuf clone per candidate)
+    // plus a redundant per-file sort.
+    normalized.sort_by(|a, b| {
+        a.location
+            .path
+            .cmp(&b.location.path)
+            .then_with(|| a.location.line_start.cmp(&b.location.line_start))
+            .then_with(|| a.location.line_end.cmp(&b.location.line_end))
+    });
 
     let mut merged: Vec<Candidate> = Vec::new();
-    for (_, mut candidates) in per_file {
-        candidates.sort_by_key(|c| (c.location.line_start, c.location.line_end));
-        let mut file_merged: Vec<Candidate> = Vec::new();
-        for candidate in candidates {
+    let mut candidates = normalized.into_iter().peekable();
+    while let Some(first) = candidates.next() {
+        let mut file_merged: Vec<Candidate> = vec![first];
+        loop {
+            let same_file = candidates
+                .peek()
+                .is_some_and(|c| c.location.path == file_merged[0].location.path);
+            if !same_file {
+                break;
+            }
+            let candidate = candidates.next().expect("peeked Some above");
             match file_merged.last_mut() {
                 Some(last) if overlaps(&last.location, &candidate.location) => {
                     merge_into(last, candidate);
