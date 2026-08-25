@@ -274,16 +274,22 @@ pub(crate) fn parse_rg_json(stdout: &str) -> Result<Vec<ExplorationFinding>, Sea
                 at_boundary = false;
             }
             "context" => {
+                // Compute the gap and advance `last_line_number` from this row's
+                // `line_number` even when `lines` is undecodable (`bytes`, no
+                // `text`): otherwise an unrelated undecodable row between two
+                // decodable ones would leave `last_line_number` stale, making the
+                // next contiguous row look like it has a gap and get misrouted as
+                // leading context for a later, unrelated match.
+                let line_number = row_line_number(data);
+                let gap = match (last_line_number, line_number) {
+                    (Some(prev), Some(n)) => prev.checked_add(1) != Some(n),
+                    _ => true,
+                };
+                at_boundary |= gap;
                 if let Some(text) = row_line_text(data) {
-                    let line_number = row_line_number(data);
-                    let gap = match (last_line_number, line_number) {
-                        (Some(prev), Some(n)) => prev.checked_add(1) != Some(n),
-                        _ => true,
-                    };
-                    at_boundary |= gap;
                     handle_context_line(&mut findings, &mut pending_before, at_boundary, text);
-                    last_line_number = line_number.or(last_line_number);
                 }
+                last_line_number = line_number.or(last_line_number);
             }
             _ => {} // end / summary / unknown: ignored, not a decode error
         }
@@ -485,6 +491,32 @@ mod tests {
         );
         let findings = parse_rg_json(input).unwrap();
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn parse_rg_json_undecodable_context_row_keeps_line_bookkeeping() {
+        // An undecodable (`bytes`-only) context row between two decodable ones
+        // must still update `last_line_number`/`at_boundary` from its own
+        // `line_number` even though it contributes no text itself: otherwise
+        // the next contiguous context row would see a spurious gap and get
+        // misrouted as leading context for a later, unrelated match instead of
+        // trailing context for the match it actually follows.
+        let input = concat!(
+            "{\"type\":\"begin\",\"data\":{\"path\":{\"text\":\"f.rs\"}}}\n",
+            "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
+            "\"lines\":{\"text\":\"MATCH_A\\n\"},\"line_number\":3}}\n",
+            "{\"type\":\"context\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
+            "\"lines\":{\"bytes\":\"AAAA\"},\"line_number\":4}}\n",
+            "{\"type\":\"context\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
+            "\"lines\":{\"text\":\"line5\\n\"},\"line_number\":5}}\n",
+            "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
+            "\"lines\":{\"text\":\"MATCH_B\\n\"},\"line_number\":20}}\n",
+            "{\"type\":\"end\",\"data\":{\"path\":{\"text\":\"f.rs\"}}}\n",
+        );
+        let findings = parse_rg_json(input).unwrap();
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].snippet.as_deref(), Some("MATCH_A\nline5"));
+        assert_eq!(findings[1].snippet.as_deref(), Some("MATCH_B"));
     }
 
     #[test]

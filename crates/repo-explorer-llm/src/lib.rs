@@ -285,10 +285,21 @@ fn to_genai_messages(
     messages: &[Message],
     cache_system_prompt: bool,
 ) -> Result<Vec<genai::chat::ChatMessage>, ProviderError> {
+    // Tool-call id -> originating tool name, so a later Role::Tool message can
+    // report its fn_name even when the provider that issued the call differs
+    // from the one this conversation is now being replayed to (cross-provider
+    // failover): call ids are provider-native and mean nothing to a different
+    // provider's adapter, but the name is stable across providers.
+    let call_id_to_fn_name: std::collections::HashMap<&str, &str> = messages
+        .iter()
+        .flat_map(|m| &m.tool_calls)
+        .map(|tc| (tc.id.as_str(), tc.name.as_str()))
+        .collect();
+
     messages
         .iter()
         .map(|m| {
-            let mapped = to_genai_message(provider, m)?;
+            let mapped = to_genai_message(provider, m, &call_id_to_fn_name)?;
             Ok(if cache_system_prompt && m.role == Role::System {
                 mapped.with_options(
                     genai::chat::MessageOptions::default()
@@ -301,10 +312,13 @@ fn to_genai_messages(
         .collect()
 }
 
-/// Map a single domain `Message` onto a genai `ChatMessage`.
+/// Map a single domain `Message` onto a genai `ChatMessage`. `call_id_to_fn_name`
+/// resolves a `Role::Tool` message's originating tool name (see
+/// `to_genai_messages`), independent of which provider issued the call id.
 fn to_genai_message(
     provider: &str,
     message: &Message,
+    call_id_to_fn_name: &std::collections::HashMap<&str, &str>,
 ) -> Result<genai::chat::ChatMessage, ProviderError> {
     use genai::chat::{ChatMessage, ContentPart, MessageContent, ToolResponse};
 
@@ -326,10 +340,11 @@ fn to_genai_message(
         }
         Role::Tool => {
             let call_id = message.tool_call_id.clone().unwrap_or_default();
-            Ok(ChatMessage::tool(ToolResponse::new(
-                call_id,
-                message.content.clone(),
-            )))
+            let mut response = ToolResponse::new(call_id.clone(), message.content.clone());
+            if let Some(fn_name) = call_id_to_fn_name.get(call_id.as_str()) {
+                response = response.with_fn_name(*fn_name);
+            }
+            Ok(ChatMessage::tool(response))
         }
     }
 }
@@ -596,6 +611,37 @@ mod tests {
                 message: "credit balance is too low".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn to_genai_messages_resolves_tool_response_fn_name_across_providers() {
+        // The call id looks like an Anthropic-native id (as opposed to this
+        // crate's own synthetic ids), simulating a history built against one
+        // provider and replayed to another on cross-provider failover.
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "toolu_01ABC".to_string(),
+                    name: "read_file".to_string(),
+                    arguments_json: "{}".to_string(),
+                }],
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: "file contents".to_string(),
+                tool_calls: vec![],
+                tool_call_id: Some("toolu_01ABC".to_string()),
+            },
+        ];
+
+        let chat_messages =
+            to_genai_messages("gemini", &messages, false).expect("mapping succeeds");
+        let responses = chat_messages[1].content.tool_responses();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].fn_name.as_deref(), Some("read_file"));
     }
 
     #[test]

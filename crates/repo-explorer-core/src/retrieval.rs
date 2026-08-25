@@ -95,6 +95,29 @@ fn find_quote_start(s: &str) -> Option<(usize, char)> {
     None
 }
 
+/// Locate the delimiter that closes a literal opened with `quote` in `s`.
+/// `"` and `` ` `` always count; `'` is skipped when it sits inside a word
+/// (a word char on both sides, e.g. the possessive in `cache's`) so a
+/// contraction/possessive apostrophe within the literal doesn't close it
+/// early — the genuine closing quote is itself preceded by a word char (the
+/// literal's last letter), so, unlike `find_quote_start`, only a word char on
+/// *both* sides marks it as non-delimiting.
+fn find_quote_end(s: &str, quote: char) -> Option<usize> {
+    for (i, c) in s.char_indices() {
+        if c != quote {
+            continue;
+        }
+        if quote == '\''
+            && s[..i].chars().next_back().is_some_and(is_word_char)
+            && s[i + 1..].chars().next().is_some_and(is_word_char)
+        {
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
 /// Derive deterministic search inputs from a free-text query.
 pub fn derive_patterns(query: &str) -> QueryPatterns {
     let mut patterns = QueryPatterns::default();
@@ -106,7 +129,7 @@ pub fn derive_patterns(query: &str) -> QueryPatterns {
         unquoted.push_str(&rest[..open]);
         unquoted.push(' ');
         let after = &rest[open + 1..];
-        match after.find(quote) {
+        match find_quote_end(after, quote) {
             Some(close) => {
                 push_unique(&mut patterns.literals, after[..close].trim().to_string());
                 rest = &after[close + 1..];
