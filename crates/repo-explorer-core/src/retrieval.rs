@@ -165,9 +165,9 @@ fn kind_rank(kind: CandidateKind) -> u32 {
     kind_base_score(kind)
 }
 
-/// Number of distinct query identifiers/literals appearing (case-insensitive)
-/// in the candidate's symbol, path, or snippet.
-fn coverage(candidate: &Candidate, patterns: &QueryPatterns) -> u32 {
+/// Number of distinct query identifiers/literals (pre-lowercased by the
+/// caller) appearing in the candidate's symbol, path, or snippet.
+fn coverage(candidate: &Candidate, lowered_patterns: &[String]) -> u32 {
     let haystack = format!(
         "{} {} {}",
         candidate.symbol.as_deref().unwrap_or(""),
@@ -175,11 +175,9 @@ fn coverage(candidate: &Candidate, patterns: &QueryPatterns) -> u32 {
         candidate.snippet.as_deref().unwrap_or("")
     )
     .to_ascii_lowercase();
-    patterns
-        .identifiers
+    lowered_patterns
         .iter()
-        .chain(patterns.literals.iter())
-        .filter(|token| !token.is_empty() && haystack.contains(&token.to_ascii_lowercase()))
+        .filter(|token| haystack.contains(token.as_str()))
         .count() as u32
 }
 
@@ -188,7 +186,9 @@ fn coverage(candidate: &Candidate, patterns: &QueryPatterns) -> u32 {
 fn normalize_location(location: FileLocation) -> FileLocation {
     let path = normalize_rel_path(&location.path);
     let (mut start, mut end) = (location.line_start, location.line_end);
-    if end < start {
+    if end == 0 {
+        end = start;
+    } else if end < start {
         std::mem::swap(&mut start, &mut end);
     }
     FileLocation {
@@ -225,6 +225,15 @@ fn merge_into(a: &mut Candidate, b: Candidate) {
 /// Merge overlapping candidates per file, score, rank, and truncate to
 /// `top_k`. Deterministic: stable ordering by (score desc, path, line_start).
 pub fn merge_and_rank(raw: Vec<Candidate>, patterns: &QueryPatterns, top_k: u32) -> Vec<Candidate> {
+    // Lowercase pattern tokens once; coverage() reuses this across every candidate.
+    let lowered_patterns: Vec<String> = patterns
+        .identifiers
+        .iter()
+        .chain(patterns.literals.iter())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect();
+
     let mut per_file: HashMap<PathBuf, Vec<Candidate>> = HashMap::new();
     for mut candidate in raw {
         candidate.location = normalize_location(candidate.location);
@@ -251,7 +260,7 @@ pub fn merge_and_rank(raw: Vec<Candidate>, patterns: &QueryPatterns, top_k: u32)
         let density_boost = 15 * (file_merged.len().saturating_sub(1)).min(4) as u32;
         for mut candidate in file_merged {
             let base = kind_base_score(candidate.kind);
-            let coverage_boost = (30 * coverage(&candidate, patterns)).min(120);
+            let coverage_boost = (30 * coverage(&candidate, &lowered_patterns)).min(120);
             candidate.score = (base + coverage_boost + density_boost).min(MAX_SCORE);
             merged.push(candidate);
         }

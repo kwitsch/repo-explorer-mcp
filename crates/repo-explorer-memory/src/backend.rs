@@ -40,16 +40,27 @@ impl MemoryClientBackend {
         self.client.close().await;
     }
 
+    /// Shared `base_args -> client.call -> decode_result` sequence used by
+    /// both `probe_status` and `probe_changes`; each caller keeps its own
+    /// error-downgrading on top of this.
+    async fn call_and_decode(
+        &self,
+        tool: &'static str,
+        project: &str,
+    ) -> Result<Value, MemoryError> {
+        let args = base_args(project.to_string());
+        let result = self.client.call(tool, args).await?;
+        decode_result(result)
+    }
+
     /// Probe `index_status` for the project, returning `(exists,
     /// last_indexed_at)`; a tool error meaning "not indexed" is reported as
     /// `exists = false` rather than an `Err`. The changed-file count is not
     /// this call's to know, so the full `IndexProbe` is assembled by
     /// `ensure_fresh_index` instead of being returned half-filled here.
     async fn probe_status(&self, project: &str) -> Result<(bool, Option<SystemTime>), MemoryError> {
-        let args = base_args(project.to_string());
-        match self.client.call("index_status", args).await {
-            Ok(result) => {
-                let json = decode_result("index_status", result)?;
+        match self.call_and_decode("index_status", project).await {
+            Ok(json) => {
                 // An unrecognized/empty response must NOT be optimistically
                 // treated as "already indexed" — default to `false` so an
                 // unknown shape forces a (safe) reindex instead of skipping one.
@@ -76,10 +87,8 @@ impl MemoryClientBackend {
 
     /// Fill `changed_files` from `detect_changes` for an existing project.
     async fn probe_changes(&self, project: &str) -> Result<ChangeCount, MemoryError> {
-        let args = base_args(project.to_string());
-        match self.client.call("detect_changes", args).await {
-            Ok(result) => {
-                let json = decode_result("detect_changes", result)?;
+        match self.call_and_decode("detect_changes", project).await {
+            Ok(json) => {
                 // Only a shape we actually understand yields a `Known` count.
                 // An absent field, an unexpected type, or a number that is not
                 // a plain non-negative integer is `Unknown` — never `Known(0)`,
@@ -150,7 +159,7 @@ impl MemoryClientBackend {
         let mut args = base_args(project);
         build_args(&mut args);
         let result = self.client.call(tool, args).await?;
-        let json = decode_result(tool, result)?;
+        let json = decode_result(result)?;
         Ok(map(tool, &json))
     }
 

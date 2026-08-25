@@ -158,7 +158,7 @@ fn symbol_candidates(findings: Vec<ExplorationFinding>, token: &str) -> Vec<Cand
     findings
         .into_iter()
         .map(|f| {
-            let symbol = f.note.clone();
+            let symbol = f.note;
             let kind = match symbol.as_deref() {
                 Some(name) if last_segment(name) == token => CandidateKind::SymbolExact,
                 _ => CandidateKind::SymbolFuzzy,

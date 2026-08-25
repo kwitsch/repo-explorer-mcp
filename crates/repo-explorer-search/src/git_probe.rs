@@ -5,6 +5,7 @@
 use crate::process::{SpawnSpec, run};
 use repo_explorer_core::fingerprint::{RepoFingerprint, RepoStateProbe};
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -44,25 +45,29 @@ fn sha256_hex(parts: &[&str]) -> String {
     let digest = hasher.finalize();
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
+        write!(out, "{byte:02x}").unwrap();
     }
     out
 }
 
 impl RepoStateProbe for GitStateProbe {
     async fn fingerprint(&self, repo_root: &Path) -> Option<RepoFingerprint> {
-        let head = self.git(repo_root, &["rev-parse", "HEAD"]).await?;
-        let head_sha = head.trim().to_string();
-        if head_sha.is_empty() {
-            return None;
-        }
         // The dirty digest covers the porcelain status (path set incl.
         // untracked files) plus the full `git diff HEAD` patch text, whose
         // `index` lines pin the base blobs — so an equal digest means equal
         // dirty *content* for tracked files, not merely an equal path set.
         // Blind spot: content edits inside an already-untracked file.
-        let status = self.git(repo_root, &["status", "--porcelain"]).await?;
-        let diff = self.git(repo_root, &["diff", "HEAD"]).await?;
+        let (head, status, diff) = tokio::join!(
+            self.git(repo_root, &["rev-parse", "HEAD"]),
+            self.git(repo_root, &["status", "--porcelain"]),
+            self.git(repo_root, &["diff", "HEAD"])
+        );
+        let head_sha = head?.trim().to_string();
+        if head_sha.is_empty() {
+            return None;
+        }
+        let status = status?;
+        let diff = diff?;
         Some(RepoFingerprint {
             head_sha,
             dirty_hash: sha256_hex(&[&status, &diff]),

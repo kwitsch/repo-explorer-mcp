@@ -215,7 +215,7 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
 
     let mut providers: Vec<ProviderConfig> = Vec::new();
     let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for dp in &detected {
+    for dp in detected {
         eprintln!();
         eprintln!("Configuring `{}` provider:", dp.kind);
 
@@ -262,7 +262,7 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
         // default for this kind; else explicit (the GOOGLE_API_KEY case).
         let api_key_env = match default_api_key_env(dp.kind) {
             Some(def) if def == dp.api_key_env => None,
-            _ => Some(dp.api_key_env.clone()),
+            _ => Some(dp.api_key_env),
         };
 
         providers.push(ProviderConfig {

@@ -159,79 +159,16 @@ async fn update_self(client: &reqwest::Client) -> ComponentReport {
         }
     };
 
-    let release = match fetch_latest_release(client, SELF_OWNER, SELF_REPO).await {
-        Ok(r) => r,
-        Err(e) => {
-            return ComponentReport {
-                name,
-                current_version: Some(current.to_string()),
-                latest_version: None,
-                action: "error",
-                detail: Some(e.to_string()),
-            };
-        }
-    };
-
-    let latest = match parse_tag_version(&release.tag_name) {
-        Ok(v) => v,
-        Err(e) => {
-            return ComponentReport {
-                name,
-                current_version: Some(current.to_string()),
-                latest_version: None,
-                action: "error",
-                detail: Some(e.to_string()),
-            };
-        }
-    };
-
-    if latest <= current {
-        return ComponentReport {
-            name,
-            current_version: Some(current.to_string()),
-            latest_version: Some(latest.to_string()),
-            action: "up-to-date",
-            detail: None,
-        };
-    }
-
-    let Some(asset) = pick_asset(&release.assets) else {
-        return ComponentReport {
-            name,
-            current_version: Some(current.to_string()),
-            latest_version: Some(latest.to_string()),
-            action: "error",
-            detail: Some(format!(
-                "no release asset matched this platform ({})",
-                current_os_keyword()
-            )),
-        };
-    };
-
-    match install_from_asset(
+    check_and_install(
         client,
-        &release.assets,
-        asset,
+        name,
+        SELF_OWNER,
         SELF_REPO,
+        SELF_REPO,
+        Some(current),
         InstallTarget::SelfExe,
     )
     .await
-    {
-        Ok(note) => ComponentReport {
-            name,
-            current_version: Some(current.to_string()),
-            latest_version: Some(latest.to_string()),
-            action: "updated",
-            detail: note.map(str::to_string),
-        },
-        Err(e) => ComponentReport {
-            name,
-            current_version: Some(current.to_string()),
-            latest_version: Some(latest.to_string()),
-            action: "error",
-            detail: Some(e.to_string()),
-        },
-    }
 }
 
 async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> ComponentReport {
@@ -250,14 +187,40 @@ async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> 
         }
     };
 
-    let current_version = read_installed_version_blocking(path.clone()).await;
+    let current = read_installed_version_blocking(path.clone()).await;
 
-    let release = match fetch_latest_release(client, dep.owner, dep.repo).await {
+    check_and_install(
+        client,
+        name,
+        dep.owner,
+        dep.repo,
+        dep.command,
+        current,
+        InstallTarget::Path(&path),
+    )
+    .await
+}
+
+/// Shared fetch-release -> parse-tag -> compare-versions -> pick-asset ->
+/// install -> [`ComponentReport`] sequence used by both `update_self` and
+/// `update_dependency`, once each has arrived at its own `current` version
+/// (or `None`, if it couldn't be determined but a release lookup is still
+/// worth doing to report the latest version).
+async fn check_and_install(
+    client: &reqwest::Client,
+    name: String,
+    owner: &str,
+    repo: &str,
+    command: &str,
+    current: Option<semver::Version>,
+    target: InstallTarget<'_>,
+) -> ComponentReport {
+    let release = match fetch_latest_release(client, owner, repo).await {
         Ok(r) => r,
         Err(e) => {
             return ComponentReport {
                 name,
-                current_version: current_version.map(|v| v.to_string()),
+                current_version: current.as_ref().map(|v| v.to_string()),
                 latest_version: None,
                 action: "error",
                 detail: Some(e.to_string()),
@@ -270,7 +233,7 @@ async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> 
         Err(e) => {
             return ComponentReport {
                 name,
-                current_version: current_version.map(|v| v.to_string()),
+                current_version: current.as_ref().map(|v| v.to_string()),
                 latest_version: None,
                 action: "error",
                 detail: Some(e.to_string()),
@@ -278,7 +241,7 @@ async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> 
         }
     };
 
-    let Some(current) = current_version else {
+    let Some(current) = current else {
         return ComponentReport {
             name,
             current_version: None,
@@ -315,15 +278,7 @@ async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> 
         };
     };
 
-    match install_from_asset(
-        client,
-        &release.assets,
-        asset,
-        dep.command,
-        InstallTarget::Path(&path),
-    )
-    .await
-    {
+    match install_from_asset(client, &release.assets, asset, command, target).await {
         Ok(note) => ComponentReport {
             name,
             current_version: Some(current.to_string()),
@@ -486,17 +441,19 @@ enum ArchiveFormat {
     Zip,
 }
 
+/// Expects `name` already lowercased by the caller, so a name lowercased
+/// once up front (e.g. by `pick_asset`, per asset) isn't lowercased again here.
 fn archive_format(name: &str) -> Option<ArchiveFormat> {
-    let lower = name.to_lowercase();
-    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
         Some(ArchiveFormat::TarGz)
-    } else if lower.ends_with(".zip") {
+    } else if name.ends_with(".zip") {
         Some(ArchiveFormat::Zip)
     } else {
         None
     }
 }
 
+/// Expects `name` already lowercased by the caller (see [`archive_format`]).
 fn is_archive(name: &str) -> bool {
     archive_format(name).is_some()
 }
@@ -629,7 +586,7 @@ fn matches_binary_name(entry_name: &str, command: &str) -> bool {
 }
 
 fn extract_binary(asset_name: &str, data: &[u8], command: &str) -> Result<Vec<u8>> {
-    match archive_format(asset_name) {
+    match archive_format(&asset_name.to_lowercase()) {
         Some(ArchiveFormat::TarGz) => extract_from_tar_gz(data, command),
         Some(ArchiveFormat::Zip) => extract_from_zip(data, command),
         // Not archived — the whole payload is the binary itself.

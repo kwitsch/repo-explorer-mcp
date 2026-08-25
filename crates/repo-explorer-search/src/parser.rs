@@ -13,26 +13,20 @@ use std::path::PathBuf;
 /// Split one grep-style line into `(path, line, content, is_match)`.
 ///
 /// The path itself may contain both `:` and `-` (e.g. `repo-explorer-core`, or
-/// a date-like file name such as `2024-01-01.rs`), so we cannot scan for
-/// whichever separator (`:` or `-`) shows up first in byte order — a `-`
-/// buried inside the path could be mistaken for the context separator before
-/// the real `:line:` match separator further right is ever reached. Instead
-/// we scan for each separator kind independently, over the *whole* line, and
-/// prefer `:` (match lines) over `-` (context lines): a match line's path
-/// never legitimately contains a `:NN:` run, so this can't misfire the other
-/// way.
+/// a date-like file name such as `2024-01-01.rs`), and the content after the
+/// separator may too (e.g. a timestamp like `12:30:05`), so we can't scan for
+/// either separator kind over the *whole* line independently -- a `:NN:`- or
+/// `-NN-`-shaped run further right could be mistaken for the real separator.
+/// Instead we scan once, left to right, for the first `<sep><digits><sep>`
+/// run of *either* kind: whichever is found earliest is the real separator,
+/// since neither path nor content can legitimately contain one further left
+/// than it.
 fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
-    scan_for_separator(line, b':').or_else(|| scan_for_separator(line, b'-'))
-}
-
-/// Scan `line` for the first `<sep><digits><sep>` run using exactly `sep` as
-/// both delimiters: that middle run is the line number, everything before is
-/// the path, everything after is the content.
-fn scan_for_separator(line: &str, sep: u8) -> Option<(&str, u32, &str, bool)> {
     let bytes = line.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == sep && i > 0 {
+        let sep = bytes[i];
+        if (sep == b':' || sep == b'-') && i > 0 {
             let mut j = i + 1;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
                 j += 1;
@@ -50,10 +44,43 @@ fn scan_for_separator(line: &str, sep: u8) -> Option<(&str, u32, &str, bool)> {
     None
 }
 
+/// Build one finding for a match line, prepending any buffered before-context
+/// collected since the last group boundary (and clearing the buffer). Shared
+/// by `parse_rtk` and `parse_rg_json`.
+fn push_finding(
+    findings: &mut Vec<ExplorationFinding>,
+    pending_before: &mut Vec<String>,
+    path: &str,
+    line: u32,
+    content: Option<&str>,
+) {
+    let snippet = if pending_before.is_empty() {
+        content.map(str::to_string)
+    } else {
+        let mut combined = pending_before.join("\n");
+        if let Some(c) = content {
+            combined.push('\n');
+            combined.push_str(c);
+        }
+        pending_before.clear();
+        Some(combined)
+    };
+    findings.push(ExplorationFinding {
+        location: FileLocation {
+            path: PathBuf::from(path),
+            line_start: line,
+            line_end: line,
+        },
+        snippet,
+        note: None,
+    });
+}
+
 /// Append a context line's text to the previous finding's snippet (joined by
 /// `\n`), or start a fresh snippet if there is none yet; on a best-effort
-/// basis, dropped if there is no previous finding. Shared by `parse_rtk` and
-/// `parse_rg_json`, whose context-line handling is otherwise identical.
+/// basis, dropped if there is no previous finding. Only for context that
+/// trails the finding it follows -- context that leads the next, not yet
+/// created, finding is buffered by the caller instead (see `push_finding`).
 fn append_context(findings: &mut [ExplorationFinding], text: &str) {
     if let Some(last) = findings.last_mut() {
         match last.snippet.as_mut() {
@@ -66,29 +93,35 @@ fn append_context(findings: &mut [ExplorationFinding], text: &str) {
     }
 }
 
-/// Parse `rtk rg -H -n` output. Each match line becomes one finding; a context
-/// line appends its content to the previous finding's snippet on a best-effort
-/// basis (dropped if there is no previous finding).
+/// Parse `rtk rg -H -n` output. Each match line becomes one finding. A context
+/// line before any group boundary (`--`) appends to the previous finding's
+/// snippet on a best-effort basis (dropped if there is no previous finding);
+/// a context line after a boundary is buffered and prepended to the next
+/// finding instead, since it leads that match rather than trailing the one
+/// before the boundary.
 pub(crate) fn parse_rtk(stdout: &str) -> Vec<ExplorationFinding> {
     let mut findings: Vec<ExplorationFinding> = Vec::new();
+    let mut pending_before: Vec<String> = Vec::new();
+    let mut at_boundary = false;
     for line in stdout.lines() {
-        if line.is_empty() || line == "--" {
+        if line.is_empty() {
+            continue;
+        }
+        if line == "--" {
+            at_boundary = true;
             continue;
         }
         match split_grep_line(line) {
             Some((path, num, content, true)) => {
-                findings.push(ExplorationFinding {
-                    location: FileLocation {
-                        path: PathBuf::from(path),
-                        line_start: num,
-                        line_end: num,
-                    },
-                    snippet: Some(content.to_string()),
-                    note: None,
-                });
+                push_finding(&mut findings, &mut pending_before, path, num, Some(content));
+                at_boundary = false;
             }
             Some((_, _, content, false)) => {
-                append_context(&mut findings, content);
+                if at_boundary {
+                    pending_before.push(content.to_string());
+                } else {
+                    append_context(&mut findings, content);
+                }
             }
             None => {}
         }
@@ -100,7 +133,9 @@ pub(crate) fn parse_rtk(stdout: &str) -> Vec<ExplorationFinding> {
 /// (a non-JSON line means the whole stream shape is wrong -> `Decode`); a
 /// well-formed line missing expected fields (including a `bytes`-only binary
 /// row) is skipped. Only `"match"` produces a finding; `"context"` appends to
-/// the previous finding's snippet; all other event types are ignored.
+/// the previous finding's snippet unless a `"begin"` (new file) has been seen
+/// since, in which case it is buffered and prepended to that file's next
+/// finding instead; all other event types are ignored.
 fn row_line_text(data: &Value) -> Option<&str> {
     data.get("lines")
         .and_then(|l| l.get("text"))
@@ -110,6 +145,8 @@ fn row_line_text(data: &Value) -> Option<&str> {
 
 pub(crate) fn parse_rg_json(stdout: &str) -> Result<Vec<ExplorationFinding>, SearchError> {
     let mut findings: Vec<ExplorationFinding> = Vec::new();
+    let mut pending_before: Vec<String> = Vec::new();
+    let mut at_boundary = false;
     for line in stdout.lines() {
         if line.trim().is_empty() {
             continue;
@@ -123,6 +160,9 @@ pub(crate) fn parse_rg_json(stdout: &str) -> Result<Vec<ExplorationFinding>, Sea
             continue;
         };
         match kind {
+            "begin" => {
+                at_boundary = true;
+            }
             "match" => {
                 // bytes-only / binary row: drop gracefully
                 let Some(path) = data
@@ -137,23 +177,26 @@ pub(crate) fn parse_rg_json(stdout: &str) -> Result<Vec<ExplorationFinding>, Sea
                     .and_then(Value::as_u64)
                     .map(saturate_u32)
                     .unwrap_or(0);
-                let snippet = row_line_text(data).map(str::to_string);
-                findings.push(ExplorationFinding {
-                    location: FileLocation {
-                        path: PathBuf::from(path),
-                        line_start: line_number,
-                        line_end: line_number,
-                    },
+                let snippet = row_line_text(data);
+                push_finding(
+                    &mut findings,
+                    &mut pending_before,
+                    path,
+                    line_number,
                     snippet,
-                    note: None,
-                });
+                );
+                at_boundary = false;
             }
             "context" => {
                 if let Some(text) = row_line_text(data) {
-                    append_context(&mut findings, text);
+                    if at_boundary {
+                        pending_before.push(text.to_string());
+                    } else {
+                        append_context(&mut findings, text);
+                    }
                 }
             }
-            _ => {} // begin / end / summary / unknown: ignored, not a decode error
+            _ => {} // end / summary / unknown: ignored, not a decode error
         }
     }
     Ok(findings)

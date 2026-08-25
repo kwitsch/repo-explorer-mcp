@@ -384,7 +384,7 @@ where
                         }
                         ProviderResponse::ToolCalls(calls) => {
                             messages.push(Message::assistant_tool_calls(calls.clone()));
-                            if let Some(finish) = calls.iter().find(|c| c.name == "finish") {
+                            for finish in calls.iter().filter(|c| c.name == "finish") {
                                 match parse_finish(&finish.arguments_json) {
                                     Ok(result) => return Ok(result),
                                     Err(reason) => {
@@ -560,11 +560,9 @@ When you have gathered enough information, you MUST conclude by calling the fini
 /// fallback prompt.
 const SEED_CANDIDATES: usize = 8;
 
-fn user_prompt(
-    query: &ExplorationQuery,
-    index_note: Option<&str>,
-    candidates: &[Candidate],
-) -> String {
+/// The 4-part preamble shared by the fallback loop's and the verification
+/// stage's user prompts: query text, scope hint, max_results, index note.
+pub(crate) fn query_preamble(query: &ExplorationQuery, index_note: Option<&str>) -> String {
     let mut s = format!("Exploration query: {}", query.text);
     if let Some(scope) = &query.scope_hint {
         s.push_str(&format!("\nScope hint: {}", scope.display()));
@@ -576,6 +574,15 @@ fn user_prompt(
         s.push('\n');
         s.push_str(note);
     }
+    s
+}
+
+fn user_prompt(
+    query: &ExplorationQuery,
+    index_note: Option<&str>,
+    candidates: &[Candidate],
+) -> String {
+    let mut s = query_preamble(query, index_note);
     if !candidates.is_empty() {
         s.push_str(
             "\nStarting points found by the deterministic retrieval pre-stage (ranked, may be incomplete):",

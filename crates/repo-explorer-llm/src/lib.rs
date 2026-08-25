@@ -47,7 +47,7 @@ pub(crate) fn classify_error_facts(provider: &str, facts: &GenaiErrorFacts) -> P
     let code_lower = code.to_lowercase();
 
     // Structured code wins when present.
-    if code_lower.contains("insufficient_quota") || code_lower.contains("quota") {
+    if code_lower.contains("quota") {
         return ProviderError::QuotaExceeded { provider, message };
     }
     if code_lower.contains("rate_limit") {
@@ -55,7 +55,9 @@ pub(crate) fn classify_error_facts(provider: &str, facts: &GenaiErrorFacts) -> P
     }
 
     match facts.status {
-        Some(429) => {
+        // 429 is standard rate-limiting; 529 is Anthropic's overloaded_error,
+        // a transient-overload signal that should failover the same way.
+        Some(429) | Some(529) => {
             if message_indicates_quota(&message) {
                 ProviderError::QuotaExceeded { provider, message }
             } else {
@@ -64,7 +66,7 @@ pub(crate) fn classify_error_facts(provider: &str, facts: &GenaiErrorFacts) -> P
         }
         Some(401) | Some(403) => ProviderError::Authentication { provider, message },
         Some(400) | Some(404) | Some(422) => ProviderError::InvalidRequest { provider, message },
-        // 5xx and any other status: transport-level.
+        // Other 5xx and any other status: transport-level.
         Some(_) => ProviderError::Transport { provider, message },
         // No status at all: connection/transport failure (unless the message
         // clearly names a quota/billing condition).
@@ -341,17 +343,28 @@ fn to_genai_message(
     }
 }
 
+/// Parse `json` as a JSON value, mapping a parse failure to `InvalidRequest`
+/// with a message built by `describe` from the underlying `serde_json` error.
+fn parse_json_or_invalid_request(
+    provider: &str,
+    json: &str,
+    describe: impl FnOnce(&serde_json::Error) -> String,
+) -> Result<serde_json::Value, ProviderError> {
+    serde_json::from_str(json).map_err(|e| ProviderError::InvalidRequest {
+        provider: provider.to_string(),
+        message: describe(&e),
+    })
+}
+
 /// Map a domain `ToolCall` onto a genai `ToolCall`, parsing the JSON arguments
 /// text (this crate owns `serde_json`); a parse failure is an `InvalidRequest`.
 fn to_genai_tool_call(
     provider: &str,
     tc: &ToolCall,
 ) -> Result<genai::chat::ToolCall, ProviderError> {
-    let fn_arguments: serde_json::Value =
-        serde_json::from_str(&tc.arguments_json).map_err(|e| ProviderError::InvalidRequest {
-            provider: provider.to_string(),
-            message: format!("tool call `{}` has invalid arguments JSON: {e}", tc.name),
-        })?;
+    let fn_arguments = parse_json_or_invalid_request(provider, &tc.arguments_json, |e| {
+        format!("tool call `{}` has invalid arguments JSON: {e}", tc.name)
+    })?;
     Ok(genai::chat::ToolCall {
         call_id: tc.id.clone(),
         fn_name: tc.name.clone(),
@@ -365,13 +378,9 @@ fn to_genai_tool_call(
 fn to_genai_tools(provider: &str, tools: &[Tool]) -> Result<Vec<genai::chat::Tool>, ProviderError> {
     let mut out = Vec::with_capacity(tools.len());
     for t in tools {
-        let schema: serde_json::Value =
-            serde_json::from_str(&t.parameters_schema_json).map_err(|e| {
-                ProviderError::InvalidRequest {
-                    provider: provider.to_string(),
-                    message: format!("tool `{}` has invalid parameter schema: {e}", t.name),
-                }
-            })?;
+        let schema = parse_json_or_invalid_request(provider, &t.parameters_schema_json, |e| {
+            format!("tool `{}` has invalid parameter schema: {e}", t.name)
+        })?;
         out.push(
             genai::chat::Tool::new(t.name.clone())
                 .with_description(t.description.clone())
@@ -387,11 +396,9 @@ fn from_genai_response(
     provider: &str,
     response: genai::chat::ChatResponse,
 ) -> Result<ProviderResponse, ProviderError> {
-    let text = response.first_text().map(|s| s.to_string());
-    let tool_calls = response.into_tool_calls();
-
-    if !tool_calls.is_empty() {
-        let mapped = tool_calls
+    if !response.tool_calls().is_empty() {
+        let mapped = response
+            .into_tool_calls()
             .into_iter()
             .map(|tc| ToolCall {
                 id: tc.call_id,
@@ -402,7 +409,7 @@ fn from_genai_response(
         return Ok(ProviderResponse::ToolCalls(mapped));
     }
 
-    match text {
+    match response.into_first_text() {
         Some(text) => Ok(ProviderResponse::Text(text)),
         None => Err(ProviderError::InvalidResponse {
             provider: provider.to_string(),

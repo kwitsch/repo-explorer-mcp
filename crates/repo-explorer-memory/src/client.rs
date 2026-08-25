@@ -92,10 +92,7 @@ fn text_of(result: &CallToolResult) -> String {
 /// (typed JSON); otherwise parse the concatenated text blocks as JSON; a
 /// non-JSON text response is returned as `Value::String` so per-tool mappers
 /// can parse plain-text table formats (`search_code` answers in one).
-pub(crate) fn decode_result(
-    _tool: &'static str,
-    result: CallToolResult,
-) -> Result<Value, MemoryError> {
+pub(crate) fn decode_result(result: CallToolResult) -> Result<Value, MemoryError> {
     if let Some(sc) = result.structured_content {
         return Ok(sc);
     }

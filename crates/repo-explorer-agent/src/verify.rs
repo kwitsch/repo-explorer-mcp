@@ -10,7 +10,7 @@ use repo_explorer_core::llm::{
     CallOptions, Clock, LlmProvider, Message, ProviderResponse, ProviderRouter,
 };
 use repo_explorer_core::memory::MemoryBackend;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::agent::TokenBudget;
@@ -84,7 +84,7 @@ where
                 match completion.response {
                     ProviderResponse::ToolCalls(calls) if !calls.is_empty() => {
                         messages.push(Message::assistant_tool_calls(calls.clone()));
-                        if let Some(finish) = calls.iter().find(|c| c.name == "finish") {
+                        for finish in calls.iter().filter(|c| c.name == "finish") {
                             match parse_finish(&finish.arguments_json) {
                                 Ok(result) => return VerifyOutcome::Finished(result),
                                 Err(reason) => messages.push(Message::tool(
@@ -136,17 +136,7 @@ fn kind_label(kind: CandidateKind) -> &'static str {
 }
 
 fn verify_user_prompt(query: &ExplorationQuery, index_note: Option<&str>, block: &str) -> String {
-    let mut s = format!("Exploration query: {}", query.text);
-    if let Some(scope) = &query.scope_hint {
-        s.push_str(&format!("\nScope hint: {}", scope.display()));
-    }
-    if let Some(max) = query.max_results {
-        s.push_str(&format!("\nDesired maximum results: {max}"));
-    }
-    if let Some(note) = index_note {
-        s.push('\n');
-        s.push_str(note);
-    }
+    let mut s = crate::agent::query_preamble(query, index_note);
     s.push_str("\n\nCandidates:\n");
     s.push_str(block);
     s
@@ -161,22 +151,19 @@ async fn candidates_block<M: MemoryBackend>(
     candidates: &[Candidate],
     caps: &RenderCaps,
 ) -> String {
-    let mut unique_paths: Vec<PathBuf> = Vec::new();
-    for c in candidates {
-        if !unique_paths.contains(&c.location.path) {
-            unique_paths.push(c.location.path.clone());
-        }
-    }
-    let skeletons: HashMap<PathBuf, String> = join_all(unique_paths.iter().map(|path| async {
-        let outline = skeleton_for(memory, repo_root, path).await?;
-        Some((path.clone(), outline))
-    }))
-    .await
-    .into_iter()
-    .flatten()
-    .collect();
+    let unique_paths: HashSet<PathBuf> =
+        candidates.iter().map(|c| c.location.path.clone()).collect();
+    let skeletons: HashMap<PathBuf, String> =
+        join_all(unique_paths.into_iter().map(|path| async move {
+            let outline = skeleton_for(memory, repo_root, &path).await?;
+            Some((path, outline))
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
 
-    let mut shown_outline: Vec<&PathBuf> = Vec::new();
+    let mut shown_outline: HashSet<&PathBuf> = HashSet::new();
     let mut out = String::new();
     for (idx, c) in candidates.iter().enumerate() {
         let symbol = c
@@ -193,8 +180,7 @@ async fn candidates_block<M: MemoryBackend>(
             kind_label(c.kind),
         ));
         if let Some(outline) = skeletons.get(&c.location.path) {
-            if !shown_outline.contains(&&c.location.path) {
-                shown_outline.push(&c.location.path);
+            if shown_outline.insert(&c.location.path) {
                 out.push_str(outline);
                 out.push('\n');
             }

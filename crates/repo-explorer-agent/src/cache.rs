@@ -31,6 +31,10 @@ impl<V: Clone> CappedMap<V> {
         self.map.get(key).cloned()
     }
 
+    fn get_mut(&mut self, key: &str) -> Option<&mut V> {
+        self.map.get_mut(key)
+    }
+
     fn insert(&mut self, key: String, value: V) {
         if self.cap == 0 {
             return;
@@ -118,16 +122,23 @@ impl ResultCache {
 
     /// Fingerprint-independent query key: invalidation is handled via the
     /// stored fingerprint, not the key.
+    ///
+    /// Each field is length-prefixed (`len:content`) rather than joined with a
+    /// bare delimiter, so differing field boundaries can never hash-collide
+    /// regardless of what characters the fields themselves contain.
     pub(crate) fn query_key(query: &ExplorationQuery) -> String {
+        let text = query.text.trim().to_lowercase();
+        let scope = query
+            .scope_hint
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let max_results = query.max_results.map(|m| m.to_string()).unwrap_or_default();
         format!(
-            "{}#{}#{}",
-            query.text.trim().to_lowercase(),
-            query
-                .scope_hint
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            query.max_results.map(|m| m.to_string()).unwrap_or_default()
+            "{}:{text}{}:{scope}{}:{max_results}",
+            text.len(),
+            scope.len(),
+            max_results.len()
         )
     }
 
@@ -143,9 +154,8 @@ impl ResultCache {
     /// its contributing paths.
     pub(crate) fn refresh_query_fingerprint(&self, key: &str, fingerprint: RepoFingerprint) {
         let mut inner = self.lock();
-        if let Some(mut entry) = inner.queries.get(key) {
+        if let Some(entry) = inner.queries.get_mut(key) {
             entry.fingerprint = fingerprint;
-            inner.queries.insert(key.to_string(), entry);
         }
     }
 

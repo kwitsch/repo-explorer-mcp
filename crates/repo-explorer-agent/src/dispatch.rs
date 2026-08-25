@@ -102,7 +102,7 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
             // search is approximated by matching any non-empty line (pattern
             // `.`) restricted to files matching `pattern` as a glob.
             let (pattern, file_glob) = if name == "find" {
-                (".", Some(args.pattern.clone()))
+                (".", Some(args.pattern))
             } else {
                 (args.pattern.as_str(), None)
             };
@@ -168,7 +168,10 @@ fn snippet_target(args: GetCodeSnippetArgs) -> Result<SnippetTarget, String> {
 /// scope is only checked lexically because it need not exist yet.
 fn reject_escaping_path(label: &str, raw: &str) -> Result<PathBuf, String> {
     let rel = Path::new(raw);
-    if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir)) {
+    if rel.is_absolute()
+        || rel.has_root()
+        || rel.components().any(|c| matches!(c, Component::ParentDir))
+    {
         return Err(format!("{label} `{raw}` escapes the repository root"));
     }
     Ok(rel.to_path_buf())
