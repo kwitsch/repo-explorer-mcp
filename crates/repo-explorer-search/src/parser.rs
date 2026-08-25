@@ -80,13 +80,31 @@ fn find_sep_run(bytes: &[u8], sep: u8, start: usize) -> Option<(usize, usize)> {
 /// does *not* end in a plausible extension (`.` followed by one or more
 /// ASCII-alphabetic bytes and nothing else); otherwise the `:` run sits
 /// right after a real path segment and is the genuine separator.
-fn trailing_token_has_extension(bytes: &[u8], start: usize, end: usize) -> bool {
+///
+/// One more wrinkle: an extension-less real file (`issue-42-fix`, or
+/// `Makefile`/`README`/`LICENSE`-style names) can produce a plausible `-N-`
+/// run left of the genuine `:N:` separator with no extension anywhere to
+/// find -- not on the trailing token, not earlier in the path -- so
+/// `trailing_token_has_extension` alone can only rule the dash run out, not
+/// confirm it. What still tells them apart: genuine dash-delimited content
+/// that happens to be a bare word (`status` in
+/// `src/log.rs-69-status:42:ok`) sits after a path that already carries its
+/// own extension (`.rs`), while an extension-less file's trailing segment
+/// (`fix` in `issue-42-fix`) sits after a path prefix (`issue`) with none.
+/// So a bare-letters trailing token (`trailing_token_is_bare_word`) only
+/// flips the verdict to `:` when the path before the dash run also has no
+/// `.` anywhere.
+fn trailing_token(bytes: &[u8], start: usize, end: usize) -> &[u8] {
     let span = &bytes[start..end];
     let token_start = span
         .iter()
         .rposition(u8::is_ascii_whitespace)
         .map_or(0, |p| p + 1);
-    let token = &span[token_start..];
+    &span[token_start..]
+}
+
+fn trailing_token_has_extension(bytes: &[u8], start: usize, end: usize) -> bool {
+    let token = trailing_token(bytes, start, end);
     match token.iter().rposition(|&b| b == b'.') {
         Some(dot) => {
             let ext = &token[dot + 1..];
@@ -94,6 +112,20 @@ fn trailing_token_has_extension(bytes: &[u8], start: usize, end: usize) -> bool 
         }
         None => false,
     }
+}
+
+/// True when the trailing token (see `trailing_token`) is a non-empty run of
+/// ASCII letters with no `.` at all -- shaped like a bare, extension-less
+/// path segment (`fix` in `issue-42-fix`) rather than incidental content
+/// (`status`, a bare number like `10`, or a bracket/mixed token like
+/// `data[10`). On its own this is not enough to trust the `:` run -- `status`
+/// in `src/log.rs-69-status:42:ok` has the same shape but is genuine
+/// dash-delimited content -- so `split_grep_line` only acts on it once the
+/// path *before* the dash run also carries no extension of its own (see
+/// there for why).
+fn trailing_token_is_bare_word(bytes: &[u8], start: usize, end: usize) -> bool {
+    let token = trailing_token(bytes, start, end);
+    !token.is_empty() && token.iter().all(u8::is_ascii_alphabetic)
 }
 
 /// Starting from the leftmost plausible `-N-` run, walk every later `-N-`
@@ -128,7 +160,12 @@ fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
     let colon = find_sep_run(bytes, b':', 0);
     let dash = find_sep_run(bytes, b'-', 0);
     let (sep, i, j) = match (colon, dash) {
-        (Some(c), Some(d)) if d.0 < c.0 && !trailing_token_has_extension(bytes, d.1 + 1, c.0) => {
+        (Some(c), Some(d))
+            if d.0 < c.0
+                && !trailing_token_has_extension(bytes, d.1 + 1, c.0)
+                && !(trailing_token_is_bare_word(bytes, d.1 + 1, c.0)
+                    && !bytes[..d.0].contains(&b'.')) =>
+        {
             let d = resolve_dash_sep_run(bytes, d);
             (b'-', d.0, d.1)
         }
@@ -443,6 +480,16 @@ mod tests {
         // separator further right.
         let result = split_grep_line("issue-42-fix.rs:10:the fix");
         assert_eq!(result, Some(("issue-42-fix.rs", 10, "the fix", true)));
+    }
+
+    #[test]
+    fn split_grep_line_handles_unpadded_dash_numbered_extensionless_path() {
+        // Same shape as the extension-bearing case above, but the real file
+        // (`issue-42-fix`) has no extension at all -- neither on the
+        // trailing token (`fix`) nor earlier in the path (`issue`) -- so the
+        // `-42-` run must still lose to the real `:10:` match separator.
+        let result = split_grep_line("issue-42-fix:10:the fix");
+        assert_eq!(result, Some(("issue-42-fix", 10, "the fix", true)));
     }
 
     #[test]

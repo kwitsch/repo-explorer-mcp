@@ -32,7 +32,7 @@ fn tool(name: &str, description: &str, schema: serde_json::Value) -> Tool {
 /// The 10-tool catalog, built once per process. `finish` is always included;
 /// the loop re-offers the whole catalog on every turn, which is what makes
 /// `finish` "forced".
-pub fn tool_catalog() -> &'static [Tool] {
+pub(crate) fn tool_catalog() -> &'static [Tool] {
     static CATALOG: LazyLock<Vec<Tool>> = LazyLock::new(build_catalog);
     &CATALOG
 }

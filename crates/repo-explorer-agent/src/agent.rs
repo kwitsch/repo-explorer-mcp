@@ -186,8 +186,7 @@ where
         if outcome.confidence >= self.settings.early_exit_confidence
             && !outcome.candidates.is_empty()
         {
-            let result =
-                self.result_from_candidates(&outcome.candidates, query, outcome.confidence);
+            let result = self.result_from_candidates(outcome.candidates, query, outcome.confidence);
             return Ok(self.complete_run("early-exit", 0, &query_key, fingerprint, result));
         }
 
@@ -335,7 +334,7 @@ where
     /// Build the early-exit result straight from the ranked candidates.
     fn result_from_candidates(
         &self,
-        candidates: &[Candidate],
+        candidates: Vec<Candidate>,
         query: &ExplorationQuery,
         confidence: u32,
     ) -> ExplorationResult {
@@ -345,9 +344,8 @@ where
             .unwrap_or(candidates.len());
         let findings = tidy_findings(
             candidates
-                .iter()
+                .into_iter()
                 .take(take)
-                .cloned()
                 .map(finding_from_candidate)
                 .collect(),
             &self.caps,
