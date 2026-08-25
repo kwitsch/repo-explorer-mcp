@@ -5,16 +5,17 @@
 //! fallback loop instead of erroring.
 
 use futures_util::future::join_all;
-use repo_explorer_core::domain::{Candidate, CandidateKind, ExplorationQuery, ExplorationResult};
+use repo_explorer_core::domain::{Candidate, ExplorationQuery, ExplorationResult};
 use repo_explorer_core::llm::{
     CallOptions, Clock, LlmProvider, Message, ProviderResponse, ProviderRouter,
 };
 use repo_explorer_core::memory::MemoryBackend;
+use repo_explorer_core::retrieval::kind_label;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::agent::TokenBudget;
-use crate::dispatch::read_file;
+use crate::dispatch::{parse_args, read_file};
 use crate::render::{RenderCaps, cap_file_lines, cap_snippet};
 use crate::skeleton::skeleton_for;
 use crate::tools::{ExpandArgs, parse_finish, verify_catalog};
@@ -125,16 +126,6 @@ where
     VerifyOutcome::Escalate
 }
 
-fn kind_label(kind: CandidateKind) -> &'static str {
-    match kind {
-        CandidateKind::SymbolExact => "exact symbol match",
-        CandidateKind::SymbolFuzzy => "symbol name match",
-        CandidateKind::FileNameHit => "file name match",
-        CandidateKind::SemanticHit => "semantic search match",
-        CandidateKind::ContentHit => "text match",
-    }
-}
-
 fn verify_user_prompt(query: &ExplorationQuery, index_note: Option<&str>, block: &str) -> String {
     let mut s = crate::agent::query_preamble(query, index_note);
     s.push_str("\n\nCandidates:\n");
@@ -201,9 +192,9 @@ fn expand_content(
     arguments_json: &str,
     caps: &RenderCaps,
 ) -> String {
-    let args: ExpandArgs = match serde_json::from_str(arguments_json) {
+    let args: ExpandArgs = match parse_args(arguments_json) {
         Ok(args) => args,
-        Err(e) => return format!("invalid arguments: {e}"),
+        Err(e) => return e,
     };
     if args.candidate_ids.is_empty() {
         return "invalid arguments: candidate_ids must be non-empty".to_string();
@@ -238,7 +229,7 @@ fn expand_content(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use repo_explorer_core::domain::FileLocation;
+    use repo_explorer_core::domain::{CandidateKind, FileLocation};
     use repo_explorer_core::memory::mock::MockMemoryBackend;
 
     fn candidate(path: &str, start: u32, end: u32) -> Candidate {

@@ -53,7 +53,7 @@ fn is_identifier_like(token: &str) -> bool {
     if has_underscore || has_digit || (has_lower && has_upper) {
         return true;
     }
-    token.len() >= 4 && !STOPWORDS.contains(&token.to_ascii_lowercase().as_str())
+    token.len() >= 4 && !STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(token))
 }
 
 /// Escape a literal so grep backends treat it verbatim. Hand-rolled: core has
@@ -287,15 +287,21 @@ pub fn confidence(ranked: &[Candidate]) -> u32 {
     (top.score / 10 + margin / 20).min(100)
 }
 
-/// Render a candidate as a finding, preserving its provenance in the note.
-pub fn finding_from_candidate(candidate: Candidate) -> ExplorationFinding {
-    let kind = match candidate.kind {
+/// Human-readable label for a candidate's provenance, shared by the
+/// finding renderer and the verification-stage candidate-block renderer.
+pub fn kind_label(kind: CandidateKind) -> &'static str {
+    match kind {
         CandidateKind::SymbolExact => "exact symbol match",
         CandidateKind::SymbolFuzzy => "symbol name match",
         CandidateKind::FileNameHit => "file name match",
         CandidateKind::SemanticHit => "semantic search match",
         CandidateKind::ContentHit => "text match",
-    };
+    }
+}
+
+/// Render a candidate as a finding, preserving its provenance in the note.
+pub fn finding_from_candidate(candidate: Candidate) -> ExplorationFinding {
+    let kind = kind_label(candidate.kind);
     let note = match &candidate.symbol {
         Some(symbol) => format!("{kind}: `{symbol}`"),
         None => kind.to_string(),

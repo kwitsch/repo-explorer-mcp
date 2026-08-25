@@ -10,38 +10,48 @@ use repo_explorer_core::search::SearchError;
 use serde_json::Value;
 use std::path::PathBuf;
 
-/// Split one grep-style line into `(path, line, content, is_match)`.
-///
-/// The path itself may contain both `:` and `-` (e.g. `repo-explorer-core`, or
-/// a date-like file name such as `2024-01-01.rs`), and the content after the
-/// separator may too (e.g. a timestamp like `12:30:05`), so we can't scan for
-/// either separator kind over the *whole* line independently -- a `:NN:`- or
-/// `-NN-`-shaped run further right could be mistaken for the real separator.
-/// Instead we scan once, left to right, for the first `<sep><digits><sep>`
-/// run of *either* kind: whichever is found earliest is the real separator,
-/// since neither path nor content can legitimately contain one further left
-/// than it.
-fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
-    let bytes = line.as_bytes();
+/// Find the leftmost `<sep><digits><sep>` run for one separator byte.
+fn find_sep_run(bytes: &[u8], sep: u8) -> Option<(usize, usize)> {
     let mut i = 0;
     while i < bytes.len() {
-        let sep = bytes[i];
-        if (sep == b':' || sep == b'-') && i > 0 {
+        if bytes[i] == sep && i > 0 {
             let mut j = i + 1;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
                 j += 1;
             }
             // require at least one digit AND a matching closing separator
             if j > i + 1 && j < bytes.len() && bytes[j] == sep {
-                let path = &line[..i];
-                let num: u64 = line[i + 1..j].parse().ok()?;
-                let content = &line[j + 1..];
-                return Some((path, saturate_u32(num), content, sep == b':'));
+                return Some((i, j));
             }
         }
         i += 1;
     }
     None
+}
+
+/// Split one grep-style line into `(path, line, content, is_match)`.
+///
+/// The path itself may contain both `:` and `-` (e.g. `repo-explorer-core`, or
+/// a date-like file name such as `2024-01-01.rs`), and the content after the
+/// separator may too (e.g. a timestamp like `12:30:05`), so we can't just
+/// scan for the leftmost `<sep><digits><sep>` run of either separator kind:
+/// a date-like `-NN-` run inside a *path* can sit to the left of the real
+/// `:NN:` match separator further right, and would be picked instead (as it
+/// is here, since `2024-01-01.rs` is the doc-cited example). A literal `:`
+/// essentially never occurs inside a real file path (Windows forbids it
+/// outright), so unlike `-` it can't be shadowed by an earlier false run.
+/// We therefore look for the leftmost `:<digits>:` run first -- finding one
+/// identifies a match line unambiguously -- and only fall back to the
+/// leftmost `-<digits>-` run (a context line) when no `:` run exists at all.
+fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
+    let bytes = line.as_bytes();
+    let (sep, i, j) = find_sep_run(bytes, b':')
+        .map(|(i, j)| (b':', i, j))
+        .or_else(|| find_sep_run(bytes, b'-').map(|(i, j)| (b'-', i, j)))?;
+    let path = &line[..i];
+    let num: u64 = line[i + 1..j].parse().ok()?;
+    let content = &line[j + 1..];
+    Some((path, saturate_u32(num), content, sep == b':'))
 }
 
 /// Build one finding for a match line, prepending any buffered before-context
@@ -93,6 +103,23 @@ fn append_context(findings: &mut [ExplorationFinding], text: &str) {
     }
 }
 
+/// Route one context line's text to the right place depending on where it
+/// falls relative to a group boundary: text seen since a boundary leads the
+/// next, not yet created, finding and is buffered; otherwise it trails the
+/// previous finding. Shared by `parse_rtk` and `parse_rg_json`.
+fn handle_context_line(
+    findings: &mut [ExplorationFinding],
+    pending_before: &mut Vec<String>,
+    at_boundary: bool,
+    text: &str,
+) {
+    if at_boundary {
+        pending_before.push(text.to_string());
+    } else {
+        append_context(findings, text);
+    }
+}
+
 /// Parse `rtk rg -H -n` output. Each match line becomes one finding. A context
 /// line before any group boundary (`--`) appends to the previous finding's
 /// snippet on a best-effort basis (dropped if there is no previous finding);
@@ -117,11 +144,7 @@ pub(crate) fn parse_rtk(stdout: &str) -> Vec<ExplorationFinding> {
                 at_boundary = false;
             }
             Some((_, _, content, false)) => {
-                if at_boundary {
-                    pending_before.push(content.to_string());
-                } else {
-                    append_context(&mut findings, content);
-                }
+                handle_context_line(&mut findings, &mut pending_before, at_boundary, content);
             }
             None => {}
         }
@@ -189,11 +212,7 @@ pub(crate) fn parse_rg_json(stdout: &str) -> Result<Vec<ExplorationFinding>, Sea
             }
             "context" => {
                 if let Some(text) = row_line_text(data) {
-                    if at_boundary {
-                        pending_before.push(text.to_string());
-                    } else {
-                        append_context(&mut findings, text);
-                    }
+                    handle_context_line(&mut findings, &mut pending_before, at_boundary, text);
                 }
             }
             _ => {} // end / summary / unknown: ignored, not a decode error
@@ -244,6 +263,14 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].location.line_start, 5);
         assert_eq!(findings[0].snippet.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn split_grep_line_handles_date_like_file_name() {
+        // The `-01-` run inside the file name must not be mistaken for the
+        // real `:70:` match separator further right.
+        let result = split_grep_line("2024-01-01.rs:70:some content");
+        assert_eq!(result, Some(("2024-01-01.rs", 70, "some content", true)));
     }
 
     #[test]

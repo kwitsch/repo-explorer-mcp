@@ -431,6 +431,33 @@ fn usage_from(usage: &genai::chat::Usage) -> Option<TokenUsage> {
     })
 }
 
+/// Build the genai `ChatRequest`/`ChatOptions` pair from already-mapped
+/// messages/tools and the domain `CallOptions`: attaches tools when
+/// non-empty, always captures usage, and maps `max_tokens` /
+/// `force_tool` onto their genai counterparts (`force_tool` becomes a
+/// `ToolChoice::tool`). Pure — no I/O — unlike `complete_with_tools`, which
+/// also performs the network call.
+fn build_chat_request(
+    chat_messages: Vec<genai::chat::ChatMessage>,
+    genai_tools: Vec<genai::chat::Tool>,
+    options: &CallOptions,
+) -> (genai::chat::ChatRequest, genai::chat::ChatOptions) {
+    let mut request = genai::chat::ChatRequest::new(chat_messages);
+    if !genai_tools.is_empty() {
+        request = request.with_tools(genai_tools);
+    }
+
+    let mut chat_options = genai::chat::ChatOptions::default().with_capture_usage(true);
+    if let Some(max_tokens) = options.max_tokens {
+        chat_options = chat_options.with_max_tokens(max_tokens);
+    }
+    if let Some(tool) = &options.force_tool {
+        chat_options = chat_options.with_tool_choice(genai::chat::ToolChoice::tool(tool.clone()));
+    }
+
+    (request, chat_options)
+}
+
 impl LlmProvider for GenaiProvider {
     async fn complete_with_tools(
         &self,
@@ -440,20 +467,7 @@ impl LlmProvider for GenaiProvider {
     ) -> Result<Completion, ProviderError> {
         let chat_messages = to_genai_messages(&self.name, messages, self.cache_system_prompt)?;
         let genai_tools = to_genai_tools(&self.name, tools)?;
-
-        let mut request = genai::chat::ChatRequest::new(chat_messages);
-        if !genai_tools.is_empty() {
-            request = request.with_tools(genai_tools);
-        }
-
-        let mut chat_options = genai::chat::ChatOptions::default().with_capture_usage(true);
-        if let Some(max_tokens) = options.max_tokens {
-            chat_options = chat_options.with_max_tokens(max_tokens);
-        }
-        if let Some(tool) = &options.force_tool {
-            chat_options =
-                chat_options.with_tool_choice(genai::chat::ToolChoice::tool(tool.clone()));
-        }
+        let (request, chat_options) = build_chat_request(chat_messages, genai_tools, options);
 
         match self
             .client
@@ -586,6 +600,45 @@ mod tests {
                 provider: "p".to_string(),
                 message: "credit balance is too low".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn build_chat_request_defaults_to_no_tools_no_cap_and_captures_usage() {
+        let (request, chat_options) = build_chat_request(vec![], vec![], &CallOptions::default());
+        assert!(request.tools.is_none());
+        assert_eq!(chat_options.capture_usage, Some(true));
+        assert_eq!(chat_options.max_tokens, None);
+        assert_eq!(chat_options.tool_choice, None);
+    }
+
+    #[test]
+    fn build_chat_request_attaches_tools_when_present() {
+        let tools = vec![genai::chat::Tool::new("search")];
+        let (request, _) = build_chat_request(vec![], tools, &CallOptions::default());
+        assert_eq!(request.tools.map(|t| t.len()), Some(1));
+    }
+
+    #[test]
+    fn build_chat_request_maps_max_tokens() {
+        let options = CallOptions {
+            max_tokens: Some(256),
+            ..Default::default()
+        };
+        let (_, chat_options) = build_chat_request(vec![], vec![], &options);
+        assert_eq!(chat_options.max_tokens, Some(256));
+    }
+
+    #[test]
+    fn build_chat_request_maps_force_tool_to_tool_choice() {
+        let options = CallOptions {
+            force_tool: Some("search".to_string()),
+            ..Default::default()
+        };
+        let (_, chat_options) = build_chat_request(vec![], vec![], &options);
+        assert_eq!(
+            chat_options.tool_choice,
+            Some(genai::chat::ToolChoice::tool("search"))
         );
     }
 
