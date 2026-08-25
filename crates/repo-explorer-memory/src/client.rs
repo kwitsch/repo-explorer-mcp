@@ -24,13 +24,6 @@ impl MemoryClient {
     /// a `endpoint` config yields `MemoryError::UnsupportedTransport`.
     /// Config validation guarantees exactly one of `command`/`endpoint` is set.
     pub(crate) async fn connect(config: &CodebaseMemoryConfig) -> Result<Self, MemoryError> {
-        if config.command.is_some() && config.endpoint.is_some() {
-            return Err(MemoryError::Transport(
-                "codebase_memory config sets both `command` and `endpoint`; \
-                 exactly one is required (Config::validate should have rejected this)"
-                    .to_string(),
-            ));
-        }
         match &config.command {
             Some(cmd) => {
                 let mut command = tokio::process::Command::new(cmd);

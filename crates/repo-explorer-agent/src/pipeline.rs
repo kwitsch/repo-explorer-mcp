@@ -48,7 +48,7 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
 
     let symbol_legs = join_all(patterns.identifiers.iter().take(SYMBOL_LOOKUP_TOKENS).map(
         |token| {
-            memoized(leg_cache, format!("symbol#{token}"), async move {
+            memoized(leg_cache, move || format!("symbol#{token}"), async move {
                 let graph_query = GraphQuery {
                     name_pattern: Some(token.clone()),
                     max_results: Some(PER_LEG_MAX_RESULTS),
@@ -67,7 +67,14 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
 
     let semantic_leg = memoized(
         leg_cache,
-        format!("semantic#{}", query.text.trim().to_lowercase()),
+        move || {
+            format!(
+                "semantic#{}#{}#{}",
+                query.text.trim().to_lowercase(),
+                scope.map(|p| p.display().to_string()).unwrap_or_default(),
+                query.max_results.map(|m| m.to_string()).unwrap_or_default()
+            )
+        },
         async move {
             match memory.search_code(repo_root, query).await {
                 Ok(res) => candidates_of_kind(res.findings, CandidateKind::SemanticHit),
@@ -80,37 +87,55 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
     );
 
     let grep_legs = join_all(patterns.grep_patterns.iter().map(|pattern| {
-        memoized(leg_cache, format!("grep#{pattern}"), async move {
-            let options = SearchOptions {
-                max_results: Some(PER_LEG_MAX_RESULTS),
-                ..SearchOptions::default()
-            };
-            match search.search(repo_root, pattern, scope, &options).await {
-                Ok(findings) => candidates_of_kind(findings, CandidateKind::ContentHit),
-                Err(e) => {
-                    tracing::debug!(leg = "grep", %pattern, error = %e, "retrieval leg failed");
-                    Vec::new()
+        memoized(
+            leg_cache,
+            move || {
+                format!(
+                    "grep#{pattern}#{}",
+                    scope.map(|p| p.display().to_string()).unwrap_or_default()
+                )
+            },
+            async move {
+                let options = SearchOptions {
+                    max_results: Some(PER_LEG_MAX_RESULTS),
+                    ..SearchOptions::default()
+                };
+                match search.search(repo_root, pattern, scope, &options).await {
+                    Ok(findings) => candidates_of_kind(findings, CandidateKind::ContentHit),
+                    Err(e) => {
+                        tracing::debug!(leg = "grep", %pattern, error = %e, "retrieval leg failed");
+                        Vec::new()
+                    }
                 }
-            }
-        })
+            },
+        )
     }));
 
     let file_legs = join_all(patterns.path_tokens.iter().take(FILE_LOOKUP_TOKENS).map(
         |token| {
-            memoized(leg_cache, format!("file#{token}"), async move {
-                let options = SearchOptions {
-                    max_results: Some(PER_LEG_MAX_RESULTS),
-                    file_glob: Some(file_glob_for(token)),
-                    ..SearchOptions::default()
-                };
-                match search.search(repo_root, ".", scope, &options).await {
-                    Ok(findings) => file_candidates(findings),
-                    Err(e) => {
-                        tracing::debug!(leg = "file", %token, error = %e, "retrieval leg failed");
-                        Vec::new()
+            memoized(
+                leg_cache,
+                move || {
+                    format!(
+                        "file#{token}#{}",
+                        scope.map(|p| p.display().to_string()).unwrap_or_default()
+                    )
+                },
+                async move {
+                    let options = SearchOptions {
+                        max_results: Some(PER_LEG_MAX_RESULTS),
+                        file_glob: Some(file_glob_for(token)),
+                        ..SearchOptions::default()
+                    };
+                    match search.search(repo_root, ".", scope, &options).await {
+                        Ok(findings) => file_candidates(findings),
+                        Err(e) => {
+                            tracing::debug!(leg = "file", %token, error = %e, "retrieval leg failed");
+                            Vec::new()
+                        }
                     }
-                }
-            })
+                },
+            )
         },
     ));
 
@@ -132,13 +157,15 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
 }
 
 /// Wrap a leg future with the leg cache: return the memoized candidates when
-/// present, otherwise run the leg and store its result.
+/// present, otherwise run the leg and store its result. `leg` is only called
+/// when a cache is actually active, so an inactive cache costs no key-format
+/// work.
 async fn memoized(
     leg_cache: LegCache<'_>,
-    leg: String,
+    leg: impl FnOnce() -> String,
     fut: impl Future<Output = Vec<Candidate>>,
 ) -> Vec<Candidate> {
-    let key = leg_cache.map(|(cache, fp)| (cache, ResultCache::leg_key(fp, &leg)));
+    let key = leg_cache.map(|(cache, fp)| (cache, ResultCache::leg_key(fp, &leg())));
     if let Some((cache, key)) = &key
         && let Some(hit) = cache.get_leg(key)
     {
@@ -176,7 +203,8 @@ fn symbol_candidates(findings: Vec<ExplorationFinding>, token: &str) -> Vec<Cand
 
 /// A qualified name's final segment (`a::b::c` → `c`, `a.b` → `b`).
 fn last_segment(name: &str) -> &str {
-    name.rsplit(&[':', '.'][..]).next().unwrap_or(name)
+    // rsplit always yields at least the whole string, so this is infallible.
+    name.rsplit(&[':', '.'][..]).next().unwrap()
 }
 
 fn candidates_of_kind(findings: Vec<ExplorationFinding>, kind: CandidateKind) -> Vec<Candidate> {
@@ -216,7 +244,8 @@ fn file_candidates(findings: Vec<ExplorationFinding>) -> Vec<Candidate> {
 /// Glob for a path-like token: a bare file name matches by basename; a token
 /// without an extension matches as a substring.
 fn file_glob_for(token: &str) -> String {
-    let name = token.rsplit('/').next().unwrap_or(token);
+    // rsplit always yields at least the whole string, so this is infallible.
+    let name = token.rsplit('/').next().unwrap();
     if name.contains('.') {
         name.to_string()
     } else {
@@ -321,6 +350,64 @@ mod tests {
         let out = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
         assert!(out.candidates.is_empty());
         assert_eq!(out.confidence, 0);
+    }
+
+    #[tokio::test]
+    async fn leg_cache_does_not_cross_scopes() {
+        let search = MockSearchBackend::new().with_search_result(Ok(vec![]));
+        let memory = MockMemoryBackend::new();
+        let cache = ResultCache::new(16);
+        let fp = RepoFingerprint {
+            head_sha: "sha".to_string(),
+            dirty_hash: "clean".to_string(),
+        };
+
+        let unscoped = ExplorationQuery {
+            text: "decide_freshness".to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let _ = retrieve(
+            &memory,
+            &search,
+            Path::new("/repo"),
+            &unscoped,
+            12,
+            Some((&cache, &fp)),
+        )
+        .await;
+
+        let scoped = ExplorationQuery {
+            text: "decide_freshness".to_string(),
+            scope_hint: Some(PathBuf::from("crates/api")),
+            max_results: None,
+        };
+        let _ = retrieve(
+            &memory,
+            &search,
+            Path::new("/repo"),
+            &scoped,
+            12,
+            Some((&cache, &fp)),
+        )
+        .await;
+
+        // A second query differing only by scope_hint must not be served from
+        // the first query's cached (wrongly-scoped) leg entry — the grep leg
+        // must re-run search for its own scope.
+        let scopes: Vec<Option<PathBuf>> = search
+            .calls()
+            .into_iter()
+            .map(|SearchCall::Search { scope, .. }| scope)
+            .collect();
+        assert!(
+            scopes.contains(&None),
+            "unscoped search never ran: {scopes:?}"
+        );
+        assert!(
+            scopes.contains(&Some(PathBuf::from("crates/api"))),
+            "scoped search never ran: {scopes:?}"
+        );
     }
 
     #[tokio::test]

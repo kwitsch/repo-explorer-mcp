@@ -502,7 +502,12 @@ impl Config {
                     kind: provider.kind.clone(),
                 });
             }
-            let var = provider.resolve_api_key_env().unwrap_or_default();
+            // `provider.kind` already passed the `KNOWN_PROVIDER_KINDS` check above,
+            // so `default_api_key_env` must have a matching arm; a `None` here means
+            // the two lists drifted out of sync, which is a bug worth failing loudly on.
+            let var = provider
+                .resolve_api_key_env()
+                .expect("kind passed KNOWN_PROVIDER_KINDS but has no default_api_key_env entry");
             if !env_var_is_set(&get_env, &var) {
                 return Err(ValidationError::MissingEnvVar {
                     index,

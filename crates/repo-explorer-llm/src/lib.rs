@@ -40,9 +40,9 @@ fn message_indicates_quota(message: &str) -> bool {
 /// Pure classification of error facts into a `ProviderError`. Best-effort:
 /// both `RateLimited` and `QuotaExceeded` are failover triggers, so the finer
 /// split need not be exact for correctness.
-pub(crate) fn classify_error_facts(provider: &str, facts: &GenaiErrorFacts) -> ProviderError {
+pub(crate) fn classify_error_facts(provider: &str, facts: GenaiErrorFacts) -> ProviderError {
     let provider = provider.to_string();
-    let message = facts.message.clone();
+    let message = facts.message;
     let code = facts.code.as_deref().unwrap_or("");
     let code_lower = code.to_lowercase();
 
@@ -94,7 +94,7 @@ pub(crate) fn classify_genai_error(provider: &str, err: &genai::Error) -> Provid
         code: None,
         message: err.to_string(),
     };
-    classify_error_facts(provider, &facts)
+    classify_error_facts(provider, facts)
 }
 
 /// Return the HTTP status if the `genai::Error` (or its nested web error)
@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     fn http_429_classifies_as_rate_limited() {
-        let e = classify_error_facts("primary", &facts(Some(429), None, "slow down"));
+        let e = classify_error_facts("primary", facts(Some(429), None, "slow down"));
         assert_eq!(
             e,
             ProviderError::RateLimited {
@@ -542,7 +542,7 @@ mod tests {
     fn openai_insufficient_quota_classifies_as_quota() {
         let e = classify_error_facts(
             "p",
-            &facts(Some(429), Some("insufficient_quota"), "no credit"),
+            facts(Some(429), Some("insufficient_quota"), "no credit"),
         );
         assert_eq!(
             e,
@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn http_401_classifies_as_authentication_and_is_not_failover() {
-        let e = classify_error_facts("p", &facts(Some(401), None, "bad key"));
+        let e = classify_error_facts("p", facts(Some(401), None, "bad key"));
         assert_eq!(
             e,
             ProviderError::Authentication {
@@ -568,7 +568,7 @@ mod tests {
 
     #[test]
     fn http_400_classifies_as_invalid_request() {
-        let e = classify_error_facts("p", &facts(Some(400), None, "bad body"));
+        let e = classify_error_facts("p", facts(Some(400), None, "bad body"));
         assert_eq!(
             e,
             ProviderError::InvalidRequest {
@@ -580,7 +580,7 @@ mod tests {
 
     #[test]
     fn no_status_falls_back_to_transport() {
-        let e = classify_error_facts("p", &facts(None, None, "connection reset"));
+        let e = classify_error_facts("p", facts(None, None, "connection reset"));
         assert_eq!(
             e,
             ProviderError::Transport {
@@ -593,7 +593,7 @@ mod tests {
     #[test]
     fn quota_via_substring_when_status_only_429() {
         // Anthropic billing/overloaded phrasing without a structured code.
-        let e = classify_error_facts("p", &facts(Some(429), None, "credit balance is too low"));
+        let e = classify_error_facts("p", facts(Some(429), None, "credit balance is too low"));
         assert_eq!(
             e,
             ProviderError::QuotaExceeded {
@@ -646,7 +646,7 @@ mod tests {
     fn error_message_never_echoes_a_key() {
         // The classifier only ever copies the provided message; assert it does
         // not fabricate secrets and preserves the given text verbatim.
-        let e = classify_error_facts("p", &facts(Some(500), None, "server error"));
+        let e = classify_error_facts("p", facts(Some(500), None, "server error"));
         assert_eq!(
             e,
             ProviderError::Transport {

@@ -79,6 +79,23 @@ fn push_unique(list: &mut Vec<String>, value: String) {
     }
 }
 
+/// Locate the next quote delimiter in `s`. `"` and `` ` `` always count; `'`
+/// only counts when not preceded by a word char, so contractions/possessives
+/// (`user's`, `isn't`) are left as plain text instead of opening a literal
+/// that some later, unrelated apostrophe would then close.
+fn find_quote_start(s: &str) -> Option<(usize, char)> {
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' | '`' => return Some((i, c)),
+            '\'' if !s[..i].chars().next_back().is_some_and(is_word_char) => {
+                return Some((i, c));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Derive deterministic search inputs from a free-text query.
 pub fn derive_patterns(query: &str) -> QueryPatterns {
     let mut patterns = QueryPatterns::default();
@@ -86,8 +103,7 @@ pub fn derive_patterns(query: &str) -> QueryPatterns {
     // Quoted literals: content of "…", '…', and `…` pairs.
     let mut rest = query;
     let mut unquoted = String::new();
-    while let Some(open) = rest.find(['"', '\'', '`']) {
-        let quote = rest.as_bytes()[open] as char;
+    while let Some((open, quote)) = find_quote_start(rest) {
         unquoted.push_str(&rest[..open]);
         unquoted.push(' ');
         let after = &rest[open + 1..];
@@ -160,11 +176,6 @@ fn kind_base_score(kind: CandidateKind) -> u32 {
     }
 }
 
-fn kind_rank(kind: CandidateKind) -> u32 {
-    // Higher = stronger; used to pick the surviving kind when merging.
-    kind_base_score(kind)
-}
-
 /// Number of distinct query identifiers/literals (pre-lowercased by the
 /// caller) appearing in the candidate's symbol, path, or snippet.
 fn coverage(candidate: &Candidate, lowered_patterns: &[String]) -> u32 {
@@ -206,7 +217,7 @@ fn overlaps(a: &FileLocation, b: &FileLocation) -> bool {
 fn merge_into(a: &mut Candidate, b: Candidate) {
     a.location.line_start = a.location.line_start.min(b.location.line_start);
     a.location.line_end = a.location.line_end.max(b.location.line_end);
-    if kind_rank(b.kind) > kind_rank(a.kind) {
+    if kind_base_score(b.kind) > kind_base_score(a.kind) {
         a.kind = b.kind;
         a.symbol = b.symbol.or(a.symbol.take());
         if b.snippet.is_some() {
@@ -368,6 +379,15 @@ mod tests {
         let p = derive_patterns("what is \"decide_freshness");
         assert!(p.literals.is_empty());
         assert_eq!(p.identifiers, vec!["decide_freshness"]);
+    }
+
+    #[test]
+    fn possessive_and_contraction_apostrophes_are_not_quote_delimiters() {
+        let p = derive_patterns("how does the cache's ttl work and isn't it stale");
+        assert!(p.literals.is_empty(), "got {:?}", p.literals);
+        assert!(p.identifiers.contains(&"cache".to_string()));
+        assert!(p.identifiers.contains(&"work".to_string()));
+        assert!(p.identifiers.contains(&"stale".to_string()));
     }
 
     #[test]

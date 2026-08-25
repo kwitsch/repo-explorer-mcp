@@ -215,21 +215,11 @@ async fn check_and_install(
     current: Option<semver::Version>,
     target: InstallTarget<'_>,
 ) -> ComponentReport {
-    let release = match fetch_latest_release(client, owner, repo).await {
-        Ok(r) => r,
-        Err(e) => {
-            return ComponentReport {
-                name,
-                current_version: current.as_ref().map(|v| v.to_string()),
-                latest_version: None,
-                action: "error",
-                detail: Some(e.to_string()),
-            };
-        }
-    };
-
-    let latest = match parse_tag_version(&release.tag_name) {
-        Ok(v) => v,
+    let (release, latest) = match fetch_latest_release(client, owner, repo)
+        .await
+        .and_then(|r| parse_tag_version(&r.tag_name).map(|v| (r, v)))
+    {
+        Ok(pair) => pair,
         Err(e) => {
             return ComponentReport {
                 name,

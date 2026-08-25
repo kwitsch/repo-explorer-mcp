@@ -10,7 +10,12 @@ use repo_explorer_core::search::SearchError;
 use serde_json::Value;
 use std::path::PathBuf;
 
-/// Find the leftmost `<sep><digits><sep>` run for one separator byte.
+/// Find the leftmost *plausible* `<sep><digits><sep>` run for one separator
+/// byte: the digit span must not be zero-padded, since real rg/rtk line
+/// numbers are always printed unpadded. A zero-padded span (e.g. the `01` in
+/// a date-like path segment `-01-`) is therefore not a real line number and
+/// is skipped in favor of a later run rather than accepted as a fabricated
+/// one.
 fn find_sep_run(bytes: &[u8], sep: u8) -> Option<(usize, usize)> {
     let mut i = 0;
     while i < bytes.len() {
@@ -19,8 +24,11 @@ fn find_sep_run(bytes: &[u8], sep: u8) -> Option<(usize, usize)> {
             while j < bytes.len() && bytes[j].is_ascii_digit() {
                 j += 1;
             }
-            // require at least one digit AND a matching closing separator
-            if j > i + 1 && j < bytes.len() && bytes[j] == sep {
+            let digits = j - (i + 1);
+            let zero_padded = digits > 1 && bytes[i + 1] == b'0';
+            // require at least one digit, a matching closing separator, and a
+            // plausible (unpadded) line number
+            if digits > 0 && j < bytes.len() && bytes[j] == sep && !zero_padded {
                 return Some((i, j));
             }
         }
@@ -34,20 +42,27 @@ fn find_sep_run(bytes: &[u8], sep: u8) -> Option<(usize, usize)> {
 /// The path itself may contain both `:` and `-` (e.g. `repo-explorer-core`, or
 /// a date-like file name such as `2024-01-01.rs`), and the content after the
 /// separator may too (e.g. a timestamp like `12:30:05`), so we can't just
-/// scan for the leftmost `<sep><digits><sep>` run of either separator kind:
-/// a date-like `-NN-` run inside a *path* can sit to the left of the real
-/// `:NN:` match separator further right, and would be picked instead (as it
-/// is here, since `2024-01-01.rs` is the doc-cited example). A literal `:`
+/// take whichever separator kind turns up a run first: a date-like `-NN-` run
+/// inside a *path* can sit to the left of the real `:NN:` match separator
+/// further right (as in the `2024-01-01.rs` case above), while a timestamp-like
+/// `:NN:` run inside *content* can sit to the right of the real `-NN-` context
+/// separator (e.g. `src/log.rs-69-12:30:05 boot`). `find_sep_run` already
+/// rules out the first case by rejecting zero-padded digit spans (`01` is
+/// never a real line number), so among whatever plausible runs remain for
+/// each separator kind, the leftmost one is the real separator: a literal `:`
 /// essentially never occurs inside a real file path (Windows forbids it
-/// outright), so unlike `-` it can't be shadowed by an earlier false run.
-/// We therefore look for the leftmost `:<digits>:` run first -- finding one
-/// identifies a match line unambiguously -- and only fall back to the
-/// leftmost `-<digits>-` run (a context line) when no `:` run exists at all.
+/// outright), so a plausible `:` run can only be shadowed by an *earlier*
+/// plausible `-` run when the line is genuinely `-`-delimited.
 fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
     let bytes = line.as_bytes();
-    let (sep, i, j) = find_sep_run(bytes, b':')
-        .map(|(i, j)| (b':', i, j))
-        .or_else(|| find_sep_run(bytes, b'-').map(|(i, j)| (b'-', i, j)))?;
+    let colon = find_sep_run(bytes, b':');
+    let dash = find_sep_run(bytes, b'-');
+    let (sep, i, j) = match (colon, dash) {
+        (Some(c), Some(d)) if d.0 < c.0 => (b'-', d.0, d.1),
+        (Some(c), _) => (b':', c.0, c.1),
+        (None, Some(d)) => (b'-', d.0, d.1),
+        (None, None) => return None,
+    };
     let path = &line[..i];
     let num: u64 = line[i + 1..j].parse().ok()?;
     let content = &line[j + 1..];
@@ -156,9 +171,13 @@ pub(crate) fn parse_rtk(stdout: &str) -> Vec<ExplorationFinding> {
 /// (a non-JSON line means the whole stream shape is wrong -> `Decode`); a
 /// well-formed line missing expected fields (including a `bytes`-only binary
 /// row) is skipped. Only `"match"` produces a finding; `"context"` appends to
-/// the previous finding's snippet unless a `"begin"` (new file) has been seen
-/// since, in which case it is buffered and prepended to that file's next
-/// finding instead; all other event types are ignored.
+/// the previous finding's snippet when its line number is contiguous with the
+/// last line seen in this file (so it trails that match), or is buffered and
+/// prepended to the next finding instead when there's a gap (so it leads the
+/// next match) -- unlike rtk's explicit `--` separator, `rg --json` has no
+/// marker between match groups within one file, so line-number contiguity is
+/// the only signal available to tell trailing context from leading context;
+/// all other event types are ignored.
 fn row_line_text(data: &Value) -> Option<&str> {
     data.get("lines")
         .and_then(|l| l.get("text"))
@@ -169,7 +188,10 @@ fn row_line_text(data: &Value) -> Option<&str> {
 pub(crate) fn parse_rg_json(stdout: &str) -> Result<Vec<ExplorationFinding>, SearchError> {
     let mut findings: Vec<ExplorationFinding> = Vec::new();
     let mut pending_before: Vec<String> = Vec::new();
-    let mut at_boundary = false;
+    // Line number of the last match/context row seen in the current file;
+    // `None` right after `begin` (no rows seen yet) or once `saturate_u32`
+    // pins a `line_number` at `u32::MAX` (no successor can be contiguous).
+    let mut last_line_number: Option<u32> = None;
     for line in stdout.lines() {
         if line.trim().is_empty() {
             continue;
@@ -184,7 +206,7 @@ pub(crate) fn parse_rg_json(stdout: &str) -> Result<Vec<ExplorationFinding>, Sea
         };
         match kind {
             "begin" => {
-                at_boundary = true;
+                last_line_number = None;
             }
             "match" => {
                 // bytes-only / binary row: drop gracefully
@@ -208,11 +230,20 @@ pub(crate) fn parse_rg_json(stdout: &str) -> Result<Vec<ExplorationFinding>, Sea
                     line_number,
                     snippet,
                 );
-                at_boundary = false;
+                last_line_number = Some(line_number);
             }
             "context" => {
                 if let Some(text) = row_line_text(data) {
+                    let line_number = data
+                        .get("line_number")
+                        .and_then(Value::as_u64)
+                        .map(saturate_u32);
+                    let at_boundary = match (last_line_number, line_number) {
+                        (Some(prev), Some(n)) => prev.checked_add(1) != Some(n),
+                        _ => true,
+                    };
                     handle_context_line(&mut findings, &mut pending_before, at_boundary, text);
+                    last_line_number = line_number.or(last_line_number);
                 }
             }
             _ => {} // end / summary / unknown: ignored, not a decode error
@@ -271,6 +302,48 @@ mod tests {
         // real `:70:` match separator further right.
         let result = split_grep_line("2024-01-01.rs:70:some content");
         assert_eq!(result, Some(("2024-01-01.rs", 70, "some content", true)));
+    }
+
+    #[test]
+    fn split_grep_line_handles_context_line_with_colon_in_content() {
+        // The `:30:` run inside the content must not be mistaken for the
+        // real `-69-` context separator further left.
+        let result = split_grep_line("src/log.rs-69-12:30:05 boot");
+        assert_eq!(result, Some(("src/log.rs", 69, "12:30:05 boot", false)));
+    }
+
+    #[test]
+    fn parse_rg_json_routes_context_between_two_match_groups_in_one_file() {
+        // Two matches (3, 9) far enough apart that their context windows
+        // (radius 1) don't overlap: context(4) trails match A, context(8)
+        // leads match B -- there is no `begin`/boundary marker between them,
+        // so this must be inferred from line-number contiguity alone.
+        let input = concat!(
+            "{\"type\":\"begin\",\"data\":{\"path\":{\"text\":\"f.rs\"}}}\n",
+            "{\"type\":\"context\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
+            "\"lines\":{\"text\":\"line2\\n\"},\"line_number\":2}}\n",
+            "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
+            "\"lines\":{\"text\":\"MATCH_A\\n\"},\"line_number\":3}}\n",
+            "{\"type\":\"context\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
+            "\"lines\":{\"text\":\"line4\\n\"},\"line_number\":4}}\n",
+            "{\"type\":\"context\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
+            "\"lines\":{\"text\":\"line8\\n\"},\"line_number\":8}}\n",
+            "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
+            "\"lines\":{\"text\":\"MATCH_B\\n\"},\"line_number\":9}}\n",
+            "{\"type\":\"context\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
+            "\"lines\":{\"text\":\"line10\\n\"},\"line_number\":10}}\n",
+            "{\"type\":\"end\",\"data\":{\"path\":{\"text\":\"f.rs\"}}}\n",
+        );
+        let findings = parse_rg_json(input).unwrap();
+        assert_eq!(findings.len(), 2);
+        assert_eq!(
+            findings[0].snippet.as_deref(),
+            Some("line2\nMATCH_A\nline4")
+        );
+        assert_eq!(
+            findings[1].snippet.as_deref(),
+            Some("line8\nMATCH_B\nline10")
+        );
     }
 
     #[test]

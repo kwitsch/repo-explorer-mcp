@@ -164,10 +164,7 @@ where
         };
 
         // Stage 2: deterministic retrieval — no LLM.
-        let leg_cache = match (&self.cache, &fingerprint) {
-            (Some(cache), Some(fp)) => Some((cache, fp)),
-            _ => None,
-        };
+        let leg_cache = self.cache_for(fingerprint.as_ref());
         let outcome = pipeline::retrieve(
             &self.memory,
             &self.search,
@@ -191,9 +188,14 @@ where
         {
             let result =
                 self.result_from_candidates(&outcome.candidates, query, outcome.confidence);
-            tracing::info!(path = "early-exit", tokens = 0u64, "exploration complete");
-            self.store_query_cache(&query_key, fingerprint, &outcome.candidates, &result);
-            return Ok(result);
+            return Ok(self.complete_run(
+                "early-exit",
+                0,
+                &query_key,
+                fingerprint,
+                &outcome.candidates,
+                result,
+            ));
         }
 
         // Stage 4: LLM verification over the candidates.
@@ -213,13 +215,15 @@ where
             .await
             {
                 let result = self.finalize(result);
-                tracing::info!(
-                    path = "verify",
-                    tokens = budget.spent(),
-                    "exploration complete"
-                );
-                self.store_query_cache(&query_key, fingerprint, &outcome.candidates, &result);
-                return Ok(result);
+                let tokens = budget.spent();
+                return Ok(self.complete_run(
+                    "verify",
+                    tokens,
+                    &query_key,
+                    fingerprint,
+                    &outcome.candidates,
+                    result,
+                ));
             }
             tracing::info!("verification escalated to the fallback loop");
         }
@@ -236,13 +240,15 @@ where
             )
             .await?;
         let result = self.finalize(result);
-        tracing::info!(
-            path = "fallback",
-            tokens = budget.spent(),
-            "exploration complete"
-        );
-        self.store_query_cache(&query_key, fingerprint, &outcome.candidates, &result);
-        Ok(result)
+        let tokens = budget.spent();
+        Ok(self.complete_run(
+            "fallback",
+            tokens,
+            &query_key,
+            fingerprint,
+            &outcome.candidates,
+            result,
+        ))
     }
 
     /// Normalize/dedupe/cap the final findings once, whatever stage produced
@@ -250,6 +256,34 @@ where
     fn finalize(&self, mut result: ExplorationResult) -> ExplorationResult {
         result.findings = tidy_findings(result.findings, &self.caps);
         result
+    }
+
+    /// The shared tail of every `run()` branch: log completion, persist to
+    /// the query cache, and hand back the result for the caller to wrap in
+    /// `Ok`.
+    fn complete_run(
+        &self,
+        path: &'static str,
+        tokens: u64,
+        query_key: &str,
+        fingerprint: Option<RepoFingerprint>,
+        candidates: &[Candidate],
+        result: ExplorationResult,
+    ) -> ExplorationResult {
+        tracing::info!(path, tokens, "exploration complete");
+        self.store_query_cache(query_key, fingerprint, candidates, &result);
+        result
+    }
+
+    /// The cache is usable this call only when caching is enabled and a
+    /// fingerprint was obtainable this run — shared by every read path.
+    /// (`store_query_cache` needs an owned fingerprint to move into the
+    /// entry, so it keeps its own guard.)
+    fn cache_for<'a>(&'a self, fingerprint: Option<&'a RepoFingerprint>) -> pipeline::LegCache<'a> {
+        match (&self.cache, fingerprint) {
+            (Some(cache), Some(fp)) => Some((cache, fp)),
+            _ => None,
+        }
     }
 
     /// Serve from the query cache when the entry is still valid: same
@@ -261,10 +295,7 @@ where
         query_key: &str,
         fingerprint: &Option<RepoFingerprint>,
     ) -> Option<ExplorationResult> {
-        let (cache, fp) = match (&self.cache, fingerprint) {
-            (Some(cache), Some(fp)) => (cache, fp),
-            _ => return None,
-        };
+        let (cache, fp) = self.cache_for(fingerprint.as_ref())?;
         let entry = cache.get_query(query_key)?;
         if entry.fingerprint == *fp {
             return Some(entry.result);
@@ -513,13 +544,12 @@ where
         call: &ToolCall,
         fingerprint: Option<&RepoFingerprint>,
     ) -> (Message, Vec<ExplorationFinding>) {
-        let key = match (&self.cache, fingerprint) {
-            (Some(cache), Some(fp)) => Some((
+        let key = self.cache_for(fingerprint).map(|(cache, fp)| {
+            (
                 cache,
                 ResultCache::tool_key(fp, &call.name, &call.arguments_json),
-            )),
-            _ => None,
-        };
+            )
+        });
         if let Some((cache, key)) = &key
             && let Some((content, findings)) = cache.get_tool(key)
         {
