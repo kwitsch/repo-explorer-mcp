@@ -54,13 +54,13 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
                     max_results: Some(PER_LEG_MAX_RESULTS),
                     ..GraphQuery::default()
                 };
-                match memory.search_graph(repo_root, &graph_query).await {
-                    Ok(res) => symbol_candidates(res.findings, token),
-                    Err(e) => {
-                        tracing::debug!(leg = "symbol", %token, error = %e, "retrieval leg failed");
-                        Vec::new()
-                    }
-                }
+                soft_leg(
+                    "symbol",
+                    token,
+                    memory.search_graph(repo_root, &graph_query),
+                    |res| symbol_candidates(res.findings, token),
+                )
+                .await
             })
         },
     ));
@@ -69,20 +69,20 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
         leg_cache,
         move || {
             format!(
-                "semantic#{}#{}#{}",
-                query.text.trim().to_lowercase(),
-                scope.map(|p| p.display().to_string()).unwrap_or_default(),
-                query.max_results.map(|m| m.to_string()).unwrap_or_default()
+                "semantic{}{}{}",
+                encode_field(&query.text.trim().to_lowercase()),
+                encode_field(&scope_display(scope)),
+                encode_field(&query.max_results.map(|m| m.to_string()).unwrap_or_default())
             )
         },
         async move {
-            match memory.search_code(repo_root, query).await {
-                Ok(res) => candidates_of_kind(res.findings, CandidateKind::SemanticHit),
-                Err(e) => {
-                    tracing::debug!(leg = "semantic", error = %e, "retrieval leg failed");
-                    Vec::new()
-                }
-            }
+            soft_leg(
+                "semantic",
+                query.text.as_str(),
+                memory.search_code(repo_root, query),
+                |res| candidates_of_kind(res.findings, CandidateKind::SemanticHit),
+            )
+            .await
         },
     );
 
@@ -91,8 +91,9 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
             leg_cache,
             move || {
                 format!(
-                    "grep#{pattern}#{}",
-                    scope.map(|p| p.display().to_string()).unwrap_or_default()
+                    "grep{}{}",
+                    encode_field(pattern),
+                    encode_field(&scope_display(scope))
                 )
             },
             async move {
@@ -100,44 +101,49 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
                     max_results: Some(PER_LEG_MAX_RESULTS),
                     ..SearchOptions::default()
                 };
-                match search.search(repo_root, pattern, scope, &options).await {
-                    Ok(findings) => candidates_of_kind(findings, CandidateKind::ContentHit),
-                    Err(e) => {
-                        tracing::debug!(leg = "grep", %pattern, error = %e, "retrieval leg failed");
-                        Vec::new()
-                    }
-                }
+                soft_leg(
+                    "grep",
+                    pattern,
+                    search.search(repo_root, pattern, scope, &options),
+                    |findings| candidates_of_kind(findings, CandidateKind::ContentHit),
+                )
+                .await
             },
         )
     }));
 
-    let file_legs = join_all(patterns.path_tokens.iter().take(FILE_LOOKUP_TOKENS).map(
-        |token| {
-            memoized(
-                leg_cache,
-                move || {
-                    format!(
-                        "file#{token}#{}",
-                        scope.map(|p| p.display().to_string()).unwrap_or_default()
-                    )
-                },
-                async move {
-                    let options = SearchOptions {
-                        max_results: Some(PER_LEG_MAX_RESULTS),
-                        file_glob: Some(file_glob_for(token)),
-                        ..SearchOptions::default()
-                    };
-                    match search.search(repo_root, ".", scope, &options).await {
-                        Ok(findings) => file_candidates(findings),
-                        Err(e) => {
-                            tracing::debug!(leg = "file", %token, error = %e, "retrieval leg failed");
-                            Vec::new()
-                        }
-                    }
-                },
-            )
-        },
-    ));
+    let file_legs = join_all(
+        patterns
+            .path_tokens
+            .iter()
+            .take(FILE_LOOKUP_TOKENS)
+            .map(|token| {
+                memoized(
+                    leg_cache,
+                    move || {
+                        format!(
+                            "file{}{}",
+                            encode_field(token),
+                            encode_field(&scope_display(scope))
+                        )
+                    },
+                    async move {
+                        let options = SearchOptions {
+                            max_results: Some(PER_LEG_MAX_RESULTS),
+                            file_glob: Some(file_glob_for(token)),
+                            ..SearchOptions::default()
+                        };
+                        soft_leg(
+                            "file",
+                            token,
+                            search.search(repo_root, ".", scope, &options),
+                            file_candidates,
+                        )
+                        .await
+                    },
+                )
+            }),
+    );
 
     let (symbols, semantic, greps, files) =
         futures_util::future::join4(symbol_legs, semantic_leg, grep_legs, file_legs).await;
@@ -176,6 +182,37 @@ async fn memoized(
         cache.put_leg(key, out.clone());
     }
     out
+}
+
+/// Run one fanout leg's backend call: classify a success, log-and-empty a
+/// failure. Failures are soft — a failed leg contributes nothing rather than
+/// failing the whole query.
+async fn soft_leg<T, E: std::fmt::Display>(
+    leg: &'static str,
+    ctx: impl std::fmt::Display,
+    fut: impl Future<Output = Result<T, E>>,
+    classify: impl FnOnce(T) -> Vec<Candidate>,
+) -> Vec<Candidate> {
+    match fut.await {
+        Ok(res) => classify(res),
+        Err(e) => {
+            tracing::debug!(leg, %ctx, error = %e, "retrieval leg failed");
+            Vec::new()
+        }
+    }
+}
+
+/// Render the scope hint for cache-key inclusion.
+fn scope_display(scope: Option<&Path>) -> String {
+    scope.map(|p| p.display().to_string()).unwrap_or_default()
+}
+
+/// Length-prefix a field (`len:content`) so concatenating several fields into
+/// a cache key can never collide across differing field boundaries,
+/// regardless of what characters the fields themselves contain — mirrors
+/// `ResultCache::query_key`.
+fn encode_field(s: &str) -> String {
+    format!("{}:{}", s.len(), s)
 }
 
 /// Classify symbol-lookup findings: the memory backend carries the symbol name
@@ -407,6 +444,72 @@ mod tests {
         assert!(
             scopes.contains(&Some(PathBuf::from("crates/api"))),
             "scoped search never ran: {scopes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_leg_cache_key_does_not_collide_across_pattern_scope_boundary() {
+        // Regression: a bare `#`-joined leg key let pattern `x#y` (unscoped)
+        // and pattern `x` (scope `y#`) hash to the identical key
+        // `"grep#x#y#"`. Query B must not be served query A's cached rows.
+        let cache = ResultCache::new(16);
+        let fp = RepoFingerprint {
+            head_sha: "sha".to_string(),
+            dirty_hash: "clean".to_string(),
+        };
+        let memory = MockMemoryBackend::new();
+
+        let search_a = MockSearchBackend::new().with_search_result(Ok(vec![finding(
+            "from_query_a.rs",
+            1,
+            None,
+        )]));
+        let query_a = ExplorationQuery {
+            text: r#"grep for "x#y""#.to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let _ = retrieve(
+            &memory,
+            &search_a,
+            Path::new("/repo"),
+            &query_a,
+            12,
+            Some((&cache, &fp)),
+        )
+        .await;
+
+        let search_b = MockSearchBackend::new().with_search_result(Ok(vec![finding(
+            "from_query_b.rs",
+            1,
+            None,
+        )]));
+        let query_b = ExplorationQuery {
+            text: r#"grep for "x""#.to_string(),
+            scope_hint: Some(PathBuf::from("y#")),
+            max_results: None,
+        };
+        let out_b = retrieve(
+            &memory,
+            &search_b,
+            Path::new("/repo"),
+            &query_b,
+            12,
+            Some((&cache, &fp)),
+        )
+        .await;
+
+        assert!(
+            !search_b.calls().is_empty(),
+            "query B's grep leg was served from query A's cache instead of running its own search"
+        );
+        assert!(
+            out_b
+                .candidates
+                .iter()
+                .all(|c| c.location.path.as_path() != Path::new("from_query_a.rs")),
+            "query B's candidates were contaminated by query A's cached grep results: {:?}",
+            out_b.candidates
         );
     }
 

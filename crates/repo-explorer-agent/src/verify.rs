@@ -84,14 +84,22 @@ where
                 budget.add(completion.usage);
                 match completion.response {
                     ProviderResponse::ToolCalls(calls) if !calls.is_empty() => {
-                        messages.push(Message::assistant_tool_calls(calls.clone()));
+                        // Check for a successful finish before cloning anything: the
+                        // common case (finish on the first turn) returns right here.
+                        let finished = calls
+                            .iter()
+                            .filter(|c| c.name == "finish")
+                            .find_map(|finish| parse_finish(&finish.arguments_json).ok());
+                        if let Some(result) = finished {
+                            return VerifyOutcome::Finished(result);
+                        }
+                        let mut responses = Vec::new();
                         for finish in calls.iter().filter(|c| c.name == "finish") {
-                            match parse_finish(&finish.arguments_json) {
-                                Ok(result) => return VerifyOutcome::Finished(result),
-                                Err(reason) => messages.push(Message::tool(
+                            if let Err(reason) = parse_finish(&finish.arguments_json) {
+                                responses.push(Message::tool(
                                     &finish.id,
                                     format!("finish rejected: {reason}; call finish again"),
-                                )),
+                                ));
                             }
                         }
                         for call in calls.iter().filter(|c| c.name != "finish") {
@@ -104,8 +112,10 @@ where
                                 ),
                                 other => format!("unknown tool: {other}"),
                             };
-                            messages.push(Message::tool(&call.id, content));
+                            responses.push(Message::tool(&call.id, content));
                         }
+                        messages.push(Message::assistant_tool_calls(calls));
+                        messages.extend(responses);
                     }
                     ProviderResponse::ToolCalls(_) => {
                         messages.push(Message::assistant_tool_calls(Vec::new()));

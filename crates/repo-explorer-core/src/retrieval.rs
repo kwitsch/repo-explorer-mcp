@@ -37,7 +37,7 @@ const STOPWORDS: &[&str] = &[
 ];
 
 fn is_word_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+    c.is_alphanumeric() || c == '_'
 }
 
 /// True for tokens worth treating as identifiers: snake_case, camelCase,
@@ -124,7 +124,12 @@ pub fn derive_patterns(query: &str) -> QueryPatterns {
     // compounds contribute both the compound's segments and, for paths, the
     // compound itself.
     for raw in unquoted.split_whitespace() {
-        let trimmed = raw.trim_matches(|c: char| !is_word_char(c) && !matches!(c, '/' | '.'));
+        // Leading '.' is exempted (preserves `./x` relative-path tokens);
+        // trailing '.' is not, so a sentence-ending period doesn't stick to
+        // the token (e.g. "…/retrieval.rs." at a sentence's end).
+        let trimmed = raw
+            .trim_start_matches(|c: char| !is_word_char(c) && !matches!(c, '/' | '.'))
+            .trim_end_matches(|c: char| !is_word_char(c) && c != '/');
         if trimmed.is_empty() {
             continue;
         }
@@ -142,17 +147,11 @@ pub fn derive_patterns(query: &str) -> QueryPatterns {
         }
     }
 
-    for literal in &patterns.literals {
+    for token in patterns.literals.iter().chain(patterns.identifiers.iter()) {
         if patterns.grep_patterns.len() >= MAX_GREP_PATTERNS {
             break;
         }
-        push_unique(&mut patterns.grep_patterns, escape_regex(literal));
-    }
-    for identifier in &patterns.identifiers {
-        if patterns.grep_patterns.len() >= MAX_GREP_PATTERNS {
-            break;
-        }
-        push_unique(&mut patterns.grep_patterns, escape_regex(identifier));
+        push_unique(&mut patterns.grep_patterns, escape_regex(token));
     }
 
     patterns

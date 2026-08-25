@@ -142,7 +142,8 @@ fn read_line() -> anyhow::Result<Option<String>> {
     if n == 0 {
         return Ok(None);
     }
-    Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
+    line.truncate(line.trim_end_matches(['\r', '\n']).len());
+    Ok(Some(line))
 }
 
 /// Prompt (showing `default`) on stderr; empty input or EOF returns `default`.
@@ -150,8 +151,15 @@ fn prompt_default(prompt: &str, default: &str) -> anyhow::Result<String> {
     eprint!("{prompt} [{default}]: ");
     let _ = std::io::stderr().flush();
     match read_line()? {
-        Some(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
-        _ => Ok(default.to_string()),
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(default.to_string())
+            } else {
+                Ok(trimmed.to_string())
+            }
+        }
+        None => Ok(default.to_string()),
     }
 }
 

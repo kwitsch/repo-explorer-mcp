@@ -11,7 +11,6 @@ pub(crate) enum Tool {
     Ripgrep,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedBackend {
     pub tool: Tool,
     pub path: PathBuf,

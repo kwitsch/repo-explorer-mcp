@@ -67,6 +67,21 @@ fn expand_tool() -> Tool {
     )
 }
 
+/// Shared JSON-Schema for `grep` and `find`, mirroring `PatternArgs` — one
+/// shape, so one schema literal.
+fn pattern_args_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string"},
+            "scope": {"type": "string"},
+            "max_results": {"type": "integer"}
+        },
+        "required": ["pattern"],
+        "additionalProperties": false
+    })
+}
+
 fn build_catalog() -> Vec<Tool> {
     vec![
         tool(
@@ -155,30 +170,12 @@ fn build_catalog() -> Vec<Tool> {
         tool(
             "grep",
             "SUPPLEMENT/fallback: raw content search of files under the repo. Use only when the memory tools are insufficient. Args: pattern (required), optional scope, max_results.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string"},
-                    "scope": {"type": "string"},
-                    "max_results": {"type": "integer"}
-                },
-                "required": ["pattern"],
-                "additionalProperties": false
-            }),
+            pattern_args_schema(),
         ),
         tool(
             "find",
             "SUPPLEMENT/fallback: search for files by name pattern. Use only when the memory tools are insufficient. Args: pattern (required), optional scope, max_results.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string"},
-                    "scope": {"type": "string"},
-                    "max_results": {"type": "integer"}
-                },
-                "required": ["pattern"],
-                "additionalProperties": false
-            }),
+            pattern_args_schema(),
         ),
         tool(
             "read_file",

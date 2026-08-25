@@ -414,12 +414,17 @@ where
                             ));
                         }
                         ProviderResponse::ToolCalls(calls) => {
-                            messages.push(Message::assistant_tool_calls(calls.clone()));
+                            // Deferred: `calls` is only read via `.iter()` below (never
+                            // mutated), so it's moved into the assistant message once
+                            // those borrows are done instead of cloned up front. On the
+                            // common immediate-finish path we return before any of that
+                            // is needed, skipping the allocation entirely.
+                            let mut turn_messages: Vec<Message> = Vec::new();
                             for finish in calls.iter().filter(|c| c.name == "finish") {
                                 match parse_finish(&finish.arguments_json) {
                                     Ok(result) => return Ok(result),
                                     Err(reason) => {
-                                        messages.push(Message::tool(
+                                        turn_messages.push(Message::tool(
                                             &finish.id,
                                             format!(
                                                 "finish rejected: {reason}; fix the arguments and call finish again"
@@ -435,10 +440,12 @@ where
                                 && single_call_rejections < MAX_SINGLE_CALL_REJECTIONS
                             {
                                 single_call_rejections += 1;
-                                messages.push(Message::tool(
+                                turn_messages.push(Message::tool(
                                     &non_finish[0].id,
                                     "call rejected: batch ALL independent tool calls of a turn into one response (they execute concurrently); resend this call together with the other lookups you need",
                                 ));
+                                messages.push(Message::assistant_tool_calls(calls));
+                                messages.extend(turn_messages);
                                 continue;
                             }
                             if !non_finish.is_empty() {
@@ -449,6 +456,8 @@ where
                                     self.cached_dispatch(repo_root, call, fingerprint)
                                 }))
                                 .await;
+                            messages.push(Message::assistant_tool_calls(calls));
+                            messages.extend(turn_messages);
                             for (message, new_findings) in results {
                                 messages.push(message);
                                 for f in new_findings {

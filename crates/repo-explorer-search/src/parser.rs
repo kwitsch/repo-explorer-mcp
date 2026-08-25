@@ -47,18 +47,29 @@ fn find_sep_run(bytes: &[u8], sep: u8) -> Option<(usize, usize)> {
 /// further right (as in the `2024-01-01.rs` case above), while a timestamp-like
 /// `:NN:` run inside *content* can sit to the right of the real `-NN-` context
 /// separator (e.g. `src/log.rs-69-12:30:05 boot`). `find_sep_run` already
-/// rules out the first case by rejecting zero-padded digit spans (`01` is
-/// never a real line number), so among whatever plausible runs remain for
-/// each separator kind, the leftmost one is the real separator: a literal `:`
-/// essentially never occurs inside a real file path (Windows forbids it
-/// outright), so a plausible `:` run can only be shadowed by an *earlier*
-/// plausible `-` run when the line is genuinely `-`-delimited.
+/// rules out the first case for zero-padded digit spans (`01` is never a real
+/// line number), but an unpadded dash-numbered path segment (`issue-42-fix.rs`)
+/// still yields a plausible `-` run left of the real `:` one, so position alone
+/// can't disambiguate: `src/log.rs-69-12:30:05 boot` and
+/// `issue-42-fix.rs:10:the fix` both have a plausible `-` run starting left of
+/// a plausible `:` run, yet the former is genuinely `-`-delimited (dash real)
+/// and the latter is genuinely `:`-delimited (dash is inside the path). What
+/// differs is what sits between the two runs: a real trailing path segment
+/// (`fix.rs`, `old.rs`) contains a non-digit byte, while genuine content
+/// wedged between a real `-NN-` separator and a coincidental `:NN:` run in a
+/// timestamp (`12`) is pure digits. So when both runs exist and the `-` run
+/// starts first, only trust it if the gap up to the `:` run is all digits;
+/// otherwise the `-` run is a false path match and the `:` run is real.
 fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
     let bytes = line.as_bytes();
     let colon = find_sep_run(bytes, b':');
     let dash = find_sep_run(bytes, b'-');
     let (sep, i, j) = match (colon, dash) {
-        (Some(c), Some(d)) if d.0 < c.0 => (b'-', d.0, d.1),
+        (Some(c), Some(d))
+            if d.0 < c.0 && line[d.1 + 1..c.0].bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            (b'-', d.0, d.1)
+        }
         (Some(c), _) => (b':', c.0, c.1),
         (None, Some(d)) => (b'-', d.0, d.1),
         (None, None) => return None,
@@ -217,11 +228,16 @@ pub(crate) fn parse_rg_json(stdout: &str) -> Result<Vec<ExplorationFinding>, Sea
                 else {
                     continue;
                 };
-                let line_number = data
+                // missing line_number: rg is always run with `-H` line numbering
+                // on, so a real match row always has one -- drop it like the
+                // missing-path case above rather than fabricate line 0
+                let Some(line_number) = data
                     .get("line_number")
                     .and_then(Value::as_u64)
                     .map(saturate_u32)
-                    .unwrap_or(0);
+                else {
+                    continue;
+                };
                 let snippet = row_line_text(data);
                 push_finding(
                     &mut findings,
@@ -313,6 +329,21 @@ mod tests {
     }
 
     #[test]
+    fn split_grep_line_handles_unpadded_dash_numbered_path() {
+        // The `-42-` run inside the file name (unpadded, so not caught by the
+        // zero-padding check) must not be mistaken for the real `:10:` match
+        // separator further right.
+        let result = split_grep_line("issue-42-fix.rs:10:the fix");
+        assert_eq!(result, Some(("issue-42-fix.rs", 10, "the fix", true)));
+    }
+
+    #[test]
+    fn split_grep_line_handles_dash_numbered_path_with_more_segments() {
+        let result = split_grep_line("src/file-42-old.rs:70:content");
+        assert_eq!(result, Some(("src/file-42-old.rs", 70, "content", true)));
+    }
+
+    #[test]
     fn parse_rg_json_routes_context_between_two_match_groups_in_one_file() {
         // Two matches (3, 9) far enough apart that their context windows
         // (radius 1) don't overlap: context(4) trails match A, context(8)
@@ -371,6 +402,18 @@ mod tests {
         let input = concat!(
             "{\"type\":\"match\",\"data\":{\"path\":{\"bytes\":\"AAAA\"},",
             "\"lines\":{\"bytes\":\"BBBB\"},\"line_number\":3}}\n"
+        );
+        let findings = parse_rg_json(input).unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn parse_rg_json_drops_match_row_missing_line_number() {
+        // A match row without `line_number` must be dropped like the missing-path
+        // case, not fabricate a bogus `line 0` finding.
+        let input = concat!(
+            "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"a.rs\"},",
+            "\"lines\":{\"text\":\"x\\n\"}}}\n"
         );
         let findings = parse_rg_json(input).unwrap();
         assert!(findings.is_empty());

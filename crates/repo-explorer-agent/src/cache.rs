@@ -39,13 +39,16 @@ impl<V: Clone> CappedMap<V> {
         if self.cap == 0 {
             return;
         }
-        if self.map.insert(key.clone(), value).is_none() {
-            self.order.push_back(key);
+        if !self.map.contains_key(&key) {
+            self.order.push_back(key.clone());
+            self.map.insert(key, value);
             while self.map.len() > self.cap {
                 if let Some(oldest) = self.order.pop_front() {
                     self.map.remove(&oldest);
                 }
             }
+        } else {
+            self.map.insert(key, value);
         }
     }
 

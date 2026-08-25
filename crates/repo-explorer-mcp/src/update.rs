@@ -286,13 +286,21 @@ async fn check_and_install(
     }
 }
 
+/// Spawn `<path> --version`, bounded by [`SUBPROCESS_TIMEOUT`]. Shared by
+/// [`read_installed_version`] (best-effort version-string extraction) and
+/// [`verify_executable`] (hard exit-status check) so the invocation itself is
+/// defined once.
+fn run_version_probe(path: &Path) -> Option<std::process::Output> {
+    let mut command = std::process::Command::new(path);
+    command.arg("--version");
+    run_with_timeout(command, SUBPROCESS_TIMEOUT)
+}
+
 /// Run `<path> --version` (bounded by [`SUBPROCESS_TIMEOUT`]) and pull the
 /// first semver-looking substring out of its output (checked on stdout, then
 /// stderr, since CLIs disagree on which stream `--version` writes to).
 fn read_installed_version(path: &Path) -> Option<semver::Version> {
-    let mut command = std::process::Command::new(path);
-    command.arg("--version");
-    let output = run_with_timeout(command, SUBPROCESS_TIMEOUT)?;
+    let output = run_version_probe(path)?;
     extract_semver(&String::from_utf8_lossy(&output.stdout))
         .or_else(|| extract_semver(&String::from_utf8_lossy(&output.stderr)))
 }
@@ -647,9 +655,7 @@ fn write_temp_executable(dir: &Path, prefix: &str, data: &[u8]) -> Result<std::p
 /// replaces anything already installed: run `<path> --version` and require a
 /// clean exit.
 fn verify_executable(path: &Path) -> Result<()> {
-    let mut command = std::process::Command::new(path);
-    command.arg("--version");
-    let output = run_with_timeout(command, SUBPROCESS_TIMEOUT).with_context(|| {
+    let output = run_version_probe(path).with_context(|| {
         format!(
             "downloaded update at {} failed to execute (or didn't exit within {SUBPROCESS_TIMEOUT:?})",
             path.display()

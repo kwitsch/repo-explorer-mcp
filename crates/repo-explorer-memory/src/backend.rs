@@ -275,6 +275,21 @@ fn parse_line_range(cell: &str) -> (u32, u32) {
     (start, end)
 }
 
+/// Build the `ExplorationFinding` shape both table-row parsers
+/// (`columnar_findings`, `text_table_findings`) return: no snippet (neither
+/// tool shape carries one) plus whatever symbol/name `note` was resolved.
+fn finding(file: &str, line_start: u32, line_end: u32, note: Option<String>) -> ExplorationFinding {
+    ExplorationFinding {
+        location: FileLocation {
+            path: std::path::PathBuf::from(file),
+            line_start,
+            line_end,
+        },
+        snippet: None,
+        note,
+    }
+}
+
 /// Decode `codebase-memory-mcp`'s columnar graph payload
 /// `{cols, groups: [{qn_prefix?, file, rows: [[cell, ...], ...]}, ...]}`
 /// (what `search_graph` with `format: "json"` actually returns). `None` when
@@ -309,21 +324,41 @@ fn columnar_findings(json: &Value) -> Option<Vec<ExplorationFinding>> {
                     format!("{qn_prefix}.{name}")
                 }
             });
-            findings.push(ExplorationFinding {
-                location: FileLocation {
-                    path: std::path::PathBuf::from(file),
-                    line_start,
-                    line_end,
-                },
-                snippet: None,
-                note,
-            });
+            findings.push(finding(file, line_start, line_end, note));
         }
     }
     Some(findings)
 }
 
-/// Parse the plain-text table `search_code` answers with:
+/// A text-table section's `(cols: ...)` header, resolved once into the fixed
+/// positions `text_table_findings` needs per row, instead of re-running a
+/// linear `position()` scan over the column names for every row.
+struct TableCols {
+    len: usize,
+    file: Option<usize>,
+    lines: Option<usize>,
+    qn: Option<usize>,
+    name: Option<usize>,
+}
+
+/// Parse a header line's tail (after the section name's `:`) for a
+/// `(cols: ...)` list; `None` when the line carries no such list (e.g. a
+/// trailing summary line like `total_grep_matches: 44`).
+fn parse_header_cols(rest: &str) -> Option<TableCols> {
+    let (_, tail) = rest.split_once("(cols:")?;
+    let names: Vec<&str> = tail.trim_end_matches(')').split_whitespace().collect();
+    let pos = |name: &str| names.iter().position(|c| *c == name);
+    Some(TableCols {
+        len: names.len(),
+        file: pos("file"),
+        lines: pos("lines"),
+        qn: pos("qn"),
+        name: pos("name"),
+    })
+}
+
+/// Parse the plain-text tables `codebase-memory-mcp` answers with — one or
+/// more sections shaped like:
 ///
 /// ```text
 /// results: 3  (cols: qn label file lines matches in out)
@@ -331,47 +366,42 @@ fn columnar_findings(json: &Value) -> Option<Vec<ExplorationFinding>> {
 /// dirs: 1  (cols: dir hits)
 /// ```
 ///
-/// Only the indented rows under the `results:` header are findings; the
-/// column order comes from the header's `(cols: …)` list.
+/// `search_code` sends a single `results:` section; `get_architecture`
+/// (which, unlike `search_graph`, never requests `format: "json"`) sends
+/// several — `node_labels:`, `edge_types:`, `packages:`, `entry_points:`,
+/// etc. Every unindented line is treated as a new section header and parsed
+/// for its `(cols: …)` list; only the indented rows under a header whose
+/// columns include `file` become findings, so a column-less section (a
+/// summary line) or a file-less one (e.g. `packages:`) is walked but simply
+/// contributes nothing.
 fn text_table_findings(text: &str) -> Vec<ExplorationFinding> {
     let mut findings = Vec::new();
-    let mut cols: Option<Vec<String>> = None;
+    let mut cols: Option<TableCols> = None;
     for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("results:") {
-            cols = rest.split_once("(cols:").map(|(_, tail)| {
-                tail.trim_end_matches(')')
-                    .split_whitespace()
-                    .map(str::to_string)
-                    .collect()
-            });
-            continue;
-        }
-        let Some(col_names) = &cols else { continue };
         if !line.starts_with(' ') {
-            break; // next section (dirs/totals) ends the results table
-        }
-        let cells: Vec<&str> = line.split_whitespace().collect();
-        if cells.len() != col_names.len() {
+            cols = line
+                .split_once(':')
+                .and_then(|(_, rest)| parse_header_cols(rest));
             continue;
         }
-        let cell = |name: &str| {
-            col_names
-                .iter()
-                .position(|c| c == name)
-                .and_then(|i| cells.get(i).copied())
+        let Some(t) = &cols else { continue };
+        let cells: Vec<&str> = line.split_whitespace().collect();
+        if cells.len() != t.len {
+            continue;
+        }
+        let Some(file) = t.file.and_then(|i| cells.get(i).copied()) else {
+            continue;
         };
-        let Some(file) = cell("file") else { continue };
-        let (line_start, line_end) = cell("lines").map(parse_line_range).unwrap_or((0, 0));
-        let note = cell("qn").or_else(|| cell("name")).map(str::to_string);
-        findings.push(ExplorationFinding {
-            location: FileLocation {
-                path: std::path::PathBuf::from(file),
-                line_start,
-                line_end,
-            },
-            snippet: None,
-            note,
-        });
+        let (line_start, line_end) = t
+            .lines
+            .and_then(|i| cells.get(i).copied())
+            .map(parse_line_range)
+            .unwrap_or((0, 0));
+        let note =
+            t.qn.or(t.name)
+                .and_then(|i| cells.get(i).copied())
+                .map(str::to_string);
+        findings.push(finding(file, line_start, line_end, note));
     }
     findings
 }
@@ -631,6 +661,35 @@ dirs: 1  (cols: dir hits)\n  crates/ 28\ntotal_grep_matches: 44\n";
             res.findings
                 .iter()
                 .all(|f| f.location.path != std::path::Path::new("crates/"))
+        );
+    }
+
+    /// Real `get_architecture` payload shape: multiple plain-text sections,
+    /// none named `results:`, only some (`entry_points:`) carrying a `file`
+    /// column.
+    #[test]
+    fn text_table_get_architecture_payload_decodes() {
+        let text = "\
+node_labels: 2  (cols: label count)\n  Function 120\n  Method 136\n\
+packages: 1  (cols: name nodes fan_in fan_out)\n  repo-explorer-core 256 0 0\n\
+entry_points: 2  (cols: qn file)\n  \
+repo.crates.repo-explorer-mcp.src.main.main crates/repo-explorer-mcp/src/main.rs\n  \
+repo.crates.repo-explorer-core.src.lib.run crates/repo-explorer-core/src/lib.rs\n";
+        let res = findings_and_summary("get_architecture", &Value::String(text.to_string()));
+        assert_eq!(res.findings.len(), 2);
+        assert_eq!(
+            res.findings[0].location.path,
+            std::path::PathBuf::from("crates/repo-explorer-mcp/src/main.rs")
+        );
+        assert_eq!(
+            res.findings[0].note.as_deref(),
+            Some("repo.crates.repo-explorer-mcp.src.main.main")
+        );
+        // No `file` column on node_labels/packages must not produce findings.
+        assert!(
+            res.findings
+                .iter()
+                .all(|f| f.location.path != std::path::Path::new("Function"))
         );
     }
 

@@ -55,28 +55,19 @@ pub(crate) fn classify_error_facts(provider: &str, facts: GenaiErrorFacts) -> Pr
     }
 
     match facts.status {
-        // 429 is standard rate-limiting; 529 is Anthropic's overloaded_error,
-        // a transient-overload signal that should failover the same way.
-        Some(429) | Some(529) => {
-            if message_indicates_quota(&message) {
-                ProviderError::QuotaExceeded { provider, message }
-            } else {
-                ProviderError::RateLimited { provider, message }
-            }
+        // 429 is standard rate-limiting; 529 is Anthropic's overloaded_error, a
+        // transient-overload signal that should failover the same way; no
+        // status at all is a connection/transport failure. All three report
+        // QuotaExceeded instead when the message clearly names a quota/billing
+        // condition.
+        Some(429) | Some(529) | None if message_indicates_quota(&message) => {
+            ProviderError::QuotaExceeded { provider, message }
         }
+        Some(429) | Some(529) => ProviderError::RateLimited { provider, message },
         Some(401) | Some(403) => ProviderError::Authentication { provider, message },
         Some(400) | Some(404) | Some(422) => ProviderError::InvalidRequest { provider, message },
-        // Other 5xx and any other status: transport-level.
-        Some(_) => ProviderError::Transport { provider, message },
-        // No status at all: connection/transport failure (unless the message
-        // clearly names a quota/billing condition).
-        None => {
-            if message_indicates_quota(&message) {
-                ProviderError::QuotaExceeded { provider, message }
-            } else {
-                ProviderError::Transport { provider, message }
-            }
-        }
+        // Other 5xx, any other status, and no status at all: transport-level.
+        Some(_) | None => ProviderError::Transport { provider, message },
     }
 }
 
