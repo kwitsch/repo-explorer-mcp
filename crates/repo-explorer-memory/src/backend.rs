@@ -226,19 +226,30 @@ fn location_from(json: &Value) -> Option<FileLocation> {
     })
 }
 
+/// Build an `ExplorationFinding` from a row: `location_from` for the
+/// location (`None` short-circuits, since a finding with no resolvable
+/// location isn't one), a `snippet_keys` lookup for the snippet, and
+/// `symbol_note` for the note. Shared by [`single_snippet`] and
+/// [`findings_and_summary`]'s row loop, which differ only in which keys the
+/// upstream tool uses for the snippet field.
+fn finding_from_row(row: &Value, snippet_keys: &[&str]) -> Option<ExplorationFinding> {
+    let location = location_from(row)?;
+    let snippet = first_field(row, snippet_keys)
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+    Some(ExplorationFinding {
+        location,
+        snippet,
+        note: symbol_note(row),
+    })
+}
+
 /// Decode a `get_code_snippet` response: 0 or 1 finding, reusing the same row
 /// shape as [`findings_and_summary`] if a location resolves.
 fn single_snippet(tool: &'static str, json: &Value) -> ExplorationResult {
     let mut findings = Vec::new();
-    if let Some(location) = location_from(json) {
-        let snippet = first_field(json, &["snippet", "code", "source", "text"])
-            .and_then(Value::as_str)
-            .map(|s| s.to_string());
-        findings.push(ExplorationFinding {
-            location,
-            snippet,
-            note: symbol_note(json),
-        });
+    if let Some(f) = finding_from_row(json, &["snippet", "code", "source", "text"]) {
+        findings.push(f);
     }
     let summary = if findings.is_empty() {
         format!("{tool}: no snippet resolved")
@@ -421,15 +432,8 @@ fn findings_and_summary(tool: &'static str, json: &Value) -> ExplorationResult {
     let mut findings = Vec::new();
     if let Some(rows) = first_field(json, &["results", "rows", "hits"]).and_then(Value::as_array) {
         for row in rows {
-            if let Some(location) = location_from(row) {
-                let snippet = first_field(row, &["snippet", "text"])
-                    .and_then(Value::as_str)
-                    .map(|s| s.to_string());
-                findings.push(ExplorationFinding {
-                    location,
-                    snippet,
-                    note: symbol_note(row),
-                });
+            if let Some(f) = finding_from_row(row, &["snippet", "text"]) {
+                findings.push(f);
             }
         }
         let summary = format!(

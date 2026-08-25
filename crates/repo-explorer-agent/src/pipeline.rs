@@ -253,12 +253,19 @@ fn candidates_of_kind(findings: Vec<ExplorationFinding>, kind: CandidateKind) ->
 /// per unique path.
 fn file_candidates(findings: Vec<ExplorationFinding>) -> Vec<Candidate> {
     let mut seen = HashSet::new();
-    findings
+    // Dedup by borrowed path first so the owned pass below can move each
+    // survivor's path straight into its Candidate instead of cloning it.
+    let keep: Vec<bool> = findings
         .iter()
-        .filter(|f| seen.insert(&f.location.path))
-        .map(|f| Candidate {
+        .map(|f| seen.insert(&f.location.path))
+        .collect();
+    findings
+        .into_iter()
+        .zip(keep)
+        .filter(|(_, keep)| *keep)
+        .map(|(f, _)| Candidate {
             location: FileLocation {
-                path: f.location.path.clone(),
+                path: f.location.path,
                 line_start: 1,
                 line_end: 1,
             },
