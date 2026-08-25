@@ -424,15 +424,23 @@ fn text_table_findings(text: &str) -> Vec<ExplorationFinding> {
     findings
 }
 
+/// Build a result whose summary only reports the finding count, with no
+/// distinct row count of its own (the text-table and columnar-JSON shapes).
+fn result_with_finding_count(
+    tool: &'static str,
+    findings: Vec<ExplorationFinding>,
+) -> ExplorationResult {
+    let summary = format!("{tool}: {} locatable finding(s)", findings.len());
+    ExplorationResult { findings, summary }
+}
+
 /// Turn a tool response into findings plus a compact summary string. Handles
 /// the three shapes `codebase-memory-mcp` actually produces: an array of
 /// object rows (`results`/`rows`/`hits`), the columnar `{cols, groups}` JSON,
 /// and the plain-text table (reaching here as `Value::String`).
 fn findings_and_summary(tool: &'static str, json: &Value) -> ExplorationResult {
     if let Value::String(text) = json {
-        let findings = text_table_findings(text);
-        let summary = format!("{tool}: {} locatable finding(s)", findings.len());
-        return ExplorationResult { findings, summary };
+        return result_with_finding_count(tool, text_table_findings(text));
     }
     let mut findings = Vec::new();
     if let Some(rows) = first_field(json, &["results", "rows", "hits"]).and_then(Value::as_array) {
@@ -448,9 +456,7 @@ fn findings_and_summary(tool: &'static str, json: &Value) -> ExplorationResult {
         );
         return ExplorationResult { findings, summary };
     }
-    let findings = columnar_findings(json).unwrap_or_default();
-    let summary = format!("{tool}: {} locatable finding(s)", findings.len());
-    ExplorationResult { findings, summary }
+    result_with_finding_count(tool, columnar_findings(json).unwrap_or_default())
 }
 
 impl MemoryBackend for MemoryClientBackend {

@@ -1,7 +1,7 @@
 //! The exploration orchestrator. Everything deterministic runs in Rust; the
 //! LLM only selects/verifies:
 //!
-//! 1. query-cache lookup (repo fingerprint, path-level invalidation) — a hit
+//! 1. query-cache lookup (repo fingerprint, diff-based invalidation) — a hit
 //!    costs nothing;
 //! 2. deterministic retrieval pre-stage (symbol lookup + grep fanout +
 //!    ranking) — high confidence answers directly with **zero** LLM calls;
@@ -25,7 +25,7 @@ use repo_explorer_core::llm::{
     TokenUsage, ToolCall,
 };
 use repo_explorer_core::memory::{IndexStatus, MemoryBackend};
-use repo_explorer_core::retrieval::{finding_from_candidate, normalize_rel_path};
+use repo_explorer_core::retrieval::finding_from_candidate;
 use repo_explorer_core::search::SearchBackend;
 use std::collections::HashSet;
 use std::path::Path;
@@ -188,14 +188,7 @@ where
         {
             let result =
                 self.result_from_candidates(&outcome.candidates, query, outcome.confidence);
-            return Ok(self.complete_run(
-                "early-exit",
-                0,
-                &query_key,
-                fingerprint,
-                &outcome.candidates,
-                result,
-            ));
+            return Ok(self.complete_run("early-exit", 0, &query_key, fingerprint, result));
         }
 
         // Stage 4: LLM verification over the candidates.
@@ -220,7 +213,6 @@ where
                     &budget,
                     &query_key,
                     fingerprint,
-                    &outcome.candidates,
                 ));
             }
             tracing::info!("verification escalated to the fallback loop");
@@ -237,14 +229,7 @@ where
                 &mut budget,
             )
             .await?;
-        Ok(self.finalize_and_complete(
-            "fallback",
-            result,
-            &budget,
-            &query_key,
-            fingerprint,
-            &outcome.candidates,
-        ))
+        Ok(self.finalize_and_complete("fallback", result, &budget, &query_key, fingerprint))
     }
 
     /// Normalize/dedupe/cap the final findings once, whatever stage produced
@@ -263,11 +248,10 @@ where
         tokens: u64,
         query_key: &str,
         fingerprint: Option<RepoFingerprint>,
-        candidates: &[Candidate],
         result: ExplorationResult,
     ) -> ExplorationResult {
         tracing::info!(path, tokens, "exploration complete");
-        self.store_query_cache(query_key, fingerprint, candidates, &result);
+        self.store_query_cache(query_key, fingerprint, &result);
         result
     }
 
@@ -280,17 +264,9 @@ where
         budget: &TokenBudget,
         query_key: &str,
         fingerprint: Option<RepoFingerprint>,
-        candidates: &[Candidate],
     ) -> ExplorationResult {
         let result = self.finalize(result);
-        self.complete_run(
-            stage,
-            budget.spent(),
-            query_key,
-            fingerprint,
-            candidates,
-            result,
-        )
+        self.complete_run(stage, budget.spent(), query_key, fingerprint, result)
     }
 
     /// The cache is usable this call only when caching is enabled and a
@@ -305,8 +281,12 @@ where
     }
 
     /// Serve from the query cache when the entry is still valid: same
-    /// fingerprint, or a fingerprint change that provably touched none of the
-    /// entry's contributing paths.
+    /// fingerprint, or a fingerprint change that provably changed nothing at
+    /// all. Checking the diff against only the *entry's own* contributing
+    /// paths is unsound — retrieval scans the whole repo, so a path outside
+    /// those paths (not least a newly added file) can still turn into a
+    /// better match that the stale entry never saw — so any actual diff
+    /// invalidates the entry.
     async fn query_cache_lookup(
         &self,
         repo_root: &Path,
@@ -323,9 +303,7 @@ where
             .changed_paths(repo_root, &entry.fingerprint, fp)
             .await
         {
-            Some(changed)
-                if !entry.paths.is_empty() && changed.iter().all(|p| !entry.paths.contains(p)) =>
-            {
+            Some(changed) if changed.is_empty() => {
                 cache.refresh_query_fingerprint(query_key, fp.clone());
                 Some(entry.result)
             }
@@ -340,27 +318,15 @@ where
         &self,
         query_key: &str,
         fingerprint: Option<RepoFingerprint>,
-        candidates: &[Candidate],
         result: &ExplorationResult,
     ) {
         let (Some(cache), Some(fingerprint)) = (&self.cache, fingerprint) else {
             return;
         };
-        let mut paths: HashSet<_> = result
-            .findings
-            .iter()
-            .map(|f| f.location.path.clone())
-            .collect();
-        paths.extend(
-            candidates
-                .iter()
-                .map(|c| normalize_rel_path(&c.location.path)),
-        );
         cache.put_query(
             query_key.to_string(),
             QueryEntry {
                 fingerprint,
-                paths,
                 result: result.clone(),
             },
         );

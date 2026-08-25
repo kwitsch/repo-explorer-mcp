@@ -110,6 +110,7 @@ fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
     let dash = find_sep_run(bytes, b'-', 0);
     let (sep, i, j) = match (colon, dash) {
         (Some(c), Some(d)) if d.0 < c.0 && !trailing_token_has_dot(bytes, d.1 + 1, c.0) => {
+            let d = resolve_dash_sep_run(bytes, d);
             (b'-', d.0, d.1)
         }
         (Some(c), _) => (b':', c.0, c.1),
@@ -473,6 +474,20 @@ mod tests {
                 "Release 1.2.0 shipped at 10:30:00 UTC",
                 false
             ))
+        );
+    }
+
+    #[test]
+    fn split_grep_line_handles_dash_numbered_path_with_coincidental_colon_in_content() {
+        // Both a coincidental in-path `-2-` run (left of the real `-45-`
+        // context separator) and a coincidental `:30:` run in the content
+        // exist on this line; the mixed colon+dash branch must resolve the
+        // dash run the same way the no-colon branch does rather than
+        // stopping at the first in-path dash run.
+        let result = split_grep_line("component-2-renderer.tsx-45-time 12:30:00");
+        assert_eq!(
+            result,
+            Some(("component-2-renderer.tsx", 45, "time 12:30:00", false))
         );
     }
 

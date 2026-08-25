@@ -470,8 +470,12 @@ fn arch_keywords() -> Vec<&'static str> {
 /// Pick the release asset matching the current OS/arch. Restricted to known
 /// archive extensions (never a bare/unknown-format asset such as `.mcpb`,
 /// `.txt`, or `.json`, which would otherwise be installed verbatim as if it
-/// were the binary) and skips UI-bundle variants (`-ui-`), preferring a
-/// non-`portable` build when both are offered for the same platform.
+/// were the binary) and skips UI-bundle variants (`-ui-`). Among the
+/// remaining candidates, prefers a non-`portable` build, then (on a tie)
+/// the MSVC toolchain over GNU — MSVC is what Rust's default Windows
+/// toolchain and scoop/winget/choco `rg` installs produce, so it's a safer
+/// default than depending on GitHub's incidental asset-list order when a
+/// release publishes both `-pc-windows-gnu` and `-pc-windows-msvc` archives.
 fn pick_asset(assets: &[Asset]) -> Option<&Asset> {
     let os = current_os_keyword();
     let arch_keywords = arch_keywords();
@@ -486,7 +490,7 @@ fn pick_asset(assets: &[Asset]) -> Option<&Asset> {
             matches.then_some((a, name))
         })
         .collect();
-    candidates.sort_by_key(|(_, name)| name.contains("portable"));
+    candidates.sort_by_key(|(_, name)| (name.contains("portable"), name.contains("-gnu")));
     candidates.into_iter().next().map(|(a, _)| a)
 }
 
@@ -818,6 +822,29 @@ mod tests {
         ];
         let picked = pick_asset(&assets).expect("a proper archive should match");
         assert_eq!(picked.name, format!("tool-{os}-amd64.tar.gz"));
+    }
+
+    #[test]
+    fn pick_asset_prefers_msvc_over_gnu_on_a_tie() {
+        // Regression: when a release publishes both toolchain variants for
+        // the same OS/arch (e.g. ripgrep's Windows gnu and msvc zips), the
+        // pick must be deterministic and favor msvc, not whichever happens
+        // to come first in GitHub's asset list. Built from the current
+        // host's own OS/arch keywords so the test matches on any runner.
+        let os = current_os_keyword();
+        let arch = arch_keywords()[0];
+        let gnu = format!("tool-15.2.0-{arch}-{os}-gnu.zip");
+        let msvc = format!("tool-15.2.0-{arch}-{os}-msvc.zip");
+
+        let assets = vec![asset(&gnu), asset(&msvc)];
+        let picked = pick_asset(&assets).expect("an asset should match this platform");
+        assert_eq!(picked.name, msvc);
+
+        // Order-independence: the same pick regardless of list order.
+        let assets_reversed = vec![asset(&msvc), asset(&gnu)];
+        let picked_reversed =
+            pick_asset(&assets_reversed).expect("an asset should match this platform");
+        assert_eq!(picked_reversed.name, msvc);
     }
 
     #[test]

@@ -50,13 +50,7 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
         |token| {
             memoized(
                 leg_cache,
-                move || {
-                    format!(
-                        "symbol{}{}",
-                        encode_field(token),
-                        encode_field(&scope_display(scope))
-                    )
-                },
+                move || leg_key("symbol", token, scope),
                 async move {
                     let graph_query = GraphQuery {
                         name_pattern: Some(token.clone()),
@@ -100,13 +94,7 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
     let grep_legs = join_all(patterns.grep_patterns.iter().map(|pattern| {
         memoized(
             leg_cache,
-            move || {
-                format!(
-                    "grep{}{}",
-                    encode_field(pattern),
-                    encode_field(&scope_display(scope))
-                )
-            },
+            move || leg_key("grep", pattern, scope),
             async move {
                 let options = SearchOptions {
                     max_results: Some(PER_LEG_MAX_RESULTS),
@@ -131,13 +119,7 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
             .map(|token| {
                 memoized(
                     leg_cache,
-                    move || {
-                        format!(
-                            "file{}{}",
-                            encode_field(token),
-                            encode_field(&scope_display(scope))
-                        )
-                    },
+                    move || leg_key("file", token, scope),
                     async move {
                         let options = SearchOptions {
                             max_results: Some(PER_LEG_MAX_RESULTS),
@@ -222,6 +204,17 @@ async fn soft_leg<T, E: std::fmt::Display>(
 /// Render the scope hint for cache-key inclusion.
 fn scope_display(scope: Option<&Path>) -> String {
     scope.map(|p| p.display().to_string()).unwrap_or_default()
+}
+
+/// Build a leg-cache key from a leg prefix, its value, and the scope hint.
+/// Shared by every fanout leg so a future change to the (value, scope)
+/// encoding can't be applied to some legs and missed on others.
+fn leg_key(prefix: &str, value: &str, scope: Option<&Path>) -> String {
+    format!(
+        "{prefix}{}{}",
+        encode_field(value),
+        encode_field(&scope_display(scope))
+    )
 }
 
 /// Build candidates from findings, with `kind_of` classifying each finding

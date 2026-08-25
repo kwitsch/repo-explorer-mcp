@@ -7,8 +7,7 @@ use repo_explorer_core::domain::{
     Candidate, ExplorationFinding, ExplorationQuery, ExplorationResult,
 };
 use repo_explorer_core::fingerprint::RepoFingerprint;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 /// A capped `String`-keyed map with FIFO eviction (oldest inserted first out).
@@ -70,9 +69,6 @@ pub(crate) fn encode_field(s: &str) -> String {
 #[derive(Debug, Clone)]
 pub(crate) struct QueryEntry {
     pub fingerprint: RepoFingerprint,
-    /// Repo-relative paths the result was derived from; a change to any of
-    /// them invalidates the entry.
-    pub paths: HashSet<PathBuf>,
     pub result: ExplorationResult,
 }
 
@@ -169,8 +165,8 @@ impl ResultCache {
         self.lock().queries.insert(key, entry);
     }
 
-    /// Keep a still-valid entry current after the repo moved without touching
-    /// its contributing paths.
+    /// Keep a still-valid entry current after the repo moved without any
+    /// actual diff (see `AgentLoop::query_cache_lookup`).
     pub(crate) fn refresh_query_fingerprint(&self, key: &str, fingerprint: RepoFingerprint) {
         let mut inner = self.lock();
         if let Some(entry) = inner.queries.get_mut(key) {
@@ -194,10 +190,9 @@ mod tests {
         }
     }
 
-    fn entry(sha: &str, path: &str) -> QueryEntry {
+    fn entry(sha: &str) -> QueryEntry {
         QueryEntry {
             fingerprint: fp(sha),
-            paths: HashSet::from([PathBuf::from(path)]),
             result: ExplorationResult {
                 findings: vec![],
                 summary: format!("from {sha}"),
@@ -236,7 +231,7 @@ mod tests {
     #[test]
     fn query_refresh_and_remove() {
         let cache = ResultCache::new(4);
-        cache.put_query("q".into(), entry("a", "src/x.rs"));
+        cache.put_query("q".into(), entry("a"));
         cache.refresh_query_fingerprint("q", fp("b"));
         assert_eq!(cache.get_query("q").unwrap().fingerprint, fp("b"));
         cache.remove_query("q");
