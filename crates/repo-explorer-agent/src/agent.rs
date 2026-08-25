@@ -25,7 +25,7 @@ use repo_explorer_core::llm::{
     TokenUsage, ToolCall,
 };
 use repo_explorer_core::memory::{IndexStatus, MemoryBackend};
-use repo_explorer_core::retrieval::finding_from_candidate;
+use repo_explorer_core::retrieval::{finding_from_candidate, normalize_rel_path};
 use repo_explorer_core::search::SearchBackend;
 use std::collections::HashSet;
 use std::path::Path;
@@ -331,7 +331,11 @@ where
             .iter()
             .map(|f| f.location.path.clone())
             .collect();
-        paths.extend(candidates.iter().map(|c| c.location.path.clone()));
+        paths.extend(
+            candidates
+                .iter()
+                .map(|c| normalize_rel_path(&c.location.path)),
+        );
         cache.put_query(
             query_key.to_string(),
             QueryEntry {

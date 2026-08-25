@@ -162,7 +162,11 @@ fn snippet_target(args: GetCodeSnippetArgs) -> Result<SnippetTarget, String> {
 }
 
 /// The one lexical "stays inside the repository" check: reject a
-/// model-supplied path that is absolute or walks out via a `..` component.
+/// model-supplied path that is absolute, walks out via a `..` component, or
+/// (on Windows) names a drive via a prefix component — `Component::Prefix`
+/// also catches a drive-relative path like `C:foo`, which is neither
+/// `is_absolute()` nor `has_root()` since it resolves against that drive's
+/// own current directory rather than `repo_root`.
 /// `label` names the offending input in the error (`scope`, `read_file path`).
 /// `read_file` additionally verifies the *resolved* path; a `SearchBackend`
 /// scope is only checked lexically because it need not exist yet.
@@ -170,7 +174,9 @@ fn reject_escaping_path(label: &str, raw: &str) -> Result<PathBuf, String> {
     let rel = Path::new(raw);
     if rel.is_absolute()
         || rel.has_root()
-        || rel.components().any(|c| matches!(c, Component::ParentDir))
+        || rel
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
     {
         return Err(format!("{label} `{raw}` escapes the repository root"));
     }

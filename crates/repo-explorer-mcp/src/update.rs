@@ -97,13 +97,13 @@ pub async fn run_update() -> ExitCode {
     let mut handles = Vec::with_capacity(1 + DEPENDENCY_BINARIES.len());
     let self_client = client.clone();
     handles.push((
-        SELF_REPO.to_string(),
+        SELF_REPO,
         tokio::spawn(async move { update_self(&self_client).await }),
     ));
     for dep in DEPENDENCY_BINARIES {
         let client = client.clone();
         handles.push((
-            dep.command.to_string(),
+            dep.command,
             tokio::spawn(async move { update_dependency(&client, dep).await }),
         ));
     }
@@ -113,7 +113,7 @@ pub async fn run_update() -> ExitCode {
         components.push(match handle.await {
             Ok(report) => report,
             Err(e) => ComponentReport {
-                name,
+                name: name.to_string(),
                 current_version: None,
                 latest_version: None,
                 action: "error",
@@ -581,7 +581,7 @@ fn verify_sha256(data: &[u8], checksum_text: &str, asset_name: &str) -> Result<(
 fn matches_binary_name(entry_name: &str, command: &str) -> bool {
     let base = entry_name.rsplit('/').next().unwrap_or(entry_name);
     let base = base.rsplit('\\').next().unwrap_or(base);
-    base == command || base == format!("{command}.exe")
+    base == command || base.strip_suffix(".exe") == Some(command)
 }
 
 fn extract_binary(asset_name: &str, data: &[u8], command: &str) -> Result<Vec<u8>> {

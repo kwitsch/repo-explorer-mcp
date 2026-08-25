@@ -58,6 +58,14 @@ impl<V: Clone> CappedMap<V> {
     }
 }
 
+/// Length-prefix a field (`len:content`) so concatenating several fields into
+/// a cache key can never collide across differing field boundaries,
+/// regardless of what characters the fields themselves contain. Shared by
+/// `query_key` below and the retrieval-leg keys in `pipeline.rs`.
+pub(crate) fn encode_field(s: &str) -> String {
+    format!("{}:{}", s.len(), s)
+}
+
 /// One cached query result plus what it depends on.
 #[derive(Debug, Clone)]
 pub(crate) struct QueryEntry {
@@ -99,8 +107,19 @@ impl ResultCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// `tool` and `args_json` are model-supplied and unvalidated at this
+    /// point, so both are length-prefixed via `encode_field` rather than
+    /// joined with a bare delimiter — differing field boundaries can never
+    /// hash-collide regardless of what characters the fields themselves
+    /// contain.
     pub(crate) fn tool_key(fp: &RepoFingerprint, tool: &str, args_json: &str) -> String {
-        format!("{}#{}#{tool}#{args_json}", fp.head_sha, fp.dirty_hash)
+        format!(
+            "{}#{}#{}{}",
+            fp.head_sha,
+            fp.dirty_hash,
+            encode_field(tool),
+            encode_field(args_json)
+        )
     }
 
     pub(crate) fn get_tool(&self, key: &str) -> Option<(String, Vec<ExplorationFinding>)> {
@@ -124,11 +143,8 @@ impl ResultCache {
     }
 
     /// Fingerprint-independent query key: invalidation is handled via the
-    /// stored fingerprint, not the key.
-    ///
-    /// Each field is length-prefixed (`len:content`) rather than joined with a
-    /// bare delimiter, so differing field boundaries can never hash-collide
-    /// regardless of what characters the fields themselves contain.
+    /// stored fingerprint, not the key. Fields are joined via `encode_field`
+    /// so differing field boundaries can never collide.
     pub(crate) fn query_key(query: &ExplorationQuery) -> String {
         let text = query.text.trim().to_lowercase();
         let scope = query
@@ -138,10 +154,10 @@ impl ResultCache {
             .unwrap_or_default();
         let max_results = query.max_results.map(|m| m.to_string()).unwrap_or_default();
         format!(
-            "{}:{text}{}:{scope}{}:{max_results}",
-            text.len(),
-            scope.len(),
-            max_results.len()
+            "{}{}{}",
+            encode_field(&text),
+            encode_field(&scope),
+            encode_field(&max_results)
         )
     }
 
@@ -234,6 +250,15 @@ mod tests {
         let c = ResultCache::tool_key(&fp("s1"), "find", "{\"p\":1}");
         assert_ne!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn tool_key_does_not_collide_across_tool_arg_boundary() {
+        // "grep" + '{"pattern":"a#b"}' vs 'grep#{"pattern":"a' + 'b"}' — same
+        // concatenation, different tool/args split; must not collide.
+        let a = ResultCache::tool_key(&fp("s"), "grep", "{\"pattern\":\"a#b\"}");
+        let b = ResultCache::tool_key(&fp("s"), "grep#{\"pattern\":\"a", "b\"}");
+        assert_ne!(a, b);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::cache::ResultCache;
+use crate::cache::{ResultCache, encode_field};
 
 /// How many identifier tokens get their own symbol-lookup leg.
 const SYMBOL_LOOKUP_TOKENS: usize = 4;
@@ -205,14 +205,6 @@ async fn soft_leg<T, E: std::fmt::Display>(
 /// Render the scope hint for cache-key inclusion.
 fn scope_display(scope: Option<&Path>) -> String {
     scope.map(|p| p.display().to_string()).unwrap_or_default()
-}
-
-/// Length-prefix a field (`len:content`) so concatenating several fields into
-/// a cache key can never collide across differing field boundaries,
-/// regardless of what characters the fields themselves contain — mirrors
-/// `ResultCache::query_key`.
-fn encode_field(s: &str) -> String {
-    format!("{}:{}", s.len(), s)
 }
 
 /// Classify symbol-lookup findings: the memory backend carries the symbol name

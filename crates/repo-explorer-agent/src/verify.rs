@@ -152,12 +152,11 @@ async fn candidates_block<M: MemoryBackend>(
     candidates: &[Candidate],
     caps: &RenderCaps,
 ) -> String {
-    let unique_paths: HashSet<PathBuf> =
-        candidates.iter().map(|c| c.location.path.clone()).collect();
+    let unique_paths: HashSet<&PathBuf> = candidates.iter().map(|c| &c.location.path).collect();
     let skeletons: HashMap<PathBuf, String> =
         join_all(unique_paths.into_iter().map(|path| async move {
-            let outline = skeleton_for(memory, repo_root, &path).await?;
-            Some((path, outline))
+            let outline = skeleton_for(memory, repo_root, path).await?;
+            Some((path.clone(), outline))
         }))
         .await
         .into_iter()
