@@ -50,7 +50,7 @@ const DEPENDENCY_BINARIES: &[DependencyBinary] = &[
 
 /// True when `--update` is present among the raw CLI args.
 pub fn wants_update(args: &[String]) -> bool {
-    args.iter().any(|a| a == "--update")
+    crate::has_flag(args, &["--update"])
 }
 
 #[derive(Debug, Deserialize)]

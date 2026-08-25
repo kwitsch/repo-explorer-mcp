@@ -239,6 +239,9 @@ pub(crate) fn parse_rg_json(stdout: &str) -> Result<Vec<ExplorationFinding>, Sea
         };
         match kind {
             "begin" => {
+                // drop any leading-context buffered for a dropped match in the
+                // previous file, so it can't leak into this file's first finding
+                pending_before.clear();
                 last_line_number = None;
                 at_boundary = true;
             }

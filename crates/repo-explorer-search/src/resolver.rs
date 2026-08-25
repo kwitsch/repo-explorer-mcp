@@ -16,11 +16,23 @@ pub(crate) struct ResolvedBackend {
     pub path: PathBuf,
 }
 
-/// Pick which binary to run. An explicit config path wins over PATH detection
-/// for that tool (config doc says `None` -> auto-detect); a bad explicit path
-/// is trusted as-is and surfaces as a spawn failure at run time, not here.
-/// `prefer_rtk == true` tries rtk then rg; `false` tries rg then rtk. Returns
-/// `None` when neither tool resolves.
+/// Resolve a single tool: an explicit config path wins over PATH detection
+/// (config doc says `None` -> auto-detect); a bad explicit path is trusted
+/// as-is and surfaces as a spawn failure at run time, not here.
+fn try_tool(
+    explicit: Option<&Path>,
+    tool: Tool,
+    find: impl Fn() -> Option<PathBuf>,
+) -> Option<ResolvedBackend> {
+    let path = match explicit {
+        Some(p) => p.to_path_buf(),
+        None => find()?,
+    };
+    Some(ResolvedBackend { tool, path })
+}
+
+/// Pick which binary to run. `prefer_rtk == true` tries rtk then rg; `false`
+/// tries rg then rtk. Returns `None` when neither tool resolves.
 pub(crate) fn resolve_backend(
     rtk_path: Option<&Path>,
     ripgrep_path: Option<&Path>,
@@ -28,26 +40,8 @@ pub(crate) fn resolve_backend(
     find_rtk: impl Fn() -> Option<PathBuf>,
     find_rg: impl Fn() -> Option<PathBuf>,
 ) -> Option<ResolvedBackend> {
-    let try_rtk = || -> Option<ResolvedBackend> {
-        let path = match rtk_path {
-            Some(p) => p.to_path_buf(),
-            None => find_rtk()?,
-        };
-        Some(ResolvedBackend {
-            tool: Tool::Rtk,
-            path,
-        })
-    };
-    let try_rg = || -> Option<ResolvedBackend> {
-        let path = match ripgrep_path {
-            Some(p) => p.to_path_buf(),
-            None => find_rg()?,
-        };
-        Some(ResolvedBackend {
-            tool: Tool::Ripgrep,
-            path,
-        })
-    };
+    let try_rtk = || try_tool(rtk_path, Tool::Rtk, &find_rtk);
+    let try_rg = || try_tool(ripgrep_path, Tool::Ripgrep, &find_rg);
     if prefer_rtk {
         try_rtk().or_else(try_rg)
     } else {

@@ -20,7 +20,7 @@ use std::sync::LazyLock;
 
 /// True for the single-token subcommand `setup` (mirrors `wants_config_test`).
 pub fn wants_setup(args: &[String]) -> bool {
-    args.iter().any(|a| a == "setup")
+    crate::has_flag(args, &["setup"])
 }
 
 /// A provider inferred from a set env var. `kind` is one of KNOWN_PROVIDER_KINDS.

@@ -374,8 +374,7 @@ where
         let take = query
             .max_results
             .map(|m| m as usize)
-            .unwrap_or(candidates.len())
-            .min(candidates.len());
+            .unwrap_or(candidates.len());
         let findings = tidy_findings(
             candidates
                 .iter()
