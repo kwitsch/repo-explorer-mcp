@@ -7,7 +7,6 @@ edition.workspace = true
 repo-explorer-core = { version = "0.1.0", path = "../repo-explorer-core" }
 genai = "0.6"
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [features]
 # Enables live provider calls (real network + real API keys). Never run by the

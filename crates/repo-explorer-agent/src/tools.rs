@@ -3,7 +3,7 @@
 //! supplies it from loop state.
 
 use repo_explorer_core::domain::{ExplorationFinding, ExplorationResult, FileLocation};
-use repo_explorer_core::llm::Tool;
+use repo_explorer_core::llm::{Message, Tool, ToolCall};
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
@@ -377,6 +377,33 @@ pub(crate) fn parse_finish(arguments_json: &str) -> Result<ExplorationResult, St
         findings,
         summary: args.summary,
     })
+}
+
+/// Resolve the `finish` calls of one model turn: the first one that parses
+/// successfully ends the turn immediately; otherwise a rejection
+/// `Role::Tool` message is built for every one that failed to parse, so the
+/// caller can feed it back to the model and let it retry. Shared by the
+/// fallback loop and the verification stage, which otherwise duplicated this
+/// exact resolution logic.
+pub(crate) fn resolve_finish(calls: &[ToolCall]) -> Result<ExplorationResult, Vec<Message>> {
+    let finishes: Vec<&ToolCall> = calls.iter().filter(|c| c.name == "finish").collect();
+    if let Some(result) = finishes
+        .iter()
+        .find_map(|c| parse_finish(&c.arguments_json).ok())
+    {
+        return Ok(result);
+    }
+    let rejections = finishes
+        .iter()
+        .filter_map(|c| {
+            let reason = parse_finish(&c.arguments_json).err()?;
+            Some(Message::tool(
+                &c.id,
+                format!("finish rejected: {reason}; fix the arguments and call finish again"),
+            ))
+        })
+        .collect();
+    Err(rejections)
 }
 
 #[cfg(test)]

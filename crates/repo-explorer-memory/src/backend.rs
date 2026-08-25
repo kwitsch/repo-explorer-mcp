@@ -253,8 +253,8 @@ fn single_snippet(tool: &'static str, json: &Value) -> ExplorationResult {
 fn symbol_note(row: &Value) -> Option<String> {
     first_field(row, &["qualified_name", "name", "symbol"])
         .and_then(Value::as_str)
-        .map(|s| s.to_string())
         .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
 }
 
 /// Parse a `"start-end"` / `"start"` line-range cell (tolerating quotes) into

@@ -34,7 +34,7 @@ use crate::cache::{QueryEntry, ResultCache};
 use crate::dispatch::dispatch_call;
 use crate::pipeline;
 use crate::render::{RenderCaps, tidy_findings};
-use crate::tools::{finish_only_catalog, parse_finish, tool_catalog};
+use crate::tools::{finish_only_catalog, parse_finish, resolve_finish, tool_catalog};
 use crate::verify::{VerifyOutcome, verify};
 
 /// The only hard-failure mode: the provider router could not produce a response
@@ -214,15 +214,13 @@ where
             )
             .await
             {
-                let result = self.finalize(result);
-                let tokens = budget.spent();
-                return Ok(self.complete_run(
+                return Ok(self.finalize_and_complete(
                     "verify",
-                    tokens,
+                    result,
+                    &budget,
                     &query_key,
                     fingerprint,
                     &outcome.candidates,
-                    result,
                 ));
             }
             tracing::info!("verification escalated to the fallback loop");
@@ -239,15 +237,13 @@ where
                 &mut budget,
             )
             .await?;
-        let result = self.finalize(result);
-        let tokens = budget.spent();
-        Ok(self.complete_run(
+        Ok(self.finalize_and_complete(
             "fallback",
-            tokens,
+            result,
+            &budget,
             &query_key,
             fingerprint,
             &outcome.candidates,
-            result,
         ))
     }
 
@@ -273,6 +269,28 @@ where
         tracing::info!(path, tokens, "exploration complete");
         self.store_query_cache(query_key, fingerprint, candidates, &result);
         result
+    }
+
+    /// The shared tail of the verify/fallback branches: finalize the result,
+    /// then run it through `complete_run` with the tokens spent so far.
+    fn finalize_and_complete(
+        &self,
+        stage: &'static str,
+        result: ExplorationResult,
+        budget: &TokenBudget,
+        query_key: &str,
+        fingerprint: Option<RepoFingerprint>,
+        candidates: &[Candidate],
+    ) -> ExplorationResult {
+        let result = self.finalize(result);
+        self.complete_run(
+            stage,
+            budget.spent(),
+            query_key,
+            fingerprint,
+            candidates,
+            result,
+        )
     }
 
     /// The cache is usable this call only when caching is enabled and a
@@ -423,20 +441,10 @@ where
                             // those borrows are done instead of cloned up front. On the
                             // common immediate-finish path we return before any of that
                             // is needed, skipping the allocation entirely.
-                            let mut turn_messages: Vec<Message> = Vec::new();
-                            for finish in calls.iter().filter(|c| c.name == "finish") {
-                                match parse_finish(&finish.arguments_json) {
-                                    Ok(result) => return Ok(result),
-                                    Err(reason) => {
-                                        turn_messages.push(Message::tool(
-                                            &finish.id,
-                                            format!(
-                                                "finish rejected: {reason}; fix the arguments and call finish again"
-                                            ),
-                                        ));
-                                    }
-                                }
-                            }
+                            let mut turn_messages: Vec<Message> = match resolve_finish(&calls) {
+                                Ok(result) => return Ok(result),
+                                Err(rejections) => rejections,
+                            };
                             let non_finish: Vec<&ToolCall> =
                                 calls.iter().filter(|c| c.name != "finish").collect();
                             if calls.len() == 1

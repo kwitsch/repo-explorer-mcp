@@ -235,14 +235,19 @@ fn merge_into(a: &mut Candidate, b: Candidate) {
 /// Merge overlapping candidates per file, score, rank, and truncate to
 /// `top_k`. Deterministic: stable ordering by (score desc, path, line_start).
 pub fn merge_and_rank(raw: Vec<Candidate>, patterns: &QueryPatterns, top_k: u32) -> Vec<Candidate> {
-    // Lowercase pattern tokens once; coverage() reuses this across every candidate.
-    let lowered_patterns: Vec<String> = patterns
-        .identifiers
-        .iter()
-        .chain(patterns.literals.iter())
-        .filter(|token| !token.is_empty())
-        .map(|token| token.to_ascii_lowercase())
-        .collect();
+    // Lowercase pattern tokens once, deduped post-lowercasing so a term
+    // repeated under different casing (or as both identifier and literal)
+    // isn't double-counted by coverage()'s distinct-match contract.
+    let mut lowered_patterns: Vec<String> = Vec::new();
+    for token in patterns.identifiers.iter().chain(patterns.literals.iter()) {
+        if token.is_empty() {
+            continue;
+        }
+        let lowered = token.to_ascii_lowercase();
+        if !lowered_patterns.contains(&lowered) {
+            lowered_patterns.push(lowered);
+        }
+    }
 
     let mut per_file: HashMap<PathBuf, Vec<Candidate>> = HashMap::new();
     for mut candidate in raw {
@@ -519,6 +524,22 @@ mod tests {
                 (PathBuf::from("a.rs"), 9),
                 (PathBuf::from("b.rs"), 1),
             ]
+        );
+    }
+
+    #[test]
+    fn coverage_boost_does_not_double_count_case_variants() {
+        // "Cache" and "cache" are distinct identifiers pre-lowercasing but
+        // must collapse to one distinct term for coverage scoring.
+        let p = derive_patterns("check Cache and cache items");
+        assert_eq!(p.identifiers, vec!["check", "Cache", "cache", "items"]);
+        let mut c = candidate("a.rs", 1, 1, CandidateKind::ContentHit);
+        c.snippet = Some("check cache items".to_string());
+        let ranked = merge_and_rank(vec![c], &p, 10);
+        // 3 distinct terms ("check", "cache", "items") -> boost of 90, not 120.
+        assert_eq!(
+            ranked[0].score,
+            kind_base_score(CandidateKind::ContentHit) + 90
         );
     }
 

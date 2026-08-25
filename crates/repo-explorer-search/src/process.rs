@@ -56,7 +56,8 @@ pub(crate) async fn run(spec: &SpawnSpec) -> Result<String, SearchError> {
     })?;
 
     match output.status.code() {
-        Some(0) | Some(1) => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
+        Some(0) | Some(1) => Ok(String::from_utf8(output.stdout)
+            .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())),
         other => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let code_str = other

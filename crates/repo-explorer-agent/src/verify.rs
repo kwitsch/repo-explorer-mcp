@@ -18,7 +18,7 @@ use crate::agent::TokenBudget;
 use crate::dispatch::{parse_args, read_file};
 use crate::render::{RenderCaps, cap_file_lines, cap_snippet};
 use crate::skeleton::skeleton_for;
-use crate::tools::{ExpandArgs, parse_finish, verify_catalog};
+use crate::tools::{ExpandArgs, resolve_finish, verify_catalog};
 
 /// Lines of body context fetched around a candidate on `expand`.
 const EXPAND_CONTEXT_BEFORE: u32 = 10;
@@ -86,22 +86,10 @@ where
                     ProviderResponse::ToolCalls(calls) if !calls.is_empty() => {
                         // Check for a successful finish before cloning anything: the
                         // common case (finish on the first turn) returns right here.
-                        let finished = calls
-                            .iter()
-                            .filter(|c| c.name == "finish")
-                            .find_map(|finish| parse_finish(&finish.arguments_json).ok());
-                        if let Some(result) = finished {
-                            return VerifyOutcome::Finished(result);
-                        }
-                        let mut responses = Vec::new();
-                        for finish in calls.iter().filter(|c| c.name == "finish") {
-                            if let Err(reason) = parse_finish(&finish.arguments_json) {
-                                responses.push(Message::tool(
-                                    &finish.id,
-                                    format!("finish rejected: {reason}; call finish again"),
-                                ));
-                            }
-                        }
+                        let mut responses = match resolve_finish(&calls) {
+                            Ok(result) => return VerifyOutcome::Finished(result),
+                            Err(rejections) => rejections,
+                        };
                         for call in calls.iter().filter(|c| c.name != "finish") {
                             let content = match call.name.as_str() {
                                 "expand" => expand_content(
