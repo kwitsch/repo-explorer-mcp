@@ -213,14 +213,16 @@ fn handle_context_line(
 
 /// Parse `rtk rg -H -n` output. Each match line becomes one finding. A context
 /// line before any group boundary (`--`) appends to the previous finding's
-/// snippet on a best-effort basis (dropped if there is no previous finding);
-/// a context line after a boundary is buffered and prepended to the next
-/// finding instead, since it leads that match rather than trailing the one
-/// before the boundary.
+/// snippet; a context line after a boundary -- including before the very
+/// first match, since the stream starts at a boundary -- is buffered and
+/// prepended to the next finding instead, since it leads that match rather
+/// than trailing the one before the boundary.
 pub(crate) fn parse_rtk(stdout: &str) -> Vec<ExplorationFinding> {
     let mut findings: Vec<ExplorationFinding> = Vec::new();
     let mut pending_before: Vec<String> = Vec::new();
-    let mut at_boundary = false;
+    // Starts true, mirroring parse_rg_json: any context before the first
+    // match in the whole stream is leading, not trailing a prior finding.
+    let mut at_boundary = true;
     for line in stdout.lines() {
         if line.is_empty() {
             continue;
@@ -376,8 +378,9 @@ mod tests {
     #[test]
     fn parse_rtk_extracts_matches_and_appends_context() {
         let findings = parse_rtk(&fixture("rtk_rg_output.txt"));
-        // Two match lines (70, 71); the leading context line (69) is dropped
-        // (no prior match), the trailing context line (72) appends to 71.
+        // Two match lines (70, 71); the leading context line (69), coming
+        // before any "--" boundary, is prepended as findings[0]'s leading
+        // context, and the trailing context line (72) appends to 71.
         assert_eq!(findings.len(), 2);
         assert_eq!(
             findings[0].location.path,
@@ -387,7 +390,7 @@ mod tests {
         assert_eq!(findings[0].location.line_end, 70);
         assert_eq!(
             findings[0].snippet.as_deref(),
-            Some("    #[serde(default = \"default_prefer_rtk\")]")
+            Some("    pub timeout_seconds: u64,\n    #[serde(default = \"default_prefer_rtk\")]")
         );
         assert_eq!(findings[1].location.line_start, 71);
         let s1 = findings[1].snippet.as_deref().unwrap();

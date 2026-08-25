@@ -583,7 +583,10 @@ fn verify_sha256(data: &[u8], checksum_text: &str, asset_name: &str) -> Result<(
 /// True when `entry_name`'s base filename is `command` (optionally with a
 /// `.exe` suffix), ignoring any archive-internal directory prefix.
 fn matches_binary_name(entry_name: &str, command: &str) -> bool {
-    let base = entry_name.rsplit(['/', '\\']).next().unwrap_or(entry_name);
+    let base = entry_name
+        .rsplit(['/', '\\'])
+        .next()
+        .expect("rsplit always yields at least one item");
     base == command || base.strip_suffix(".exe") == Some(command)
 }
 

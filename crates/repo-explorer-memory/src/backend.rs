@@ -198,6 +198,15 @@ fn first_field<'a>(json: &'a Value, keys: &[&str]) -> Option<&'a Value> {
     keys.iter().find_map(|k| json.get(*k))
 }
 
+/// Insert `key: v` into `args` when `v` is `Some` — the single place every
+/// optional-`u32`-to-JSON-number tool arg goes through, instead of a
+/// repeated `if let Some(x) = opt { args.insert(...) }` at each call site.
+fn insert_opt_u32(args: &mut Map<String, Value>, key: &str, v: Option<u32>) {
+    if let Some(v) = v {
+        args.insert(key.to_string(), Value::Number(v.into()));
+    }
+}
+
 /// Does a tool-failure message indicate "this project is not indexed yet"
 /// (as opposed to some other recoverable-or-not failure)? Matches the
 /// observed `codebase-memory-mcp` phrasing ("project not found or not
@@ -498,9 +507,7 @@ impl MemoryBackend for MemoryClientBackend {
                     Value::String(scope.to_string_lossy().into_owned()),
                 );
             }
-            if let Some(limit) = query.max_results {
-                args.insert("limit".to_string(), Value::Number(limit.into()));
-            }
+            insert_opt_u32(args, "limit", query.max_results);
         })
         .await
     }
@@ -521,9 +528,7 @@ impl MemoryBackend for MemoryClientBackend {
             if let Some(v) = &query.label {
                 args.insert("label".to_string(), Value::String(v.clone()));
             }
-            if let Some(limit) = query.max_results {
-                args.insert("limit".to_string(), Value::Number(limit.into()));
-            }
+            insert_opt_u32(args, "limit", query.max_results);
         })
         .await
     }
@@ -536,9 +541,7 @@ impl MemoryBackend for MemoryClientBackend {
     ) -> Result<ExplorationResult, MemoryError> {
         self.call_memory_tool("query_graph", repo_root, |args| {
             args.insert("query".to_string(), Value::String(query.to_string()));
-            if let Some(limit) = max_results {
-                args.insert("limit".to_string(), Value::Number(limit.into()));
-            }
+            insert_opt_u32(args, "limit", max_results);
         })
         .await
     }
@@ -553,9 +556,7 @@ impl MemoryBackend for MemoryClientBackend {
         self.call_memory_tool("trace_path", repo_root, |args| {
             args.insert("from".to_string(), Value::String(from.to_string()));
             args.insert("to".to_string(), Value::String(to.to_string()));
-            if let Some(depth) = max_depth {
-                args.insert("max_depth".to_string(), Value::Number(depth.into()));
-            }
+            insert_opt_u32(args, "max_depth", max_depth);
         })
         .await
     }
@@ -566,9 +567,7 @@ impl MemoryBackend for MemoryClientBackend {
         depth: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
         self.call_memory_tool("get_architecture", repo_root, |args| {
-            if let Some(d) = depth {
-                args.insert("depth".to_string(), Value::Number(d.into()));
-            }
+            insert_opt_u32(args, "depth", depth);
         })
         .await
     }
@@ -594,12 +593,8 @@ impl MemoryBackend for MemoryClientBackend {
                         "file".to_string(),
                         Value::String(file.to_string_lossy().into_owned()),
                     );
-                    if let Some(s) = start_line {
-                        args.insert("start_line".to_string(), Value::Number((*s).into()));
-                    }
-                    if let Some(e) = end_line {
-                        args.insert("end_line".to_string(), Value::Number((*e).into()));
-                    }
+                    insert_opt_u32(args, "start_line", *start_line);
+                    insert_opt_u32(args, "end_line", *end_line);
                 }
             },
             single_snippet,

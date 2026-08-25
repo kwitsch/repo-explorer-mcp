@@ -392,7 +392,10 @@ fn to_genai_tool_call(
         call_id: tc.id.clone(),
         fn_name: tc.name.clone(),
         fn_arguments,
-        thought_signatures: tc.thought_signatures.clone(),
+        // Real signatures are carried by the leading `ThoughtSignature` parts
+        // promoted in `to_genai_message`; no adapter this crate ever selects
+        // reads this field off a wrapped `ContentPart::ToolCall`.
+        thought_signatures: None,
     })
 }
 
