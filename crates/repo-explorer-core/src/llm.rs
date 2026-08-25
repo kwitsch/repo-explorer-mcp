@@ -104,6 +104,45 @@ pub enum ProviderResponse {
     ToolCalls(Vec<ToolCall>),
 }
 
+/// Token counts a provider reported for one completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn total(&self) -> u64 {
+        self.prompt_tokens.saturating_add(self.completion_tokens)
+    }
+}
+
+/// One provider turn plus the token usage it reported (`None` when the
+/// provider reports none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    pub response: ProviderResponse,
+    pub usage: Option<TokenUsage>,
+}
+
+impl From<ProviderResponse> for Completion {
+    fn from(response: ProviderResponse) -> Self {
+        Self {
+            response,
+            usage: None,
+        }
+    }
+}
+
+/// Per-call knobs for `complete_with_tools`. `Default` means "no constraint".
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CallOptions {
+    /// Force the model to call this tool (by name) instead of choosing freely.
+    pub force_tool: Option<String>,
+    /// Cap the completion length, where the provider supports it.
+    pub max_tokens: Option<u32>,
+}
+
 /// Provider-call failures. Fully comparable so mock-based tests can `assert_eq!`
 /// on error values. Every variant carries the provider `name` for attribution;
 /// any non-comparable `genai`/HTTP cause is flattened into `message` at the
@@ -174,7 +213,8 @@ pub trait LlmProvider {
         &self,
         messages: &[Message],
         tools: &[Tool],
-    ) -> Result<ProviderResponse, ProviderError>;
+        options: &CallOptions,
+    ) -> Result<Completion, ProviderError>;
 }
 
 /// Monotonic time source, injectable so cooldown-expiry tests need no real
@@ -262,7 +302,8 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
         &self,
         messages: &[Message],
         tools: &[Tool],
-    ) -> Result<ProviderResponse, RouterError> {
+        options: &CallOptions,
+    ) -> Result<Completion, RouterError> {
         // Emptiness can live one level down now: an entry with no model slots
         // is skipped by the loop below and contributes nothing to `cooling`/
         // `limited`, which would surface as `AllExhausted("")`. Treat "no slot
@@ -298,7 +339,11 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
                     }
                 }
 
-                match slot.provider.complete_with_tools(messages, tools).await {
+                match slot
+                    .provider
+                    .complete_with_tools(messages, tools, options)
+                    .await
+                {
                     Ok(resp) => return Ok(resp),
                     Err(e) if e.is_failover_trigger() => {
                         // Same poison recovery as the read site above: one
@@ -342,14 +387,15 @@ pub mod mock {
     pub struct MockCall {
         pub messages: Vec<Message>,
         pub tools: Vec<Tool>,
+        pub options: CallOptions,
     }
 
     /// A programmable `LlmProvider`: pops a scripted response per call, falling
     /// back to `fallback` when the queue is empty, and records every call.
     #[derive(Clone)]
     pub struct MockLlmProvider {
-        responses: Arc<Mutex<VecDeque<Result<ProviderResponse, ProviderError>>>>,
-        fallback: Arc<Result<ProviderResponse, ProviderError>>,
+        responses: Arc<Mutex<VecDeque<Result<Completion, ProviderError>>>>,
+        fallback: Arc<Result<Completion, ProviderError>>,
         calls: Arc<Mutex<Vec<MockCall>>>,
     }
 
@@ -357,7 +403,7 @@ pub mod mock {
         fn default() -> Self {
             Self {
                 responses: Arc::new(Mutex::new(VecDeque::new())),
-                fallback: Arc::new(Ok(ProviderResponse::Text(String::new()))),
+                fallback: Arc::new(Ok(ProviderResponse::Text(String::new()).into())),
                 calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -369,13 +415,14 @@ pub mod mock {
         }
 
         /// Queue a scripted sequence, consumed front-to-back across calls.
-        pub fn with_responses(self, r: Vec<Result<ProviderResponse, ProviderError>>) -> Self {
+        /// Build usage-free items with `Completion::from(ProviderResponse)`.
+        pub fn with_responses(self, r: Vec<Result<Completion, ProviderError>>) -> Self {
             *self.responses.lock().expect("mock responses poisoned") = r.into();
             self
         }
 
         /// Set the response returned once the scripted queue is empty.
-        pub fn with_fallback(self, r: Result<ProviderResponse, ProviderError>) -> Self {
+        pub fn with_fallback(self, r: Result<Completion, ProviderError>) -> Self {
             Self {
                 fallback: Arc::new(r),
                 ..self
@@ -393,13 +440,15 @@ pub mod mock {
             &self,
             messages: &[Message],
             tools: &[Tool],
-        ) -> Result<ProviderResponse, ProviderError> {
+            options: &CallOptions,
+        ) -> Result<Completion, ProviderError> {
             self.calls
                 .lock()
                 .expect("mock calls poisoned")
                 .push(MockCall {
                     messages: messages.to_vec(),
                     tools: tools.to_vec(),
+                    options: options.clone(),
                 });
             let popped = self
                 .responses
@@ -616,8 +665,8 @@ mod tests {
     use mock::{FakeClock, MockCall, MockLlmProvider};
     use std::time::Duration;
 
-    fn text(s: &str) -> ProviderResponse {
-        ProviderResponse::Text(s.to_string())
+    fn text(s: &str) -> Completion {
+        Completion::from(ProviderResponse::Text(s.to_string()))
     }
     fn rate_limited(p: &str) -> ProviderError {
         ProviderError::RateLimited {
@@ -629,7 +678,9 @@ mod tests {
     #[tokio::test]
     async fn empty_provider_list_is_no_providers() {
         let router: ProviderRouter<MockLlmProvider> = ProviderRouter::new(vec![], 60);
-        let got = router.complete_with_tools(&[], &[]).await;
+        let got = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
         assert_eq!(got, Err(RouterError::NoProviders));
     }
 
@@ -653,13 +704,16 @@ mod tests {
             tool_calls: vec![],
             tool_call_id: None,
         }];
-        let got = router.complete_with_tools(&msgs, &[]).await;
+        let got = router
+            .complete_with_tools(&msgs, &[], &CallOptions::default())
+            .await;
         assert_eq!(got, Ok(text("from p2")));
         assert_eq!(
             p1.calls(),
             vec![MockCall {
                 messages: msgs.clone(),
-                tools: vec![]
+                tools: vec![],
+                options: CallOptions::default()
             }]
         );
         assert_eq!(p2.calls().len(), 1);
@@ -679,7 +733,9 @@ mod tests {
             ],
             60,
         );
-        let got = router.complete_with_tools(&[], &[]).await;
+        let got = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
         match got {
             Err(RouterError::AllExhausted(summary)) => {
                 assert!(summary.contains("primary"));
@@ -706,7 +762,9 @@ mod tests {
             ],
             60,
         );
-        let got = router.complete_with_tools(&[], &[]).await;
+        let got = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
         assert_eq!(
             got,
             Err(RouterError::Provider(ProviderError::Authentication {
@@ -735,16 +793,22 @@ mod tests {
             clock.clone(),
         );
 
-        let first = router.complete_with_tools(&[], &[]).await;
+        let first = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
         assert!(matches!(first, Err(RouterError::AllExhausted(_))));
 
         clock.advance(Duration::from_secs(30));
-        let second = router.complete_with_tools(&[], &[]).await;
+        let second = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
         assert!(matches!(second, Err(RouterError::AllExhausted(_))));
         assert_eq!(p1.calls().len(), 1, "p1 must be skipped while cooling");
 
         clock.advance(Duration::from_secs(60));
-        let third = router.complete_with_tools(&[], &[]).await;
+        let third = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
         assert_eq!(third, Ok(text("p1 recovered")));
         assert_eq!(p1.calls().len(), 2, "p1 retried after cooldown elapsed");
     }
@@ -766,7 +830,9 @@ mod tests {
             ],
             60,
         );
-        let got = router.complete_with_tools(&[], &[]).await;
+        let got = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
         assert_eq!(got, Ok(text("from b")));
         assert_eq!(a.calls().len(), 1);
         assert_eq!(b.calls().len(), 1);
@@ -789,7 +855,9 @@ mod tests {
             ],
             60,
         );
-        let got = router.complete_with_tools(&[], &[]).await;
+        let got = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
         assert_eq!(got, Ok(text("from c")));
         assert_eq!(a.calls().len(), 1);
         assert_eq!(b.calls().len(), 1);
@@ -811,7 +879,9 @@ mod tests {
             ],
             60,
         );
-        let got = router.complete_with_tools(&[], &[]).await;
+        let got = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
         match got {
             Err(RouterError::AllExhausted(summary)) => {
                 assert!(summary.contains("primary/a"));
@@ -840,19 +910,25 @@ mod tests {
             clock.clone(),
         );
 
-        let first = router.complete_with_tools(&[], &[]).await;
+        let first = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
         assert!(matches!(first, Err(RouterError::AllExhausted(_))));
         assert_eq!(a.calls().len(), 1);
 
         // Within cooldown: `a` skipped, `b` still limited.
         clock.advance(Duration::from_secs(30));
-        let second = router.complete_with_tools(&[], &[]).await;
+        let second = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
         assert!(matches!(second, Err(RouterError::AllExhausted(_))));
         assert_eq!(a.calls().len(), 1, "a must be skipped while cooling");
 
         // Past cooldown: `a` retried and succeeds.
         clock.advance(Duration::from_secs(60));
-        let third = router.complete_with_tools(&[], &[]).await;
+        let third = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
         assert_eq!(third, Ok(text("a recovered")));
         assert_eq!(a.calls().len(), 2, "a retried after cooldown elapsed");
     }

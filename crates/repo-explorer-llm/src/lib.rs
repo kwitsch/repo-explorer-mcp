@@ -8,7 +8,8 @@
 
 use repo_explorer_core::config::{LlmConfig, ProviderConfig, env_var_is_set};
 use repo_explorer_core::llm::{
-    LlmProvider, Message, ProviderError, ProviderResponse, ProviderRouter, Role, Tool, ToolCall,
+    CallOptions, Completion, LlmProvider, Message, ProviderError, ProviderResponse, ProviderRouter,
+    Role, TokenUsage, Tool, ToolCall,
 };
 
 /// Genai-independent view of an error, used by the pure classifier so its tests
@@ -138,6 +139,9 @@ pub struct GenaiProvider {
     name: String,
     model: String,
     client: genai::Client,
+    /// Mark system messages with a provider-side prompt-cache hint. Only the
+    /// Anthropic adapter supports the content-level `cache_control` marker.
+    cache_system_prompt: bool,
 }
 
 impl GenaiProvider {
@@ -152,18 +156,19 @@ impl GenaiProvider {
         model: &str,
         https_proxy: Option<&str>,
     ) -> Result<Self, ProviderError> {
-        let (name, client) = Self::build_shared(provider, https_proxy)?;
-        Ok(Self::bind_model(name, model, client))
+        let shared = Self::build_shared(provider, https_proxy)?;
+        Ok(Self::bind_model(&shared, model))
     }
 
     /// The one place a `GenaiProvider` is assembled from its parts, so
     /// `from_config` and `build_router` (which reuses one client across an
     /// entry's models) cannot drift as fields are added.
-    fn bind_model(name: String, model: &str, client: genai::Client) -> Self {
+    fn bind_model(shared: &SharedProviderParts, model: &str) -> Self {
         Self {
-            name,
+            name: shared.name.clone(),
             model: model.to_string(),
-            client,
+            client: shared.client.clone(),
+            cache_system_prompt: shared.adapter_kind == genai::adapter::AdapterKind::Anthropic,
         }
     }
 
@@ -178,7 +183,7 @@ impl GenaiProvider {
     fn build_shared(
         provider: &ProviderConfig,
         https_proxy: Option<&str>,
-    ) -> Result<(String, genai::Client), ProviderError> {
+    ) -> Result<SharedProviderParts, ProviderError> {
         let name = provider.name.clone();
 
         let adapter_kind =
@@ -210,8 +215,19 @@ impl GenaiProvider {
 
         let client = build_genai_client(adapter_kind, provider, &env_name, https_proxy)?;
 
-        Ok((name, client))
+        Ok(SharedProviderParts {
+            name,
+            client,
+            adapter_kind,
+        })
     }
+}
+
+/// Per-entry parts shared by every model slot of one provider entry.
+struct SharedProviderParts {
+    name: String,
+    client: genai::Client,
+    adapter_kind: genai::adapter::AdapterKind,
 }
 
 /// Construct a `genai::Client` bound to `adapter_kind`, authenticating from the
@@ -267,14 +283,28 @@ fn build_genai_client(
 }
 
 /// Map domain `Message`s onto genai chat messages, preserving role, content,
-/// assistant `tool_calls`, and tool-result `tool_call_id`.
+/// assistant `tool_calls`, and tool-result `tool_call_id`. With
+/// `cache_system_prompt`, system messages are marked with the Anthropic
+/// `cache_control` hint so a stable system prefix hits the provider's prompt
+/// cache across turns.
 fn to_genai_messages(
     provider: &str,
     messages: &[Message],
+    cache_system_prompt: bool,
 ) -> Result<Vec<genai::chat::ChatMessage>, ProviderError> {
     messages
         .iter()
-        .map(|m| to_genai_message(provider, m))
+        .map(|m| {
+            let mapped = to_genai_message(provider, m)?;
+            Ok(if cache_system_prompt && m.role == Role::System {
+                mapped.with_options(
+                    genai::chat::MessageOptions::default()
+                        .with_cache_control(genai::chat::CacheControl::Ephemeral),
+                )
+            } else {
+                mapped
+            })
+        })
         .collect()
 }
 
@@ -381,13 +411,27 @@ fn from_genai_response(
     }
 }
 
+/// Map genai's optional/signed token counts onto the domain `TokenUsage`.
+/// `None` when the provider reported nothing at all.
+fn usage_from(usage: &genai::chat::Usage) -> Option<TokenUsage> {
+    if usage.prompt_tokens.is_none() && usage.completion_tokens.is_none() {
+        return None;
+    }
+    let clamp = |n: Option<i32>| n.map(|n| n.max(0) as u64).unwrap_or(0);
+    Some(TokenUsage {
+        prompt_tokens: clamp(usage.prompt_tokens),
+        completion_tokens: clamp(usage.completion_tokens),
+    })
+}
+
 impl LlmProvider for GenaiProvider {
     async fn complete_with_tools(
         &self,
         messages: &[Message],
         tools: &[Tool],
-    ) -> Result<ProviderResponse, ProviderError> {
-        let chat_messages = to_genai_messages(&self.name, messages)?;
+        options: &CallOptions,
+    ) -> Result<Completion, ProviderError> {
+        let chat_messages = to_genai_messages(&self.name, messages, self.cache_system_prompt)?;
         let genai_tools = to_genai_tools(&self.name, tools)?;
 
         let mut request = genai::chat::ChatRequest::new(chat_messages);
@@ -395,12 +439,25 @@ impl LlmProvider for GenaiProvider {
             request = request.with_tools(genai_tools);
         }
 
+        let mut chat_options = genai::chat::ChatOptions::default().with_capture_usage(true);
+        if let Some(max_tokens) = options.max_tokens {
+            chat_options = chat_options.with_max_tokens(max_tokens);
+        }
+        if let Some(tool) = &options.force_tool {
+            chat_options =
+                chat_options.with_tool_choice(genai::chat::ToolChoice::tool(tool.clone()));
+        }
+
         match self
             .client
-            .exec_chat(self.model.as_str(), request, None)
+            .exec_chat(self.model.as_str(), request, Some(&chat_options))
             .await
         {
-            Ok(response) => from_genai_response(&self.name, response),
+            Ok(response) => {
+                let usage = usage_from(&response.usage);
+                let response = from_genai_response(&self.name, response)?;
+                Ok(Completion { response, usage })
+            }
             Err(err) => Err(classify_genai_error(&self.name, &err)),
         }
     }
@@ -413,11 +470,10 @@ impl LlmProvider for GenaiProvider {
 pub fn build_router(cfg: &LlmConfig) -> Result<ProviderRouter<GenaiProvider>, ProviderError> {
     let mut providers = Vec::with_capacity(cfg.providers.len());
     for entry in &cfg.providers {
-        let (name, client) = GenaiProvider::build_shared(entry, cfg.https_proxy.as_deref())?;
+        let shared = GenaiProvider::build_shared(entry, cfg.https_proxy.as_deref())?;
         let mut models = Vec::with_capacity(entry.models.len());
         for model in &entry.models {
-            let provider = GenaiProvider::bind_model(name.clone(), model, client.clone());
-            models.push((model.clone(), provider));
+            models.push((model.clone(), GenaiProvider::bind_model(&shared, model)));
         }
         providers.push((entry.name.clone(), models));
     }
@@ -561,7 +617,9 @@ mod tests {
             tool_calls: vec![],
             tool_call_id: None,
         }];
-        let resp = provider.complete_with_tools(&msgs, &[]).await;
+        let resp = provider
+            .complete_with_tools(&msgs, &[], &CallOptions::default())
+            .await;
         assert!(resp.is_ok(), "live call failed: {resp:?}");
     }
 }

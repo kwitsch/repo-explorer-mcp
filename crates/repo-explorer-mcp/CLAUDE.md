@@ -12,6 +12,7 @@ errors are consumed via `?`/`.context(...)`).
 - Serialization lives in core (`config::to_toml_string`); the binary adds no `toml` dependency.
 - The wizard writes to the _resolved_ config path (the XDG default unless `--config`/`REPO_EXPLORER_CONFIG` overrides it).
 - It self-verifies the written file via `repo_explorer_core::config::load`.
+- The `[search]`, `[agent]`, `[cache]`, and `[logging]` sections are left at their (fully defaulted) core values — not prompted. `main.rs::run` plumbs `config.agent`/`config.cache` into `AgentLoop::new` together with a `GitStateProbe` built from `config.search.timeout_seconds`.
 
 ## Config path resolution
 
