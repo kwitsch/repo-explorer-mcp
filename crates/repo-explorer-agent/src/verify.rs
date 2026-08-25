@@ -180,7 +180,9 @@ async fn candidates_block<M: MemoryBackend>(
             }
         } else if let Some(snippet) = &c.snippet {
             out.push_str("  ");
-            out.push_str(&cap_snippet(snippet, caps.snippet_max_chars).replace('\n', "\n  "));
+            out.push_str(
+                &cap_snippet(snippet.clone(), caps.snippet_max_chars).replace('\n', "\n  "),
+            );
             out.push('\n');
         }
     }

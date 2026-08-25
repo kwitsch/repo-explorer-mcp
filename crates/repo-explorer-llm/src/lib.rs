@@ -206,7 +206,7 @@ impl GenaiProvider {
             });
         }
 
-        let client = build_genai_client(adapter_kind, provider, &env_name, https_proxy)?;
+        let client = build_genai_client(adapter_kind, provider, env_name, https_proxy)?;
 
         Ok(SharedProviderParts {
             name,
@@ -234,13 +234,12 @@ struct SharedProviderParts {
 fn build_genai_client(
     adapter_kind: genai::adapter::AdapterKind,
     provider: &ProviderConfig,
-    env_name: &str,
+    env_name: String,
     https_proxy: Option<&str>,
 ) -> Result<genai::Client, ProviderError> {
     use genai::WebConfig;
     use genai::resolver::{AuthData, Endpoint};
 
-    let env_name = env_name.to_string();
     let mut builder = genai::Client::builder()
         .with_adapter_kind(adapter_kind)
         .with_auth_resolver_fn(move |_model_iden: genai::ModelIden| {

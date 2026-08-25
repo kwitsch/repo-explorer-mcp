@@ -323,7 +323,9 @@ where
             .changed_paths(repo_root, &entry.fingerprint, fp)
             .await
         {
-            Some(changed) if changed.iter().all(|p| !entry.paths.contains(p)) => {
+            Some(changed)
+                if !entry.paths.is_empty() && changed.iter().all(|p| !entry.paths.contains(p)) =>
+            {
                 cache.refresh_query_fingerprint(query_key, fp.clone());
                 Some(entry.result)
             }

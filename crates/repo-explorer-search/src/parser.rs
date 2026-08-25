@@ -11,13 +11,13 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 /// Find the leftmost *plausible* `<sep><digits><sep>` run for one separator
-/// byte: the digit span must not be zero-padded, since real rg/rtk line
-/// numbers are always printed unpadded. A zero-padded span (e.g. the `01` in
-/// a date-like path segment `-01-`) is therefore not a real line number and
-/// is skipped in favor of a later run rather than accepted as a fabricated
-/// one.
-fn find_sep_run(bytes: &[u8], sep: u8) -> Option<(usize, usize)> {
-    let mut i = 0;
+/// byte at or after `start`: the digit span must not be zero-padded, since
+/// real rg/rtk line numbers are always printed unpadded. A zero-padded span
+/// (e.g. the `01` in a date-like path segment `-01-`) is therefore not a
+/// real line number and is skipped in favor of a later run rather than
+/// accepted as a fabricated one.
+fn find_sep_run(bytes: &[u8], sep: u8, start: usize) -> Option<(usize, usize)> {
+    let mut i = start;
     while i < bytes.len() {
         if bytes[i] == sep && i > 0 {
             let mut j = i + 1;
@@ -81,16 +81,42 @@ fn trailing_token_has_dot(bytes: &[u8], start: usize, end: usize) -> bool {
     span[token_start..].contains(&b'.')
 }
 
+/// Starting from the leftmost plausible `-N-` run, walk right past any run
+/// that actually sits inside the file path rather than at the real
+/// path/line-number boundary: a later `-N-` run replaces the current
+/// candidate whenever the token immediately before it (back to the last
+/// whitespace) contains a `.`, marking a real file extension -- the same
+/// disambiguation `split_grep_line` applies once between a dash run and a
+/// colon run, generalized to walk past every such run on a pure
+/// dash-delimited (no colon) line. Needed for a context line whose path
+/// itself contains an internal unpadded `-N-` segment, e.g.
+/// `component-2-renderer.tsx-45-body`, where the coincidental `-2-` run is
+/// leftmost but the real separator is the `-45-` run further right.
+fn resolve_dash_sep_run(bytes: &[u8], first: (usize, usize)) -> (usize, usize) {
+    let mut candidate = first;
+    while let Some(next) = find_sep_run(bytes, b'-', candidate.1 + 1) {
+        if trailing_token_has_dot(bytes, candidate.1 + 1, next.0) {
+            candidate = next;
+        } else {
+            break;
+        }
+    }
+    candidate
+}
+
 fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
     let bytes = line.as_bytes();
-    let colon = find_sep_run(bytes, b':');
-    let dash = find_sep_run(bytes, b'-');
+    let colon = find_sep_run(bytes, b':', 0);
+    let dash = find_sep_run(bytes, b'-', 0);
     let (sep, i, j) = match (colon, dash) {
         (Some(c), Some(d)) if d.0 < c.0 && !trailing_token_has_dot(bytes, d.1 + 1, c.0) => {
             (b'-', d.0, d.1)
         }
         (Some(c), _) => (b':', c.0, c.1),
-        (None, Some(d)) => (b'-', d.0, d.1),
+        (None, Some(d)) => {
+            let d = resolve_dash_sep_run(bytes, d);
+            (b'-', d.0, d.1)
+        }
         (None, None) => return None,
     };
     let path = &line[..i];
@@ -372,6 +398,19 @@ mod tests {
         // real `-69-` context separator further left.
         let result = split_grep_line("src/log.rs-69-12:30:05 boot");
         assert_eq!(result, Some(("src/log.rs", 69, "12:30:05 boot", false)));
+    }
+
+    #[test]
+    fn split_grep_line_handles_unpadded_dash_numbered_path_in_context_line() {
+        // No colon anywhere on the line (a context row), so the
+        // colon-vs-dash disambiguation never fires; the coincidental `-2-`
+        // run inside the file name (leftmost) must not be mistaken for the
+        // real `-45-` separator further right.
+        let result = split_grep_line("component-2-renderer.tsx-45-body");
+        assert_eq!(
+            result,
+            Some(("component-2-renderer.tsx", 45, "body", false))
+        );
     }
 
     #[test]
