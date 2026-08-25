@@ -239,13 +239,7 @@ pub fn merge_and_rank(raw: Vec<Candidate>, patterns: &QueryPatterns, top_k: u32)
     // isn't double-counted by coverage()'s distinct-match contract.
     let mut lowered_patterns: Vec<String> = Vec::new();
     for token in patterns.identifiers.iter().chain(patterns.literals.iter()) {
-        if token.is_empty() {
-            continue;
-        }
-        let lowered = token.to_ascii_lowercase();
-        if !lowered_patterns.contains(&lowered) {
-            lowered_patterns.push(lowered);
-        }
+        push_unique(&mut lowered_patterns, token.to_ascii_lowercase());
     }
 
     let mut normalized: Vec<Candidate> = raw

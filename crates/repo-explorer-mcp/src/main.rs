@@ -215,8 +215,8 @@ fn wants_config_test(args: &[String]) -> bool {
 }
 
 #[derive(serde::Serialize)]
-struct ConfigTestReport<'a> {
-    status: &'a str,
+struct ConfigTestReport {
+    status: &'static str,
     config_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<ConfigTestError>,

@@ -9,13 +9,15 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-/// Appended to every non-`finish` tool description: the loop rejects
-/// single-call turns (2-strike), so the demand must also live where the model
-/// reads tool contracts.
+/// Appended to every `tool_catalog()` tool other than `finish`: the fallback
+/// loop rejects single-call turns (2-strike), so the demand must also live
+/// where the model reads tool contracts. `expand` never gets this — it lives
+/// only in `verify_catalog()`, whose loop has no such rejection and whose
+/// system prompt asks for exactly one `expand` call per turn.
 const BATCH_SUFFIX: &str = " Batch all independent tool calls of a turn into ONE response with multiple tool calls; single-call turns are rejected.";
 
 fn tool(name: &str, description: &str, schema: serde_json::Value) -> Tool {
-    let description = if name == "finish" {
+    let description = if name == "finish" || name == "expand" {
         description.to_string()
     } else {
         format!("{description}{BATCH_SUFFIX}")

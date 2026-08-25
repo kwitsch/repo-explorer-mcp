@@ -254,11 +254,11 @@ fn candidates_of_kind(findings: Vec<ExplorationFinding>, kind: CandidateKind) ->
 fn file_candidates(findings: Vec<ExplorationFinding>) -> Vec<Candidate> {
     let mut seen = HashSet::new();
     findings
-        .into_iter()
-        .filter(|f| seen.insert(f.location.path.clone()))
+        .iter()
+        .filter(|f| seen.insert(&f.location.path))
         .map(|f| Candidate {
             location: FileLocation {
-                path: f.location.path,
+                path: f.location.path.clone(),
                 line_start: 1,
                 line_end: 1,
             },
