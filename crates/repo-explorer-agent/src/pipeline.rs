@@ -51,6 +51,7 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
             memoized(leg_cache, move || format!("symbol#{token}"), async move {
                 let graph_query = GraphQuery {
                     name_pattern: Some(token.clone()),
+                    file_pattern: scope.map(|p| p.to_string_lossy().into_owned()),
                     max_results: Some(PER_LEG_MAX_RESULTS),
                     ..GraphQuery::default()
                 };
@@ -165,11 +166,13 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
 /// Wrap a leg future with the leg cache: return the memoized candidates when
 /// present, otherwise run the leg and store its result. `leg` is only called
 /// when a cache is actually active, so an inactive cache costs no key-format
-/// work.
+/// work. Only a successful run (`Some`) is memoized — a swallowed backend
+/// failure (`None`, see `soft_leg`) must not poison the cache with a
+/// permanent-looking empty result for what was really a transient hiccup.
 async fn memoized(
     leg_cache: LegCache<'_>,
     leg: impl FnOnce() -> String,
-    fut: impl Future<Output = Vec<Candidate>>,
+    fut: impl Future<Output = Option<Vec<Candidate>>>,
 ) -> Vec<Candidate> {
     let key = leg_cache.map(|(cache, fp)| (cache, ResultCache::leg_key(fp, &leg())));
     if let Some((cache, key)) = &key
@@ -178,26 +181,30 @@ async fn memoized(
         return hit;
     }
     let out = fut.await;
-    if let Some((cache, key)) = key {
-        cache.put_leg(key, out.clone());
+    if let Some((cache, key)) = key
+        && let Some(candidates) = &out
+    {
+        cache.put_leg(key, candidates.clone());
     }
-    out
+    out.unwrap_or_default()
 }
 
-/// Run one fanout leg's backend call: classify a success, log-and-empty a
+/// Run one fanout leg's backend call: classify a success, log-and-drop a
 /// failure. Failures are soft — a failed leg contributes nothing rather than
-/// failing the whole query.
+/// failing the whole query — but stay distinguishable (`None`) from a
+/// legitimate zero-hit success (`Some(vec![])`) so `memoized` never caches a
+/// transient failure as a permanent empty answer.
 async fn soft_leg<T, E: std::fmt::Display>(
     leg: &'static str,
     ctx: impl std::fmt::Display,
     fut: impl Future<Output = Result<T, E>>,
     classify: impl FnOnce(T) -> Vec<Candidate>,
-) -> Vec<Candidate> {
+) -> Option<Vec<Candidate>> {
     match fut.await {
-        Ok(res) => classify(res),
+        Ok(res) => Some(classify(res)),
         Err(e) => {
             tracing::debug!(leg, %ctx, error = %e, "retrieval leg failed");
-            Vec::new()
+            None
         }
     }
 }

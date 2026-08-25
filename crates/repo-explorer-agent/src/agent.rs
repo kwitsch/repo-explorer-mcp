@@ -31,7 +31,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::cache::{QueryEntry, ResultCache};
-use crate::dispatch::dispatch_call;
+use crate::dispatch::dispatch_inner;
 use crate::pipeline;
 use crate::render::{RenderCaps, tidy_findings};
 use crate::tools::{finish_only_catalog, parse_finish, resolve_finish, tool_catalog};
@@ -558,8 +558,8 @@ where
         }
     }
 
-    /// `dispatch_call` behind the tool-result memo (active only with a cache
-    /// and a fingerprint).
+    /// `dispatch_inner` behind the tool-result memo (active only with a cache
+    /// and a fingerprint); only a successful dispatch is cached.
     async fn cached_dispatch(
         &self,
         repo_root: &Path,
@@ -577,12 +577,17 @@ where
         {
             return (Message::tool(&call.id, content), findings);
         }
-        let (message, findings) =
-            dispatch_call(&self.memory, &self.search, repo_root, call, &self.caps).await;
-        if let Some((cache, key)) = key {
-            cache.put_tool(key, (message.content.clone(), findings.clone()));
+        // Only a successful call is memoized — a failure (subprocess/RPC
+        // error) is typically transient and must be retried, not replayed.
+        match dispatch_inner(&self.memory, &self.search, repo_root, call, &self.caps).await {
+            Ok((content, findings)) => {
+                if let Some((cache, key)) = key {
+                    cache.put_tool(key, (content.clone(), findings.clone()));
+                }
+                (Message::tool(&call.id, content), findings)
+            }
+            Err(msg) => (Message::tool(&call.id, msg), Vec::new()),
         }
-        (message, findings)
     }
 }
 
@@ -669,10 +674,12 @@ fn user_prompt(
 mod tests {
     use super::*;
     use repo_explorer_core::config::AgentSettings;
+    use repo_explorer_core::fingerprint::RepoFingerprint;
     use repo_explorer_core::fingerprint::mock::MockRepoStateProbe;
     use repo_explorer_core::llm::mock::{FakeClock, MockLlmProvider};
     use repo_explorer_core::llm::{Completion, ToolCall};
     use repo_explorer_core::memory::mock::MockMemoryBackend;
+    use repo_explorer_core::search::SearchError;
     use repo_explorer_core::search::mock::MockSearchBackend;
     use std::path::PathBuf;
 
@@ -751,6 +758,54 @@ mod tests {
         };
         let got = agent.run(&PathBuf::from("/repo"), &query).await;
         assert!(matches!(got, Err(AgentLoopError::Provider(_))));
+    }
+
+    #[tokio::test]
+    async fn failed_tool_call_is_not_cached() {
+        // Regression: a transient backend error must not be memoized under the
+        // tool-result key, or a later byte-identical call would replay the
+        // stale failure forever instead of retrying.
+        let search = MockSearchBackend::new().with_search_result(Err(SearchError::BackendFailed {
+            backend: "rg",
+            message: "boom".to_string(),
+        }));
+        let router = ProviderRouter::with_clock(
+            vec![(
+                "primary".to_string(),
+                vec![("m".to_string(), MockLlmProvider::new())],
+            )],
+            60,
+            FakeClock::new(),
+        );
+        let agent = AgentLoop::new(
+            MockMemoryBackend::new(),
+            search,
+            router,
+            MockRepoStateProbe::new(),
+            AgentSettings::default(),
+            CacheSettings::default(),
+        );
+        let fp = RepoFingerprint {
+            head_sha: "abc".to_string(),
+            dirty_hash: "def".to_string(),
+        };
+        let call = ToolCall {
+            id: "c1".to_string(),
+            name: "grep".to_string(),
+            arguments_json: r#"{"pattern":"fn main"}"#.to_string(),
+        };
+
+        let (message, findings) = agent
+            .cached_dispatch(&PathBuf::from("/repo"), &call, Some(&fp))
+            .await;
+        assert!(message.content.contains("failed"));
+        assert!(findings.is_empty());
+
+        let key = ResultCache::tool_key(&fp, &call.name, &call.arguments_json);
+        let cached = agent
+            .cache_for(Some(&fp))
+            .and_then(|(cache, _)| cache.get_tool(&key));
+        assert!(cached.is_none(), "a failed tool call must not be memoized");
     }
 
     #[test]

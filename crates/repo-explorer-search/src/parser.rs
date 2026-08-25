@@ -56,22 +56,39 @@ fn find_sep_run(bytes: &[u8], sep: u8) -> Option<(usize, usize)> {
 /// and the latter is genuinely `:`-delimited (dash is inside the path). What
 /// differs is what sits between the two runs: a real trailing path segment
 /// (`fix.rs`, `old.rs`) always carries a file extension, so it contains a
-/// `.`, while a coincidental `:NN:` run inside genuine `-`-delimited content
-/// never does -- whether that content is a bare word (`status`), a bare
-/// timestamp (`12:30:05`), or a word/timestamp mix (`boot 12:30:05`,
-/// `data[10:20:2]`). (Checking only the byte right before the `:` run for a
-/// digit is not enough: that misses the bare-word case, e.g.
-/// `status:42:ok`, where nothing but a `.` distinguishes it from a real
-/// trailing path segment.) So when both runs exist and the `-` run starts
-/// first, only trust it if no `.` appears between the two runs; otherwise
-/// the `:` run sits right after a real path segment and is the genuine
-/// separator.
+/// `.` in the unbroken token butting right up against the candidate `:` run,
+/// while a coincidental `:NN:` run inside genuine `-`-delimited content never
+/// does -- whether that content is a bare word (`status`), a bare timestamp
+/// (`12:30:05`), a word/timestamp mix (`boot 12:30:05`, `data[10:20:2]`), or
+/// prose containing an unrelated decimal number further back (`Release
+/// 1.2.0 shipped at 10:30:00 UTC`, where the `.` in `1.2.0` sits well
+/// outside the whitespace-delimited token -- `10` -- immediately before the
+/// `:30:` run). (Checking only the byte right before the `:` run for a digit
+/// is not enough: that misses the bare-word case, e.g. `status:42:ok`, where
+/// nothing but a `.` distinguishes it from a real trailing path segment; and
+/// checking for a `.` anywhere between the two runs is too broad: that
+/// misclassifies the prose case above.) So when both runs exist and the `-`
+/// run starts first, only trust it if the token immediately preceding the
+/// `:` run -- the span back to the previous whitespace, or to the `-` run's
+/// end if there is none -- has no `.`; otherwise the `:` run sits right
+/// after a real path segment and is the genuine separator.
+fn trailing_token_has_dot(bytes: &[u8], start: usize, end: usize) -> bool {
+    let span = &bytes[start..end];
+    let token_start = span
+        .iter()
+        .rposition(u8::is_ascii_whitespace)
+        .map_or(0, |p| p + 1);
+    span[token_start..].contains(&b'.')
+}
+
 fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
     let bytes = line.as_bytes();
     let colon = find_sep_run(bytes, b':');
     let dash = find_sep_run(bytes, b'-');
     let (sep, i, j) = match (colon, dash) {
-        (Some(c), Some(d)) if d.0 < c.0 && !bytes[d.1 + 1..c.0].contains(&b'.') => (b'-', d.0, d.1),
+        (Some(c), Some(d)) if d.0 < c.0 && !trailing_token_has_dot(bytes, d.1 + 1, c.0) => {
+            (b'-', d.0, d.1)
+        }
         (Some(c), _) => (b':', c.0, c.1),
         (None, Some(d)) => (b'-', d.0, d.1),
         (None, None) => return None,
@@ -397,6 +414,27 @@ mod tests {
         // wins.
         let result = split_grep_line("src/log.rs-69-status:42:ok");
         assert_eq!(result, Some(("src/log.rs", 69, "status:42:ok", false)));
+    }
+
+    #[test]
+    fn split_grep_line_handles_context_line_with_decimal_before_coincidental_colon_run() {
+        // A `.` earlier in the content (inside the decimal `1.2.0`, well
+        // outside the whitespace-delimited token -- `10` -- immediately
+        // before the coincidental `:30:` run) must not be mistaken for a
+        // real trailing path segment's extension: the genuine `-2-` context
+        // separator wins, and the whole timestamp-bearing sentence is
+        // preserved as content rather than truncated at the coincidental
+        // colon run.
+        let result = split_grep_line("./CHANGELOG.md-2-Release 1.2.0 shipped at 10:30:00 UTC");
+        assert_eq!(
+            result,
+            Some((
+                "./CHANGELOG.md",
+                2,
+                "Release 1.2.0 shipped at 10:30:00 UTC",
+                false
+            ))
+        );
     }
 
     #[test]

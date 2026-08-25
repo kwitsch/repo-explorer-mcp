@@ -40,15 +40,15 @@ impl MemoryClientBackend {
         self.client.close().await;
     }
 
-    /// Shared `base_args -> client.call -> decode_result` sequence used by
-    /// both `probe_status` and `probe_changes`; each caller keeps its own
-    /// error-downgrading on top of this.
+    /// Shared `client.call -> decode_result` sequence used by every tool call
+    /// site (`probe_status`, `probe_changes`, `call_memory_tool_with`); each
+    /// caller builds its own `args` and keeps its own error-downgrading on
+    /// top of this.
     async fn call_and_decode(
         &self,
         tool: &'static str,
-        project: &str,
+        args: Map<String, Value>,
     ) -> Result<Value, MemoryError> {
-        let args = base_args(project.to_string());
         let result = self.client.call(tool, args).await?;
         decode_result(result)
     }
@@ -59,7 +59,10 @@ impl MemoryClientBackend {
     /// this call's to know, so the full `IndexProbe` is assembled by
     /// `ensure_fresh_index` instead of being returned half-filled here.
     async fn probe_status(&self, project: &str) -> Result<(bool, Option<SystemTime>), MemoryError> {
-        match self.call_and_decode("index_status", project).await {
+        match self
+            .call_and_decode("index_status", base_args(project.to_string()))
+            .await
+        {
             Ok(json) => {
                 // An unrecognized/empty response must NOT be optimistically
                 // treated as "already indexed" — default to `false` so an
@@ -87,7 +90,10 @@ impl MemoryClientBackend {
 
     /// Fill `changed_files` from `detect_changes` for an existing project.
     async fn probe_changes(&self, project: &str) -> Result<ChangeCount, MemoryError> {
-        match self.call_and_decode("detect_changes", project).await {
+        match self
+            .call_and_decode("detect_changes", base_args(project.to_string()))
+            .await
+        {
             Ok(json) => {
                 // Only a shape we actually understand yields a `Known` count.
                 // An absent field, an unexpected type, or a number that is not
@@ -145,11 +151,11 @@ impl MemoryClientBackend {
 
     /// Shared tail of every read-only memory-query method: resolve
     /// `repo_root` to its project name, build `{"project": ...}` plus
-    /// whatever `build_args` inserts, call `tool`, decode, and turn the
-    /// response into an `ExplorationResult` — the one place that
-    /// resolve/call/decode sequence lives. `map` is the only per-tool
-    /// difference (row-array responses use [`findings_and_summary`];
-    /// `get_code_snippet` decodes a single row).
+    /// whatever `build_args` inserts, then hand off to [`call_and_decode`]
+    /// for the call/decode itself and turn the response into an
+    /// `ExplorationResult`. `map` is the only per-tool difference
+    /// (row-array responses use [`findings_and_summary`]; `get_code_snippet`
+    /// decodes a single row).
     async fn call_memory_tool_with(
         &self,
         tool: &'static str,
@@ -160,8 +166,7 @@ impl MemoryClientBackend {
         let project = project_name(repo_root).await?;
         let mut args = base_args(project);
         build_args(&mut args);
-        let result = self.client.call(tool, args).await?;
-        let json = decode_result(result)?;
+        let json = self.call_and_decode(tool, args).await?;
         Ok(map(tool, &json))
     }
 

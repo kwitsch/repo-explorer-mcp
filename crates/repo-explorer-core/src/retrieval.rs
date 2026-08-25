@@ -45,6 +45,12 @@ fn is_identifier_like(token: &str) -> bool {
     if token.len() < 3 {
         return false;
     }
+    // Stopword check must precede the shape checks below: a capitalized
+    // stopword (e.g. "How") still has_lower && has_upper and would otherwise
+    // short-circuit past the filter.
+    if STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(token)) {
+        return false;
+    }
     let has_underscore = token.contains('_');
     let has_digit = token.chars().any(|c| c.is_ascii_digit());
     let has_lower = token.chars().any(|c| c.is_ascii_lowercase());
@@ -52,7 +58,7 @@ fn is_identifier_like(token: &str) -> bool {
     if has_underscore || has_digit || (has_lower && has_upper) {
         return true;
     }
-    token.len() >= 4 && !STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(token))
+    token.len() >= 4
 }
 
 /// Escape a literal so grep backends treat it verbatim. Hand-rolled: core has

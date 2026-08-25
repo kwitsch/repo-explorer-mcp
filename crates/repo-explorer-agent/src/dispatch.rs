@@ -5,7 +5,9 @@
 //! panics, never fatal. `finish` is handled by the loop, not here.
 
 use repo_explorer_core::domain::{ExplorationFinding, ExplorationQuery, ExplorationResult};
-use repo_explorer_core::llm::{Message, ToolCall};
+#[cfg(test)]
+use repo_explorer_core::llm::Message;
+use repo_explorer_core::llm::ToolCall;
 use repo_explorer_core::memory::{GraphQuery, MemoryBackend, SnippetTarget};
 use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use std::path::{Component, Path, PathBuf};
@@ -17,7 +19,11 @@ use crate::tools::{
 };
 
 /// Dispatch a single non-`finish` tool call, returning the `Role::Tool` message
-/// to push and any findings to accumulate.
+/// to push and any findings to accumulate. Test-only: production dispatch goes
+/// through `dispatch_inner` directly (the agent's tool-result cache needs the
+/// success/error discriminant this wrapper collapses away), but this stays as
+/// the unit under test for that Ok/Err → `Message` mapping.
+#[cfg(test)]
 pub(crate) async fn dispatch_call<M: MemoryBackend, S: SearchBackend>(
     memory: &M,
     search: &S,
@@ -31,7 +37,10 @@ pub(crate) async fn dispatch_call<M: MemoryBackend, S: SearchBackend>(
     }
 }
 
-async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
+/// `pub(crate)` (rather than private) so callers that need the success/error
+/// discriminant `dispatch_call` collapses away — e.g. the tool-result cache,
+/// which must never memoize a failure — can call this directly.
+pub(crate) async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
     memory: &M,
     search: &S,
     repo_root: &Path,
