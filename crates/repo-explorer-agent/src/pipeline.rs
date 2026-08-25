@@ -74,9 +74,8 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
         leg_cache,
         move || {
             format!(
-                "semantic{}{}{}",
-                encode_field(&query.text),
-                encode_field(&scope_display(scope)),
+                "{}{}",
+                leg_key("semantic", &query.text, scope),
                 encode_field(&query.max_results.map(|m| m.to_string()).unwrap_or_default())
             )
         },

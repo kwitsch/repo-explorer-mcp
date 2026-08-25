@@ -332,6 +332,24 @@ fn to_genai_message(
             if !message.content.is_empty() {
                 parts.push(ContentPart::Text(message.content.clone()));
             }
+            // Gemini stamps every captured thought signature onto the first
+            // tool call only (see `from_genai_response`); re-emit them as
+            // leading `ThoughtSignature` parts ahead of the tool-call parts —
+            // the shape genai's own `ChatMessage::from(Vec<ToolCall>)` builds —
+            // so the Gemini adapter's request builder reattaches them instead
+            // of sending the continued turn with the signature missing.
+            if let Some(signatures) = message
+                .tool_calls
+                .first()
+                .and_then(|tc| tc.thought_signatures.as_ref())
+            {
+                parts.extend(
+                    signatures
+                        .iter()
+                        .cloned()
+                        .map(ContentPart::ThoughtSignature),
+                );
+            }
             for tc in &message.tool_calls {
                 parts.push(ContentPart::ToolCall(to_genai_tool_call(provider, tc)?));
             }
@@ -374,7 +392,7 @@ fn to_genai_tool_call(
         call_id: tc.id.clone(),
         fn_name: tc.name.clone(),
         fn_arguments,
-        thought_signatures: None,
+        thought_signatures: tc.thought_signatures.clone(),
     })
 }
 
@@ -413,6 +431,7 @@ fn from_genai_response(
                 id: tc.call_id,
                 name: tc.fn_name,
                 arguments_json: tc.fn_arguments.to_string(),
+                thought_signatures: tc.thought_signatures,
             })
             .collect();
         return Ok(ProviderResponse::ToolCalls(mapped));
@@ -625,6 +644,7 @@ mod tests {
                     id: "toolu_01ABC".to_string(),
                     name: "read_file".to_string(),
                     arguments_json: "{}".to_string(),
+                    thought_signatures: None,
                 }],
                 tool_call_id: None,
             },

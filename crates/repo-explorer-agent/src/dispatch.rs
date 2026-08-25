@@ -282,6 +282,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             arguments_json: args.to_string(),
+            thought_signatures: None,
         }
     }
 

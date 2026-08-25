@@ -187,10 +187,11 @@ pub fn derive_patterns(query: &str) -> QueryPatterns {
 
 /// Strip a leading `./` so the same file never appears under two spellings
 /// (grep emits `./x` without a scope and `x` with one).
-pub fn normalize_rel_path(path: &Path) -> PathBuf {
-    path.strip_prefix(".")
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|_| path.to_path_buf())
+pub fn normalize_rel_path(path: PathBuf) -> PathBuf {
+    match path.strip_prefix(".") {
+        Ok(stripped) => stripped.to_path_buf(),
+        Err(_) => path,
+    }
 }
 
 fn kind_base_score(kind: CandidateKind) -> u32 {
@@ -206,13 +207,13 @@ fn kind_base_score(kind: CandidateKind) -> u32 {
 /// Number of distinct query identifiers/literals (pre-lowercased by the
 /// caller) appearing in the candidate's symbol, path, or snippet.
 fn coverage(candidate: &Candidate, lowered_patterns: &[String]) -> u32 {
-    let haystack = format!(
+    let mut haystack = format!(
         "{} {} {}",
         candidate.symbol.as_deref().unwrap_or(""),
         candidate.location.path.to_string_lossy(),
         candidate.snippet.as_deref().unwrap_or("")
-    )
-    .to_ascii_lowercase();
+    );
+    haystack.make_ascii_lowercase();
     lowered_patterns
         .iter()
         .filter(|token| haystack.contains(token.as_str()))
@@ -222,7 +223,7 @@ fn coverage(candidate: &Candidate, lowered_patterns: &[String]) -> u32 {
 /// Normalize a location: strip `./`, swap an inverted line range, and widen a
 /// zero `line_end` to `line_start`.
 fn normalize_location(location: FileLocation) -> FileLocation {
-    let path = normalize_rel_path(&location.path);
+    let path = normalize_rel_path(location.path);
     let (mut start, mut end) = (location.line_start, location.line_end);
     if end == 0 {
         end = start;
@@ -236,7 +237,17 @@ fn normalize_location(location: FileLocation) -> FileLocation {
     }
 }
 
+/// `(0, 0)` is `normalize_location`'s "location unknown" sentinel, not a real
+/// one-line span at line 0 — two candidates that both merely lack line data
+/// must not be treated as overlapping just because they share that sentinel.
+fn is_unknown_location(loc: &FileLocation) -> bool {
+    loc.line_start == 0 && loc.line_end == 0
+}
+
 fn overlaps(a: &FileLocation, b: &FileLocation) -> bool {
+    if is_unknown_location(a) || is_unknown_location(b) {
+        return false;
+    }
     a.line_start <= b.line_end && b.line_start <= a.line_end
 }
 
@@ -508,6 +519,23 @@ mod tests {
         assert_eq!(ranked[0].location.line_end, 25);
         assert_eq!(ranked[0].kind, CandidateKind::SymbolExact);
         assert_eq!(ranked[0].symbol.as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn unknown_location_sentinels_do_not_merge_distinct_symbols() {
+        // Two symbols in the same file both missing line data (backend
+        // omitted the `lines` column) must survive as distinct candidates,
+        // not collapse into one via the (0, 0) "location unknown" sentinel.
+        let p = QueryPatterns::default();
+        let mut a = candidate("a.rs", 0, 0, CandidateKind::SymbolExact);
+        a.symbol = Some("decide_freshness".to_string());
+        let mut b = candidate("a.rs", 0, 0, CandidateKind::SymbolExact);
+        b.symbol = Some("StalenessWindow".to_string());
+        let ranked = merge_and_rank(vec![a, b], &p, 10);
+        assert_eq!(ranked.len(), 2);
+        let symbols: Vec<_> = ranked.iter().map(|c| c.symbol.as_deref()).collect();
+        assert!(symbols.contains(&Some("decide_freshness")));
+        assert!(symbols.contains(&Some("StalenessWindow")));
     }
 
     #[test]

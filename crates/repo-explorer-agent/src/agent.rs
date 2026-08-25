@@ -304,7 +304,7 @@ where
             .await
         {
             Some(changed) if changed.is_empty() => {
-                cache.refresh_query_fingerprint(query_key, fp.clone());
+                cache.refresh_query_fingerprint(query_key, &entry.fingerprint, fp.clone());
                 Some(entry.result)
             }
             _ => {
@@ -658,6 +658,7 @@ mod tests {
             arguments_json:
                 r#"{"findings":[{"location":{"path":"src/lib.rs","line_start":1,"line_end":2},"note":"here"}],"summary":"done"}"#
                     .to_string(),
+            thought_signatures: None,
         }
     }
 
@@ -761,6 +762,7 @@ mod tests {
             id: "c1".to_string(),
             name: "grep".to_string(),
             arguments_json: r#"{"pattern":"fn main"}"#.to_string(),
+            thought_signatures: None,
         };
 
         let (message, findings) = agent

@@ -86,6 +86,10 @@ pub struct ToolCall {
     pub name: String,
     /// Raw JSON arguments (kept as text so the type stays `Eq`).
     pub arguments_json: String,
+    /// Opaque provider continuation blob(s) (e.g. Gemini 3 "thought
+    /// signatures") that must be replayed verbatim on the next request to
+    /// validate this call; `None` for providers that don't use them.
+    pub thought_signatures: Option<Vec<String>>,
 }
 
 /// A tool the model may call.
@@ -506,6 +510,7 @@ mod tests {
             id: "c1".to_string(),
             name: "search_code".to_string(),
             arguments_json: r#"{"q":"main"}"#.to_string(),
+            thought_signatures: None,
         };
         assert_eq!(call, call.clone());
 

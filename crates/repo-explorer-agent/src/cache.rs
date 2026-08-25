@@ -166,10 +166,23 @@ impl ResultCache {
     }
 
     /// Keep a still-valid entry current after the repo moved without any
-    /// actual diff (see `AgentLoop::query_cache_lookup`).
-    pub(crate) fn refresh_query_fingerprint(&self, key: &str, fingerprint: RepoFingerprint) {
+    /// actual diff (see `AgentLoop::query_cache_lookup`). Compare-and-swap
+    /// against `expected` (the fingerprint the caller's empty-diff decision
+    /// was based on): if a concurrent call already replaced the entry (e.g.
+    /// a full recompute via `store_query_cache`), its fingerprint no longer
+    /// matches `expected` and this becomes a no-op, so a stale relabel can
+    /// never pair a fresher result with a fingerprint it wasn't produced
+    /// from.
+    pub(crate) fn refresh_query_fingerprint(
+        &self,
+        key: &str,
+        expected: &RepoFingerprint,
+        fingerprint: RepoFingerprint,
+    ) {
         let mut inner = self.lock();
-        if let Some(entry) = inner.queries.get_mut(key) {
+        if let Some(entry) = inner.queries.get_mut(key)
+            && entry.fingerprint == *expected
+        {
             entry.fingerprint = fingerprint;
         }
     }
@@ -232,10 +245,24 @@ mod tests {
     fn query_refresh_and_remove() {
         let cache = ResultCache::new(4);
         cache.put_query("q".into(), entry("a"));
-        cache.refresh_query_fingerprint("q", fp("b"));
+        cache.refresh_query_fingerprint("q", &fp("a"), fp("b"));
         assert_eq!(cache.get_query("q").unwrap().fingerprint, fp("b"));
         cache.remove_query("q");
         assert!(cache.get_query("q").is_none());
+    }
+
+    #[test]
+    fn query_refresh_is_a_no_op_when_entry_moved_on() {
+        // Simulates the race: a concurrent full recompute already replaced
+        // the entry (fingerprint "c") before this stale refresh (based on
+        // stale expectation "a") lands — it must not clobber "c"'s result.
+        let cache = ResultCache::new(4);
+        cache.put_query("q".into(), entry("a"));
+        cache.put_query("q".into(), entry("c"));
+        cache.refresh_query_fingerprint("q", &fp("a"), fp("b"));
+        let got = cache.get_query("q").unwrap();
+        assert_eq!(got.fingerprint, fp("c"), "stale refresh must not apply");
+        assert_eq!(got.result.summary, "from c");
     }
 
     #[test]

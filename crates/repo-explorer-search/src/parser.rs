@@ -55,51 +55,70 @@ fn find_sep_run(bytes: &[u8], sep: u8, start: usize) -> Option<(usize, usize)> {
 /// a plausible `:` run, yet the former is genuinely `-`-delimited (dash real)
 /// and the latter is genuinely `:`-delimited (dash is inside the path). What
 /// differs is what sits between the two runs: a real trailing path segment
-/// (`fix.rs`, `old.rs`) always carries a file extension, so it contains a
-/// `.` in the unbroken token butting right up against the candidate `:` run,
-/// while a coincidental `:NN:` run inside genuine `-`-delimited content never
-/// does -- whether that content is a bare word (`status`), a bare timestamp
-/// (`12:30:05`), a word/timestamp mix (`boot 12:30:05`, `data[10:20:2]`), or
-/// prose containing an unrelated decimal number further back (`Release
-/// 1.2.0 shipped at 10:30:00 UTC`, where the `.` in `1.2.0` sits well
-/// outside the whitespace-delimited token -- `10` -- immediately before the
-/// `:30:` run). (Checking only the byte right before the `:` run for a digit
+/// (`fix.rs`, `old.rs`) always carries a file extension made of nothing but
+/// letters, so the unbroken token butting right up against the candidate
+/// `:` run ends in `.` followed by only ASCII-alphabetic bytes, while a
+/// coincidental `:NN:` run inside genuine `-`-delimited content never looks
+/// like that -- whether that content is a bare word (`status`), a bare
+/// timestamp (`12:30:05`), a word/timestamp mix (`boot 12:30:05`,
+/// `data[10:20:2]`), prose containing an unrelated decimal number further
+/// back (`Release 1.2.0 shipped at 10:30:00 UTC`, where the `.` in `1.2.0`
+/// sits well outside the whitespace-delimited token -- `10` -- immediately
+/// before the `:30:` run), or a token that does carry a `.` right up against
+/// the run but whose suffix isn't extension-shaped (`self.matrix[10:20:2]`,
+/// where the token is `self.matrix[10` and what follows the last `.` is
+/// `matrix[10` -- letters, digits, and a bracket, not a plausible
+/// extension; or a version-like `v1.2:30:00`, where the suffix is the lone
+/// digit `2`). (Checking only the byte right before the `:` run for a digit
 /// is not enough: that misses the bare-word case, e.g. `status:42:ok`, where
 /// nothing but a `.` distinguishes it from a real trailing path segment; and
-/// checking for a `.` anywhere between the two runs is too broad: that
-/// misclassifies the prose case above.) So when both runs exist and the `-`
-/// run starts first, only trust it if the token immediately preceding the
-/// `:` run -- the span back to the previous whitespace, or to the `-` run's
-/// end if there is none -- has no `.`; otherwise the `:` run sits right
-/// after a real path segment and is the genuine separator.
-fn trailing_token_has_dot(bytes: &[u8], start: usize, end: usize) -> bool {
+/// treating any `.` in the trailing token as proof of a real extension is
+/// too loose: that misclassifies the bracket-index and version-token cases
+/// above.) So when both runs exist and the `-` run starts first, only trust
+/// it if the token immediately preceding the `:` run -- the span back to
+/// the previous whitespace, or to the `-` run's end if there is none --
+/// does *not* end in a plausible extension (`.` followed by one or more
+/// ASCII-alphabetic bytes and nothing else); otherwise the `:` run sits
+/// right after a real path segment and is the genuine separator.
+fn trailing_token_has_extension(bytes: &[u8], start: usize, end: usize) -> bool {
     let span = &bytes[start..end];
     let token_start = span
         .iter()
         .rposition(u8::is_ascii_whitespace)
         .map_or(0, |p| p + 1);
-    span[token_start..].contains(&b'.')
+    let token = &span[token_start..];
+    match token.iter().rposition(|&b| b == b'.') {
+        Some(dot) => {
+            let ext = &token[dot + 1..];
+            !ext.is_empty() && ext.iter().all(u8::is_ascii_alphabetic)
+        }
+        None => false,
+    }
 }
 
-/// Starting from the leftmost plausible `-N-` run, walk right past any run
-/// that actually sits inside the file path rather than at the real
-/// path/line-number boundary: a later `-N-` run replaces the current
-/// candidate whenever the token immediately before it (back to the last
-/// whitespace) contains a `.`, marking a real file extension -- the same
-/// disambiguation `split_grep_line` applies once between a dash run and a
-/// colon run, generalized to walk past every such run on a pure
-/// dash-delimited (no colon) line. Needed for a context line whose path
-/// itself contains an internal unpadded `-N-` segment, e.g.
-/// `component-2-renderer.tsx-45-body`, where the coincidental `-2-` run is
-/// leftmost but the real separator is the `-45-` run further right.
+/// Starting from the leftmost plausible `-N-` run, walk every later `-N-`
+/// run on the line and adopt one as the new candidate whenever the token
+/// immediately before it (back to the last whitespace, or to the prior run
+/// examined) ends in a plausible extension, marking a real file extension --
+/// the same disambiguation `split_grep_line` applies once between a dash run
+/// and a colon run, generalized to walk past every such run on a pure
+/// dash-delimited (no colon) line. The scan position advances past every run
+/// examined regardless of whether it was adopted, so a run whose preceding
+/// token has no extension (a coincidental in-path `-N-` segment) is skipped
+/// over rather than ending the walk -- needed for a path with two or more
+/// such segments before its extension, e.g.
+/// `component-1-item-2-view.tsx-45-body`, where neither the coincidental
+/// `-1-` nor `-2-` run has an extension-bearing token before it, but the
+/// real `-45-` separator further right (preceded by `view.tsx`) does; ending
+/// the walk at the first non-extension run would wrongly settle on `-1-`.
 fn resolve_dash_sep_run(bytes: &[u8], first: (usize, usize)) -> (usize, usize) {
     let mut candidate = first;
-    while let Some(next) = find_sep_run(bytes, b'-', candidate.1 + 1) {
-        if trailing_token_has_dot(bytes, candidate.1 + 1, next.0) {
+    let mut cursor = first.1 + 1;
+    while let Some(next) = find_sep_run(bytes, b'-', cursor) {
+        if trailing_token_has_extension(bytes, cursor, next.0) {
             candidate = next;
-        } else {
-            break;
         }
+        cursor = next.1 + 1;
     }
     candidate
 }
@@ -109,7 +128,7 @@ fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
     let colon = find_sep_run(bytes, b':', 0);
     let dash = find_sep_run(bytes, b'-', 0);
     let (sep, i, j) = match (colon, dash) {
-        (Some(c), Some(d)) if d.0 < c.0 && !trailing_token_has_dot(bytes, d.1 + 1, c.0) => {
+        (Some(c), Some(d)) if d.0 < c.0 && !trailing_token_has_extension(bytes, d.1 + 1, c.0) => {
             let d = resolve_dash_sep_run(bytes, d);
             (b'-', d.0, d.1)
         }
@@ -488,6 +507,33 @@ mod tests {
         assert_eq!(
             result,
             Some(("component-2-renderer.tsx", 45, "time 12:30:00", false))
+        );
+    }
+
+    #[test]
+    fn split_grep_line_handles_bracket_index_dot_before_coincidental_colon_run() {
+        // The trailing token before the coincidental `:20:` run is
+        // `self.matrix[10` -- it has a `.`, but what follows it (`matrix[10`)
+        // is not extension-shaped (letters, digits, and a bracket), so it
+        // must not be mistaken for a real trailing path segment: the genuine
+        // `-15-` context separator wins.
+        let result = split_grep_line("code.py-15-    self.matrix[10:20:2]");
+        assert_eq!(
+            result,
+            Some(("code.py", 15, "    self.matrix[10:20:2]", false))
+        );
+    }
+
+    #[test]
+    fn split_grep_line_handles_dash_numbered_path_with_two_intermediate_segments() {
+        // Two coincidental in-path `-N-` runs (`-1-`, `-2-`) sit left of the
+        // real `-45-` separator, neither directly preceded by a dotted
+        // extension -- the walk must skip past both rather than stopping at
+        // the first and settling on `-1-`.
+        let result = split_grep_line("component-1-item-2-view.tsx-45-body");
+        assert_eq!(
+            result,
+            Some(("component-1-item-2-view.tsx", 45, "body", false))
         );
     }
 

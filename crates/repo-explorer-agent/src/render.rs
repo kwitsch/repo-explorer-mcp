@@ -61,7 +61,7 @@ pub(crate) fn tidy_findings(
     let mut seen = HashSet::new();
     let mut out: Vec<ExplorationFinding> = Vec::with_capacity(findings.len());
     for mut f in findings {
-        f.location.path = normalize_rel_path(&f.location.path);
+        f.location.path = normalize_rel_path(f.location.path);
         if seen.contains(&f.location) {
             continue;
         }

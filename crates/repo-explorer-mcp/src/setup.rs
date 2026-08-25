@@ -24,7 +24,6 @@ pub fn wants_setup(args: &[String]) -> bool {
 }
 
 /// A provider inferred from a set env var. `kind` is one of KNOWN_PROVIDER_KINDS.
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct DetectedProvider {
     kind: &'static str,
     api_key_env: String,
