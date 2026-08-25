@@ -48,21 +48,31 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
 
     let symbol_legs = join_all(patterns.identifiers.iter().take(SYMBOL_LOOKUP_TOKENS).map(
         |token| {
-            memoized(leg_cache, move || format!("symbol#{token}"), async move {
-                let graph_query = GraphQuery {
-                    name_pattern: Some(token.clone()),
-                    file_pattern: scope.map(|p| p.to_string_lossy().into_owned()),
-                    max_results: Some(PER_LEG_MAX_RESULTS),
-                    ..GraphQuery::default()
-                };
-                soft_leg(
-                    "symbol",
-                    token,
-                    memory.search_graph(repo_root, &graph_query),
-                    |res| symbol_candidates(res.findings, token),
-                )
-                .await
-            })
+            memoized(
+                leg_cache,
+                move || {
+                    format!(
+                        "symbol{}{}",
+                        encode_field(token),
+                        encode_field(&scope_display(scope))
+                    )
+                },
+                async move {
+                    let graph_query = GraphQuery {
+                        name_pattern: Some(token.clone()),
+                        file_pattern: scope.map(|p| p.to_string_lossy().into_owned()),
+                        max_results: Some(PER_LEG_MAX_RESULTS),
+                        ..GraphQuery::default()
+                    };
+                    soft_leg(
+                        "symbol",
+                        token,
+                        memory.search_graph(repo_root, &graph_query),
+                        |res| symbol_candidates(res.findings, token),
+                    )
+                    .await
+                },
+            )
         },
     ));
 
@@ -214,27 +224,37 @@ fn scope_display(scope: Option<&Path>) -> String {
     scope.map(|p| p.display().to_string()).unwrap_or_default()
 }
 
-/// Classify symbol-lookup findings: the memory backend carries the symbol name
-/// in `note`; an exact (last-segment) name match is `SymbolExact`, everything
-/// else `SymbolFuzzy`.
-fn symbol_candidates(findings: Vec<ExplorationFinding>, token: &str) -> Vec<Candidate> {
+/// Build candidates from findings, with `kind_of` classifying each finding
+/// individually. Shared by `symbol_candidates` (kind depends on the finding)
+/// and `candidates_of_kind` (kind is fixed) so the two never drift apart on
+/// how a `Candidate` is otherwise assembled from an `ExplorationFinding`.
+fn candidates_with(
+    findings: Vec<ExplorationFinding>,
+    kind_of: impl Fn(&ExplorationFinding) -> CandidateKind,
+) -> Vec<Candidate> {
     findings
         .into_iter()
         .map(|f| {
-            let symbol = f.note;
-            let kind = match symbol.as_deref() {
-                Some(name) if last_segment(name) == token => CandidateKind::SymbolExact,
-                _ => CandidateKind::SymbolFuzzy,
-            };
+            let kind = kind_of(&f);
             Candidate {
                 location: f.location,
-                symbol,
+                symbol: f.note,
                 kind,
                 score: 0,
                 snippet: f.snippet,
             }
         })
         .collect()
+}
+
+/// Classify symbol-lookup findings: the memory backend carries the symbol name
+/// in `note`; an exact (last-segment) name match is `SymbolExact`, everything
+/// else `SymbolFuzzy`.
+fn symbol_candidates(findings: Vec<ExplorationFinding>, token: &str) -> Vec<Candidate> {
+    candidates_with(findings, |f| match f.note.as_deref() {
+        Some(name) if last_segment(name) == token => CandidateKind::SymbolExact,
+        _ => CandidateKind::SymbolFuzzy,
+    })
 }
 
 /// A qualified name's final segment (`a::b::c` → `c`, `a.b` → `b`).
@@ -244,16 +264,7 @@ fn last_segment(name: &str) -> &str {
 }
 
 fn candidates_of_kind(findings: Vec<ExplorationFinding>, kind: CandidateKind) -> Vec<Candidate> {
-    findings
-        .into_iter()
-        .map(|f| Candidate {
-            location: f.location,
-            symbol: f.note,
-            kind,
-            score: 0,
-            snippet: f.snippet,
-        })
-        .collect()
+    candidates_with(findings, |_| kind)
 }
 
 /// Collapse content rows from the `find` emulation to one file-level candidate
