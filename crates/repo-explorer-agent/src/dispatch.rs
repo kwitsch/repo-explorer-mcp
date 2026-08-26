@@ -74,13 +74,9 @@ pub(crate) async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
             let file_pattern = args
                 .file_pattern
                 .as_deref()
-                .map(|s| {
-                    if escapes_repo_root(Path::new(s)) {
-                        return Err(format!("file_pattern `{s}` escapes the repository root"));
-                    }
-                    Ok(s.to_string())
-                })
-                .transpose()?;
+                .map(|s| reject_escaping_path("file_pattern", s))
+                .transpose()?
+                .map(|p| p.to_string_lossy().into_owned());
             let query = GraphQuery {
                 name_pattern: args.name_pattern,
                 file_pattern,
@@ -245,11 +241,7 @@ pub(crate) fn read_file(
     start_line: Option<u32>,
     end_line: Option<u32>,
 ) -> Result<String, String> {
-    if escapes_repo_root(Path::new(path)) {
-        return Err(format!(
-            "read_file path `{path}` escapes the repository root"
-        ));
-    }
+    reject_escaping_path("read_file path", path)?;
     let canonical_root = canonical_repo_root(repo_root)?;
     read_file_canonical(repo_root, &canonical_root, path, start_line, end_line)
 }

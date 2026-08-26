@@ -4,7 +4,7 @@
 //! caps are the token-diet half of the retrieval-pipeline design.
 
 use repo_explorer_core::domain::{ExplorationFinding, ExplorationResult, FileLocation};
-use repo_explorer_core::retrieval::normalize_rel_path;
+use repo_explorer_core::retrieval::{is_unknown_location, normalize_rel_path};
 use serde::Serialize;
 use std::collections::HashSet;
 
@@ -49,14 +49,6 @@ pub(crate) fn cap_file_lines(contents: String, max_lines: usize) -> String {
     let marker = format!("…[truncated after {max_lines} lines; request a narrower line range]");
     out.push(&marker);
     out.join("\n")
-}
-
-/// `(0, 0)` is core's `normalize_location` "location unknown" sentinel (see
-/// `retrieval::is_unknown_location`), not a real one-line span at line 0 —
-/// mirrored here so dedupe doesn't collapse distinct symbols that merely
-/// share it.
-fn is_unknown_location(loc: &FileLocation) -> bool {
-    loc.line_start == 0 && loc.line_end == 0
 }
 
 /// Dedupe key: the location, plus the note when the location is the

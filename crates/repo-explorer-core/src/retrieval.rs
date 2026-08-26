@@ -242,7 +242,9 @@ pub fn normalize_location(location: FileLocation) -> FileLocation {
 /// `(0, 0)` is `normalize_location`'s "location unknown" sentinel, not a real
 /// one-line span at line 0 — two candidates that both merely lack line data
 /// must not be treated as overlapping just because they share that sentinel.
-fn is_unknown_location(loc: &FileLocation) -> bool {
+/// `pub` so callers outside this module (e.g. the agent crate's finding
+/// dedupe) can apply the same "unknown" test instead of reimplementing it.
+pub fn is_unknown_location(loc: &FileLocation) -> bool {
     loc.line_start == 0 && loc.line_end == 0
 }
 

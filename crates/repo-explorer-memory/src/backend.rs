@@ -15,7 +15,8 @@ use repo_explorer_core::memory::{
 };
 use serde_json::{Map, Value};
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 /// A `MemoryBackend` backed by a live `rmcp` client. Holds the staleness
 /// threshold from config so `ensure_fresh_index` needs no extra arguments.
@@ -25,6 +26,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub struct MemoryClientBackend {
     client: Option<MemoryClient>,
     staleness: Duration,
+    /// Wall-clock time this process last successfully ran `index_repository`,
+    /// used as the `last_indexed_at` fed to `decide_freshness`. The real
+    /// `index_status` response carries no timestamp field at all (verified
+    /// against the live tool), so this in-process record is the only source
+    /// of that value — without it, `last_indexed_at` would always be `None`
+    /// and every `ensure_fresh_index` call would reindex regardless of the
+    /// configured staleness threshold.
+    last_reindexed_at: Mutex<Option<SystemTime>>,
 }
 
 impl MemoryClientBackend {
@@ -34,6 +43,7 @@ impl MemoryClientBackend {
         Ok(Self {
             client: Some(client),
             staleness: Duration::from_secs(config.staleness_seconds),
+            last_reindexed_at: Mutex::new(None),
         })
     }
 
@@ -79,12 +89,15 @@ impl MemoryClientBackend {
             .await
     }
 
-    /// Probe `index_status` for the project, returning `(exists,
-    /// last_indexed_at)`; a tool error meaning "not indexed" is reported as
-    /// `exists = false` rather than an `Err`. The changed-file count is not
-    /// this call's to know, so the full `IndexProbe` is assembled by
-    /// `ensure_fresh_index` instead of being returned half-filled here.
-    async fn probe_status(&self, project: &str) -> Result<(bool, Option<SystemTime>), MemoryError> {
+    /// Probe `index_status` for the project, returning whether it exists; a
+    /// tool error meaning "not indexed" is reported as `exists = false`
+    /// rather than an `Err`. The changed-file count is not this call's to
+    /// know, so the full `IndexProbe` is assembled by `ensure_fresh_index`
+    /// instead of being returned half-filled here. The real response carries
+    /// no last-indexed timestamp of any kind, so this does not attempt to
+    /// parse one — `ensure_fresh_index` sources `last_indexed_at` from
+    /// `last_reindexed_at` instead.
+    async fn probe_status(&self, project: &str) -> Result<bool, MemoryError> {
         match self.probe("index_status", project).await {
             Ok(json) => {
                 // An unrecognized/empty response must NOT be optimistically
@@ -100,19 +113,14 @@ impl MemoryClientBackend {
                     || first_field(&json, &["indexed", "exists"])
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
-                let last_indexed_at = json
-                    .get("last_indexed_at")
-                    .and_then(Value::as_i64)
-                    .and_then(|secs| u64::try_from(secs).ok())
-                    .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
-                Ok((exists, last_indexed_at))
+                Ok(exists)
             }
             // Only a tool error that explicitly indicates the project is
             // unknown/not-yet-indexed is downgraded to "not indexed"; any other
             // tool failure (permission error, malformed input, internal fault)
             // is surfaced to the caller instead of being silently reinterpreted.
             Err(MemoryError::ToolFailed { message, .. }) if is_not_indexed_error(&message) => {
-                Ok((false, None))
+                Ok(false)
             }
             Err(e) => Err(e),
         }
@@ -176,7 +184,12 @@ impl MemoryClientBackend {
         let mut args = Map::new();
         insert_path(&mut args, "path", abs_repo_root);
         match self.client().call("index_repository", args).await {
-            Ok(_) => Ok(IndexStatus::Reindexed),
+            Ok(_) => {
+                // Record when *we* just rebuilt it — the only clock available,
+                // since the upstream tool never reports a build timestamp.
+                *self.last_reindexed_at.lock().unwrap() = Some(SystemTime::now());
+                Ok(IndexStatus::Reindexed)
+            }
             Err(MemoryError::ToolFailed { message, .. }) => {
                 Ok(IndexStatus::IndexingFailed { reason: message })
             }
@@ -497,11 +510,15 @@ fn text_table_findings(text: &str) -> Vec<ExplorationFinding> {
             continue;
         }
         let Some(t) = &cols else { continue };
+        // Known from the header, once per section — skip the row's
+        // allocation entirely for a column-less/file-less section instead of
+        // collecting cells just to discard them below.
+        let Some(file_col) = t.file else { continue };
         let cells: Vec<&str> = line.split_whitespace().collect();
         if cells.len() != t.len {
             continue;
         }
-        let Some(file) = t.file.and_then(|i| cells.get(i).copied()) else {
+        let Some(file) = cells.get(file_col).copied() else {
             continue;
         };
         let (line_start, line_end) = t
@@ -561,12 +578,19 @@ impl MemoryBackend for MemoryClientBackend {
         // second time inside `run_index`.
         let abs = canonicalize_repo_root(repo_root).await;
         let project = project_name_from_abs(repo_root, &abs)?;
-        let (exists, last_indexed_at) = self.probe_status(&project).await?;
+        let exists = self.probe_status(&project).await?;
         // `detect_changes` is only meaningful for a project that exists.
         let changed_files = if exists {
             self.probe_changes(&project).await?
         } else {
             ChangeCount::Known(0)
+        };
+        // Only meaningful once this project has been indexed; irrelevant
+        // (and forced to `Reindex` regardless) when `exists` is false.
+        let last_indexed_at = if exists {
+            *self.last_reindexed_at.lock().unwrap()
+        } else {
+            None
         };
         let probe = IndexProbe {
             exists,
