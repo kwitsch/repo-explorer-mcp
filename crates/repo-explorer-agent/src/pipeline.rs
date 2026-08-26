@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::cache::{ResultCache, encode_field, opt_to_string, scope_display};
+use crate::dispatch::MATCH_ANY_NON_EMPTY_LINE;
 
 /// How many identifier tokens get their own symbol-lookup leg.
 const SYMBOL_LOOKUP_TOKENS: usize = 4;
@@ -128,7 +129,7 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
                         soft_leg(
                             "file",
                             token,
-                            search.search(repo_root, ".", scope, &options),
+                            search.search(repo_root, MATCH_ANY_NON_EMPTY_LINE, scope, &options),
                             file_candidates,
                         )
                         .await

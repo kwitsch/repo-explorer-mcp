@@ -18,6 +18,13 @@ use crate::tools::{
     SearchCodeArgs, SearchGraphArgs, TracePathArgs,
 };
 
+/// `SearchBackend` has no dedicated filename-search capability; this pattern
+/// stands in for one by matching any non-empty line, so a search restricted
+/// via `file_glob`/`scope` degenerates into "does this file exist". Shared
+/// with `pipeline`'s file-lookup retrieval leg, which approximates the same
+/// capability the same way.
+pub(crate) const MATCH_ANY_NON_EMPTY_LINE: &str = ".";
+
 /// Dispatch a single non-`finish` tool call, returning the `Role::Tool` message
 /// to push and any findings to accumulate. Test-only: production dispatch goes
 /// through `dispatch_inner` directly (the agent's tool-result cache needs the
@@ -111,7 +118,7 @@ pub(crate) async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
             // search is approximated by matching any non-empty line (pattern
             // `.`) restricted to files matching `pattern` as a glob.
             let (pattern, file_glob) = if name == "find" {
-                (".", Some(args.pattern))
+                (MATCH_ANY_NON_EMPTY_LINE, Some(args.pattern))
             } else {
                 (args.pattern.as_str(), None)
             };
@@ -353,7 +360,7 @@ mod tests {
                 scope,
                 ..
             } => {
-                assert_eq!(pattern, ".");
+                assert_eq!(pattern, MATCH_ANY_NON_EMPTY_LINE);
                 assert_eq!(options.file_glob.as_deref(), Some("*.rs"));
                 assert_eq!(scope, &None);
             }

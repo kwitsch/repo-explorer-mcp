@@ -133,27 +133,41 @@ fn trailing_token_is_bare_word(bytes: &[u8], start: usize, end: usize) -> bool {
     !token.is_empty() && token.iter().all(u8::is_ascii_alphabetic)
 }
 
-/// Starting from the leftmost plausible `-N-` run, walk every later `-N-`
-/// run on the line and adopt one as the new candidate whenever the token
-/// immediately before it (back to the last whitespace, or to the prior run
-/// examined) ends in a plausible extension, marking a real file extension --
-/// the same disambiguation `split_grep_line` applies once between a dash run
-/// and a colon run, generalized to walk past every such run on a pure
-/// dash-delimited (no colon) line. The scan position advances past every run
-/// examined regardless of whether it was adopted, so a run whose preceding
-/// token has no extension (a coincidental in-path `-N-` segment) is skipped
-/// over rather than ending the walk -- needed for a path with two or more
-/// such segments before its extension, e.g.
-/// `component-1-item-2-view.tsx-45-body`, where neither the coincidental
-/// `-1-` nor `-2-` run has an extension-bearing token before it, but the
-/// real `-45-` separator further right (preceded by `view.tsx`) does; ending
-/// the walk at the first non-extension run would wrongly settle on `-1-`.
+/// Starting from the leftmost plausible `-N-` run, walk later `-N-` runs on
+/// the line and adopt the first one found whose token immediately before it
+/// (back to the last whitespace, or to the prior run examined) ends in a
+/// plausible extension, marking a real file extension -- the same
+/// disambiguation `split_grep_line` applies once between a dash run and a
+/// colon run, generalized to walk past every such run on a pure
+/// dash-delimited (no colon) line. A run whose preceding token has no
+/// extension (a coincidental in-path `-N-` segment) is skipped over rather
+/// than ending the walk -- needed for a path with two or more such segments
+/// before its extension, e.g. `component-1-item-2-view.tsx-45-body`, where
+/// neither the coincidental `-1-` nor `-2-` run has an extension-bearing
+/// token before it, but the real `-45-` separator further right (preceded by
+/// `view.tsx`) does; ending the walk at the first non-extension run would
+/// wrongly settle on `-1-`.
+///
+/// Once a run *is* adopted, though, that's the genuine path/line separator
+/// and the walk stops right there instead of continuing into the content
+/// that follows it: that content can itself contain a coincidental
+/// extension-shaped token immediately before a later `-N-` run (e.g. a
+/// mentioned filename like `see other.log-42-more`, or `readme.md-20-line`),
+/// which would otherwise be misadopted as a "more real" separator and
+/// corrupt the path/line/content split. The same reasoning applies to the
+/// leftmost run itself: if the token before *it* already looks like a real
+/// extension (e.g. `src/log.rs-69-...`, where `log.rs` precedes `-69-`), it
+/// is already the genuine separator and the walk never starts.
 fn resolve_dash_sep_run(bytes: &[u8], first: (usize, usize)) -> (usize, usize) {
+    if trailing_token_has_extension(bytes, 0, first.0) {
+        return first;
+    }
     let mut candidate = first;
     let mut cursor = first.1 + 1;
     while let Some(next) = find_sep_run(bytes, b'-', cursor, bytes.len()) {
         if trailing_token_has_extension(bytes, cursor, next.0) {
             candidate = next;
+            break;
         }
         cursor = next.1 + 1;
     }
@@ -592,6 +606,29 @@ mod tests {
         assert_eq!(
             result,
             Some(("component-1-item-2-view.tsx", 45, "body", false))
+        );
+    }
+
+    #[test]
+    fn split_grep_line_handles_extension_shaped_token_in_content_after_dash_separator() {
+        // The genuine `-10-` separator is directly preceded by an
+        // extension-bearing path (`foo.rs`), so it must be adopted
+        // immediately rather than walked past into the content, where the
+        // coincidental `-20-` run (preceded by the extension-shaped
+        // `readme.md`) must not be mistaken for a "more real" separator.
+        let result = split_grep_line("foo.rs-10-see readme.md-20-line");
+        assert_eq!(result, Some(("foo.rs", 10, "see readme.md-20-line", false)));
+
+        let result = split_grep_line("src/parser.rs-10-see utils.rs-20-also");
+        assert_eq!(
+            result,
+            Some(("src/parser.rs", 10, "see utils.rs-20-also", false))
+        );
+
+        let result = split_grep_line("src/log.rs-69-see other.log-42-more text");
+        assert_eq!(
+            result,
+            Some(("src/log.rs", 69, "see other.log-42-more text", false))
         );
     }
 
