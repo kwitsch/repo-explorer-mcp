@@ -62,10 +62,9 @@ pub(crate) fn tidy_findings(
     let mut out: Vec<ExplorationFinding> = Vec::with_capacity(findings.len());
     for mut f in findings {
         f.location.path = normalize_rel_path(f.location.path);
-        if seen.contains(&f.location) {
+        if !seen.insert(f.location.clone()) {
             continue;
         }
-        seen.insert(f.location.clone());
         f.snippet = f
             .snippet
             .map(|s| cap_snippet(s, caps.snippet_max_chars))

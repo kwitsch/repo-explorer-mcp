@@ -11,14 +11,19 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 /// Find the leftmost *plausible* `<sep><digits><sep>` run for one separator
-/// byte at or after `start`: the digit span must not be zero-padded, since
-/// real rg/rtk line numbers are always printed unpadded. A zero-padded span
-/// (e.g. the `01` in a date-like path segment `-01-`) is therefore not a
-/// real line number and is skipped in favor of a later run rather than
-/// accepted as a fabricated one.
-fn find_sep_run(bytes: &[u8], sep: u8, start: usize) -> Option<(usize, usize)> {
+/// byte in `bytes[start..end]`: the digit span must not be zero-padded,
+/// since real rg/rtk line numbers are always printed unpadded. A
+/// zero-padded span (e.g. the `01` in a date-like path segment `-01-`) is
+/// therefore not a real line number and is skipped in favor of a later run
+/// rather than accepted as a fabricated one. `end` lets a caller who only
+/// cares about runs strictly before some other position skip scanning
+/// past it — a run's closing separator can never be found beyond `end`,
+/// and its digit span (bounded by the first non-digit byte, `end`'s own
+/// content included) naturally stops there too, so bounding is
+/// behavior-preserving for that use, not just an optimization by coincidence.
+fn find_sep_run(bytes: &[u8], sep: u8, start: usize, end: usize) -> Option<(usize, usize)> {
     let mut i = start;
-    while i < bytes.len() {
+    while i < end {
         if bytes[i] == sep && i > 0 {
             let mut j = i + 1;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
@@ -146,7 +151,7 @@ fn trailing_token_is_bare_word(bytes: &[u8], start: usize, end: usize) -> bool {
 fn resolve_dash_sep_run(bytes: &[u8], first: (usize, usize)) -> (usize, usize) {
     let mut candidate = first;
     let mut cursor = first.1 + 1;
-    while let Some(next) = find_sep_run(bytes, b'-', cursor) {
+    while let Some(next) = find_sep_run(bytes, b'-', cursor, bytes.len()) {
         if trailing_token_has_extension(bytes, cursor, next.0) {
             candidate = next;
         }
@@ -157,8 +162,11 @@ fn resolve_dash_sep_run(bytes: &[u8], first: (usize, usize)) -> (usize, usize) {
 
 fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
     let bytes = line.as_bytes();
-    let colon = find_sep_run(bytes, b':', 0);
-    let dash = find_sep_run(bytes, b'-', 0);
+    let colon = find_sep_run(bytes, b':', 0, bytes.len());
+    // Only a dash run starting before the colon run can change the outcome
+    // (see the match arms below), so skip scanning past it once found.
+    let dash_end = colon.map_or(bytes.len(), |c| c.0);
+    let dash = find_sep_run(bytes, b'-', 0, dash_end);
     let (sep, i, j) = match (colon, dash) {
         (Some(c), Some(d))
             if d.0 < c.0

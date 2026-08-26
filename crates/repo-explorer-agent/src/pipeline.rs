@@ -14,7 +14,7 @@ use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::cache::{ResultCache, encode_field};
+use crate::cache::{ResultCache, encode_field, opt_to_string, scope_display};
 
 /// How many identifier tokens get their own symbol-lookup leg.
 const SYMBOL_LOOKUP_TOKENS: usize = 4;
@@ -76,7 +76,7 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
             format!(
                 "{}{}",
                 leg_key("semantic", &query.text, scope),
-                encode_field(&query.max_results.map(|m| m.to_string()).unwrap_or_default())
+                encode_field(&opt_to_string(query.max_results))
             )
         },
         async move {
@@ -198,11 +198,6 @@ async fn soft_leg<T, E: std::fmt::Display>(
             None
         }
     }
-}
-
-/// Render the scope hint for cache-key inclusion.
-fn scope_display(scope: Option<&Path>) -> String {
-    scope.map(|p| p.display().to_string()).unwrap_or_default()
 }
 
 /// Build a leg-cache key from a leg prefix, its value, and the scope hint.

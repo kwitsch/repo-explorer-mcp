@@ -7,7 +7,10 @@ use repo_explorer_core::domain::{
     Candidate, ExplorationFinding, ExplorationQuery, ExplorationResult,
 };
 use repo_explorer_core::fingerprint::RepoFingerprint;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
+use std::path::Path;
 use std::sync::Mutex;
 
 /// A capped `String`-keyed map with FIFO eviction (oldest inserted first out).
@@ -38,16 +41,19 @@ impl<V: Clone> CappedMap<V> {
         if self.cap == 0 {
             return;
         }
-        if !self.map.contains_key(&key) {
-            self.order.push_back(key.clone());
-            self.map.insert(key, value);
-            while self.map.len() > self.cap {
-                if let Some(oldest) = self.order.pop_front() {
-                    self.map.remove(&oldest);
+        match self.map.entry(key) {
+            Entry::Occupied(mut e) => {
+                e.insert(value);
+            }
+            Entry::Vacant(e) => {
+                self.order.push_back(e.key().clone());
+                e.insert(value);
+                while self.map.len() > self.cap {
+                    if let Some(oldest) = self.order.pop_front() {
+                        self.map.remove(&oldest);
+                    }
                 }
             }
-        } else {
-            self.map.insert(key, value);
         }
     }
 
@@ -62,7 +68,29 @@ impl<V: Clone> CappedMap<V> {
 /// regardless of what characters the fields themselves contain. Shared by
 /// `query_key` below and the retrieval-leg keys in `pipeline.rs`.
 pub(crate) fn encode_field(s: &str) -> String {
-    format!("{}:{}", s.len(), s)
+    let mut out = String::with_capacity(s.len() + 8);
+    encode_field_into(&mut out, s);
+    out
+}
+
+/// Same encoding as `encode_field`, writing into an existing buffer instead
+/// of allocating a new one — lets a multi-field key build in a single
+/// `String`.
+pub(crate) fn encode_field_into(out: &mut String, s: &str) {
+    let _ = write!(out, "{}:", s.len());
+    out.push_str(s);
+}
+
+/// Render an optional scope path for cache-key inclusion. Shared by
+/// `query_key` below and `leg_key` in `pipeline.rs` so the two can never
+/// encode a scope hint differently.
+pub(crate) fn scope_display(scope: Option<&Path>) -> String {
+    scope.map(|p| p.display().to_string()).unwrap_or_default()
+}
+
+/// Render an optional value for cache-key inclusion.
+pub(crate) fn opt_to_string<T: ToString>(v: Option<T>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_default()
 }
 
 /// One cached query result plus what it depends on.
@@ -109,13 +137,13 @@ impl ResultCache {
     /// hash-collide regardless of what characters the fields themselves
     /// contain.
     pub(crate) fn tool_key(fp: &RepoFingerprint, tool: &str, args_json: &str) -> String {
-        format!(
-            "{}#{}#{}{}",
-            fp.head_sha,
-            fp.dirty_hash,
-            encode_field(tool),
-            encode_field(args_json)
-        )
+        let mut key = String::with_capacity(
+            fp.head_sha.len() + fp.dirty_hash.len() + tool.len() + args_json.len() + 20,
+        );
+        let _ = write!(key, "{}#{}#", fp.head_sha, fp.dirty_hash);
+        encode_field_into(&mut key, tool);
+        encode_field_into(&mut key, args_json);
+        key
     }
 
     pub(crate) fn get_tool(&self, key: &str) -> Option<(String, Vec<ExplorationFinding>)> {
@@ -143,18 +171,13 @@ impl ResultCache {
     /// so differing field boundaries can never collide.
     pub(crate) fn query_key(query: &ExplorationQuery) -> String {
         let text = query.text.trim().to_lowercase();
-        let scope = query
-            .scope_hint
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        let max_results = query.max_results.map(|m| m.to_string()).unwrap_or_default();
-        format!(
-            "{}{}{}",
-            encode_field(&text),
-            encode_field(&scope),
-            encode_field(&max_results)
-        )
+        let scope = scope_display(query.scope_hint.as_deref());
+        let max_results = opt_to_string(query.max_results);
+        let mut key = String::with_capacity(text.len() + scope.len() + max_results.len() + 24);
+        encode_field_into(&mut key, &text);
+        encode_field_into(&mut key, &scope);
+        encode_field_into(&mut key, &max_results);
+        key
     }
 
     pub(crate) fn get_query(&self, key: &str) -> Option<QueryEntry> {
@@ -187,8 +210,22 @@ impl ResultCache {
         }
     }
 
-    pub(crate) fn remove_query(&self, key: &str) {
-        self.lock().queries.remove(key);
+    /// Compare-and-delete counterpart to `refresh_query_fingerprint`, guarding
+    /// against the same race: only remove the entry if its fingerprint still
+    /// matches `expected` (the fingerprint the caller's invalidation decision
+    /// was based on). If a concurrent call already replaced the entry with a
+    /// fresher, correctly-fingerprinted result, this becomes a no-op instead
+    /// of deleting that fresher entry.
+    pub(crate) fn remove_query(&self, key: &str, expected: &RepoFingerprint) {
+        let mut inner = self.lock();
+        let still_stale = inner
+            .queries
+            .map
+            .get(key)
+            .is_some_and(|entry| entry.fingerprint == *expected);
+        if still_stale {
+            inner.queries.remove(key);
+        }
     }
 }
 
@@ -247,8 +284,24 @@ mod tests {
         cache.put_query("q".into(), entry("a"));
         cache.refresh_query_fingerprint("q", &fp("a"), fp("b"));
         assert_eq!(cache.get_query("q").unwrap().fingerprint, fp("b"));
-        cache.remove_query("q");
+        cache.remove_query("q", &fp("b"));
         assert!(cache.get_query("q").is_none());
+    }
+
+    #[test]
+    fn remove_query_is_a_no_op_when_entry_moved_on() {
+        // Same race as `query_refresh_is_a_no_op_when_entry_moved_on`, but for
+        // the compare-and-delete path: a concurrent full recompute already
+        // replaced the entry (fingerprint "c") before this stale removal
+        // (based on stale expectation "a") lands — it must not delete "c"'s
+        // freshly-stored result.
+        let cache = ResultCache::new(4);
+        cache.put_query("q".into(), entry("a"));
+        cache.put_query("q".into(), entry("c"));
+        cache.remove_query("q", &fp("a"));
+        let got = cache.get_query("q").unwrap();
+        assert_eq!(got.fingerprint, fp("c"), "stale removal must not apply");
+        assert_eq!(got.result.summary, "from c");
     }
 
     #[test]

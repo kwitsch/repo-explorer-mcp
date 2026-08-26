@@ -307,7 +307,7 @@ where
                 Some(entry.result)
             }
             _ => {
-                cache.remove_query(query_key);
+                cache.remove_query(query_key, &entry.fingerprint);
                 None
             }
         }
@@ -566,8 +566,7 @@ fn accumulate(
     seen: &mut HashSet<FileLocation>,
     f: ExplorationFinding,
 ) {
-    if !seen.contains(&f.location) {
-        seen.insert(f.location.clone());
+    if seen.insert(f.location.clone()) {
         findings.push(f);
     }
 }

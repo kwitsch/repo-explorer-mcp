@@ -198,32 +198,6 @@ fn validate_scope(scope: Option<&str>) -> Result<Option<PathBuf>, String> {
     scope.map(|s| reject_escaping_path("scope", s)).transpose()
 }
 
-thread_local! {
-    /// Last (raw, canonicalized) `repo_root` seen on this thread. `read_file`
-    /// is called once per candidate id by verify.rs's `expand_content` loop
-    /// with an unchanging `repo_root`; this lets that batch pay the
-    /// `canonicalize` syscall once instead of once per call.
-    static REPO_ROOT_CACHE: std::cell::RefCell<Option<(PathBuf, PathBuf)>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// [`std::fs::canonicalize`] on `repo_root`, memoized against the previous
-/// call on this thread. `path` is only used to format the error message.
-fn canonicalize_repo_root(repo_root: &Path, path: &str) -> Result<PathBuf, String> {
-    REPO_ROOT_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some((cached_raw, cached_canonical)) = cache.as_ref()
-            && cached_raw == repo_root
-        {
-            return Ok(cached_canonical.clone());
-        }
-        let canonical = std::fs::canonicalize(repo_root)
-            .map_err(|e| format!("read_file failed for `{path}`: {e}"))?;
-        *cache = Some((repo_root.to_path_buf(), canonical.clone()));
-        Ok(canonical)
-    })
-}
-
 /// Also used directly by the verification stage's `expand` handler.
 pub(crate) fn read_file(
     repo_root: &Path,
@@ -235,7 +209,8 @@ pub(crate) fn read_file(
     let full = repo_root.join(rel);
     let canonical_full =
         std::fs::canonicalize(&full).map_err(|e| format!("read_file failed for `{path}`: {e}"))?;
-    let canonical_root = canonicalize_repo_root(repo_root, path)?;
+    let canonical_root = std::fs::canonicalize(repo_root)
+        .map_err(|e| format!("read_file failed for `{path}`: {e}"))?;
     if !canonical_full.starts_with(&canonical_root) {
         return Err(format!(
             "read_file path `{path}` escapes the repository root"
