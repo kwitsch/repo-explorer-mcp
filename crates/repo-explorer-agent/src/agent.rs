@@ -223,7 +223,7 @@ where
                 repo_root,
                 query,
                 index_note.as_deref(),
-                &outcome.candidates,
+                outcome.candidates,
                 fingerprint.as_ref(),
                 &mut budget,
             )
@@ -366,14 +366,14 @@ where
         repo_root: &Path,
         query: &ExplorationQuery,
         index_note: Option<&str>,
-        candidates: &[Candidate],
+        candidates: Vec<Candidate>,
         fingerprint: Option<&RepoFingerprint>,
         budget: &mut TokenBudget,
     ) -> Result<ExplorationResult, AgentLoopError> {
         let tools = tool_catalog();
         let mut messages: Vec<Message> = vec![
             Message::system(FALLBACK_SYSTEM_PROMPT),
-            Message::user(user_prompt(query, index_note, candidates)),
+            Message::user(user_prompt(query, index_note, &candidates)),
         ];
 
         let mut findings: Vec<ExplorationFinding> = Vec::new();
@@ -464,11 +464,7 @@ where
             return Ok(result);
         }
         for candidate in candidates {
-            accumulate(
-                &mut findings,
-                &mut seen,
-                finding_from_candidate(candidate.clone()),
-            );
+            accumulate(&mut findings, &mut seen, finding_from_candidate(candidate));
         }
         let cause = if turn_limit_hit {
             format!(

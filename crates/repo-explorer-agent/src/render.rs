@@ -3,7 +3,7 @@
 //! stable per-file ordering. Every byte rendered here is a prompt token — the
 //! caps are the token-diet half of the retrieval-pipeline design.
 
-use repo_explorer_core::domain::{ExplorationFinding, ExplorationResult};
+use repo_explorer_core::domain::{ExplorationFinding, ExplorationResult, FileLocation};
 use repo_explorer_core::retrieval::normalize_rel_path;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -51,9 +51,30 @@ pub(crate) fn cap_file_lines(contents: String, max_lines: usize) -> String {
     out.join("\n")
 }
 
-/// Normalize, dedupe (by normalized location; first seen wins), and cap
-/// snippets — preserving the input order. Use where order carries meaning
-/// (rank order of the retrieval pre-stage, the model's own finish order).
+/// `(0, 0)` is core's `normalize_location` "location unknown" sentinel (see
+/// `retrieval::is_unknown_location`), not a real one-line span at line 0 —
+/// mirrored here so dedupe doesn't collapse distinct symbols that merely
+/// share it.
+fn is_unknown_location(loc: &FileLocation) -> bool {
+    loc.line_start == 0 && loc.line_end == 0
+}
+
+/// Dedupe key: the location, plus the note when the location is the
+/// "unknown" sentinel — core's `merge_and_rank` deliberately keeps
+/// same-file candidates with unknown lines separate (see
+/// `unknown_location_sentinels_do_not_merge_distinct_symbols`), so their
+/// findings must not be collapsed here just because they share `(0, 0)`.
+fn dedupe_key(f: &ExplorationFinding) -> (FileLocation, Option<String>) {
+    let note = is_unknown_location(&f.location)
+        .then(|| f.note.clone())
+        .flatten();
+    (f.location.clone(), note)
+}
+
+/// Normalize, dedupe (by normalized location, disambiguated by note for the
+/// unknown-location sentinel; first seen wins), and cap snippets —
+/// preserving the input order. Use where order carries meaning (rank order
+/// of the retrieval pre-stage, the model's own finish order).
 pub(crate) fn tidy_findings(
     findings: Vec<ExplorationFinding>,
     caps: &RenderCaps,
@@ -62,7 +83,7 @@ pub(crate) fn tidy_findings(
     let mut out: Vec<ExplorationFinding> = Vec::with_capacity(findings.len());
     for mut f in findings {
         f.location.path = normalize_rel_path(f.location.path);
-        if !seen.insert(f.location.clone()) {
+        if !seen.insert(dedupe_key(&f)) {
             continue;
         }
         f.snippet = f
@@ -212,6 +233,34 @@ mod tests {
         assert_eq!(out[0].location.line_start, 2);
         assert_eq!(out[2].location.path, PathBuf::from("b.rs"));
         assert_eq!(out[2].snippet.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn unknown_location_sentinel_does_not_merge_distinct_symbols() {
+        // Two SymbolExact findings in the same file, both missing line data
+        // (core's (0, 0) "location unknown" sentinel), must survive tidying
+        // as distinct findings rather than collapsing into one just because
+        // they share the sentinel location.
+        let caps = RenderCaps::default();
+        let mut a = finding("a.rs", 0, None);
+        a.note = Some("exact symbol match: `decide_freshness`".to_string());
+        let mut b = finding("a.rs", 0, None);
+        b.note = Some("exact symbol match: `StalenessWindow`".to_string());
+        let out = tidy_findings(vec![a, b], &caps);
+        assert_eq!(out.len(), 2);
+        let notes: Vec<_> = out.iter().map(|f| f.note.as_deref()).collect();
+        assert!(notes.contains(&Some("exact symbol match: `decide_freshness`")));
+        assert!(notes.contains(&Some("exact symbol match: `StalenessWindow`")));
+    }
+
+    #[test]
+    fn unknown_location_sentinel_still_dedupes_true_duplicates() {
+        let caps = RenderCaps::default();
+        let mut a = finding("a.rs", 0, None);
+        a.note = Some("exact symbol match: `decide_freshness`".to_string());
+        let b = a.clone();
+        let out = tidy_findings(vec![a, b], &caps);
+        assert_eq!(out.len(), 1);
     }
 
     #[test]
