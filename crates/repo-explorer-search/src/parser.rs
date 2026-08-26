@@ -5,7 +5,7 @@
 //! `rg --json` JSON-lines. Both are tolerant of malformed individual rows (skip,
 //! not fatal) and saturate `u64`->`u32` line numbers (never a bare `as` cast).
 
-use repo_explorer_core::domain::{ExplorationFinding, FileLocation, saturate_u32};
+use repo_explorer_core::domain::{saturate_u32, ExplorationFinding, FileLocation};
 use repo_explorer_core::search::SearchError;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -161,23 +161,40 @@ fn token_is_bare_word(token: &[u8]) -> bool {
 /// extension (e.g. `src/log.rs-69-...`, where `log.rs` precedes `-69-`), it
 /// is already the genuine separator and the walk never starts.
 ///
-/// If the walk exhausts every later run without any preceding token ever
-/// looking extension-shaped -- a wholly extension-less file, e.g.
-/// `issue-42-fix-1-line one context` -- `candidate` has been advanced to
-/// each run in turn regardless, so it ends up the *last* (rightmost) run
-/// seen rather than snapping back to the leftmost, coincidental one: for an
-/// extension-less path the genuine separator is the one immediately before
-/// the real content, not the first digit-dash segment in the name.
+/// The walk is bounded to the line's first whitespace byte: a real path
+/// never contains whitespace (these tools always print `path<sep>line<sep>
+/// content`, and the path portion is exactly what `find_sep_run`/this walk
+/// are trying to delimit), so any `-N-` run at or after that point is
+/// definitely inside free-text content, not a candidate separator at all --
+/// e.g. `README-1-see item-2-here`: the coincidental `-2-` run sits inside
+/// `item-2-here`, which only appears after the space following `see`, so it
+/// is never even examined and the genuine `-1-` run is returned untouched.
+///
+/// If the walk exhausts every later in-bound run without any preceding
+/// token ever looking extension-shaped, the *last* run examined is
+/// returned rather than `first`: within the whitespace-bounded path region
+/// a later run is always at least as plausible as an earlier one (neither
+/// has positive extension evidence, so position is the only signal left,
+/// and the separator is what immediately precedes the content that
+/// follows it) -- e.g. `issue-42-fix-1-line one context`: both `-42-` and
+/// `-1-` sit before the line's first whitespace (inside "line one
+/// context"), so both are in-bound candidates, and `-1-` (examined last)
+/// is the genuine separator, not the coincidental `-42-` inside the file
+/// name.
 fn resolve_dash_sep_run(bytes: &[u8], first: (usize, usize)) -> (usize, usize) {
     if trailing_token_has_extension(bytes, 0, first.0) {
         return first;
     }
+    let ws_bound = bytes
+        .iter()
+        .position(u8::is_ascii_whitespace)
+        .unwrap_or(bytes.len());
     let mut candidate = first;
     let mut cursor = first.1 + 1;
-    while let Some(next) = find_sep_run(bytes, b'-', cursor, bytes.len()) {
+    while let Some(next) = find_sep_run(bytes, b'-', cursor, ws_bound) {
         candidate = next;
         if trailing_token_has_extension(bytes, cursor, next.0) {
-            break;
+            return next;
         }
         cursor = next.1 + 1;
     }
@@ -511,13 +528,44 @@ mod tests {
     #[test]
     fn split_grep_line_handles_extensionless_file_in_context_line() {
         // No colon anywhere (a context row) and the file itself has no
-        // extension, so no run's preceding token is ever extension-shaped;
-        // the real `-1-` separator (rightmost) must still win over the
-        // coincidental `-42-` run (leftmost) embedded in the file name.
+        // extension, so no run's preceding token is ever extension-shaped.
+        // Both `-42-` (coincidental, inside the file name) and `-1-` (the
+        // genuine separator) sit before the line's first whitespace, so both
+        // are in-bound candidates; the genuine one is the one examined last,
+        // immediately before the real content (`line one context`) begins.
         let result = split_grep_line("./issue-42-fix-1-line one context");
         assert_eq!(
             result,
             Some(("./issue-42-fix", 1, "line one context", false))
+        );
+    }
+
+    #[test]
+    fn split_grep_line_handles_extensionless_file_with_coincidental_dash_run_in_content() {
+        // No colon anywhere and the file (`README`) has no extension. The
+        // coincidental `-2-` run sits inside `item-2-here`, which only
+        // appears after the space following `see` -- past the walk's
+        // whitespace bound -- so it is never even examined, and the
+        // genuine, leftmost `-1-` separator is returned untouched.
+        let result = split_grep_line("README-1-see item-2-here");
+        assert_eq!(result, Some(("README", 1, "see item-2-here", false)));
+
+        // Same shape, but the extensionless path itself also contains a
+        // (non-digit) dash (`run-tests`), and both `-3-` and the coincidental
+        // `-2-` inside `step-2-verify output` sit before the line's first
+        // whitespace (between "verify" and "output") -- so, unlike the
+        // README case above, the whitespace bound alone can't rule `-2-`
+        // out. With no extension evidence to prefer one over the other
+        // either, this specific shape is genuinely ambiguous from the bytes
+        // alone (`run-tests` at line 3 vs. `run-tests-3-step` at line 2 are
+        // both equally plausible extensionless file names) -- this pins
+        // down the walk's actual, deterministic choice (the run examined
+        // last within bounds) rather than asserting one reading is somehow
+        // provably correct.
+        let result = split_grep_line("run-tests-3-step-2-verify output");
+        assert_eq!(
+            result,
+            Some(("run-tests-3-step", 2, "verify output", false))
         );
     }
 

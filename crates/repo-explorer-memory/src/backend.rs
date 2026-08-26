@@ -207,6 +207,14 @@ fn insert_opt_u32(args: &mut Map<String, Value>, key: &str, v: Option<u32>) {
     }
 }
 
+/// Insert `key: v.clone()` into `args` when `v` is `Some` — the `Option<String>`
+/// counterpart to [`insert_opt_u32`], for the same "skip when absent" tool args.
+fn insert_opt_str(args: &mut Map<String, Value>, key: &str, v: &Option<String>) {
+    if let Some(v) = v {
+        args.insert(key.to_string(), Value::String(v.clone()));
+    }
+}
+
 /// Does a tool-failure message indicate "this project is not indexed yet"
 /// (as opposed to some other recoverable-or-not failure)? Matches the
 /// observed `codebase-memory-mcp` phrasing ("project not found or not
@@ -519,15 +527,9 @@ impl MemoryBackend for MemoryClientBackend {
     ) -> Result<ExplorationResult, MemoryError> {
         self.call_memory_tool("search_graph", repo_root, |args| {
             args.insert("format".to_string(), Value::String("json".to_string()));
-            if let Some(v) = &query.name_pattern {
-                args.insert("name_pattern".to_string(), Value::String(v.clone()));
-            }
-            if let Some(v) = &query.file_pattern {
-                args.insert("file_pattern".to_string(), Value::String(v.clone()));
-            }
-            if let Some(v) = &query.label {
-                args.insert("label".to_string(), Value::String(v.clone()));
-            }
+            insert_opt_str(args, "name_pattern", &query.name_pattern);
+            insert_opt_str(args, "file_pattern", &query.file_pattern);
+            insert_opt_str(args, "label", &query.label);
             insert_opt_u32(args, "limit", query.max_results);
         })
         .await

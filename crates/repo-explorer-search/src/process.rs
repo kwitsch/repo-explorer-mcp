@@ -19,8 +19,12 @@ pub(crate) struct SpawnSpec {
 /// Spawn the process, capture stdout, and enforce the timeout.
 ///
 /// Exit `0` and exit `1` (rg/rtk "no matches") are both success; exit `1`
-/// simply yields empty output. Any other exit code (>= 2, or a signal) is a
-/// real failure. A spawn failure or timeout maps to the matching `SearchError`.
+/// simply yields empty output. Exit `2` with non-empty stdout is also
+/// success: rg/rtk use it for a partial-error walk (e.g. a match found
+/// alongside an unrelated permission-denied path elsewhere in the tree),
+/// and stdout already holds the complete, valid result in that case. Any
+/// other exit code (a bare `2`, `>= 3`, or a signal) is a real failure. A
+/// spawn failure or timeout maps to the matching `SearchError`.
 pub(crate) async fn run(spec: &SpawnSpec) -> Result<String, SearchError> {
     let mut cmd = Command::new(&spec.program);
     cmd.args(&spec.args)
@@ -55,9 +59,12 @@ pub(crate) async fn run(spec: &SpawnSpec) -> Result<String, SearchError> {
         message: format!("process error: {e}"),
     })?;
 
+    let stdout = String::from_utf8(output.stdout)
+        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned());
+
     match output.status.code() {
-        Some(0) | Some(1) => Ok(String::from_utf8(output.stdout)
-            .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())),
+        Some(0) | Some(1) => Ok(stdout),
+        Some(2) if !stdout.is_empty() => Ok(stdout),
         other => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let code_str = other

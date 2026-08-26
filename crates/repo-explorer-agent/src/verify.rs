@@ -224,11 +224,10 @@ fn expand_content(
             .location
             .line_end
             .saturating_add(EXPAND_CONTEXT_AFTER);
-        let root = canonical_root
-            .get_or_insert_with(|| canonical_repo_root(repo_root))
-            .clone();
-        let result =
-            root.and_then(|r| read_file_canonical(repo_root, &r, &path, Some(start), Some(end)));
+        let result = match canonical_root.get_or_insert_with(|| canonical_repo_root(repo_root)) {
+            Ok(r) => read_file_canonical(repo_root, r, &path, Some(start), Some(end)),
+            Err(e) => Err(e.clone()),
+        };
         match result {
             Ok(body) => sections.push(format!(
                 "[{id}] {path}:{start}-{end}\n{}",

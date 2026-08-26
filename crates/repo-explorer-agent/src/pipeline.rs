@@ -12,7 +12,7 @@ use repo_explorer_core::memory::{GraphQuery, MemoryBackend};
 use repo_explorer_core::retrieval::{confidence, derive_patterns, merge_and_rank};
 use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::cache::{ResultCache, encode_field, opt_to_string, scope_display};
 use crate::dispatch::MATCH_ANY_NON_EMPTY_LINE;
@@ -45,7 +45,16 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
     leg_cache: LegCache<'_>,
 ) -> RetrievalOutcome {
     let patterns = derive_patterns(&query.text);
-    let scope = query.scope_hint.as_deref();
+    // Unlike the LLM's own grep/find scope argument (validated in dispatch.rs
+    // via `reject_escaping_path`), this top-level query's `scope_hint` comes
+    // straight from the MCP caller with no validation applied upstream. Drop
+    // an escaping hint rather than handing it to `search.search` unchecked —
+    // fall back to unscoped (still repo_root-bounded) instead of leaking
+    // content from outside the repository.
+    let scope = query
+        .scope_hint
+        .as_deref()
+        .filter(|p| !escapes_repo_root(p));
 
     let symbol_legs = join_all(patterns.identifiers.iter().take(SYMBOL_LOOKUP_TOKENS).map(
         |token| {
@@ -281,6 +290,17 @@ fn file_candidates(findings: Vec<ExplorationFinding>) -> Vec<Candidate> {
             snippet: None,
         })
         .collect()
+}
+
+/// Mirrors dispatch.rs's `reject_escaping_path` lexical check: true if `scope`
+/// is absolute, walks out via a `..` component, or (on Windows) names a drive
+/// via a prefix component.
+fn escapes_repo_root(scope: &Path) -> bool {
+    scope.is_absolute()
+        || scope.has_root()
+        || scope
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
 }
 
 /// Glob for a path-like token: a bare file name matches by basename; a token
@@ -534,6 +554,48 @@ mod tests {
             let SearchCall::Search { scope, options, .. } = call;
             assert_eq!(scope.as_deref(), Some(Path::new("crates")));
             assert_eq!(options.max_results, Some(PER_LEG_MAX_RESULTS));
+        }
+    }
+
+    #[tokio::test]
+    async fn escaping_scope_hint_is_dropped_instead_of_reaching_search() {
+        let search = MockSearchBackend::new().with_search_result(Ok(vec![]));
+        let memory = MockMemoryBackend::new();
+        let query = ExplorationQuery {
+            text: "main".to_string(),
+            scope_hint: Some(PathBuf::from("/etc")),
+            max_results: None,
+        };
+        let _ = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
+        let calls = search.calls();
+        assert!(!calls.is_empty());
+        for call in &calls {
+            let SearchCall::Search { scope, .. } = call;
+            assert_eq!(
+                scope, &None,
+                "escaping scope_hint must not reach the search backend"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn relative_escaping_scope_hint_is_dropped_instead_of_reaching_search() {
+        let search = MockSearchBackend::new().with_search_result(Ok(vec![]));
+        let memory = MockMemoryBackend::new();
+        let query = ExplorationQuery {
+            text: "main".to_string(),
+            scope_hint: Some(PathBuf::from("../../etc")),
+            max_results: None,
+        };
+        let _ = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
+        let calls = search.calls();
+        assert!(!calls.is_empty());
+        for call in &calls {
+            let SearchCall::Search { scope, .. } = call;
+            assert_eq!(
+                scope, &None,
+                "escaping scope_hint must not reach the search backend"
+            );
         }
     }
 }

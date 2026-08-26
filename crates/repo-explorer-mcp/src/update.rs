@@ -479,7 +479,7 @@ fn arch_keywords() -> Vec<&'static str> {
 fn pick_asset(assets: &[Asset]) -> Option<&Asset> {
     let os = current_os_keyword();
     let arch_keywords = arch_keywords();
-    let mut candidates: Vec<(&Asset, String)> = assets
+    assets
         .iter()
         .filter_map(|a| {
             let name = a.name.to_lowercase();
@@ -489,9 +489,8 @@ fn pick_asset(assets: &[Asset]) -> Option<&Asset> {
                 && !name.contains("-ui-");
             matches.then_some((a, name))
         })
-        .collect();
-    candidates.sort_by_key(|(_, name)| (name.contains("portable"), name.contains("-gnu")));
-    candidates.into_iter().next().map(|(a, _)| a)
+        .min_by_key(|(_, name)| (name.contains("portable"), name.contains("-gnu")))
+        .map(|(a, _)| a)
 }
 
 /// Find `<asset>.sha256`, the sidecar checksum naming convention this
