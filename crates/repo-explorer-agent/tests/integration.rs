@@ -23,6 +23,7 @@ fn tc(id: &str, name: &str, args: &str) -> ToolCall {
         id: id.to_string(),
         name: name.to_string(),
         arguments_json: args.to_string(),
+        thought_signatures: None,
     }
 }
 
@@ -510,7 +511,48 @@ async fn repeated_query_is_served_from_cache() {
 }
 
 #[tokio::test]
-async fn fingerprint_change_with_untouched_paths_keeps_cache_entry() {
+async fn fingerprint_change_with_no_diff_keeps_cache_entry() {
+    let memory = MockMemoryBackend::new().with_search_graph_result(Ok(ExplorationResult {
+        findings: vec![symbol_finding("src/fresh.rs", "decide_freshness")],
+        summary: "1 row".to_string(),
+    }));
+    let mem_probe = memory.clone();
+    // An empty diff is the only fingerprint change a cache hit can prove safe
+    // to reuse without rerunning retrieval.
+    let probe = MockRepoStateProbe::new()
+        .with_fingerprint(Some(fp("aaa")))
+        .with_changed_paths(Some(Vec::new()));
+    let probe_handle = probe.clone();
+    let agent = AgentLoop::new(
+        memory,
+        MockSearchBackend::new(),
+        single_router(MockLlmProvider::new()),
+        probe,
+        AgentSettings::default(),
+        CacheSettings::default(),
+    );
+
+    let first = agent
+        .run(&PathBuf::from("/repo"), &query("decide_freshness"))
+        .await
+        .unwrap();
+    let calls_after_first = mem_probe.calls().len();
+
+    probe_handle.set_fingerprint(Some(fp("bbb")));
+    let second = agent
+        .run(&PathBuf::from("/repo"), &query("decide_freshness"))
+        .await
+        .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(mem_probe.calls().len(), calls_after_first);
+}
+
+#[tokio::test]
+async fn fingerprint_change_touching_unrelated_path_recomputes() {
+    // A path outside the cached result's own paths can still turn into a
+    // better match (e.g. a newly added file) that the stale entry never saw,
+    // so any actual diff — even to a path the old result never mentioned —
+    // must invalidate the entry rather than being assumed safe.
     let memory = MockMemoryBackend::new().with_search_graph_result(Ok(ExplorationResult {
         findings: vec![symbol_finding("src/fresh.rs", "decide_freshness")],
         summary: "1 row".to_string(),
@@ -529,20 +571,21 @@ async fn fingerprint_change_with_untouched_paths_keeps_cache_entry() {
         CacheSettings::default(),
     );
 
-    let first = agent
+    let _ = agent
         .run(&PathBuf::from("/repo"), &query("decide_freshness"))
         .await
         .unwrap();
     let calls_after_first = mem_probe.calls().len();
 
-    // The repo moved, but only an unrelated path changed.
     probe_handle.set_fingerprint(Some(fp("bbb")));
-    let second = agent
+    let _ = agent
         .run(&PathBuf::from("/repo"), &query("decide_freshness"))
         .await
         .unwrap();
-    assert_eq!(first, second);
-    assert_eq!(mem_probe.calls().len(), calls_after_first);
+    assert!(
+        mem_probe.calls().len() > calls_after_first,
+        "a change to any path, even one unrelated to the old answer, must recompute"
+    );
 }
 
 #[tokio::test]

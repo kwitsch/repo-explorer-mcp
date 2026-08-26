@@ -5,7 +5,9 @@
 //! panics, never fatal. `finish` is handled by the loop, not here.
 
 use repo_explorer_core::domain::{ExplorationFinding, ExplorationQuery, ExplorationResult};
-use repo_explorer_core::llm::{Message, ToolCall};
+#[cfg(test)]
+use repo_explorer_core::llm::Message;
+use repo_explorer_core::llm::ToolCall;
 use repo_explorer_core::memory::{GraphQuery, MemoryBackend, SnippetTarget};
 use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use std::path::{Component, Path, PathBuf};
@@ -17,7 +19,11 @@ use crate::tools::{
 };
 
 /// Dispatch a single non-`finish` tool call, returning the `Role::Tool` message
-/// to push and any findings to accumulate.
+/// to push and any findings to accumulate. Test-only: production dispatch goes
+/// through `dispatch_inner` directly (the agent's tool-result cache needs the
+/// success/error discriminant this wrapper collapses away), but this stays as
+/// the unit under test for that Ok/Err → `Message` mapping.
+#[cfg(test)]
 pub(crate) async fn dispatch_call<M: MemoryBackend, S: SearchBackend>(
     memory: &M,
     search: &S,
@@ -31,7 +37,10 @@ pub(crate) async fn dispatch_call<M: MemoryBackend, S: SearchBackend>(
     }
 }
 
-async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
+/// `pub(crate)` (rather than private) so callers that need the success/error
+/// discriminant `dispatch_call` collapses away — e.g. the tool-result cache,
+/// which must never memoize a failure — can call this directly.
+pub(crate) async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
     memory: &M,
     search: &S,
     repo_root: &Path,
@@ -102,7 +111,7 @@ async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
             // search is approximated by matching any non-empty line (pattern
             // `.`) restricted to files matching `pattern` as a glob.
             let (pattern, file_glob) = if name == "find" {
-                (".", Some(args.pattern.clone()))
+                (".", Some(args.pattern))
             } else {
                 (args.pattern.as_str(), None)
             };
@@ -143,7 +152,7 @@ async fn call_and_render<E: std::fmt::Display>(
     Ok(render_result(res, caps))
 }
 
-fn parse_args<T: serde::de::DeserializeOwned>(json: &str) -> Result<T, String> {
+pub(crate) fn parse_args<T: serde::de::DeserializeOwned>(json: &str) -> Result<T, String> {
     serde_json::from_str(json).map_err(|e| format!("invalid arguments: {e}"))
 }
 
@@ -162,13 +171,22 @@ fn snippet_target(args: GetCodeSnippetArgs) -> Result<SnippetTarget, String> {
 }
 
 /// The one lexical "stays inside the repository" check: reject a
-/// model-supplied path that is absolute or walks out via a `..` component.
+/// model-supplied path that is absolute, walks out via a `..` component, or
+/// (on Windows) names a drive via a prefix component — `Component::Prefix`
+/// also catches a drive-relative path like `C:foo`, which is neither
+/// `is_absolute()` nor `has_root()` since it resolves against that drive's
+/// own current directory rather than `repo_root`.
 /// `label` names the offending input in the error (`scope`, `read_file path`).
 /// `read_file` additionally verifies the *resolved* path; a `SearchBackend`
 /// scope is only checked lexically because it need not exist yet.
 fn reject_escaping_path(label: &str, raw: &str) -> Result<PathBuf, String> {
     let rel = Path::new(raw);
-    if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir)) {
+    if rel.is_absolute()
+        || rel.has_root()
+        || rel
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+    {
         return Err(format!("{label} `{raw}` escapes the repository root"));
     }
     Ok(rel.to_path_buf())
@@ -239,6 +257,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             arguments_json: args.to_string(),
+            thought_signatures: None,
         }
     }
 

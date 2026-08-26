@@ -40,6 +40,8 @@ impl CliSearchBackend {
 fn push_flags(args: &mut Vec<String>, options: &SearchOptions) {
     if options.case_sensitive {
         args.push("-s".to_string());
+    } else {
+        args.push("-S".to_string());
     }
     if let Some(n) = options.context_lines {
         args.push("-C".to_string());

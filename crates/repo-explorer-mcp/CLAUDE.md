@@ -38,9 +38,6 @@ errors are consumed via `?`/`.context(...)`).
 
 - Tracked components: `repo-explorer-mcp` (`kwitsch/repo-explorer-mcp`), `rtk` (`rtk-ai/rtk`), `rg`/ripgrep (`BurntSushi/ripgrep`), `codebase-memory-mcp` (`DeusData/codebase-memory-mcp`).
 - Runs instead of the MCP server loop, dispatched before config resolution and before the `setup` dispatch/auto-run.
-- Downloads the release asset matching the current OS/arch and verifies it against a `<asset>.sha256` sidecar when the release publishes one.
-- Extracts the binary when the asset is a `.tar.gz`/`.zip` archive.
-- Runs the extracted file with `--version` to confirm it executes **before** replacing anything already installed — self via `self_replace`, dependency binaries via atomic rename next to their resolved `which` path.
 - A dependency binary whose installed version can't be determined, or that isn't on `PATH`, is skipped rather than blindly overwritten.
 - This crate owns the `reqwest`/`semver`/`sha2`/`hex`/`flate2`/`tar`/`zip`/`self-replace` dependencies; core stays free of them.
 - It also uses `which`, already owned by `repo-explorer-search` — the only dependency this crate shares with another non-core crate rather than owning outright.

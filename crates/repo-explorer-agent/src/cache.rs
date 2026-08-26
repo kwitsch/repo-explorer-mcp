@@ -7,8 +7,10 @@ use repo_explorer_core::domain::{
     Candidate, ExplorationFinding, ExplorationQuery, ExplorationResult,
 };
 use repo_explorer_core::fingerprint::RepoFingerprint;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
+use std::path::Path;
 use std::sync::Mutex;
 
 /// A capped `String`-keyed map with FIFO eviction (oldest inserted first out).
@@ -31,15 +33,25 @@ impl<V: Clone> CappedMap<V> {
         self.map.get(key).cloned()
     }
 
+    fn get_mut(&mut self, key: &str) -> Option<&mut V> {
+        self.map.get_mut(key)
+    }
+
     fn insert(&mut self, key: String, value: V) {
         if self.cap == 0 {
             return;
         }
-        if self.map.insert(key.clone(), value).is_none() {
-            self.order.push_back(key);
-            while self.map.len() > self.cap {
-                if let Some(oldest) = self.order.pop_front() {
-                    self.map.remove(&oldest);
+        match self.map.entry(key) {
+            Entry::Occupied(mut e) => {
+                e.insert(value);
+            }
+            Entry::Vacant(e) => {
+                self.order.push_back(e.key().clone());
+                e.insert(value);
+                while self.map.len() > self.cap {
+                    if let Some(oldest) = self.order.pop_front() {
+                        self.map.remove(&oldest);
+                    }
                 }
             }
         }
@@ -51,13 +63,40 @@ impl<V: Clone> CappedMap<V> {
     }
 }
 
+/// Length-prefix a field (`len:content`) so concatenating several fields into
+/// a cache key can never collide across differing field boundaries,
+/// regardless of what characters the fields themselves contain. Shared by
+/// `query_key` below and the retrieval-leg keys in `pipeline.rs`.
+pub(crate) fn encode_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    encode_field_into(&mut out, s);
+    out
+}
+
+/// Same encoding as `encode_field`, writing into an existing buffer instead
+/// of allocating a new one — lets a multi-field key build in a single
+/// `String`.
+pub(crate) fn encode_field_into(out: &mut String, s: &str) {
+    let _ = write!(out, "{}:", s.len());
+    out.push_str(s);
+}
+
+/// Render an optional scope path for cache-key inclusion. Shared by
+/// `query_key` below and `leg_key` in `pipeline.rs` so the two can never
+/// encode a scope hint differently.
+pub(crate) fn scope_display(scope: Option<&Path>) -> String {
+    scope.map(|p| p.display().to_string()).unwrap_or_default()
+}
+
+/// Render an optional value for cache-key inclusion.
+pub(crate) fn opt_to_string<T: ToString>(v: Option<T>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_default()
+}
+
 /// One cached query result plus what it depends on.
 #[derive(Debug, Clone)]
 pub(crate) struct QueryEntry {
     pub fingerprint: RepoFingerprint,
-    /// Repo-relative paths the result was derived from; a change to any of
-    /// them invalidates the entry.
-    pub paths: HashSet<PathBuf>,
     pub result: ExplorationResult,
 }
 
@@ -92,8 +131,19 @@ impl ResultCache {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// `tool` and `args_json` are model-supplied and unvalidated at this
+    /// point, so both are length-prefixed via `encode_field` rather than
+    /// joined with a bare delimiter — differing field boundaries can never
+    /// hash-collide regardless of what characters the fields themselves
+    /// contain.
     pub(crate) fn tool_key(fp: &RepoFingerprint, tool: &str, args_json: &str) -> String {
-        format!("{}#{}#{tool}#{args_json}", fp.head_sha, fp.dirty_hash)
+        let mut key = String::with_capacity(
+            fp.head_sha.len() + fp.dirty_hash.len() + tool.len() + args_json.len() + 20,
+        );
+        let _ = write!(key, "{}#{}#", fp.head_sha, fp.dirty_hash);
+        encode_field_into(&mut key, tool);
+        encode_field_into(&mut key, args_json);
+        key
     }
 
     pub(crate) fn get_tool(&self, key: &str) -> Option<(String, Vec<ExplorationFinding>)> {
@@ -117,18 +167,17 @@ impl ResultCache {
     }
 
     /// Fingerprint-independent query key: invalidation is handled via the
-    /// stored fingerprint, not the key.
+    /// stored fingerprint, not the key. Fields are joined via `encode_field`
+    /// so differing field boundaries can never collide.
     pub(crate) fn query_key(query: &ExplorationQuery) -> String {
-        format!(
-            "{}#{}#{}",
-            query.text.trim().to_lowercase(),
-            query
-                .scope_hint
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            query.max_results.map(|m| m.to_string()).unwrap_or_default()
-        )
+        let text = query.text.trim().to_lowercase();
+        let scope = scope_display(query.scope_hint.as_deref());
+        let max_results = opt_to_string(query.max_results);
+        let mut key = String::with_capacity(text.len() + scope.len() + max_results.len() + 24);
+        encode_field_into(&mut key, &text);
+        encode_field_into(&mut key, &scope);
+        encode_field_into(&mut key, &max_results);
+        key
     }
 
     pub(crate) fn get_query(&self, key: &str) -> Option<QueryEntry> {
@@ -139,18 +188,44 @@ impl ResultCache {
         self.lock().queries.insert(key, entry);
     }
 
-    /// Keep a still-valid entry current after the repo moved without touching
-    /// its contributing paths.
-    pub(crate) fn refresh_query_fingerprint(&self, key: &str, fingerprint: RepoFingerprint) {
+    /// Keep a still-valid entry current after the repo moved without any
+    /// actual diff (see `AgentLoop::query_cache_lookup`). Compare-and-swap
+    /// against `expected` (the fingerprint the caller's empty-diff decision
+    /// was based on): if a concurrent call already replaced the entry (e.g.
+    /// a full recompute via `store_query_cache`), its fingerprint no longer
+    /// matches `expected` and this becomes a no-op, so a stale relabel can
+    /// never pair a fresher result with a fingerprint it wasn't produced
+    /// from.
+    pub(crate) fn refresh_query_fingerprint(
+        &self,
+        key: &str,
+        expected: &RepoFingerprint,
+        fingerprint: RepoFingerprint,
+    ) {
         let mut inner = self.lock();
-        if let Some(mut entry) = inner.queries.get(key) {
+        if let Some(entry) = inner.queries.get_mut(key)
+            && entry.fingerprint == *expected
+        {
             entry.fingerprint = fingerprint;
-            inner.queries.insert(key.to_string(), entry);
         }
     }
 
-    pub(crate) fn remove_query(&self, key: &str) {
-        self.lock().queries.remove(key);
+    /// Compare-and-delete counterpart to `refresh_query_fingerprint`, guarding
+    /// against the same race: only remove the entry if its fingerprint still
+    /// matches `expected` (the fingerprint the caller's invalidation decision
+    /// was based on). If a concurrent call already replaced the entry with a
+    /// fresher, correctly-fingerprinted result, this becomes a no-op instead
+    /// of deleting that fresher entry.
+    pub(crate) fn remove_query(&self, key: &str, expected: &RepoFingerprint) {
+        let mut inner = self.lock();
+        let still_stale = inner
+            .queries
+            .map
+            .get(key)
+            .is_some_and(|entry| entry.fingerprint == *expected);
+        if still_stale {
+            inner.queries.remove(key);
+        }
     }
 }
 
@@ -165,10 +240,9 @@ mod tests {
         }
     }
 
-    fn entry(sha: &str, path: &str) -> QueryEntry {
+    fn entry(sha: &str) -> QueryEntry {
         QueryEntry {
             fingerprint: fp(sha),
-            paths: HashSet::from([PathBuf::from(path)]),
             result: ExplorationResult {
                 findings: vec![],
                 summary: format!("from {sha}"),
@@ -207,11 +281,41 @@ mod tests {
     #[test]
     fn query_refresh_and_remove() {
         let cache = ResultCache::new(4);
-        cache.put_query("q".into(), entry("a", "src/x.rs"));
-        cache.refresh_query_fingerprint("q", fp("b"));
+        cache.put_query("q".into(), entry("a"));
+        cache.refresh_query_fingerprint("q", &fp("a"), fp("b"));
         assert_eq!(cache.get_query("q").unwrap().fingerprint, fp("b"));
-        cache.remove_query("q");
+        cache.remove_query("q", &fp("b"));
         assert!(cache.get_query("q").is_none());
+    }
+
+    #[test]
+    fn remove_query_is_a_no_op_when_entry_moved_on() {
+        // Same race as `query_refresh_is_a_no_op_when_entry_moved_on`, but for
+        // the compare-and-delete path: a concurrent full recompute already
+        // replaced the entry (fingerprint "c") before this stale removal
+        // (based on stale expectation "a") lands — it must not delete "c"'s
+        // freshly-stored result.
+        let cache = ResultCache::new(4);
+        cache.put_query("q".into(), entry("a"));
+        cache.put_query("q".into(), entry("c"));
+        cache.remove_query("q", &fp("a"));
+        let got = cache.get_query("q").unwrap();
+        assert_eq!(got.fingerprint, fp("c"), "stale removal must not apply");
+        assert_eq!(got.result.summary, "from c");
+    }
+
+    #[test]
+    fn query_refresh_is_a_no_op_when_entry_moved_on() {
+        // Simulates the race: a concurrent full recompute already replaced
+        // the entry (fingerprint "c") before this stale refresh (based on
+        // stale expectation "a") lands — it must not clobber "c"'s result.
+        let cache = ResultCache::new(4);
+        cache.put_query("q".into(), entry("a"));
+        cache.put_query("q".into(), entry("c"));
+        cache.refresh_query_fingerprint("q", &fp("a"), fp("b"));
+        let got = cache.get_query("q").unwrap();
+        assert_eq!(got.fingerprint, fp("c"), "stale refresh must not apply");
+        assert_eq!(got.result.summary, "from c");
     }
 
     #[test]
@@ -221,6 +325,15 @@ mod tests {
         let c = ResultCache::tool_key(&fp("s1"), "find", "{\"p\":1}");
         assert_ne!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn tool_key_does_not_collide_across_tool_arg_boundary() {
+        // "grep" + '{"pattern":"a#b"}' vs 'grep#{"pattern":"a' + 'b"}' — same
+        // concatenation, different tool/args split; must not collide.
+        let a = ResultCache::tool_key(&fp("s"), "grep", "{\"pattern\":\"a#b\"}");
+        let b = ResultCache::tool_key(&fp("s"), "grep#{\"pattern\":\"a", "b\"}");
+        assert_ne!(a, b);
     }
 
     #[test]

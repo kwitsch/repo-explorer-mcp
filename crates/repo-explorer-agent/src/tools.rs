@@ -3,19 +3,21 @@
 //! supplies it from loop state.
 
 use repo_explorer_core::domain::{ExplorationFinding, ExplorationResult, FileLocation};
-use repo_explorer_core::llm::Tool;
+use repo_explorer_core::llm::{Message, Tool, ToolCall};
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-/// Appended to every non-`finish` tool description: the loop rejects
-/// single-call turns (2-strike), so the demand must also live where the model
-/// reads tool contracts.
+/// Appended to every `tool_catalog()` tool other than `finish`: the fallback
+/// loop rejects single-call turns (2-strike), so the demand must also live
+/// where the model reads tool contracts. `expand` never gets this — it lives
+/// only in `verify_catalog()`, whose loop has no such rejection and whose
+/// system prompt asks for exactly one `expand` call per turn.
 const BATCH_SUFFIX: &str = " Batch all independent tool calls of a turn into ONE response with multiple tool calls; single-call turns are rejected.";
 
 fn tool(name: &str, description: &str, schema: serde_json::Value) -> Tool {
-    let description = if name == "finish" {
+    let description = if name == "finish" || name == "expand" {
         description.to_string()
     } else {
         format!("{description}{BATCH_SUFFIX}")
@@ -30,7 +32,7 @@ fn tool(name: &str, description: &str, schema: serde_json::Value) -> Tool {
 /// The 10-tool catalog, built once per process. `finish` is always included;
 /// the loop re-offers the whole catalog on every turn, which is what makes
 /// `finish` "forced".
-pub fn tool_catalog() -> &'static [Tool] {
+pub(crate) fn tool_catalog() -> &'static [Tool] {
     static CATALOG: LazyLock<Vec<Tool>> = LazyLock::new(build_catalog);
     &CATALOG
 }
@@ -65,6 +67,21 @@ fn expand_tool() -> Tool {
             "additionalProperties": false
         }),
     )
+}
+
+/// Shared JSON-Schema for `grep` and `find`, mirroring `PatternArgs` — one
+/// shape, so one schema literal.
+fn pattern_args_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string"},
+            "scope": {"type": "string"},
+            "max_results": {"type": "integer"}
+        },
+        "required": ["pattern"],
+        "additionalProperties": false
+    })
 }
 
 fn build_catalog() -> Vec<Tool> {
@@ -155,30 +172,12 @@ fn build_catalog() -> Vec<Tool> {
         tool(
             "grep",
             "SUPPLEMENT/fallback: raw content search of files under the repo. Use only when the memory tools are insufficient. Args: pattern (required), optional scope, max_results.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string"},
-                    "scope": {"type": "string"},
-                    "max_results": {"type": "integer"}
-                },
-                "required": ["pattern"],
-                "additionalProperties": false
-            }),
+            pattern_args_schema(),
         ),
         tool(
             "find",
             "SUPPLEMENT/fallback: search for files by name pattern. Use only when the memory tools are insufficient. Args: pattern (required), optional scope, max_results.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string"},
-                    "scope": {"type": "string"},
-                    "max_results": {"type": "integer"}
-                },
-                "required": ["pattern"],
-                "additionalProperties": false
-            }),
+            pattern_args_schema(),
         ),
         tool(
             "read_file",
@@ -380,6 +379,26 @@ pub(crate) fn parse_finish(arguments_json: &str) -> Result<ExplorationResult, St
         findings,
         summary: args.summary,
     })
+}
+
+/// Resolve the `finish` calls of one model turn: the first one that parses
+/// successfully ends the turn immediately; otherwise a rejection
+/// `Role::Tool` message is built for every one that failed to parse, so the
+/// caller can feed it back to the model and let it retry. Shared by the
+/// fallback loop and the verification stage, which otherwise duplicated this
+/// exact resolution logic.
+pub(crate) fn resolve_finish(calls: &[ToolCall]) -> Result<ExplorationResult, Vec<Message>> {
+    let mut rejections = Vec::new();
+    for c in calls.iter().filter(|c| c.name == "finish") {
+        match parse_finish(&c.arguments_json) {
+            Ok(result) => return Ok(result),
+            Err(reason) => rejections.push(Message::tool(
+                &c.id,
+                format!("finish rejected: {reason}; fix the arguments and call finish again"),
+            )),
+        }
+    }
+    Err(rejections)
 }
 
 #[cfg(test)]

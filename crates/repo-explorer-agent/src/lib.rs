@@ -19,4 +19,3 @@ mod tools;
 mod verify;
 
 pub use agent::{AgentLoop, AgentLoopError};
-pub use tools::tool_catalog;

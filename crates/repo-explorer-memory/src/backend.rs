@@ -40,16 +40,30 @@ impl MemoryClientBackend {
         self.client.close().await;
     }
 
+    /// Shared `client.call -> decode_result` sequence used by every tool call
+    /// site (`probe_status`, `probe_changes`, `call_memory_tool_with`); each
+    /// caller builds its own `args` and keeps its own error-downgrading on
+    /// top of this.
+    async fn call_and_decode(
+        &self,
+        tool: &'static str,
+        args: Map<String, Value>,
+    ) -> Result<Value, MemoryError> {
+        let result = self.client.call(tool, args).await?;
+        decode_result(result)
+    }
+
     /// Probe `index_status` for the project, returning `(exists,
     /// last_indexed_at)`; a tool error meaning "not indexed" is reported as
     /// `exists = false` rather than an `Err`. The changed-file count is not
     /// this call's to know, so the full `IndexProbe` is assembled by
     /// `ensure_fresh_index` instead of being returned half-filled here.
     async fn probe_status(&self, project: &str) -> Result<(bool, Option<SystemTime>), MemoryError> {
-        let args = base_args(project.to_string());
-        match self.client.call("index_status", args).await {
-            Ok(result) => {
-                let json = decode_result("index_status", result)?;
+        match self
+            .call_and_decode("index_status", base_args(project.to_string()))
+            .await
+        {
+            Ok(json) => {
                 // An unrecognized/empty response must NOT be optimistically
                 // treated as "already indexed" — default to `false` so an
                 // unknown shape forces a (safe) reindex instead of skipping one.
@@ -76,10 +90,11 @@ impl MemoryClientBackend {
 
     /// Fill `changed_files` from `detect_changes` for an existing project.
     async fn probe_changes(&self, project: &str) -> Result<ChangeCount, MemoryError> {
-        let args = base_args(project.to_string());
-        match self.client.call("detect_changes", args).await {
-            Ok(result) => {
-                let json = decode_result("detect_changes", result)?;
+        match self
+            .call_and_decode("detect_changes", base_args(project.to_string()))
+            .await
+        {
+            Ok(json) => {
                 // Only a shape we actually understand yields a `Known` count.
                 // An absent field, an unexpected type, or a number that is not
                 // a plain non-negative integer is `Unknown` — never `Known(0)`,
@@ -134,23 +149,24 @@ impl MemoryClientBackend {
         }
     }
 
-    /// Shared tail of every read-only memory-query method: build `{"project":
-    /// ...}` plus whatever `build_args` inserts, call `tool`, decode, and turn
-    /// the response into an `ExplorationResult` — the one place that
-    /// call/decode sequence lives. `map` is the only per-tool difference
+    /// Shared tail of every read-only memory-query method: resolve
+    /// `repo_root` to its project name, build `{"project": ...}` plus
+    /// whatever `build_args` inserts, then hand off to [`call_and_decode`]
+    /// for the call/decode itself and turn the response into an
+    /// `ExplorationResult`. `map` is the only per-tool difference
     /// (row-array responses use [`findings_and_summary`]; `get_code_snippet`
     /// decodes a single row).
     async fn call_memory_tool_with(
         &self,
         tool: &'static str,
-        project: String,
+        repo_root: &Path,
         build_args: impl FnOnce(&mut Map<String, Value>),
         map: impl FnOnce(&'static str, &Value) -> ExplorationResult,
     ) -> Result<ExplorationResult, MemoryError> {
+        let project = project_name(repo_root).await?;
         let mut args = base_args(project);
         build_args(&mut args);
-        let result = self.client.call(tool, args).await?;
-        let json = decode_result(tool, result)?;
+        let json = self.call_and_decode(tool, args).await?;
         Ok(map(tool, &json))
     }
 
@@ -159,10 +175,10 @@ impl MemoryClientBackend {
     async fn call_memory_tool(
         &self,
         tool: &'static str,
-        project: String,
+        repo_root: &Path,
         build_args: impl FnOnce(&mut Map<String, Value>),
     ) -> Result<ExplorationResult, MemoryError> {
-        self.call_memory_tool_with(tool, project, build_args, findings_and_summary)
+        self.call_memory_tool_with(tool, repo_root, build_args, findings_and_summary)
             .await
     }
 }
@@ -180,6 +196,15 @@ fn base_args(project: String) -> Map<String, Value> {
 /// through, instead of a separate `.or_else()` chain per call site.
 fn first_field<'a>(json: &'a Value, keys: &[&str]) -> Option<&'a Value> {
     keys.iter().find_map(|k| json.get(*k))
+}
+
+/// Insert `key: v` into `args` when `v` is `Some` — the single place every
+/// optional-`u32`-to-JSON-number tool arg goes through, instead of a
+/// repeated `if let Some(x) = opt { args.insert(...) }` at each call site.
+fn insert_opt_u32(args: &mut Map<String, Value>, key: &str, v: Option<u32>) {
+    if let Some(v) = v {
+        args.insert(key.to_string(), Value::Number(v.into()));
+    }
 }
 
 /// Does a tool-failure message indicate "this project is not indexed yet"
@@ -215,19 +240,30 @@ fn location_from(json: &Value) -> Option<FileLocation> {
     })
 }
 
+/// Build an `ExplorationFinding` from a row: `location_from` for the
+/// location (`None` short-circuits, since a finding with no resolvable
+/// location isn't one), a `snippet_keys` lookup for the snippet, and
+/// `symbol_note` for the note. Shared by [`single_snippet`] and
+/// [`findings_and_summary`]'s row loop, which differ only in which keys the
+/// upstream tool uses for the snippet field.
+fn finding_from_row(row: &Value, snippet_keys: &[&str]) -> Option<ExplorationFinding> {
+    let location = location_from(row)?;
+    let snippet = first_field(row, snippet_keys)
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+    Some(ExplorationFinding {
+        location,
+        snippet,
+        note: symbol_note(row),
+    })
+}
+
 /// Decode a `get_code_snippet` response: 0 or 1 finding, reusing the same row
 /// shape as [`findings_and_summary`] if a location resolves.
 fn single_snippet(tool: &'static str, json: &Value) -> ExplorationResult {
     let mut findings = Vec::new();
-    if let Some(location) = location_from(json) {
-        let snippet = first_field(json, &["snippet", "code", "source", "text"])
-            .and_then(Value::as_str)
-            .map(|s| s.to_string());
-        findings.push(ExplorationFinding {
-            location,
-            snippet,
-            note: symbol_note(json),
-        });
+    if let Some(f) = finding_from_row(json, &["snippet", "code", "source", "text"]) {
+        findings.push(f);
     }
     let summary = if findings.is_empty() {
         format!("{tool}: no snippet resolved")
@@ -244,8 +280,8 @@ fn single_snippet(tool: &'static str, json: &Value) -> ExplorationResult {
 fn symbol_note(row: &Value) -> Option<String> {
     first_field(row, &["qualified_name", "name", "symbol"])
         .and_then(Value::as_str)
-        .map(|s| s.to_string())
         .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
 }
 
 /// Parse a `"start-end"` / `"start"` line-range cell (tolerating quotes) into
@@ -264,6 +300,21 @@ fn parse_line_range(cell: &str) -> (u32, u32) {
         .map(saturate_u32)
         .unwrap_or(start);
     (start, end)
+}
+
+/// Build the `ExplorationFinding` shape both table-row parsers
+/// (`columnar_findings`, `text_table_findings`) return: no snippet (neither
+/// tool shape carries one) plus whatever symbol/name `note` was resolved.
+fn finding(file: &str, line_start: u32, line_end: u32, note: Option<String>) -> ExplorationFinding {
+    ExplorationFinding {
+        location: FileLocation {
+            path: std::path::PathBuf::from(file),
+            line_start,
+            line_end,
+        },
+        snippet: None,
+        note,
+    }
 }
 
 /// Decode `codebase-memory-mcp`'s columnar graph payload
@@ -300,21 +351,41 @@ fn columnar_findings(json: &Value) -> Option<Vec<ExplorationFinding>> {
                     format!("{qn_prefix}.{name}")
                 }
             });
-            findings.push(ExplorationFinding {
-                location: FileLocation {
-                    path: std::path::PathBuf::from(file),
-                    line_start,
-                    line_end,
-                },
-                snippet: None,
-                note,
-            });
+            findings.push(finding(file, line_start, line_end, note));
         }
     }
     Some(findings)
 }
 
-/// Parse the plain-text table `search_code` answers with:
+/// A text-table section's `(cols: ...)` header, resolved once into the fixed
+/// positions `text_table_findings` needs per row, instead of re-running a
+/// linear `position()` scan over the column names for every row.
+struct TableCols {
+    len: usize,
+    file: Option<usize>,
+    lines: Option<usize>,
+    qn: Option<usize>,
+    name: Option<usize>,
+}
+
+/// Parse a header line's tail (after the section name's `:`) for a
+/// `(cols: ...)` list; `None` when the line carries no such list (e.g. a
+/// trailing summary line like `total_grep_matches: 44`).
+fn parse_header_cols(rest: &str) -> Option<TableCols> {
+    let (_, tail) = rest.split_once("(cols:")?;
+    let names: Vec<&str> = tail.trim_end_matches(')').split_whitespace().collect();
+    let pos = |name: &str| names.iter().position(|c| *c == name);
+    Some(TableCols {
+        len: names.len(),
+        file: pos("file"),
+        lines: pos("lines"),
+        qn: pos("qn"),
+        name: pos("name"),
+    })
+}
+
+/// Parse the plain-text tables `codebase-memory-mcp` answers with — one or
+/// more sections shaped like:
 ///
 /// ```text
 /// results: 3  (cols: qn label file lines matches in out)
@@ -322,49 +393,54 @@ fn columnar_findings(json: &Value) -> Option<Vec<ExplorationFinding>> {
 /// dirs: 1  (cols: dir hits)
 /// ```
 ///
-/// Only the indented rows under the `results:` header are findings; the
-/// column order comes from the header's `(cols: …)` list.
+/// `search_code` sends a single `results:` section; `get_architecture`
+/// (which, unlike `search_graph`, never requests `format: "json"`) sends
+/// several — `node_labels:`, `edge_types:`, `packages:`, `entry_points:`,
+/// etc. Every unindented line is treated as a new section header and parsed
+/// for its `(cols: …)` list; only the indented rows under a header whose
+/// columns include `file` become findings, so a column-less section (a
+/// summary line) or a file-less one (e.g. `packages:`) is walked but simply
+/// contributes nothing.
 fn text_table_findings(text: &str) -> Vec<ExplorationFinding> {
     let mut findings = Vec::new();
-    let mut cols: Option<Vec<String>> = None;
+    let mut cols: Option<TableCols> = None;
     for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("results:") {
-            cols = rest.split_once("(cols:").map(|(_, tail)| {
-                tail.trim_end_matches(')')
-                    .split_whitespace()
-                    .map(str::to_string)
-                    .collect()
-            });
-            continue;
-        }
-        let Some(col_names) = &cols else { continue };
         if !line.starts_with(' ') {
-            break; // next section (dirs/totals) ends the results table
-        }
-        let cells: Vec<&str> = line.split_whitespace().collect();
-        if cells.len() != col_names.len() {
+            cols = line
+                .split_once(':')
+                .and_then(|(_, rest)| parse_header_cols(rest));
             continue;
         }
-        let cell = |name: &str| {
-            col_names
-                .iter()
-                .position(|c| c == name)
-                .and_then(|i| cells.get(i).copied())
+        let Some(t) = &cols else { continue };
+        let cells: Vec<&str> = line.split_whitespace().collect();
+        if cells.len() != t.len {
+            continue;
+        }
+        let Some(file) = t.file.and_then(|i| cells.get(i).copied()) else {
+            continue;
         };
-        let Some(file) = cell("file") else { continue };
-        let (line_start, line_end) = cell("lines").map(parse_line_range).unwrap_or((0, 0));
-        let note = cell("qn").or_else(|| cell("name")).map(str::to_string);
-        findings.push(ExplorationFinding {
-            location: FileLocation {
-                path: std::path::PathBuf::from(file),
-                line_start,
-                line_end,
-            },
-            snippet: None,
-            note,
-        });
+        let (line_start, line_end) = t
+            .lines
+            .and_then(|i| cells.get(i).copied())
+            .map(parse_line_range)
+            .unwrap_or((0, 0));
+        let note =
+            t.qn.or(t.name)
+                .and_then(|i| cells.get(i).copied())
+                .map(str::to_string);
+        findings.push(finding(file, line_start, line_end, note));
     }
     findings
+}
+
+/// Build a result whose summary only reports the finding count, with no
+/// distinct row count of its own (the text-table and columnar-JSON shapes).
+fn result_with_finding_count(
+    tool: &'static str,
+    findings: Vec<ExplorationFinding>,
+) -> ExplorationResult {
+    let summary = format!("{tool}: {} locatable finding(s)", findings.len());
+    ExplorationResult { findings, summary }
 }
 
 /// Turn a tool response into findings plus a compact summary string. Handles
@@ -373,22 +449,13 @@ fn text_table_findings(text: &str) -> Vec<ExplorationFinding> {
 /// and the plain-text table (reaching here as `Value::String`).
 fn findings_and_summary(tool: &'static str, json: &Value) -> ExplorationResult {
     if let Value::String(text) = json {
-        let findings = text_table_findings(text);
-        let summary = format!("{tool}: {} locatable finding(s)", findings.len());
-        return ExplorationResult { findings, summary };
+        return result_with_finding_count(tool, text_table_findings(text));
     }
     let mut findings = Vec::new();
     if let Some(rows) = first_field(json, &["results", "rows", "hits"]).and_then(Value::as_array) {
         for row in rows {
-            if let Some(location) = location_from(row) {
-                let snippet = first_field(row, &["snippet", "text"])
-                    .and_then(Value::as_str)
-                    .map(|s| s.to_string());
-                findings.push(ExplorationFinding {
-                    location,
-                    snippet,
-                    note: symbol_note(row),
-                });
+            if let Some(f) = finding_from_row(row, &["snippet", "text"]) {
+                findings.push(f);
             }
         }
         let summary = format!(
@@ -398,9 +465,7 @@ fn findings_and_summary(tool: &'static str, json: &Value) -> ExplorationResult {
         );
         return ExplorationResult { findings, summary };
     }
-    let findings = columnar_findings(json).unwrap_or_default();
-    let summary = format!("{tool}: {} locatable finding(s)", findings.len());
-    ExplorationResult { findings, summary }
+    result_with_finding_count(tool, columnar_findings(json).unwrap_or_default())
 }
 
 impl MemoryBackend for MemoryClientBackend {
@@ -434,8 +499,7 @@ impl MemoryBackend for MemoryClientBackend {
         repo_root: &Path,
         query: &ExplorationQuery,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root).await?;
-        self.call_memory_tool("search_code", project, |args| {
+        self.call_memory_tool("search_code", repo_root, |args| {
             args.insert("pattern".to_string(), Value::String(query.text.clone()));
             if let Some(scope) = &query.scope_hint {
                 args.insert(
@@ -443,9 +507,7 @@ impl MemoryBackend for MemoryClientBackend {
                     Value::String(scope.to_string_lossy().into_owned()),
                 );
             }
-            if let Some(limit) = query.max_results {
-                args.insert("limit".to_string(), Value::Number(limit.into()));
-            }
+            insert_opt_u32(args, "limit", query.max_results);
         })
         .await
     }
@@ -455,8 +517,7 @@ impl MemoryBackend for MemoryClientBackend {
         repo_root: &Path,
         query: &GraphQuery,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root).await?;
-        self.call_memory_tool("search_graph", project, |args| {
+        self.call_memory_tool("search_graph", repo_root, |args| {
             args.insert("format".to_string(), Value::String("json".to_string()));
             if let Some(v) = &query.name_pattern {
                 args.insert("name_pattern".to_string(), Value::String(v.clone()));
@@ -467,9 +528,7 @@ impl MemoryBackend for MemoryClientBackend {
             if let Some(v) = &query.label {
                 args.insert("label".to_string(), Value::String(v.clone()));
             }
-            if let Some(limit) = query.max_results {
-                args.insert("limit".to_string(), Value::Number(limit.into()));
-            }
+            insert_opt_u32(args, "limit", query.max_results);
         })
         .await
     }
@@ -480,12 +539,9 @@ impl MemoryBackend for MemoryClientBackend {
         query: &str,
         max_results: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root).await?;
-        self.call_memory_tool("query_graph", project, |args| {
+        self.call_memory_tool("query_graph", repo_root, |args| {
             args.insert("query".to_string(), Value::String(query.to_string()));
-            if let Some(limit) = max_results {
-                args.insert("limit".to_string(), Value::Number(limit.into()));
-            }
+            insert_opt_u32(args, "limit", max_results);
         })
         .await
     }
@@ -497,13 +553,10 @@ impl MemoryBackend for MemoryClientBackend {
         to: &str,
         max_depth: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root).await?;
-        self.call_memory_tool("trace_path", project, |args| {
+        self.call_memory_tool("trace_path", repo_root, |args| {
             args.insert("from".to_string(), Value::String(from.to_string()));
             args.insert("to".to_string(), Value::String(to.to_string()));
-            if let Some(depth) = max_depth {
-                args.insert("max_depth".to_string(), Value::Number(depth.into()));
-            }
+            insert_opt_u32(args, "max_depth", max_depth);
         })
         .await
     }
@@ -513,11 +566,8 @@ impl MemoryBackend for MemoryClientBackend {
         repo_root: &Path,
         depth: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root).await?;
-        self.call_memory_tool("get_architecture", project, |args| {
-            if let Some(d) = depth {
-                args.insert("depth".to_string(), Value::Number(d.into()));
-            }
+        self.call_memory_tool("get_architecture", repo_root, |args| {
+            insert_opt_u32(args, "depth", depth);
         })
         .await
     }
@@ -527,10 +577,9 @@ impl MemoryBackend for MemoryClientBackend {
         repo_root: &Path,
         target: &SnippetTarget,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root).await?;
         self.call_memory_tool_with(
             "get_code_snippet",
-            project,
+            repo_root,
             |args| match target {
                 SnippetTarget::QualifiedName(name) => {
                     args.insert("qualified_name".to_string(), Value::String(name.clone()));
@@ -544,12 +593,8 @@ impl MemoryBackend for MemoryClientBackend {
                         "file".to_string(),
                         Value::String(file.to_string_lossy().into_owned()),
                     );
-                    if let Some(s) = start_line {
-                        args.insert("start_line".to_string(), Value::Number((*s).into()));
-                    }
-                    if let Some(e) = end_line {
-                        args.insert("end_line".to_string(), Value::Number((*e).into()));
-                    }
+                    insert_opt_u32(args, "start_line", *start_line);
+                    insert_opt_u32(args, "end_line", *end_line);
                 }
             },
             single_snippet,
@@ -622,6 +667,35 @@ dirs: 1  (cols: dir hits)\n  crates/ 28\ntotal_grep_matches: 44\n";
             res.findings
                 .iter()
                 .all(|f| f.location.path != std::path::Path::new("crates/"))
+        );
+    }
+
+    /// Real `get_architecture` payload shape: multiple plain-text sections,
+    /// none named `results:`, only some (`entry_points:`) carrying a `file`
+    /// column.
+    #[test]
+    fn text_table_get_architecture_payload_decodes() {
+        let text = "\
+node_labels: 2  (cols: label count)\n  Function 120\n  Method 136\n\
+packages: 1  (cols: name nodes fan_in fan_out)\n  repo-explorer-core 256 0 0\n\
+entry_points: 2  (cols: qn file)\n  \
+repo.crates.repo-explorer-mcp.src.main.main crates/repo-explorer-mcp/src/main.rs\n  \
+repo.crates.repo-explorer-core.src.lib.run crates/repo-explorer-core/src/lib.rs\n";
+        let res = findings_and_summary("get_architecture", &Value::String(text.to_string()));
+        assert_eq!(res.findings.len(), 2);
+        assert_eq!(
+            res.findings[0].location.path,
+            std::path::PathBuf::from("crates/repo-explorer-mcp/src/main.rs")
+        );
+        assert_eq!(
+            res.findings[0].note.as_deref(),
+            Some("repo.crates.repo-explorer-mcp.src.main.main")
+        );
+        // No `file` column on node_labels/packages must not produce findings.
+        assert!(
+            res.findings
+                .iter()
+                .all(|f| f.location.path != std::path::Path::new("Function"))
         );
     }
 

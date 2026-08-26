@@ -1,6 +1,6 @@
 {
   "name": "repo-explorer-mcp-setup",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Installer for the repo-explorer-mcp MCP server (downloads the release binary and its runtime dependencies).",
   "type": "module",
   "bin": {

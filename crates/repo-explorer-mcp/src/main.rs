@@ -27,6 +27,7 @@ Usage:
   repo-explorer-mcp [--config <path>]   Serve on stdio (default)
   repo-explorer-mcp setup               Run the interactive first-run wizard
   repo-explorer-mcp config test         Validate the resolved config only
+  repo-explorer-mcp --update            Check for and install updates
   repo-explorer-mcp --version           Print the version
   repo-explorer-mcp --help              Print this help
 
@@ -215,8 +216,8 @@ fn wants_config_test(args: &[String]) -> bool {
 }
 
 #[derive(serde::Serialize)]
-struct ConfigTestReport<'a> {
-    status: &'a str,
+struct ConfigTestReport {
+    status: &'static str,
     config_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<ConfigTestError>,

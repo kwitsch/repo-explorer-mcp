@@ -60,13 +60,13 @@ pub struct ProviderConfig {
 /// Default API-key env var name for a known provider kind, mirroring the
 /// `genai` crate's own adapter defaults. `None` for unrecognized kinds.
 /// Keyed on the same `kind` strings as `adapter_kind_for` in repo-explorer-llm.
+/// Reads `PROVIDER_DEFAULTS` — the single source of truth `KNOWN_PROVIDER_KINDS`
+/// is also derived from, so the two can never drift apart.
 pub fn default_api_key_env(kind: &str) -> Option<&'static str> {
-    match kind {
-        "anthropic" => Some("ANTHROPIC_API_KEY"),
-        "openai" => Some("OPENAI_API_KEY"),
-        "gemini" | "google" => Some("GEMINI_API_KEY"),
-        _ => None,
-    }
+    PROVIDER_DEFAULTS
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map(|(_, env)| *env)
 }
 
 /// The single definition of "is this API-key env var actually set": present
@@ -297,10 +297,31 @@ fn default_cache_max_entries() -> usize {
     256
 }
 
+/// Canonical `(kind, default api-key env var)` table. `KNOWN_PROVIDER_KINDS`
+/// and `default_api_key_env` both read from this single list so they can
+/// never drift out of sync with each other. Kept in sync with
+/// `repo_explorer_llm::adapter_kind_for`; core cannot depend on genai, so the
+/// set is re-declared here as plain strings.
+const PROVIDER_DEFAULTS: &[(&str, &str)] = &[
+    ("anthropic", "ANTHROPIC_API_KEY"),
+    ("openai", "OPENAI_API_KEY"),
+    ("gemini", "GEMINI_API_KEY"),
+    ("google", "GEMINI_API_KEY"),
+];
+
 /// Provider `kind` strings the LLM boundary can map to a genai adapter.
-/// Kept in sync with `repo_explorer_llm::adapter_kind_for`; core cannot depend
-/// on genai, so the set is re-declared here as plain strings.
-pub const KNOWN_PROVIDER_KINDS: &[&str] = &["anthropic", "openai", "gemini", "google"];
+/// Derived from `PROVIDER_DEFAULTS` (see there).
+pub const KNOWN_PROVIDER_KINDS: &[&str] = &provider_kinds();
+
+const fn provider_kinds() -> [&'static str; PROVIDER_DEFAULTS.len()] {
+    let mut out = [""; PROVIDER_DEFAULTS.len()];
+    let mut i = 0;
+    while i < PROVIDER_DEFAULTS.len() {
+        out[i] = PROVIDER_DEFAULTS[i].0;
+        i += 1;
+    }
+    out
+}
 
 /// Errors returned by [`load`].
 #[derive(Debug, thiserror::Error)]
@@ -502,7 +523,12 @@ impl Config {
                     kind: provider.kind.clone(),
                 });
             }
-            let var = provider.resolve_api_key_env().unwrap_or_default();
+            // `provider.kind` already passed the `KNOWN_PROVIDER_KINDS` check above,
+            // so `default_api_key_env` must have a matching arm; a `None` here means
+            // the two lists drifted out of sync, which is a bug worth failing loudly on.
+            let var = provider
+                .resolve_api_key_env()
+                .expect("kind passed KNOWN_PROVIDER_KINDS but has no default_api_key_env entry");
             if !env_var_is_set(&get_env, &var) {
                 return Err(ValidationError::MissingEnvVar {
                     index,
@@ -817,34 +843,22 @@ mod tests {
     #[test]
     fn https_proxy_accepts_http_and_https_schemes() {
         let mut config = config_with_provider("p", "REPO_EXPLORER_TEST_KEY_PROXY_OK");
-        unsafe {
-            std::env::set_var("REPO_EXPLORER_TEST_KEY_PROXY_OK", "x");
-        }
         config.llm.https_proxy = Some("https://proxy.example.com:8443".to_string());
-        assert!(config.validate().is_ok());
+        assert!(config.validate_with_env(every_env).is_ok());
         config.llm.https_proxy = Some("http://proxy.example.com:8080".to_string());
-        assert!(config.validate().is_ok());
-        unsafe {
-            std::env::remove_var("REPO_EXPLORER_TEST_KEY_PROXY_OK");
-        }
+        assert!(config.validate_with_env(every_env).is_ok());
     }
 
     #[test]
     fn https_proxy_rejects_non_http_scheme() {
         let mut config = config_with_provider("p", "REPO_EXPLORER_TEST_KEY_PROXY_BAD");
-        unsafe {
-            std::env::set_var("REPO_EXPLORER_TEST_KEY_PROXY_BAD", "x");
-        }
         config.llm.https_proxy = Some("proxy.example.com:8080".to_string());
         assert_eq!(
-            config.validate(),
+            config.validate_with_env(every_env),
             Err(ValidationError::InvalidHttpsProxyUrl {
                 url: "proxy.example.com:8080".to_string()
             })
         );
-        unsafe {
-            std::env::remove_var("REPO_EXPLORER_TEST_KEY_PROXY_BAD");
-        }
     }
 
     #[test]
@@ -867,32 +881,20 @@ mod tests {
     #[test]
     fn https_proxy_case_insensitive_scheme_validates() {
         let mut config = config_with_provider("p", "REPO_EXPLORER_TEST_KEY_PROXY_CASE");
-        unsafe {
-            std::env::set_var("REPO_EXPLORER_TEST_KEY_PROXY_CASE", "x");
-        }
         config.llm.https_proxy = Some("HTTPS://proxy.example.com:8443".to_string());
-        assert!(config.validate().is_ok());
-        unsafe {
-            std::env::remove_var("REPO_EXPLORER_TEST_KEY_PROXY_CASE");
-        }
+        assert!(config.validate_with_env(every_env).is_ok());
     }
 
     #[test]
     fn https_proxy_empty_host_fails_validation() {
         let mut config = config_with_provider("p", "REPO_EXPLORER_TEST_KEY_PROXY_EMPTY");
-        unsafe {
-            std::env::set_var("REPO_EXPLORER_TEST_KEY_PROXY_EMPTY", "x");
-        }
         config.llm.https_proxy = Some("https://".to_string());
         assert_eq!(
-            config.validate(),
+            config.validate_with_env(every_env),
             Err(ValidationError::InvalidHttpsProxyUrl {
                 url: "https://".to_string()
             })
         );
-        unsafe {
-            std::env::remove_var("REPO_EXPLORER_TEST_KEY_PROXY_EMPTY");
-        }
     }
 
     #[test]

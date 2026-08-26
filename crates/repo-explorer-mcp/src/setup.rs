@@ -20,11 +20,10 @@ use std::sync::LazyLock;
 
 /// True for the single-token subcommand `setup` (mirrors `wants_config_test`).
 pub fn wants_setup(args: &[String]) -> bool {
-    args.iter().any(|a| a == "setup")
+    crate::has_flag(args, &["setup"])
 }
 
 /// A provider inferred from a set env var. `kind` is one of KNOWN_PROVIDER_KINDS.
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct DetectedProvider {
     kind: &'static str,
     api_key_env: String,
@@ -142,7 +141,8 @@ fn read_line() -> anyhow::Result<Option<String>> {
     if n == 0 {
         return Ok(None);
     }
-    Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
+    line.truncate(line.trim_end_matches(['\r', '\n']).len());
+    Ok(Some(line))
 }
 
 /// Prompt (showing `default`) on stderr; empty input or EOF returns `default`.
@@ -150,8 +150,15 @@ fn prompt_default(prompt: &str, default: &str) -> anyhow::Result<String> {
     eprint!("{prompt} [{default}]: ");
     let _ = std::io::stderr().flush();
     match read_line()? {
-        Some(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
-        _ => Ok(default.to_string()),
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(default.to_string())
+            } else {
+                Ok(trimmed.to_string())
+            }
+        }
+        None => Ok(default.to_string()),
     }
 }
 
@@ -182,7 +189,7 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
     if config_path.exists() {
         eprintln!("A config already exists at {}.", config_path.display());
         let answer = prompt_default("Overwrite it? (y/N)", "n")?;
-        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        if !matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes") {
             eprintln!("Aborted; existing config left unchanged.");
             return Ok(());
         }
@@ -215,7 +222,7 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
 
     let mut providers: Vec<ProviderConfig> = Vec::new();
     let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for dp in &detected {
+    for dp in detected {
         eprintln!();
         eprintln!("Configuring `{}` provider:", dp.kind);
 
@@ -262,7 +269,7 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
         // default for this kind; else explicit (the GOOGLE_API_KEY case).
         let api_key_env = match default_api_key_env(dp.kind) {
             Some(def) if def == dp.api_key_env => None,
-            _ => Some(dp.api_key_env.clone()),
+            _ => Some(dp.api_key_env),
         };
 
         providers.push(ProviderConfig {

@@ -86,6 +86,10 @@ pub struct ToolCall {
     pub name: String,
     /// Raw JSON arguments (kept as text so the type stays `Eq`).
     pub arguments_json: String,
+    /// Opaque provider continuation blob(s) (e.g. Gemini 3 "thought
+    /// signatures") that must be replayed verbatim on the next request to
+    /// validate this call; `None` for providers that don't use them.
+    pub thought_signatures: Option<Vec<String>>,
 }
 
 /// A tool the model may call.
@@ -240,6 +244,17 @@ struct ModelSlot<P> {
     cooling_until: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
+impl<P> ModelSlot<P> {
+    /// Lock `cooling_until`, recovering from poisoning instead of propagating
+    /// the panic: a prior panic while holding this slot's cooldown state must
+    /// not permanently break the whole failover router.
+    fn lock_cooling(&self) -> std::sync::MutexGuard<'_, Option<std::time::Instant>> {
+        self.cooling_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// One provider entry: a name plus its ordered model slots.
 struct Entry<P> {
     name: String,
@@ -319,14 +334,7 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
         for entry in &self.entries {
             for slot in &entry.models {
                 {
-                    // Recover from a poisoned lock at the read site instead of
-                    // propagating the panic: a prior panic while holding this
-                    // slot's cooldown state must not permanently break the
-                    // whole failover router.
-                    let mut guard = slot
-                        .cooling_until
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let mut guard = slot.lock_cooling();
                     match *guard {
                         Some(until) if now < until => {
                             cooling.push(format!("{}/{}", entry.name, slot.model));
@@ -346,12 +354,7 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
                 {
                     Ok(resp) => return Ok(resp),
                     Err(e) if e.is_failover_trigger() => {
-                        // Same poison recovery as the read site above: one
-                        // panicked call must not permanently break the router.
-                        let mut guard = slot
-                            .cooling_until
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let mut guard = slot.lock_cooling();
                         *guard = Some(now + self.cooldown);
                         limited.push(format!("{}/{}", entry.name, slot.model));
                         continue;
@@ -507,6 +510,7 @@ mod tests {
             id: "c1".to_string(),
             name: "search_code".to_string(),
             arguments_json: r#"{"q":"main"}"#.to_string(),
+            thought_signatures: None,
         };
         assert_eq!(call, call.clone());
 

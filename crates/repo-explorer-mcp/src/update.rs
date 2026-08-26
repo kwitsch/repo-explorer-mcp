@@ -50,7 +50,7 @@ const DEPENDENCY_BINARIES: &[DependencyBinary] = &[
 
 /// True when `--update` is present among the raw CLI args.
 pub fn wants_update(args: &[String]) -> bool {
-    args.iter().any(|a| a == "--update")
+    crate::has_flag(args, &["--update"])
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,13 +97,13 @@ pub async fn run_update() -> ExitCode {
     let mut handles = Vec::with_capacity(1 + DEPENDENCY_BINARIES.len());
     let self_client = client.clone();
     handles.push((
-        SELF_REPO.to_string(),
+        SELF_REPO,
         tokio::spawn(async move { update_self(&self_client).await }),
     ));
     for dep in DEPENDENCY_BINARIES {
         let client = client.clone();
         handles.push((
-            dep.command.to_string(),
+            dep.command,
             tokio::spawn(async move { update_dependency(&client, dep).await }),
         ));
     }
@@ -113,7 +113,7 @@ pub async fn run_update() -> ExitCode {
         components.push(match handle.await {
             Ok(report) => report,
             Err(e) => ComponentReport {
-                name,
+                name: name.to_string(),
                 current_version: None,
                 latest_version: None,
                 action: "error",
@@ -159,79 +159,16 @@ async fn update_self(client: &reqwest::Client) -> ComponentReport {
         }
     };
 
-    let release = match fetch_latest_release(client, SELF_OWNER, SELF_REPO).await {
-        Ok(r) => r,
-        Err(e) => {
-            return ComponentReport {
-                name,
-                current_version: Some(current.to_string()),
-                latest_version: None,
-                action: "error",
-                detail: Some(e.to_string()),
-            };
-        }
-    };
-
-    let latest = match parse_tag_version(&release.tag_name) {
-        Ok(v) => v,
-        Err(e) => {
-            return ComponentReport {
-                name,
-                current_version: Some(current.to_string()),
-                latest_version: None,
-                action: "error",
-                detail: Some(e.to_string()),
-            };
-        }
-    };
-
-    if latest <= current {
-        return ComponentReport {
-            name,
-            current_version: Some(current.to_string()),
-            latest_version: Some(latest.to_string()),
-            action: "up-to-date",
-            detail: None,
-        };
-    }
-
-    let Some(asset) = pick_asset(&release.assets) else {
-        return ComponentReport {
-            name,
-            current_version: Some(current.to_string()),
-            latest_version: Some(latest.to_string()),
-            action: "error",
-            detail: Some(format!(
-                "no release asset matched this platform ({})",
-                current_os_keyword()
-            )),
-        };
-    };
-
-    match install_from_asset(
+    check_and_install(
         client,
-        &release.assets,
-        asset,
+        name,
+        SELF_OWNER,
         SELF_REPO,
+        SELF_REPO,
+        Some(current),
         InstallTarget::SelfExe,
     )
     .await
-    {
-        Ok(note) => ComponentReport {
-            name,
-            current_version: Some(current.to_string()),
-            latest_version: Some(latest.to_string()),
-            action: "updated",
-            detail: note.map(str::to_string),
-        },
-        Err(e) => ComponentReport {
-            name,
-            current_version: Some(current.to_string()),
-            latest_version: Some(latest.to_string()),
-            action: "error",
-            detail: Some(e.to_string()),
-        },
-    }
 }
 
 async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> ComponentReport {
@@ -250,14 +187,43 @@ async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> 
         }
     };
 
-    let current_version = read_installed_version_blocking(path.clone()).await;
+    let current = read_installed_version_blocking(path.clone()).await;
 
-    let release = match fetch_latest_release(client, dep.owner, dep.repo).await {
-        Ok(r) => r,
+    check_and_install(
+        client,
+        name,
+        dep.owner,
+        dep.repo,
+        dep.command,
+        current,
+        InstallTarget::Path(&path),
+    )
+    .await
+}
+
+/// Shared fetch-release -> parse-tag -> compare-versions -> pick-asset ->
+/// install -> [`ComponentReport`] sequence used by both `update_self` and
+/// `update_dependency`, once each has arrived at its own `current` version
+/// (or `None`, if it couldn't be determined but a release lookup is still
+/// worth doing to report the latest version).
+async fn check_and_install(
+    client: &reqwest::Client,
+    name: String,
+    owner: &str,
+    repo: &str,
+    command: &str,
+    current: Option<semver::Version>,
+    target: InstallTarget<'_>,
+) -> ComponentReport {
+    let (release, latest) = match fetch_latest_release(client, owner, repo)
+        .await
+        .and_then(|r| parse_tag_version(&r.tag_name).map(|v| (r, v)))
+    {
+        Ok(pair) => pair,
         Err(e) => {
             return ComponentReport {
                 name,
-                current_version: current_version.map(|v| v.to_string()),
+                current_version: current.as_ref().map(|v| v.to_string()),
                 latest_version: None,
                 action: "error",
                 detail: Some(e.to_string()),
@@ -265,20 +231,7 @@ async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> 
         }
     };
 
-    let latest = match parse_tag_version(&release.tag_name) {
-        Ok(v) => v,
-        Err(e) => {
-            return ComponentReport {
-                name,
-                current_version: current_version.map(|v| v.to_string()),
-                latest_version: None,
-                action: "error",
-                detail: Some(e.to_string()),
-            };
-        }
-    };
-
-    let Some(current) = current_version else {
+    let Some(current) = current else {
         return ComponentReport {
             name,
             current_version: None,
@@ -315,15 +268,7 @@ async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> 
         };
     };
 
-    match install_from_asset(
-        client,
-        &release.assets,
-        asset,
-        dep.command,
-        InstallTarget::Path(&path),
-    )
-    .await
-    {
+    match install_from_asset(client, &release.assets, asset, command, target).await {
         Ok(note) => ComponentReport {
             name,
             current_version: Some(current.to_string()),
@@ -341,13 +286,21 @@ async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> 
     }
 }
 
+/// Spawn `<path> --version`, bounded by [`SUBPROCESS_TIMEOUT`]. Shared by
+/// [`read_installed_version`] (best-effort version-string extraction) and
+/// [`verify_executable`] (hard exit-status check) so the invocation itself is
+/// defined once.
+fn run_version_probe(path: &Path) -> Option<std::process::Output> {
+    let mut command = std::process::Command::new(path);
+    command.arg("--version");
+    run_with_timeout(command, SUBPROCESS_TIMEOUT)
+}
+
 /// Run `<path> --version` (bounded by [`SUBPROCESS_TIMEOUT`]) and pull the
 /// first semver-looking substring out of its output (checked on stdout, then
 /// stderr, since CLIs disagree on which stream `--version` writes to).
 fn read_installed_version(path: &Path) -> Option<semver::Version> {
-    let mut command = std::process::Command::new(path);
-    command.arg("--version");
-    let output = run_with_timeout(command, SUBPROCESS_TIMEOUT)?;
+    let output = run_version_probe(path)?;
     extract_semver(&String::from_utf8_lossy(&output.stdout))
         .or_else(|| extract_semver(&String::from_utf8_lossy(&output.stderr)))
 }
@@ -486,17 +439,19 @@ enum ArchiveFormat {
     Zip,
 }
 
+/// Expects `name` already lowercased by the caller, so a name lowercased
+/// once up front (e.g. by `pick_asset`, per asset) isn't lowercased again here.
 fn archive_format(name: &str) -> Option<ArchiveFormat> {
-    let lower = name.to_lowercase();
-    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
         Some(ArchiveFormat::TarGz)
-    } else if lower.ends_with(".zip") {
+    } else if name.ends_with(".zip") {
         Some(ArchiveFormat::Zip)
     } else {
         None
     }
 }
 
+/// Expects `name` already lowercased by the caller (see [`archive_format`]).
 fn is_archive(name: &str) -> bool {
     archive_format(name).is_some()
 }
@@ -515,23 +470,28 @@ fn arch_keywords() -> Vec<&'static str> {
 /// Pick the release asset matching the current OS/arch. Restricted to known
 /// archive extensions (never a bare/unknown-format asset such as `.mcpb`,
 /// `.txt`, or `.json`, which would otherwise be installed verbatim as if it
-/// were the binary) and skips UI-bundle variants (`-ui-`), preferring a
-/// non-`portable` build when both are offered for the same platform.
+/// were the binary) and skips UI-bundle variants (`-ui-`). Among the
+/// remaining candidates, prefers a non-`portable` build, then (on a tie)
+/// the MSVC toolchain over GNU — MSVC is what Rust's default Windows
+/// toolchain and scoop/winget/choco `rg` installs produce, so it's a safer
+/// default than depending on GitHub's incidental asset-list order when a
+/// release publishes both `-pc-windows-gnu` and `-pc-windows-msvc` archives.
 fn pick_asset(assets: &[Asset]) -> Option<&Asset> {
     let os = current_os_keyword();
     let arch_keywords = arch_keywords();
-    let mut candidates: Vec<&Asset> = assets
+    let mut candidates: Vec<(&Asset, String)> = assets
         .iter()
-        .filter(|a| {
+        .filter_map(|a| {
             let name = a.name.to_lowercase();
-            name.contains(os)
+            let matches = name.contains(os)
                 && arch_keywords.iter().any(|k| name.contains(k))
                 && is_archive(&name)
-                && !name.contains("-ui-")
+                && !name.contains("-ui-");
+            matches.then_some((a, name))
         })
         .collect();
-    candidates.sort_by_key(|a| a.name.to_lowercase().contains("portable"));
-    candidates.into_iter().next()
+    candidates.sort_by_key(|(_, name)| (name.contains("portable"), name.contains("-gnu")));
+    candidates.into_iter().next().map(|(a, _)| a)
 }
 
 /// Find `<asset>.sha256`, the sidecar checksum naming convention this
@@ -623,13 +583,15 @@ fn verify_sha256(data: &[u8], checksum_text: &str, asset_name: &str) -> Result<(
 /// True when `entry_name`'s base filename is `command` (optionally with a
 /// `.exe` suffix), ignoring any archive-internal directory prefix.
 fn matches_binary_name(entry_name: &str, command: &str) -> bool {
-    let base = entry_name.rsplit('/').next().unwrap_or(entry_name);
-    let base = base.rsplit('\\').next().unwrap_or(base);
-    base == command || base == format!("{command}.exe")
+    let base = entry_name
+        .rsplit(['/', '\\'])
+        .next()
+        .expect("rsplit always yields at least one item");
+    base == command || base.strip_suffix(".exe") == Some(command)
 }
 
 fn extract_binary(asset_name: &str, data: &[u8], command: &str) -> Result<Vec<u8>> {
-    match archive_format(asset_name) {
+    match archive_format(&asset_name.to_lowercase()) {
         Some(ArchiveFormat::TarGz) => extract_from_tar_gz(data, command),
         Some(ArchiveFormat::Zip) => extract_from_zip(data, command),
         // Not archived — the whole payload is the binary itself.
@@ -699,9 +661,7 @@ fn write_temp_executable(dir: &Path, prefix: &str, data: &[u8]) -> Result<std::p
 /// replaces anything already installed: run `<path> --version` and require a
 /// clean exit.
 fn verify_executable(path: &Path) -> Result<()> {
-    let mut command = std::process::Command::new(path);
-    command.arg("--version");
-    let output = run_with_timeout(command, SUBPROCESS_TIMEOUT).with_context(|| {
+    let output = run_version_probe(path).with_context(|| {
         format!(
             "downloaded update at {} failed to execute (or didn't exit within {SUBPROCESS_TIMEOUT:?})",
             path.display()
@@ -865,6 +825,29 @@ mod tests {
         ];
         let picked = pick_asset(&assets).expect("a proper archive should match");
         assert_eq!(picked.name, format!("tool-{os}-amd64.tar.gz"));
+    }
+
+    #[test]
+    fn pick_asset_prefers_msvc_over_gnu_on_a_tie() {
+        // Regression: when a release publishes both toolchain variants for
+        // the same OS/arch (e.g. ripgrep's Windows gnu and msvc zips), the
+        // pick must be deterministic and favor msvc, not whichever happens
+        // to come first in GitHub's asset list. Built from the current
+        // host's own OS/arch keywords so the test matches on any runner.
+        let os = current_os_keyword();
+        let arch = arch_keywords()[0];
+        let gnu = format!("tool-15.2.0-{arch}-{os}-gnu.zip");
+        let msvc = format!("tool-15.2.0-{arch}-{os}-msvc.zip");
+
+        let assets = vec![asset(&gnu), asset(&msvc)];
+        let picked = pick_asset(&assets).expect("an asset should match this platform");
+        assert_eq!(picked.name, msvc);
+
+        // Order-independence: the same pick regardless of list order.
+        let assets_reversed = vec![asset(&msvc), asset(&gnu)];
+        let picked_reversed =
+            pick_asset(&assets_reversed).expect("an asset should match this platform");
+        assert_eq!(picked_reversed.name, msvc);
     }
 
     #[test]

@@ -40,14 +40,14 @@ fn message_indicates_quota(message: &str) -> bool {
 /// Pure classification of error facts into a `ProviderError`. Best-effort:
 /// both `RateLimited` and `QuotaExceeded` are failover triggers, so the finer
 /// split need not be exact for correctness.
-pub(crate) fn classify_error_facts(provider: &str, facts: &GenaiErrorFacts) -> ProviderError {
+pub(crate) fn classify_error_facts(provider: &str, facts: GenaiErrorFacts) -> ProviderError {
     let provider = provider.to_string();
-    let message = facts.message.clone();
+    let message = facts.message;
     let code = facts.code.as_deref().unwrap_or("");
     let code_lower = code.to_lowercase();
 
     // Structured code wins when present.
-    if code_lower.contains("insufficient_quota") || code_lower.contains("quota") {
+    if code_lower.contains("quota") {
         return ProviderError::QuotaExceeded { provider, message };
     }
     if code_lower.contains("rate_limit") {
@@ -55,26 +55,19 @@ pub(crate) fn classify_error_facts(provider: &str, facts: &GenaiErrorFacts) -> P
     }
 
     match facts.status {
-        Some(429) => {
-            if message_indicates_quota(&message) {
-                ProviderError::QuotaExceeded { provider, message }
-            } else {
-                ProviderError::RateLimited { provider, message }
-            }
+        // 429 is standard rate-limiting; 529 is Anthropic's overloaded_error, a
+        // transient-overload signal that should failover the same way; no
+        // status at all is a connection/transport failure. All three report
+        // QuotaExceeded instead when the message clearly names a quota/billing
+        // condition.
+        Some(429) | Some(529) | None if message_indicates_quota(&message) => {
+            ProviderError::QuotaExceeded { provider, message }
         }
+        Some(429) | Some(529) => ProviderError::RateLimited { provider, message },
         Some(401) | Some(403) => ProviderError::Authentication { provider, message },
         Some(400) | Some(404) | Some(422) => ProviderError::InvalidRequest { provider, message },
-        // 5xx and any other status: transport-level.
-        Some(_) => ProviderError::Transport { provider, message },
-        // No status at all: connection/transport failure (unless the message
-        // clearly names a quota/billing condition).
-        None => {
-            if message_indicates_quota(&message) {
-                ProviderError::QuotaExceeded { provider, message }
-            } else {
-                ProviderError::Transport { provider, message }
-            }
-        }
+        // Other 5xx, any other status, and no status at all: transport-level.
+        Some(_) | None => ProviderError::Transport { provider, message },
     }
 }
 
@@ -92,7 +85,7 @@ pub(crate) fn classify_genai_error(provider: &str, err: &genai::Error) -> Provid
         code: None,
         message: err.to_string(),
     };
-    classify_error_facts(provider, &facts)
+    classify_error_facts(provider, facts)
 }
 
 /// Return the HTTP status if the `genai::Error` (or its nested web error)
@@ -213,7 +206,7 @@ impl GenaiProvider {
             });
         }
 
-        let client = build_genai_client(adapter_kind, provider, &env_name, https_proxy)?;
+        let client = build_genai_client(adapter_kind, provider, env_name, https_proxy)?;
 
         Ok(SharedProviderParts {
             name,
@@ -241,13 +234,12 @@ struct SharedProviderParts {
 fn build_genai_client(
     adapter_kind: genai::adapter::AdapterKind,
     provider: &ProviderConfig,
-    env_name: &str,
+    env_name: String,
     https_proxy: Option<&str>,
 ) -> Result<genai::Client, ProviderError> {
     use genai::WebConfig;
     use genai::resolver::{AuthData, Endpoint};
 
-    let env_name = env_name.to_string();
     let mut builder = genai::Client::builder()
         .with_adapter_kind(adapter_kind)
         .with_auth_resolver_fn(move |_model_iden: genai::ModelIden| {
@@ -292,10 +284,21 @@ fn to_genai_messages(
     messages: &[Message],
     cache_system_prompt: bool,
 ) -> Result<Vec<genai::chat::ChatMessage>, ProviderError> {
+    // Tool-call id -> originating tool name, so a later Role::Tool message can
+    // report its fn_name even when the provider that issued the call differs
+    // from the one this conversation is now being replayed to (cross-provider
+    // failover): call ids are provider-native and mean nothing to a different
+    // provider's adapter, but the name is stable across providers.
+    let call_id_to_fn_name: std::collections::HashMap<&str, &str> = messages
+        .iter()
+        .flat_map(|m| &m.tool_calls)
+        .map(|tc| (tc.id.as_str(), tc.name.as_str()))
+        .collect();
+
     messages
         .iter()
         .map(|m| {
-            let mapped = to_genai_message(provider, m)?;
+            let mapped = to_genai_message(provider, m, &call_id_to_fn_name)?;
             Ok(if cache_system_prompt && m.role == Role::System {
                 mapped.with_options(
                     genai::chat::MessageOptions::default()
@@ -308,10 +311,13 @@ fn to_genai_messages(
         .collect()
 }
 
-/// Map a single domain `Message` onto a genai `ChatMessage`.
+/// Map a single domain `Message` onto a genai `ChatMessage`. `call_id_to_fn_name`
+/// resolves a `Role::Tool` message's originating tool name (see
+/// `to_genai_messages`), independent of which provider issued the call id.
 fn to_genai_message(
     provider: &str,
     message: &Message,
+    call_id_to_fn_name: &std::collections::HashMap<&str, &str>,
 ) -> Result<genai::chat::ChatMessage, ProviderError> {
     use genai::chat::{ChatMessage, ContentPart, MessageContent, ToolResponse};
 
@@ -326,19 +332,51 @@ fn to_genai_message(
             if !message.content.is_empty() {
                 parts.push(ContentPart::Text(message.content.clone()));
             }
+            // Gemini stamps every captured thought signature onto the first
+            // tool call only (see `from_genai_response`); re-emit them as
+            // leading `ThoughtSignature` parts ahead of the tool-call parts —
+            // the shape genai's own `ChatMessage::from(Vec<ToolCall>)` builds —
+            // so the Gemini adapter's request builder reattaches them instead
+            // of sending the continued turn with the signature missing.
+            if let Some(signatures) = message
+                .tool_calls
+                .first()
+                .and_then(|tc| tc.thought_signatures.as_ref())
+            {
+                parts.extend(
+                    signatures
+                        .iter()
+                        .cloned()
+                        .map(ContentPart::ThoughtSignature),
+                );
+            }
             for tc in &message.tool_calls {
                 parts.push(ContentPart::ToolCall(to_genai_tool_call(provider, tc)?));
             }
             Ok(ChatMessage::assistant(MessageContent::from_parts(parts)))
         }
         Role::Tool => {
-            let call_id = message.tool_call_id.clone().unwrap_or_default();
-            Ok(ChatMessage::tool(ToolResponse::new(
-                call_id,
-                message.content.clone(),
-            )))
+            let call_id = message.tool_call_id.as_deref().unwrap_or("");
+            let mut response = ToolResponse::new(call_id.to_string(), message.content.clone());
+            if let Some(fn_name) = call_id_to_fn_name.get(call_id) {
+                response = response.with_fn_name(*fn_name);
+            }
+            Ok(ChatMessage::tool(response))
         }
     }
+}
+
+/// Parse `json` as a JSON value, mapping a parse failure to `InvalidRequest`
+/// with a message built by `describe` from the underlying `serde_json` error.
+fn parse_json_or_invalid_request(
+    provider: &str,
+    json: &str,
+    describe: impl FnOnce(&serde_json::Error) -> String,
+) -> Result<serde_json::Value, ProviderError> {
+    serde_json::from_str(json).map_err(|e| ProviderError::InvalidRequest {
+        provider: provider.to_string(),
+        message: describe(&e),
+    })
 }
 
 /// Map a domain `ToolCall` onto a genai `ToolCall`, parsing the JSON arguments
@@ -347,15 +385,16 @@ fn to_genai_tool_call(
     provider: &str,
     tc: &ToolCall,
 ) -> Result<genai::chat::ToolCall, ProviderError> {
-    let fn_arguments: serde_json::Value =
-        serde_json::from_str(&tc.arguments_json).map_err(|e| ProviderError::InvalidRequest {
-            provider: provider.to_string(),
-            message: format!("tool call `{}` has invalid arguments JSON: {e}", tc.name),
-        })?;
+    let fn_arguments = parse_json_or_invalid_request(provider, &tc.arguments_json, |e| {
+        format!("tool call `{}` has invalid arguments JSON: {e}", tc.name)
+    })?;
     Ok(genai::chat::ToolCall {
         call_id: tc.id.clone(),
         fn_name: tc.name.clone(),
         fn_arguments,
+        // Real signatures are carried by the leading `ThoughtSignature` parts
+        // promoted in `to_genai_message`; no adapter this crate ever selects
+        // reads this field off a wrapped `ContentPart::ToolCall`.
         thought_signatures: None,
     })
 }
@@ -365,13 +404,9 @@ fn to_genai_tool_call(
 fn to_genai_tools(provider: &str, tools: &[Tool]) -> Result<Vec<genai::chat::Tool>, ProviderError> {
     let mut out = Vec::with_capacity(tools.len());
     for t in tools {
-        let schema: serde_json::Value =
-            serde_json::from_str(&t.parameters_schema_json).map_err(|e| {
-                ProviderError::InvalidRequest {
-                    provider: provider.to_string(),
-                    message: format!("tool `{}` has invalid parameter schema: {e}", t.name),
-                }
-            })?;
+        let schema = parse_json_or_invalid_request(provider, &t.parameters_schema_json, |e| {
+            format!("tool `{}` has invalid parameter schema: {e}", t.name)
+        })?;
         out.push(
             genai::chat::Tool::new(t.name.clone())
                 .with_description(t.description.clone())
@@ -387,22 +422,25 @@ fn from_genai_response(
     provider: &str,
     response: genai::chat::ChatResponse,
 ) -> Result<ProviderResponse, ProviderError> {
-    let text = response.first_text().map(|s| s.to_string());
-    let tool_calls = response.into_tool_calls();
-
-    if !tool_calls.is_empty() {
-        let mapped = tool_calls
+    let has_tool_calls = response
+        .content
+        .iter()
+        .any(|p| matches!(p, genai::chat::ContentPart::ToolCall(_)));
+    if has_tool_calls {
+        let mapped = response
+            .into_tool_calls()
             .into_iter()
             .map(|tc| ToolCall {
                 id: tc.call_id,
                 name: tc.fn_name,
                 arguments_json: tc.fn_arguments.to_string(),
+                thought_signatures: tc.thought_signatures,
             })
             .collect();
         return Ok(ProviderResponse::ToolCalls(mapped));
     }
 
-    match text {
+    match response.into_first_text() {
         Some(text) => Ok(ProviderResponse::Text(text)),
         None => Err(ProviderError::InvalidResponse {
             provider: provider.to_string(),
@@ -424,6 +462,33 @@ fn usage_from(usage: &genai::chat::Usage) -> Option<TokenUsage> {
     })
 }
 
+/// Build the genai `ChatRequest`/`ChatOptions` pair from already-mapped
+/// messages/tools and the domain `CallOptions`: attaches tools when
+/// non-empty, always captures usage, and maps `max_tokens` /
+/// `force_tool` onto their genai counterparts (`force_tool` becomes a
+/// `ToolChoice::tool`). Pure — no I/O — unlike `complete_with_tools`, which
+/// also performs the network call.
+fn build_chat_request(
+    chat_messages: Vec<genai::chat::ChatMessage>,
+    genai_tools: Vec<genai::chat::Tool>,
+    options: &CallOptions,
+) -> (genai::chat::ChatRequest, genai::chat::ChatOptions) {
+    let mut request = genai::chat::ChatRequest::new(chat_messages);
+    if !genai_tools.is_empty() {
+        request = request.with_tools(genai_tools);
+    }
+
+    let mut chat_options = genai::chat::ChatOptions::default().with_capture_usage(true);
+    if let Some(max_tokens) = options.max_tokens {
+        chat_options = chat_options.with_max_tokens(max_tokens);
+    }
+    if let Some(tool) = &options.force_tool {
+        chat_options = chat_options.with_tool_choice(genai::chat::ToolChoice::tool(tool.clone()));
+    }
+
+    (request, chat_options)
+}
+
 impl LlmProvider for GenaiProvider {
     async fn complete_with_tools(
         &self,
@@ -433,20 +498,7 @@ impl LlmProvider for GenaiProvider {
     ) -> Result<Completion, ProviderError> {
         let chat_messages = to_genai_messages(&self.name, messages, self.cache_system_prompt)?;
         let genai_tools = to_genai_tools(&self.name, tools)?;
-
-        let mut request = genai::chat::ChatRequest::new(chat_messages);
-        if !genai_tools.is_empty() {
-            request = request.with_tools(genai_tools);
-        }
-
-        let mut chat_options = genai::chat::ChatOptions::default().with_capture_usage(true);
-        if let Some(max_tokens) = options.max_tokens {
-            chat_options = chat_options.with_max_tokens(max_tokens);
-        }
-        if let Some(tool) = &options.force_tool {
-            chat_options =
-                chat_options.with_tool_choice(genai::chat::ToolChoice::tool(tool.clone()));
-        }
+        let (request, chat_options) = build_chat_request(chat_messages, genai_tools, options);
 
         match self
             .client
@@ -506,7 +558,7 @@ mod tests {
 
     #[test]
     fn http_429_classifies_as_rate_limited() {
-        let e = classify_error_facts("primary", &facts(Some(429), None, "slow down"));
+        let e = classify_error_facts("primary", facts(Some(429), None, "slow down"));
         assert_eq!(
             e,
             ProviderError::RateLimited {
@@ -521,7 +573,7 @@ mod tests {
     fn openai_insufficient_quota_classifies_as_quota() {
         let e = classify_error_facts(
             "p",
-            &facts(Some(429), Some("insufficient_quota"), "no credit"),
+            facts(Some(429), Some("insufficient_quota"), "no credit"),
         );
         assert_eq!(
             e,
@@ -534,7 +586,7 @@ mod tests {
 
     #[test]
     fn http_401_classifies_as_authentication_and_is_not_failover() {
-        let e = classify_error_facts("p", &facts(Some(401), None, "bad key"));
+        let e = classify_error_facts("p", facts(Some(401), None, "bad key"));
         assert_eq!(
             e,
             ProviderError::Authentication {
@@ -547,7 +599,7 @@ mod tests {
 
     #[test]
     fn http_400_classifies_as_invalid_request() {
-        let e = classify_error_facts("p", &facts(Some(400), None, "bad body"));
+        let e = classify_error_facts("p", facts(Some(400), None, "bad body"));
         assert_eq!(
             e,
             ProviderError::InvalidRequest {
@@ -559,7 +611,7 @@ mod tests {
 
     #[test]
     fn no_status_falls_back_to_transport() {
-        let e = classify_error_facts("p", &facts(None, None, "connection reset"));
+        let e = classify_error_facts("p", facts(None, None, "connection reset"));
         assert_eq!(
             e,
             ProviderError::Transport {
@@ -572,7 +624,7 @@ mod tests {
     #[test]
     fn quota_via_substring_when_status_only_429() {
         // Anthropic billing/overloaded phrasing without a structured code.
-        let e = classify_error_facts("p", &facts(Some(429), None, "credit balance is too low"));
+        let e = classify_error_facts("p", facts(Some(429), None, "credit balance is too low"));
         assert_eq!(
             e,
             ProviderError::QuotaExceeded {
@@ -583,10 +635,81 @@ mod tests {
     }
 
     #[test]
+    fn to_genai_messages_resolves_tool_response_fn_name_across_providers() {
+        // The call id looks like an Anthropic-native id (as opposed to this
+        // crate's own synthetic ids), simulating a history built against one
+        // provider and replayed to another on cross-provider failover.
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "toolu_01ABC".to_string(),
+                    name: "read_file".to_string(),
+                    arguments_json: "{}".to_string(),
+                    thought_signatures: None,
+                }],
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: "file contents".to_string(),
+                tool_calls: vec![],
+                tool_call_id: Some("toolu_01ABC".to_string()),
+            },
+        ];
+
+        let chat_messages =
+            to_genai_messages("gemini", &messages, false).expect("mapping succeeds");
+        let responses = chat_messages[1].content.tool_responses();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].fn_name.as_deref(), Some("read_file"));
+    }
+
+    #[test]
+    fn build_chat_request_defaults_to_no_tools_no_cap_and_captures_usage() {
+        let (request, chat_options) = build_chat_request(vec![], vec![], &CallOptions::default());
+        assert!(request.tools.is_none());
+        assert_eq!(chat_options.capture_usage, Some(true));
+        assert_eq!(chat_options.max_tokens, None);
+        assert_eq!(chat_options.tool_choice, None);
+    }
+
+    #[test]
+    fn build_chat_request_attaches_tools_when_present() {
+        let tools = vec![genai::chat::Tool::new("search")];
+        let (request, _) = build_chat_request(vec![], tools, &CallOptions::default());
+        assert_eq!(request.tools.map(|t| t.len()), Some(1));
+    }
+
+    #[test]
+    fn build_chat_request_maps_max_tokens() {
+        let options = CallOptions {
+            max_tokens: Some(256),
+            ..Default::default()
+        };
+        let (_, chat_options) = build_chat_request(vec![], vec![], &options);
+        assert_eq!(chat_options.max_tokens, Some(256));
+    }
+
+    #[test]
+    fn build_chat_request_maps_force_tool_to_tool_choice() {
+        let options = CallOptions {
+            force_tool: Some("search".to_string()),
+            ..Default::default()
+        };
+        let (_, chat_options) = build_chat_request(vec![], vec![], &options);
+        assert_eq!(
+            chat_options.tool_choice,
+            Some(genai::chat::ToolChoice::tool("search"))
+        );
+    }
+
+    #[test]
     fn error_message_never_echoes_a_key() {
         // The classifier only ever copies the provided message; assert it does
         // not fabricate secrets and preserves the given text verbatim.
-        let e = classify_error_facts("p", &facts(Some(500), None, "server error"));
+        let e = classify_error_facts("p", facts(Some(500), None, "server error"));
         assert_eq!(
             e,
             ProviderError::Transport {

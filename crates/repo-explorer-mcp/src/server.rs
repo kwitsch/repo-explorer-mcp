@@ -69,9 +69,14 @@ impl From<ExplorationResult> for ExplorationResultDto {
                 .into_iter()
                 .map(|f| ExplorationFindingDto {
                     location: FileLocationDto {
-                        // Deterministic; lossy only for non-UTF-8 path bytes,
-                        // acceptable for a display/JSON field.
-                        path: f.location.path.to_string_lossy().into_owned(),
+                        // Reuses the existing buffer for valid UTF-8 paths; only
+                        // non-UTF-8 paths pay for the lossy allocation.
+                        path: f
+                            .location
+                            .path
+                            .into_os_string()
+                            .into_string()
+                            .unwrap_or_else(|s| s.to_string_lossy().into_owned()),
                         line_start: f.location.line_start,
                         line_end: f.location.line_end,
                     },

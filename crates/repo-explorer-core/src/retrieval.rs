@@ -5,7 +5,6 @@
 //! `repo-explorer-memory`'s `freshness.rs`.
 
 use crate::domain::{Candidate, CandidateKind, ExplorationFinding, FileLocation};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Search inputs derived deterministically from a query text.
@@ -37,13 +36,19 @@ const STOPWORDS: &[&str] = &[
 ];
 
 fn is_word_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+    c.is_alphanumeric() || c == '_'
 }
 
 /// True for tokens worth treating as identifiers: snake_case, camelCase,
 /// digit-bearing, or any sufficiently long non-stopword word.
 fn is_identifier_like(token: &str) -> bool {
     if token.len() < 3 {
+        return false;
+    }
+    // Stopword check must precede the shape checks below: a capitalized
+    // stopword (e.g. "How") still has_lower && has_upper and would otherwise
+    // short-circuit past the filter.
+    if STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(token)) {
         return false;
     }
     let has_underscore = token.contains('_');
@@ -53,7 +58,7 @@ fn is_identifier_like(token: &str) -> bool {
     if has_underscore || has_digit || (has_lower && has_upper) {
         return true;
     }
-    token.len() >= 4 && !STOPWORDS.contains(&token.to_ascii_lowercase().as_str())
+    token.len() >= 4
 }
 
 /// Escape a literal so grep backends treat it verbatim. Hand-rolled: core has
@@ -79,6 +84,46 @@ fn push_unique(list: &mut Vec<String>, value: String) {
     }
 }
 
+/// Locate the next quote delimiter in `s`. `"` and `` ` `` always count; `'`
+/// only counts when not preceded by a word char, so contractions/possessives
+/// (`user's`, `isn't`) are left as plain text instead of opening a literal
+/// that some later, unrelated apostrophe would then close.
+fn find_quote_start(s: &str) -> Option<(usize, char)> {
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' | '`' => return Some((i, c)),
+            '\'' if !s[..i].chars().next_back().is_some_and(is_word_char) => {
+                return Some((i, c));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Locate the delimiter that closes a literal opened with `quote` in `s`.
+/// `"` and `` ` `` always count; `'` is skipped when it sits inside a word
+/// (a word char on both sides, e.g. the possessive in `cache's`) so a
+/// contraction/possessive apostrophe within the literal doesn't close it
+/// early — the genuine closing quote is itself preceded by a word char (the
+/// literal's last letter), so, unlike `find_quote_start`, only a word char on
+/// *both* sides marks it as non-delimiting.
+fn find_quote_end(s: &str, quote: char) -> Option<usize> {
+    for (i, c) in s.char_indices() {
+        if c != quote {
+            continue;
+        }
+        if quote == '\''
+            && s[..i].chars().next_back().is_some_and(is_word_char)
+            && s[i + 1..].chars().next().is_some_and(is_word_char)
+        {
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
 /// Derive deterministic search inputs from a free-text query.
 pub fn derive_patterns(query: &str) -> QueryPatterns {
     let mut patterns = QueryPatterns::default();
@@ -86,12 +131,11 @@ pub fn derive_patterns(query: &str) -> QueryPatterns {
     // Quoted literals: content of "…", '…', and `…` pairs.
     let mut rest = query;
     let mut unquoted = String::new();
-    while let Some(open) = rest.find(['"', '\'', '`']) {
-        let quote = rest.as_bytes()[open] as char;
+    while let Some((open, quote)) = find_quote_start(rest) {
         unquoted.push_str(&rest[..open]);
         unquoted.push(' ');
         let after = &rest[open + 1..];
-        match after.find(quote) {
+        match find_quote_end(after, quote) {
             Some(close) => {
                 push_unique(&mut patterns.literals, after[..close].trim().to_string());
                 rest = &after[close + 1..];
@@ -108,7 +152,12 @@ pub fn derive_patterns(query: &str) -> QueryPatterns {
     // compounds contribute both the compound's segments and, for paths, the
     // compound itself.
     for raw in unquoted.split_whitespace() {
-        let trimmed = raw.trim_matches(|c: char| !is_word_char(c) && !matches!(c, '/' | '.'));
+        // Leading '.' is exempted (preserves `./x` relative-path tokens);
+        // trailing '.' is not, so a sentence-ending period doesn't stick to
+        // the token (e.g. "…/retrieval.rs." at a sentence's end).
+        let trimmed = raw
+            .trim_start_matches(|c: char| !is_word_char(c) && !matches!(c, '/' | '.'))
+            .trim_end_matches(|c: char| !is_word_char(c) && c != '/');
         if trimmed.is_empty() {
             continue;
         }
@@ -126,17 +175,11 @@ pub fn derive_patterns(query: &str) -> QueryPatterns {
         }
     }
 
-    for literal in &patterns.literals {
+    for token in patterns.literals.iter().chain(patterns.identifiers.iter()) {
         if patterns.grep_patterns.len() >= MAX_GREP_PATTERNS {
             break;
         }
-        push_unique(&mut patterns.grep_patterns, escape_regex(literal));
-    }
-    for identifier in &patterns.identifiers {
-        if patterns.grep_patterns.len() >= MAX_GREP_PATTERNS {
-            break;
-        }
-        push_unique(&mut patterns.grep_patterns, escape_regex(identifier));
+        push_unique(&mut patterns.grep_patterns, escape_regex(token));
     }
 
     patterns
@@ -144,10 +187,11 @@ pub fn derive_patterns(query: &str) -> QueryPatterns {
 
 /// Strip a leading `./` so the same file never appears under two spellings
 /// (grep emits `./x` without a scope and `x` with one).
-pub fn normalize_rel_path(path: &Path) -> PathBuf {
-    path.strip_prefix(".")
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|_| path.to_path_buf())
+pub fn normalize_rel_path(path: PathBuf) -> PathBuf {
+    match path.strip_prefix(".") {
+        Ok(stripped) => stripped.to_path_buf(),
+        Err(_) => path,
+    }
 }
 
 fn kind_base_score(kind: CandidateKind) -> u32 {
@@ -160,35 +204,30 @@ fn kind_base_score(kind: CandidateKind) -> u32 {
     }
 }
 
-fn kind_rank(kind: CandidateKind) -> u32 {
-    // Higher = stronger; used to pick the surviving kind when merging.
-    kind_base_score(kind)
-}
-
-/// Number of distinct query identifiers/literals appearing (case-insensitive)
-/// in the candidate's symbol, path, or snippet.
-fn coverage(candidate: &Candidate, patterns: &QueryPatterns) -> u32 {
-    let haystack = format!(
+/// Number of distinct query identifiers/literals (pre-lowercased by the
+/// caller) appearing in the candidate's symbol, path, or snippet.
+fn coverage(candidate: &Candidate, lowered_patterns: &[String]) -> u32 {
+    let mut haystack = format!(
         "{} {} {}",
         candidate.symbol.as_deref().unwrap_or(""),
         candidate.location.path.to_string_lossy(),
         candidate.snippet.as_deref().unwrap_or("")
-    )
-    .to_ascii_lowercase();
-    patterns
-        .identifiers
+    );
+    haystack.make_ascii_lowercase();
+    lowered_patterns
         .iter()
-        .chain(patterns.literals.iter())
-        .filter(|token| !token.is_empty() && haystack.contains(&token.to_ascii_lowercase()))
+        .filter(|token| haystack.contains(token.as_str()))
         .count() as u32
 }
 
 /// Normalize a location: strip `./`, swap an inverted line range, and widen a
 /// zero `line_end` to `line_start`.
 fn normalize_location(location: FileLocation) -> FileLocation {
-    let path = normalize_rel_path(&location.path);
+    let path = normalize_rel_path(location.path);
     let (mut start, mut end) = (location.line_start, location.line_end);
-    if end < start {
+    if end == 0 {
+        end = start;
+    } else if end < start {
         std::mem::swap(&mut start, &mut end);
     }
     FileLocation {
@@ -198,7 +237,17 @@ fn normalize_location(location: FileLocation) -> FileLocation {
     }
 }
 
+/// `(0, 0)` is `normalize_location`'s "location unknown" sentinel, not a real
+/// one-line span at line 0 — two candidates that both merely lack line data
+/// must not be treated as overlapping just because they share that sentinel.
+fn is_unknown_location(loc: &FileLocation) -> bool {
+    loc.line_start == 0 && loc.line_end == 0
+}
+
 fn overlaps(a: &FileLocation, b: &FileLocation) -> bool {
+    if is_unknown_location(a) || is_unknown_location(b) {
+        return false;
+    }
     a.line_start <= b.line_end && b.line_start <= a.line_end
 }
 
@@ -206,7 +255,7 @@ fn overlaps(a: &FileLocation, b: &FileLocation) -> bool {
 fn merge_into(a: &mut Candidate, b: Candidate) {
     a.location.line_start = a.location.line_start.min(b.location.line_start);
     a.location.line_end = a.location.line_end.max(b.location.line_end);
-    if kind_rank(b.kind) > kind_rank(a.kind) {
+    if kind_base_score(b.kind) > kind_base_score(a.kind) {
         a.kind = b.kind;
         a.symbol = b.symbol.or(a.symbol.take());
         if b.snippet.is_some() {
@@ -225,20 +274,45 @@ fn merge_into(a: &mut Candidate, b: Candidate) {
 /// Merge overlapping candidates per file, score, rank, and truncate to
 /// `top_k`. Deterministic: stable ordering by (score desc, path, line_start).
 pub fn merge_and_rank(raw: Vec<Candidate>, patterns: &QueryPatterns, top_k: u32) -> Vec<Candidate> {
-    let mut per_file: HashMap<PathBuf, Vec<Candidate>> = HashMap::new();
-    for mut candidate in raw {
-        candidate.location = normalize_location(candidate.location);
-        per_file
-            .entry(candidate.location.path.clone())
-            .or_default()
-            .push(candidate);
+    // Lowercase pattern tokens once, deduped post-lowercasing so a term
+    // repeated under different casing (or as both identifier and literal)
+    // isn't double-counted by coverage()'s distinct-match contract.
+    let mut lowered_patterns: Vec<String> = Vec::new();
+    for token in patterns.identifiers.iter().chain(patterns.literals.iter()) {
+        push_unique(&mut lowered_patterns, token.to_ascii_lowercase());
     }
 
+    let mut normalized: Vec<Candidate> = raw
+        .into_iter()
+        .map(|mut candidate| {
+            candidate.location = normalize_location(candidate.location);
+            candidate
+        })
+        .collect();
+    // Single sort by (path, line_start, line_end) doubles as the per-file
+    // grouping key (consecutive runs below) and the line ordering merge()
+    // needs, replacing a HashMap groupby (one PathBuf clone per candidate)
+    // plus a redundant per-file sort.
+    normalized.sort_by(|a, b| {
+        a.location
+            .path
+            .cmp(&b.location.path)
+            .then_with(|| a.location.line_start.cmp(&b.location.line_start))
+            .then_with(|| a.location.line_end.cmp(&b.location.line_end))
+    });
+
     let mut merged: Vec<Candidate> = Vec::new();
-    for (_, mut candidates) in per_file {
-        candidates.sort_by_key(|c| (c.location.line_start, c.location.line_end));
-        let mut file_merged: Vec<Candidate> = Vec::new();
-        for candidate in candidates {
+    let mut candidates = normalized.into_iter().peekable();
+    while let Some(first) = candidates.next() {
+        let mut file_merged: Vec<Candidate> = vec![first];
+        loop {
+            let same_file = candidates
+                .peek()
+                .is_some_and(|c| c.location.path == file_merged[0].location.path);
+            if !same_file {
+                break;
+            }
+            let candidate = candidates.next().expect("peeked Some above");
             match file_merged.last_mut() {
                 Some(last) if overlaps(&last.location, &candidate.location) => {
                     merge_into(last, candidate);
@@ -251,7 +325,7 @@ pub fn merge_and_rank(raw: Vec<Candidate>, patterns: &QueryPatterns, top_k: u32)
         let density_boost = 15 * (file_merged.len().saturating_sub(1)).min(4) as u32;
         for mut candidate in file_merged {
             let base = kind_base_score(candidate.kind);
-            let coverage_boost = (30 * coverage(&candidate, patterns)).min(120);
+            let coverage_boost = (30 * coverage(&candidate, &lowered_patterns)).min(120);
             candidate.score = (base + coverage_boost + density_boost).min(MAX_SCORE);
             merged.push(candidate);
         }
@@ -278,15 +352,21 @@ pub fn confidence(ranked: &[Candidate]) -> u32 {
     (top.score / 10 + margin / 20).min(100)
 }
 
-/// Render a candidate as a finding, preserving its provenance in the note.
-pub fn finding_from_candidate(candidate: Candidate) -> ExplorationFinding {
-    let kind = match candidate.kind {
+/// Human-readable label for a candidate's provenance, shared by the
+/// finding renderer and the verification-stage candidate-block renderer.
+pub fn kind_label(kind: CandidateKind) -> &'static str {
+    match kind {
         CandidateKind::SymbolExact => "exact symbol match",
         CandidateKind::SymbolFuzzy => "symbol name match",
         CandidateKind::FileNameHit => "file name match",
         CandidateKind::SemanticHit => "semantic search match",
         CandidateKind::ContentHit => "text match",
-    };
+    }
+}
+
+/// Render a candidate as a finding, preserving its provenance in the note.
+pub fn finding_from_candidate(candidate: Candidate) -> ExplorationFinding {
+    let kind = kind_label(candidate.kind);
     let note = match &candidate.symbol {
         Some(symbol) => format!("{kind}: `{symbol}`"),
         None => kind.to_string(),
@@ -353,6 +433,15 @@ mod tests {
         let p = derive_patterns("what is \"decide_freshness");
         assert!(p.literals.is_empty());
         assert_eq!(p.identifiers, vec!["decide_freshness"]);
+    }
+
+    #[test]
+    fn possessive_and_contraction_apostrophes_are_not_quote_delimiters() {
+        let p = derive_patterns("how does the cache's ttl work and isn't it stale");
+        assert!(p.literals.is_empty(), "got {:?}", p.literals);
+        assert!(p.identifiers.contains(&"cache".to_string()));
+        assert!(p.identifiers.contains(&"work".to_string()));
+        assert!(p.identifiers.contains(&"stale".to_string()));
     }
 
     #[test]
@@ -433,6 +522,23 @@ mod tests {
     }
 
     #[test]
+    fn unknown_location_sentinels_do_not_merge_distinct_symbols() {
+        // Two symbols in the same file both missing line data (backend
+        // omitted the `lines` column) must survive as distinct candidates,
+        // not collapse into one via the (0, 0) "location unknown" sentinel.
+        let p = QueryPatterns::default();
+        let mut a = candidate("a.rs", 0, 0, CandidateKind::SymbolExact);
+        a.symbol = Some("decide_freshness".to_string());
+        let mut b = candidate("a.rs", 0, 0, CandidateKind::SymbolExact);
+        b.symbol = Some("StalenessWindow".to_string());
+        let ranked = merge_and_rank(vec![a, b], &p, 10);
+        assert_eq!(ranked.len(), 2);
+        let symbols: Vec<_> = ranked.iter().map(|c| c.symbol.as_deref()).collect();
+        assert!(symbols.contains(&Some("decide_freshness")));
+        assert!(symbols.contains(&Some("StalenessWindow")));
+    }
+
+    #[test]
     fn adjacent_but_disjoint_ranges_stay_separate() {
         let p = QueryPatterns::default();
         let ranked = merge_and_rank(
@@ -485,6 +591,22 @@ mod tests {
                 (PathBuf::from("a.rs"), 9),
                 (PathBuf::from("b.rs"), 1),
             ]
+        );
+    }
+
+    #[test]
+    fn coverage_boost_does_not_double_count_case_variants() {
+        // "Cache" and "cache" are distinct identifiers pre-lowercasing but
+        // must collapse to one distinct term for coverage scoring.
+        let p = derive_patterns("check Cache and cache items");
+        assert_eq!(p.identifiers, vec!["check", "Cache", "cache", "items"]);
+        let mut c = candidate("a.rs", 1, 1, CandidateKind::ContentHit);
+        c.snippet = Some("check cache items".to_string());
+        let ranked = merge_and_rank(vec![c], &p, 10);
+        // 3 distinct terms ("check", "cache", "items") -> boost of 90, not 120.
+        assert_eq!(
+            ranked[0].score,
+            kind_base_score(CandidateKind::ContentHit) + 90
         );
     }
 

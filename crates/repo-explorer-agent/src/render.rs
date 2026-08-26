@@ -27,10 +27,12 @@ impl Default for RenderCaps {
 const TRUNCATION_MARKER: &str = "…[truncated]";
 
 /// Cap `s` to at most `max_chars` characters (char-boundary safe), appending a
-/// marker when anything was cut. `max_chars == 0` disables the cap.
-pub(crate) fn cap_snippet(s: &str, max_chars: usize) -> String {
+/// marker when anything was cut. `max_chars == 0` disables the cap. Takes
+/// ownership so the common (already-owned, under-cap) case returns `s`
+/// unchanged instead of reallocating — mirrors `cap_file_lines` below.
+pub(crate) fn cap_snippet(s: String, max_chars: usize) -> String {
     if max_chars == 0 || s.chars().count() <= max_chars {
-        return s.to_string();
+        return s;
     }
     let mut out: String = s.chars().take(max_chars).collect();
     out.push_str(TRUNCATION_MARKER);
@@ -59,13 +61,13 @@ pub(crate) fn tidy_findings(
     let mut seen = HashSet::new();
     let mut out: Vec<ExplorationFinding> = Vec::with_capacity(findings.len());
     for mut f in findings {
-        f.location.path = normalize_rel_path(&f.location.path);
+        f.location.path = normalize_rel_path(f.location.path);
         if !seen.insert(f.location.clone()) {
             continue;
         }
         f.snippet = f
             .snippet
-            .map(|s| cap_snippet(&s, caps.snippet_max_chars))
+            .map(|s| cap_snippet(s, caps.snippet_max_chars))
             .filter(|s| !s.is_empty());
         f.note = f.note.filter(|n| !n.trim().is_empty());
         out.push(f);
@@ -171,12 +173,16 @@ mod tests {
 
     #[test]
     fn cap_snippet_boundaries() {
-        assert_eq!(cap_snippet("short", 10), "short");
-        assert_eq!(cap_snippet("short", 0), "short", "0 disables the cap");
-        let capped = cap_snippet("abcdef", 3);
+        assert_eq!(cap_snippet("short".to_string(), 10), "short");
+        assert_eq!(
+            cap_snippet("short".to_string(), 0),
+            "short",
+            "0 disables the cap"
+        );
+        let capped = cap_snippet("abcdef".to_string(), 3);
         assert!(capped.starts_with("abc") && capped.ends_with(TRUNCATION_MARKER));
         // Multi-byte chars must not split.
-        let capped = cap_snippet("äöüß", 2);
+        let capped = cap_snippet("äöüß".to_string(), 2);
         assert!(capped.starts_with("äö"));
     }
 

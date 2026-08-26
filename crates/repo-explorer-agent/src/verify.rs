@@ -5,19 +5,20 @@
 //! fallback loop instead of erroring.
 
 use futures_util::future::join_all;
-use repo_explorer_core::domain::{Candidate, CandidateKind, ExplorationQuery, ExplorationResult};
+use repo_explorer_core::domain::{Candidate, ExplorationQuery, ExplorationResult};
 use repo_explorer_core::llm::{
     CallOptions, Clock, LlmProvider, Message, ProviderResponse, ProviderRouter,
 };
 use repo_explorer_core::memory::MemoryBackend;
-use std::collections::HashMap;
+use repo_explorer_core::retrieval::kind_label;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::agent::TokenBudget;
-use crate::dispatch::read_file;
+use crate::agent::{TokenBudget, push_nudge};
+use crate::dispatch::{parse_args, read_file};
 use crate::render::{RenderCaps, cap_file_lines, cap_snippet};
 use crate::skeleton::skeleton_for;
-use crate::tools::{ExpandArgs, parse_finish, verify_catalog};
+use crate::tools::{ExpandArgs, resolve_finish, verify_catalog};
 
 /// Lines of body context fetched around a candidate on `expand`.
 const EXPAND_CONTEXT_BEFORE: u32 = 10;
@@ -83,16 +84,12 @@ where
                 budget.add(completion.usage);
                 match completion.response {
                     ProviderResponse::ToolCalls(calls) if !calls.is_empty() => {
-                        messages.push(Message::assistant_tool_calls(calls.clone()));
-                        if let Some(finish) = calls.iter().find(|c| c.name == "finish") {
-                            match parse_finish(&finish.arguments_json) {
-                                Ok(result) => return VerifyOutcome::Finished(result),
-                                Err(reason) => messages.push(Message::tool(
-                                    &finish.id,
-                                    format!("finish rejected: {reason}; call finish again"),
-                                )),
-                            }
-                        }
+                        // Check for a successful finish before cloning anything: the
+                        // common case (finish on the first turn) returns right here.
+                        let mut responses = match resolve_finish(&calls) {
+                            Ok(result) => return VerifyOutcome::Finished(result),
+                            Err(rejections) => rejections,
+                        };
                         for call in calls.iter().filter(|c| c.name != "finish") {
                             let content = match call.name.as_str() {
                                 "expand" => expand_content(
@@ -103,16 +100,24 @@ where
                                 ),
                                 other => format!("unknown tool: {other}"),
                             };
-                            messages.push(Message::tool(&call.id, content));
+                            responses.push(Message::tool(&call.id, content));
                         }
+                        messages.push(Message::assistant_tool_calls(calls));
+                        messages.extend(responses);
                     }
                     ProviderResponse::ToolCalls(_) => {
-                        messages.push(Message::assistant_tool_calls(Vec::new()));
-                        messages.push(Message::user("Respond with a tool call: expand or finish."));
+                        push_nudge(
+                            &mut messages,
+                            Message::assistant_tool_calls(Vec::new()),
+                            "Respond with a tool call: expand or finish.",
+                        );
                     }
                     ProviderResponse::Text(text) => {
-                        messages.push(Message::assistant_text(text));
-                        messages.push(Message::user("Respond with a tool call: expand or finish."));
+                        push_nudge(
+                            &mut messages,
+                            Message::assistant_text(text),
+                            "Respond with a tool call: expand or finish.",
+                        );
                     }
                 }
             }
@@ -125,28 +130,8 @@ where
     VerifyOutcome::Escalate
 }
 
-fn kind_label(kind: CandidateKind) -> &'static str {
-    match kind {
-        CandidateKind::SymbolExact => "exact symbol match",
-        CandidateKind::SymbolFuzzy => "symbol name match",
-        CandidateKind::FileNameHit => "file name match",
-        CandidateKind::SemanticHit => "semantic search match",
-        CandidateKind::ContentHit => "text match",
-    }
-}
-
 fn verify_user_prompt(query: &ExplorationQuery, index_note: Option<&str>, block: &str) -> String {
-    let mut s = format!("Exploration query: {}", query.text);
-    if let Some(scope) = &query.scope_hint {
-        s.push_str(&format!("\nScope hint: {}", scope.display()));
-    }
-    if let Some(max) = query.max_results {
-        s.push_str(&format!("\nDesired maximum results: {max}"));
-    }
-    if let Some(note) = index_note {
-        s.push('\n');
-        s.push_str(note);
-    }
+    let mut s = crate::agent::query_preamble(query, index_note);
     s.push_str("\n\nCandidates:\n");
     s.push_str(block);
     s
@@ -161,22 +146,18 @@ async fn candidates_block<M: MemoryBackend>(
     candidates: &[Candidate],
     caps: &RenderCaps,
 ) -> String {
-    let mut unique_paths: Vec<PathBuf> = Vec::new();
-    for c in candidates {
-        if !unique_paths.contains(&c.location.path) {
-            unique_paths.push(c.location.path.clone());
-        }
-    }
-    let skeletons: HashMap<PathBuf, String> = join_all(unique_paths.iter().map(|path| async {
-        let outline = skeleton_for(memory, repo_root, path).await?;
-        Some((path.clone(), outline))
-    }))
-    .await
-    .into_iter()
-    .flatten()
-    .collect();
+    let unique_paths: HashSet<&PathBuf> = candidates.iter().map(|c| &c.location.path).collect();
+    let skeletons: HashMap<PathBuf, String> =
+        join_all(unique_paths.into_iter().map(|path| async move {
+            let outline = skeleton_for(memory, repo_root, path).await?;
+            Some((path.clone(), outline))
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
 
-    let mut shown_outline: Vec<&PathBuf> = Vec::new();
+    let mut shown_outline: HashSet<&PathBuf> = HashSet::new();
     let mut out = String::new();
     for (idx, c) in candidates.iter().enumerate() {
         let symbol = c
@@ -193,14 +174,15 @@ async fn candidates_block<M: MemoryBackend>(
             kind_label(c.kind),
         ));
         if let Some(outline) = skeletons.get(&c.location.path) {
-            if !shown_outline.contains(&&c.location.path) {
-                shown_outline.push(&c.location.path);
+            if shown_outline.insert(&c.location.path) {
                 out.push_str(outline);
                 out.push('\n');
             }
         } else if let Some(snippet) = &c.snippet {
             out.push_str("  ");
-            out.push_str(&cap_snippet(snippet, caps.snippet_max_chars).replace('\n', "\n  "));
+            out.push_str(
+                &cap_snippet(snippet.clone(), caps.snippet_max_chars).replace('\n', "\n  "),
+            );
             out.push('\n');
         }
     }
@@ -215,9 +197,9 @@ fn expand_content(
     arguments_json: &str,
     caps: &RenderCaps,
 ) -> String {
-    let args: ExpandArgs = match serde_json::from_str(arguments_json) {
+    let args: ExpandArgs = match parse_args(arguments_json) {
         Ok(args) => args,
-        Err(e) => return format!("invalid arguments: {e}"),
+        Err(e) => return e,
     };
     if args.candidate_ids.is_empty() {
         return "invalid arguments: candidate_ids must be non-empty".to_string();
@@ -252,7 +234,7 @@ fn expand_content(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use repo_explorer_core::domain::FileLocation;
+    use repo_explorer_core::domain::{CandidateKind, FileLocation};
     use repo_explorer_core::memory::mock::MockMemoryBackend;
 
     fn candidate(path: &str, start: u32, end: u32) -> Candidate {

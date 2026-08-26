@@ -14,7 +14,7 @@ use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::cache::ResultCache;
+use crate::cache::{ResultCache, encode_field, opt_to_string, scope_display};
 
 /// How many identifier tokens get their own symbol-lookup leg.
 const SYMBOL_LOOKUP_TOKENS: usize = 4;
@@ -48,71 +48,94 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
 
     let symbol_legs = join_all(patterns.identifiers.iter().take(SYMBOL_LOOKUP_TOKENS).map(
         |token| {
-            memoized(leg_cache, format!("symbol#{token}"), async move {
-                let graph_query = GraphQuery {
-                    name_pattern: Some(token.clone()),
-                    max_results: Some(PER_LEG_MAX_RESULTS),
-                    ..GraphQuery::default()
-                };
-                match memory.search_graph(repo_root, &graph_query).await {
-                    Ok(res) => symbol_candidates(res.findings, token),
-                    Err(e) => {
-                        tracing::debug!(leg = "symbol", %token, error = %e, "retrieval leg failed");
-                        Vec::new()
-                    }
-                }
-            })
+            memoized(
+                leg_cache,
+                move || leg_key("symbol", token, scope),
+                async move {
+                    let graph_query = GraphQuery {
+                        name_pattern: Some(token.clone()),
+                        file_pattern: scope.map(|p| p.to_string_lossy().into_owned()),
+                        max_results: Some(PER_LEG_MAX_RESULTS),
+                        ..GraphQuery::default()
+                    };
+                    soft_leg(
+                        "symbol",
+                        token,
+                        memory.search_graph(repo_root, &graph_query),
+                        |res| symbol_candidates(res.findings, token),
+                    )
+                    .await
+                },
+            )
         },
     ));
 
     let semantic_leg = memoized(
         leg_cache,
-        format!("semantic#{}", query.text.trim().to_lowercase()),
+        move || {
+            format!(
+                "{}{}",
+                leg_key("semantic", &query.text, scope),
+                encode_field(&opt_to_string(query.max_results))
+            )
+        },
         async move {
-            match memory.search_code(repo_root, query).await {
-                Ok(res) => candidates_of_kind(res.findings, CandidateKind::SemanticHit),
-                Err(e) => {
-                    tracing::debug!(leg = "semantic", error = %e, "retrieval leg failed");
-                    Vec::new()
-                }
-            }
+            soft_leg(
+                "semantic",
+                query.text.as_str(),
+                memory.search_code(repo_root, query),
+                |res| candidates_of_kind(res.findings, CandidateKind::SemanticHit),
+            )
+            .await
         },
     );
 
     let grep_legs = join_all(patterns.grep_patterns.iter().map(|pattern| {
-        memoized(leg_cache, format!("grep#{pattern}"), async move {
-            let options = SearchOptions {
-                max_results: Some(PER_LEG_MAX_RESULTS),
-                ..SearchOptions::default()
-            };
-            match search.search(repo_root, pattern, scope, &options).await {
-                Ok(findings) => candidates_of_kind(findings, CandidateKind::ContentHit),
-                Err(e) => {
-                    tracing::debug!(leg = "grep", %pattern, error = %e, "retrieval leg failed");
-                    Vec::new()
-                }
-            }
-        })
-    }));
-
-    let file_legs = join_all(patterns.path_tokens.iter().take(FILE_LOOKUP_TOKENS).map(
-        |token| {
-            memoized(leg_cache, format!("file#{token}"), async move {
+        memoized(
+            leg_cache,
+            move || leg_key("grep", pattern, scope),
+            async move {
                 let options = SearchOptions {
                     max_results: Some(PER_LEG_MAX_RESULTS),
-                    file_glob: Some(file_glob_for(token)),
                     ..SearchOptions::default()
                 };
-                match search.search(repo_root, ".", scope, &options).await {
-                    Ok(findings) => file_candidates(findings),
-                    Err(e) => {
-                        tracing::debug!(leg = "file", %token, error = %e, "retrieval leg failed");
-                        Vec::new()
-                    }
-                }
-            })
-        },
-    ));
+                soft_leg(
+                    "grep",
+                    pattern,
+                    search.search(repo_root, pattern, scope, &options),
+                    |findings| candidates_of_kind(findings, CandidateKind::ContentHit),
+                )
+                .await
+            },
+        )
+    }));
+
+    let file_legs = join_all(
+        patterns
+            .path_tokens
+            .iter()
+            .take(FILE_LOOKUP_TOKENS)
+            .map(|token| {
+                memoized(
+                    leg_cache,
+                    move || leg_key("file", token, scope),
+                    async move {
+                        let options = SearchOptions {
+                            max_results: Some(PER_LEG_MAX_RESULTS),
+                            file_glob: Some(file_glob_for(token)),
+                            ..SearchOptions::default()
+                        };
+                        soft_leg(
+                            "file",
+                            token,
+                            search.search(repo_root, ".", scope, &options),
+                            file_candidates,
+                        )
+                        .await
+                    },
+                )
+            }),
+    );
 
     let (symbols, semantic, greps, files) =
         futures_util::future::join4(symbol_legs, semantic_leg, grep_legs, file_legs).await;
@@ -132,40 +155,77 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
 }
 
 /// Wrap a leg future with the leg cache: return the memoized candidates when
-/// present, otherwise run the leg and store its result.
+/// present, otherwise run the leg and store its result. `leg` is only called
+/// when a cache is actually active, so an inactive cache costs no key-format
+/// work. Only a successful run (`Some`) is memoized — a swallowed backend
+/// failure (`None`, see `soft_leg`) must not poison the cache with a
+/// permanent-looking empty result for what was really a transient hiccup.
 async fn memoized(
     leg_cache: LegCache<'_>,
-    leg: String,
-    fut: impl Future<Output = Vec<Candidate>>,
+    leg: impl FnOnce() -> String,
+    fut: impl Future<Output = Option<Vec<Candidate>>>,
 ) -> Vec<Candidate> {
-    let key = leg_cache.map(|(cache, fp)| (cache, ResultCache::leg_key(fp, &leg)));
+    let key = leg_cache.map(|(cache, fp)| (cache, ResultCache::leg_key(fp, &leg())));
     if let Some((cache, key)) = &key
         && let Some(hit) = cache.get_leg(key)
     {
         return hit;
     }
     let out = fut.await;
-    if let Some((cache, key)) = key {
-        cache.put_leg(key, out.clone());
+    if let Some((cache, key)) = key
+        && let Some(candidates) = &out
+    {
+        cache.put_leg(key, candidates.clone());
     }
-    out
+    out.unwrap_or_default()
 }
 
-/// Classify symbol-lookup findings: the memory backend carries the symbol name
-/// in `note`; an exact (last-segment) name match is `SymbolExact`, everything
-/// else `SymbolFuzzy`.
-fn symbol_candidates(findings: Vec<ExplorationFinding>, token: &str) -> Vec<Candidate> {
+/// Run one fanout leg's backend call: classify a success, log-and-drop a
+/// failure. Failures are soft — a failed leg contributes nothing rather than
+/// failing the whole query — but stay distinguishable (`None`) from a
+/// legitimate zero-hit success (`Some(vec![])`) so `memoized` never caches a
+/// transient failure as a permanent empty answer.
+async fn soft_leg<T, E: std::fmt::Display>(
+    leg: &'static str,
+    ctx: impl std::fmt::Display,
+    fut: impl Future<Output = Result<T, E>>,
+    classify: impl FnOnce(T) -> Vec<Candidate>,
+) -> Option<Vec<Candidate>> {
+    match fut.await {
+        Ok(res) => Some(classify(res)),
+        Err(e) => {
+            tracing::debug!(leg, %ctx, error = %e, "retrieval leg failed");
+            None
+        }
+    }
+}
+
+/// Build a leg-cache key from a leg prefix, its value, and the scope hint.
+/// Shared by every fanout leg so a future change to the (value, scope)
+/// encoding can't be applied to some legs and missed on others.
+fn leg_key(prefix: &str, value: &str, scope: Option<&Path>) -> String {
+    format!(
+        "{prefix}{}{}",
+        encode_field(value),
+        encode_field(&scope_display(scope))
+    )
+}
+
+/// Build candidates from findings, with `kind_of` classifying each finding
+/// individually. Shared by `symbol_candidates` (kind depends on the finding)
+/// and `candidates_of_kind` (kind is fixed) so the two never drift apart on
+/// how a `Candidate` is otherwise assembled from an `ExplorationFinding`.
+fn candidates_with(
+    findings: Vec<ExplorationFinding>,
+    kind_of: impl Fn(&ExplorationFinding) -> CandidateKind,
+) -> Vec<Candidate> {
     findings
         .into_iter()
         .map(|f| {
-            let symbol = f.note.clone();
-            let kind = match symbol.as_deref() {
-                Some(name) if last_segment(name) == token => CandidateKind::SymbolExact,
-                _ => CandidateKind::SymbolFuzzy,
-            };
+            let kind = kind_of(&f);
             Candidate {
                 location: f.location,
-                symbol,
+                symbol: f.note,
                 kind,
                 score: 0,
                 snippet: f.snippet,
@@ -174,32 +234,41 @@ fn symbol_candidates(findings: Vec<ExplorationFinding>, token: &str) -> Vec<Cand
         .collect()
 }
 
+/// Classify symbol-lookup findings: the memory backend carries the symbol name
+/// in `note`; an exact (last-segment) name match is `SymbolExact`, everything
+/// else `SymbolFuzzy`.
+fn symbol_candidates(findings: Vec<ExplorationFinding>, token: &str) -> Vec<Candidate> {
+    candidates_with(findings, |f| match f.note.as_deref() {
+        Some(name) if last_segment(name) == token => CandidateKind::SymbolExact,
+        _ => CandidateKind::SymbolFuzzy,
+    })
+}
+
 /// A qualified name's final segment (`a::b::c` → `c`, `a.b` → `b`).
 fn last_segment(name: &str) -> &str {
-    name.rsplit(&[':', '.'][..]).next().unwrap_or(name)
+    // rsplit always yields at least the whole string, so this is infallible.
+    name.rsplit(&[':', '.'][..]).next().unwrap()
 }
 
 fn candidates_of_kind(findings: Vec<ExplorationFinding>, kind: CandidateKind) -> Vec<Candidate> {
-    findings
-        .into_iter()
-        .map(|f| Candidate {
-            location: f.location,
-            symbol: f.note,
-            kind,
-            score: 0,
-            snippet: f.snippet,
-        })
-        .collect()
+    candidates_with(findings, |_| kind)
 }
 
 /// Collapse content rows from the `find` emulation to one file-level candidate
 /// per unique path.
 fn file_candidates(findings: Vec<ExplorationFinding>) -> Vec<Candidate> {
     let mut seen = HashSet::new();
+    // Dedup by borrowed path first so the owned pass below can move each
+    // survivor's path straight into its Candidate instead of cloning it.
+    let keep: Vec<bool> = findings
+        .iter()
+        .map(|f| seen.insert(&f.location.path))
+        .collect();
     findings
         .into_iter()
-        .filter(|f| seen.insert(f.location.path.clone()))
-        .map(|f| Candidate {
+        .zip(keep)
+        .filter(|(_, keep)| *keep)
+        .map(|(f, _)| Candidate {
             location: FileLocation {
                 path: f.location.path,
                 line_start: 1,
@@ -216,7 +285,8 @@ fn file_candidates(findings: Vec<ExplorationFinding>) -> Vec<Candidate> {
 /// Glob for a path-like token: a bare file name matches by basename; a token
 /// without an extension matches as a substring.
 fn file_glob_for(token: &str) -> String {
-    let name = token.rsplit('/').next().unwrap_or(token);
+    // rsplit always yields at least the whole string, so this is infallible.
+    let name = token.rsplit('/').next().unwrap();
     if name.contains('.') {
         name.to_string()
     } else {
@@ -321,6 +391,130 @@ mod tests {
         let out = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
         assert!(out.candidates.is_empty());
         assert_eq!(out.confidence, 0);
+    }
+
+    #[tokio::test]
+    async fn leg_cache_does_not_cross_scopes() {
+        let search = MockSearchBackend::new().with_search_result(Ok(vec![]));
+        let memory = MockMemoryBackend::new();
+        let cache = ResultCache::new(16);
+        let fp = RepoFingerprint {
+            head_sha: "sha".to_string(),
+            dirty_hash: "clean".to_string(),
+        };
+
+        let unscoped = ExplorationQuery {
+            text: "decide_freshness".to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let _ = retrieve(
+            &memory,
+            &search,
+            Path::new("/repo"),
+            &unscoped,
+            12,
+            Some((&cache, &fp)),
+        )
+        .await;
+
+        let scoped = ExplorationQuery {
+            text: "decide_freshness".to_string(),
+            scope_hint: Some(PathBuf::from("crates/api")),
+            max_results: None,
+        };
+        let _ = retrieve(
+            &memory,
+            &search,
+            Path::new("/repo"),
+            &scoped,
+            12,
+            Some((&cache, &fp)),
+        )
+        .await;
+
+        // A second query differing only by scope_hint must not be served from
+        // the first query's cached (wrongly-scoped) leg entry — the grep leg
+        // must re-run search for its own scope.
+        let scopes: Vec<Option<PathBuf>> = search
+            .calls()
+            .into_iter()
+            .map(|SearchCall::Search { scope, .. }| scope)
+            .collect();
+        assert!(
+            scopes.contains(&None),
+            "unscoped search never ran: {scopes:?}"
+        );
+        assert!(
+            scopes.contains(&Some(PathBuf::from("crates/api"))),
+            "scoped search never ran: {scopes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_leg_cache_key_does_not_collide_across_pattern_scope_boundary() {
+        // Regression: a bare `#`-joined leg key let pattern `x#y` (unscoped)
+        // and pattern `x` (scope `y#`) hash to the identical key
+        // `"grep#x#y#"`. Query B must not be served query A's cached rows.
+        let cache = ResultCache::new(16);
+        let fp = RepoFingerprint {
+            head_sha: "sha".to_string(),
+            dirty_hash: "clean".to_string(),
+        };
+        let memory = MockMemoryBackend::new();
+
+        let search_a = MockSearchBackend::new().with_search_result(Ok(vec![finding(
+            "from_query_a.rs",
+            1,
+            None,
+        )]));
+        let query_a = ExplorationQuery {
+            text: r#"grep for "x#y""#.to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let _ = retrieve(
+            &memory,
+            &search_a,
+            Path::new("/repo"),
+            &query_a,
+            12,
+            Some((&cache, &fp)),
+        )
+        .await;
+
+        let search_b = MockSearchBackend::new().with_search_result(Ok(vec![finding(
+            "from_query_b.rs",
+            1,
+            None,
+        )]));
+        let query_b = ExplorationQuery {
+            text: r#"grep for "x""#.to_string(),
+            scope_hint: Some(PathBuf::from("y#")),
+            max_results: None,
+        };
+        let out_b = retrieve(
+            &memory,
+            &search_b,
+            Path::new("/repo"),
+            &query_b,
+            12,
+            Some((&cache, &fp)),
+        )
+        .await;
+
+        assert!(
+            !search_b.calls().is_empty(),
+            "query B's grep leg was served from query A's cache instead of running its own search"
+        );
+        assert!(
+            out_b
+                .candidates
+                .iter()
+                .all(|c| c.location.path.as_path() != Path::new("from_query_a.rs")),
+            "query B's candidates were contaminated by query A's cached grep results: {:?}",
+            out_b.candidates
+        );
     }
 
     #[tokio::test]

@@ -24,13 +24,6 @@ impl MemoryClient {
     /// a `endpoint` config yields `MemoryError::UnsupportedTransport`.
     /// Config validation guarantees exactly one of `command`/`endpoint` is set.
     pub(crate) async fn connect(config: &CodebaseMemoryConfig) -> Result<Self, MemoryError> {
-        if config.command.is_some() && config.endpoint.is_some() {
-            return Err(MemoryError::Transport(
-                "codebase_memory config sets both `command` and `endpoint`; \
-                 exactly one is required (Config::validate should have rejected this)"
-                    .to_string(),
-            ));
-        }
         match &config.command {
             Some(cmd) => {
                 let mut command = tokio::process::Command::new(cmd);
@@ -92,10 +85,7 @@ fn text_of(result: &CallToolResult) -> String {
 /// (typed JSON); otherwise parse the concatenated text blocks as JSON; a
 /// non-JSON text response is returned as `Value::String` so per-tool mappers
 /// can parse plain-text table formats (`search_code` answers in one).
-pub(crate) fn decode_result(
-    _tool: &'static str,
-    result: CallToolResult,
-) -> Result<Value, MemoryError> {
+pub(crate) fn decode_result(result: CallToolResult) -> Result<Value, MemoryError> {
     if let Some(sc) = result.structured_content {
         return Ok(sc);
     }

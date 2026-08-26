@@ -1,7 +1,7 @@
 //! The exploration orchestrator. Everything deterministic runs in Rust; the
 //! LLM only selects/verifies:
 //!
-//! 1. query-cache lookup (repo fingerprint, path-level invalidation) — a hit
+//! 1. query-cache lookup (repo fingerprint, diff-based invalidation) — a hit
 //!    costs nothing;
 //! 2. deterministic retrieval pre-stage (symbol lookup + grep fanout +
 //!    ranking) — high confidence answers directly with **zero** LLM calls;
@@ -31,10 +31,10 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::cache::{QueryEntry, ResultCache};
-use crate::dispatch::dispatch_call;
+use crate::dispatch::dispatch_inner;
 use crate::pipeline;
 use crate::render::{RenderCaps, tidy_findings};
-use crate::tools::{finish_only_catalog, parse_finish, tool_catalog};
+use crate::tools::{finish_only_catalog, parse_finish, resolve_finish, tool_catalog};
 use crate::verify::{VerifyOutcome, verify};
 
 /// The only hard-failure mode: the provider router could not produce a response
@@ -164,10 +164,7 @@ where
         };
 
         // Stage 2: deterministic retrieval — no LLM.
-        let leg_cache = match (&self.cache, &fingerprint) {
-            (Some(cache), Some(fp)) => Some((cache, fp)),
-            _ => None,
-        };
+        let leg_cache = self.cache_for(fingerprint.as_ref());
         let outcome = pipeline::retrieve(
             &self.memory,
             &self.search,
@@ -189,11 +186,8 @@ where
         if outcome.confidence >= self.settings.early_exit_confidence
             && !outcome.candidates.is_empty()
         {
-            let result =
-                self.result_from_candidates(&outcome.candidates, query, outcome.confidence);
-            tracing::info!(path = "early-exit", tokens = 0u64, "exploration complete");
-            self.store_query_cache(&query_key, fingerprint, &outcome.candidates, &result);
-            return Ok(result);
+            let result = self.result_from_candidates(outcome.candidates, query, outcome.confidence);
+            return Ok(self.complete_run("early-exit", 0, &query_key, fingerprint, result));
         }
 
         // Stage 4: LLM verification over the candidates.
@@ -212,14 +206,13 @@ where
             )
             .await
             {
-                let result = self.finalize(result);
-                tracing::info!(
-                    path = "verify",
-                    tokens = budget.spent(),
-                    "exploration complete"
-                );
-                self.store_query_cache(&query_key, fingerprint, &outcome.candidates, &result);
-                return Ok(result);
+                return Ok(self.finalize_and_complete(
+                    "verify",
+                    result,
+                    &budget,
+                    &query_key,
+                    fingerprint,
+                ));
             }
             tracing::info!("verification escalated to the fallback loop");
         }
@@ -235,14 +228,7 @@ where
                 &mut budget,
             )
             .await?;
-        let result = self.finalize(result);
-        tracing::info!(
-            path = "fallback",
-            tokens = budget.spent(),
-            "exploration complete"
-        );
-        self.store_query_cache(&query_key, fingerprint, &outcome.candidates, &result);
-        Ok(result)
+        Ok(self.finalize_and_complete("fallback", result, &budget, &query_key, fingerprint))
     }
 
     /// Normalize/dedupe/cap the final findings once, whatever stage produced
@@ -252,19 +238,61 @@ where
         result
     }
 
+    /// The shared tail of every `run()` branch: log completion, persist to
+    /// the query cache, and hand back the result for the caller to wrap in
+    /// `Ok`.
+    fn complete_run(
+        &self,
+        path: &'static str,
+        tokens: u64,
+        query_key: &str,
+        fingerprint: Option<RepoFingerprint>,
+        result: ExplorationResult,
+    ) -> ExplorationResult {
+        tracing::info!(path, tokens, "exploration complete");
+        self.store_query_cache(query_key, fingerprint, &result);
+        result
+    }
+
+    /// The shared tail of the verify/fallback branches: finalize the result,
+    /// then run it through `complete_run` with the tokens spent so far.
+    fn finalize_and_complete(
+        &self,
+        stage: &'static str,
+        result: ExplorationResult,
+        budget: &TokenBudget,
+        query_key: &str,
+        fingerprint: Option<RepoFingerprint>,
+    ) -> ExplorationResult {
+        let result = self.finalize(result);
+        self.complete_run(stage, budget.spent(), query_key, fingerprint, result)
+    }
+
+    /// The cache is usable this call only when caching is enabled and a
+    /// fingerprint was obtainable this run — shared by every read path.
+    /// (`store_query_cache` needs an owned fingerprint to move into the
+    /// entry, so it keeps its own guard.)
+    fn cache_for<'a>(&'a self, fingerprint: Option<&'a RepoFingerprint>) -> pipeline::LegCache<'a> {
+        match (&self.cache, fingerprint) {
+            (Some(cache), Some(fp)) => Some((cache, fp)),
+            _ => None,
+        }
+    }
+
     /// Serve from the query cache when the entry is still valid: same
-    /// fingerprint, or a fingerprint change that provably touched none of the
-    /// entry's contributing paths.
+    /// fingerprint, or a fingerprint change that provably changed nothing at
+    /// all. Checking the diff against only the *entry's own* contributing
+    /// paths is unsound — retrieval scans the whole repo, so a path outside
+    /// those paths (not least a newly added file) can still turn into a
+    /// better match that the stale entry never saw — so any actual diff
+    /// invalidates the entry.
     async fn query_cache_lookup(
         &self,
         repo_root: &Path,
         query_key: &str,
         fingerprint: &Option<RepoFingerprint>,
     ) -> Option<ExplorationResult> {
-        let (cache, fp) = match (&self.cache, fingerprint) {
-            (Some(cache), Some(fp)) => (cache, fp),
-            _ => return None,
-        };
+        let (cache, fp) = self.cache_for(fingerprint.as_ref())?;
         let entry = cache.get_query(query_key)?;
         if entry.fingerprint == *fp {
             return Some(entry.result);
@@ -274,12 +302,12 @@ where
             .changed_paths(repo_root, &entry.fingerprint, fp)
             .await
         {
-            Some(changed) if changed.iter().all(|p| !entry.paths.contains(p)) => {
-                cache.refresh_query_fingerprint(query_key, fp.clone());
+            Some(changed) if changed.is_empty() => {
+                cache.refresh_query_fingerprint(query_key, &entry.fingerprint, fp.clone());
                 Some(entry.result)
             }
             _ => {
-                cache.remove_query(query_key);
+                cache.remove_query(query_key, &entry.fingerprint);
                 None
             }
         }
@@ -289,23 +317,15 @@ where
         &self,
         query_key: &str,
         fingerprint: Option<RepoFingerprint>,
-        candidates: &[Candidate],
         result: &ExplorationResult,
     ) {
         let (Some(cache), Some(fingerprint)) = (&self.cache, fingerprint) else {
             return;
         };
-        let mut paths: HashSet<_> = result
-            .findings
-            .iter()
-            .map(|f| f.location.path.clone())
-            .collect();
-        paths.extend(candidates.iter().map(|c| c.location.path.clone()));
         cache.put_query(
             query_key.to_string(),
             QueryEntry {
                 fingerprint,
-                paths,
                 result: result.clone(),
             },
         );
@@ -314,20 +334,18 @@ where
     /// Build the early-exit result straight from the ranked candidates.
     fn result_from_candidates(
         &self,
-        candidates: &[Candidate],
+        candidates: Vec<Candidate>,
         query: &ExplorationQuery,
         confidence: u32,
     ) -> ExplorationResult {
         let take = query
             .max_results
             .map(|m| m as usize)
-            .unwrap_or(candidates.len())
-            .min(candidates.len());
+            .unwrap_or(candidates.len());
         let findings = tidy_findings(
             candidates
-                .iter()
+                .into_iter()
                 .take(take)
-                .cloned()
                 .map(finding_from_candidate)
                 .collect(),
             &self.caps,
@@ -377,26 +395,22 @@ where
                     budget.add(completion.usage);
                     match completion.response {
                         ProviderResponse::ToolCalls(calls) if calls.is_empty() => {
-                            messages.push(Message::assistant_tool_calls(Vec::new()));
-                            messages.push(Message::user(
+                            push_nudge(
+                                &mut messages,
+                                Message::assistant_tool_calls(Vec::new()),
                                 "You must respond with a tool call; call finish when done.",
-                            ));
+                            );
                         }
                         ProviderResponse::ToolCalls(calls) => {
-                            messages.push(Message::assistant_tool_calls(calls.clone()));
-                            if let Some(finish) = calls.iter().find(|c| c.name == "finish") {
-                                match parse_finish(&finish.arguments_json) {
-                                    Ok(result) => return Ok(result),
-                                    Err(reason) => {
-                                        messages.push(Message::tool(
-                                            &finish.id,
-                                            format!(
-                                                "finish rejected: {reason}; fix the arguments and call finish again"
-                                            ),
-                                        ));
-                                    }
-                                }
-                            }
+                            // Deferred: `calls` is only read via `.iter()` below (never
+                            // mutated), so it's moved into the assistant message once
+                            // those borrows are done instead of cloned up front. On the
+                            // common immediate-finish path we return before any of that
+                            // is needed, skipping the allocation entirely.
+                            let mut turn_messages: Vec<Message> = match resolve_finish(&calls) {
+                                Ok(result) => return Ok(result),
+                                Err(rejections) => rejections,
+                            };
                             let non_finish: Vec<&ToolCall> =
                                 calls.iter().filter(|c| c.name != "finish").collect();
                             if calls.len() == 1
@@ -404,10 +418,12 @@ where
                                 && single_call_rejections < MAX_SINGLE_CALL_REJECTIONS
                             {
                                 single_call_rejections += 1;
-                                messages.push(Message::tool(
+                                turn_messages.push(Message::tool(
                                     &non_finish[0].id,
                                     "call rejected: batch ALL independent tool calls of a turn into one response (they execute concurrently); resend this call together with the other lookups you need",
                                 ));
+                                messages.push(Message::assistant_tool_calls(calls));
+                                messages.extend(turn_messages);
                                 continue;
                             }
                             if !non_finish.is_empty() {
@@ -418,6 +434,8 @@ where
                                     self.cached_dispatch(repo_root, call, fingerprint)
                                 }))
                                 .await;
+                            messages.push(Message::assistant_tool_calls(calls));
+                            messages.extend(turn_messages);
                             for (message, new_findings) in results {
                                 messages.push(message);
                                 for f in new_findings {
@@ -426,10 +444,11 @@ where
                             }
                         }
                         ProviderResponse::Text(text) => {
-                            messages.push(Message::assistant_text(text));
-                            messages.push(Message::user(
+                            push_nudge(
+                                &mut messages,
+                                Message::assistant_text(text),
                                 "You must respond with a tool call; call finish when done.",
-                            ));
+                            );
                         }
                     }
                 }
@@ -505,32 +524,36 @@ where
         }
     }
 
-    /// `dispatch_call` behind the tool-result memo (active only with a cache
-    /// and a fingerprint).
+    /// `dispatch_inner` behind the tool-result memo (active only with a cache
+    /// and a fingerprint); only a successful dispatch is cached.
     async fn cached_dispatch(
         &self,
         repo_root: &Path,
         call: &ToolCall,
         fingerprint: Option<&RepoFingerprint>,
     ) -> (Message, Vec<ExplorationFinding>) {
-        let key = match (&self.cache, fingerprint) {
-            (Some(cache), Some(fp)) => Some((
+        let key = self.cache_for(fingerprint).map(|(cache, fp)| {
+            (
                 cache,
                 ResultCache::tool_key(fp, &call.name, &call.arguments_json),
-            )),
-            _ => None,
-        };
+            )
+        });
         if let Some((cache, key)) = &key
             && let Some((content, findings)) = cache.get_tool(key)
         {
             return (Message::tool(&call.id, content), findings);
         }
-        let (message, findings) =
-            dispatch_call(&self.memory, &self.search, repo_root, call, &self.caps).await;
-        if let Some((cache, key)) = key {
-            cache.put_tool(key, (message.content.clone(), findings.clone()));
+        // Only a successful call is memoized — a failure (subprocess/RPC
+        // error) is typically transient and must be retried, not replayed.
+        match dispatch_inner(&self.memory, &self.search, repo_root, call, &self.caps).await {
+            Ok((content, findings)) => {
+                if let Some((cache, key)) = key {
+                    cache.put_tool(key, (content.clone(), findings.clone()));
+                }
+                (Message::tool(&call.id, content), findings)
+            }
+            Err(msg) => (Message::tool(&call.id, msg), Vec::new()),
         }
-        (message, findings)
     }
 }
 
@@ -560,11 +583,17 @@ When you have gathered enough information, you MUST conclude by calling the fini
 /// fallback prompt.
 const SEED_CANDIDATES: usize = 8;
 
-fn user_prompt(
-    query: &ExplorationQuery,
-    index_note: Option<&str>,
-    candidates: &[Candidate],
-) -> String {
+/// Push an assistant turn followed by the user-facing nudge asking it to
+/// retry with a tool call — the shape shared by the fallback loop's and the
+/// verification stage's empty-tool-calls and stray-text arms.
+pub(crate) fn push_nudge(messages: &mut Vec<Message>, assistant: Message, nudge: &str) {
+    messages.push(assistant);
+    messages.push(Message::user(nudge));
+}
+
+/// The 4-part preamble shared by the fallback loop's and the verification
+/// stage's user prompts: query text, scope hint, max_results, index note.
+pub(crate) fn query_preamble(query: &ExplorationQuery, index_note: Option<&str>) -> String {
     let mut s = format!("Exploration query: {}", query.text);
     if let Some(scope) = &query.scope_hint {
         s.push_str(&format!("\nScope hint: {}", scope.display()));
@@ -576,6 +605,15 @@ fn user_prompt(
         s.push('\n');
         s.push_str(note);
     }
+    s
+}
+
+fn user_prompt(
+    query: &ExplorationQuery,
+    index_note: Option<&str>,
+    candidates: &[Candidate],
+) -> String {
+    let mut s = query_preamble(query, index_note);
     if !candidates.is_empty() {
         s.push_str(
             "\nStarting points found by the deterministic retrieval pre-stage (ranked, may be incomplete):",
@@ -601,10 +639,12 @@ fn user_prompt(
 mod tests {
     use super::*;
     use repo_explorer_core::config::AgentSettings;
+    use repo_explorer_core::fingerprint::RepoFingerprint;
     use repo_explorer_core::fingerprint::mock::MockRepoStateProbe;
     use repo_explorer_core::llm::mock::{FakeClock, MockLlmProvider};
     use repo_explorer_core::llm::{Completion, ToolCall};
     use repo_explorer_core::memory::mock::MockMemoryBackend;
+    use repo_explorer_core::search::SearchError;
     use repo_explorer_core::search::mock::MockSearchBackend;
     use std::path::PathBuf;
 
@@ -615,6 +655,7 @@ mod tests {
             arguments_json:
                 r#"{"findings":[{"location":{"path":"src/lib.rs","line_start":1,"line_end":2},"note":"here"}],"summary":"done"}"#
                     .to_string(),
+            thought_signatures: None,
         }
     }
 
@@ -683,6 +724,55 @@ mod tests {
         };
         let got = agent.run(&PathBuf::from("/repo"), &query).await;
         assert!(matches!(got, Err(AgentLoopError::Provider(_))));
+    }
+
+    #[tokio::test]
+    async fn failed_tool_call_is_not_cached() {
+        // Regression: a transient backend error must not be memoized under the
+        // tool-result key, or a later byte-identical call would replay the
+        // stale failure forever instead of retrying.
+        let search = MockSearchBackend::new().with_search_result(Err(SearchError::BackendFailed {
+            backend: "rg",
+            message: "boom".to_string(),
+        }));
+        let router = ProviderRouter::with_clock(
+            vec![(
+                "primary".to_string(),
+                vec![("m".to_string(), MockLlmProvider::new())],
+            )],
+            60,
+            FakeClock::new(),
+        );
+        let agent = AgentLoop::new(
+            MockMemoryBackend::new(),
+            search,
+            router,
+            MockRepoStateProbe::new(),
+            AgentSettings::default(),
+            CacheSettings::default(),
+        );
+        let fp = RepoFingerprint {
+            head_sha: "abc".to_string(),
+            dirty_hash: "def".to_string(),
+        };
+        let call = ToolCall {
+            id: "c1".to_string(),
+            name: "grep".to_string(),
+            arguments_json: r#"{"pattern":"fn main"}"#.to_string(),
+            thought_signatures: None,
+        };
+
+        let (message, findings) = agent
+            .cached_dispatch(&PathBuf::from("/repo"), &call, Some(&fp))
+            .await;
+        assert!(message.content.contains("failed"));
+        assert!(findings.is_empty());
+
+        let key = ResultCache::tool_key(&fp, &call.name, &call.arguments_json);
+        let cached = agent
+            .cache_for(Some(&fp))
+            .and_then(|(cache, _)| cache.get_tool(&key));
+        assert!(cached.is_none(), "a failed tool call must not be memoized");
     }
 
     #[test]
