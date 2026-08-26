@@ -57,18 +57,29 @@ pub(crate) async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
     match call.name.as_str() {
         "search_code" => {
             let args: SearchCodeArgs = parse_args(&call.arguments_json)?;
+            let scope_hint = args
+                .scope_hint
+                .as_deref()
+                .map(|s| reject_escaping_path("scope_hint", s))
+                .transpose()?;
             let query = ExplorationQuery {
                 text: args.query,
-                scope_hint: args.scope_hint.map(PathBuf::from),
+                scope_hint,
                 max_results: args.max_results,
             };
             call_and_render("search_code", memory.search_code(repo_root, &query), caps).await
         }
         "search_graph" => {
             let args: SearchGraphArgs = parse_args(&call.arguments_json)?;
+            let file_pattern = args
+                .file_pattern
+                .as_deref()
+                .map(|s| reject_escaping_path("file_pattern", s))
+                .transpose()?
+                .map(|p| p.to_string_lossy().into_owned());
             let query = GraphQuery {
                 name_pattern: args.name_pattern,
-                file_pattern: args.file_pattern,
+                file_pattern,
                 label: args.label,
                 max_results: args.max_results,
             };
@@ -167,8 +178,9 @@ fn snippet_target(args: GetCodeSnippetArgs) -> Result<SnippetTarget, String> {
     if let Some(name) = args.qualified_name {
         Ok(SnippetTarget::QualifiedName(name))
     } else if let Some(file) = args.file {
+        let file = reject_escaping_path("get_code_snippet file", &file)?;
         Ok(SnippetTarget::FileRange {
-            file: PathBuf::from(file),
+            file,
             start_line: args.start_line,
             end_line: args.end_line,
         })
@@ -552,5 +564,61 @@ mod tests {
         )
         .await;
         assert!(message.content.contains("escapes the repository root"));
+    }
+
+    #[tokio::test]
+    async fn search_code_rejects_escaping_scope_hint() {
+        let memory = MockMemoryBackend::new();
+        let c = call(
+            "c11",
+            "search_code",
+            r#"{"query":"x","scope_hint":"../../../../etc"}"#,
+        );
+        let (message, _) = dispatch_call(
+            &memory,
+            &MockSearchBackend::new(),
+            &PathBuf::from("/repo"),
+            &c,
+            &RenderCaps::default(),
+        )
+        .await;
+        assert!(message.content.contains("escapes the repository root"));
+        assert!(memory.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_graph_rejects_escaping_file_pattern() {
+        let memory = MockMemoryBackend::new();
+        let c = call("c12", "search_graph", r#"{"file_pattern":"/etc"}"#);
+        let (message, _) = dispatch_call(
+            &memory,
+            &MockSearchBackend::new(),
+            &PathBuf::from("/repo"),
+            &c,
+            &RenderCaps::default(),
+        )
+        .await;
+        assert!(message.content.contains("escapes the repository root"));
+        assert!(memory.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_code_snippet_rejects_escaping_file() {
+        let memory = MockMemoryBackend::new();
+        let c = call(
+            "c13",
+            "get_code_snippet",
+            r#"{"file":"../../../../etc/passwd"}"#,
+        );
+        let (message, _) = dispatch_call(
+            &memory,
+            &MockSearchBackend::new(),
+            &PathBuf::from("/repo"),
+            &c,
+            &RenderCaps::default(),
+        )
+        .await;
+        assert!(message.content.contains("escapes the repository root"));
+        assert!(memory.calls().is_empty());
     }
 }

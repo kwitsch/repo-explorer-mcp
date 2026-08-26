@@ -145,23 +145,12 @@ fn build_http_client() -> Result<reqwest::Client> {
 }
 
 async fn update_self(client: &reqwest::Client) -> ComponentReport {
-    let name = SELF_REPO.to_string();
-    let current = match semver::Version::parse(env!("CARGO_PKG_VERSION")) {
-        Ok(v) => v,
-        Err(e) => {
-            return ComponentReport {
-                name,
-                current_version: None,
-                latest_version: None,
-                action: "error",
-                detail: Some(format!("own package version is not valid semver: {e}")),
-            };
-        }
-    };
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("CARGO_PKG_VERSION is validated as SemVer by cargo at build time");
 
     check_and_install(
         client,
-        name,
+        SELF_REPO.to_string(),
         SELF_OWNER,
         SELF_REPO,
         SELF_REPO,
