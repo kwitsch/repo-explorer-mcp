@@ -32,7 +32,7 @@ const STOPWORDS: &[&str] = &[
     "the", "and", "for", "that", "this", "with", "where", "what", "when", "which", "does", "how",
     "are", "was", "were", "will", "would", "should", "could", "into", "from", "used", "uses",
     "using", "have", "has", "been", "there", "find", "show", "code", "file", "files", "function",
-    "method", "class", "der", "die", "das", "und", "wird", "wie", "was", "welche", "wo",
+    "method", "class", "der", "die", "das", "und", "wird", "wie", "welche", "wo",
 ];
 
 fn is_word_char(c: char) -> bool {

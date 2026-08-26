@@ -14,7 +14,7 @@ use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::cache::{ResultCache, encode_field, opt_to_string, scope_display};
+use crate::cache::{ResultCache, encode_field_into, opt_to_string, scope_display};
 use crate::dispatch::{MATCH_ANY_NON_EMPTY_LINE, escapes_repo_root};
 
 /// How many identifier tokens get their own symbol-lookup leg.
@@ -83,11 +83,9 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
     let semantic_leg = memoized(
         leg_cache,
         move || {
-            format!(
-                "{}{}",
-                leg_key("semantic", &query.text, scope),
-                encode_field(&opt_to_string(query.max_results))
-            )
+            let mut key = leg_key("semantic", &query.text, scope);
+            encode_field_into(&mut key, &opt_to_string(query.max_results));
+            key
         },
         async move {
             // Reuses `query.text`/`max_results` but swaps in the already-
@@ -223,11 +221,12 @@ async fn soft_leg<T, E: std::fmt::Display>(
 /// Shared by every fanout leg so a future change to the (value, scope)
 /// encoding can't be applied to some legs and missed on others.
 fn leg_key(prefix: &str, value: &str, scope: Option<&Path>) -> String {
-    format!(
-        "{prefix}{}{}",
-        encode_field(value),
-        encode_field(&scope_display(scope))
-    )
+    let scope = scope_display(scope);
+    let mut key = String::with_capacity(prefix.len() + value.len() + scope.len() + 16);
+    key.push_str(prefix);
+    encode_field_into(&mut key, value);
+    encode_field_into(&mut key, &scope);
+    key
 }
 
 /// Build candidates from findings, with `kind_of` classifying each finding

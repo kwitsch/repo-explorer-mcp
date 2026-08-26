@@ -63,19 +63,11 @@ impl<V: Clone> CappedMap<V> {
     }
 }
 
-/// Length-prefix a field (`len:content`) so concatenating several fields into
-/// a cache key can never collide across differing field boundaries,
-/// regardless of what characters the fields themselves contain. Shared by
-/// `query_key` below and the retrieval-leg keys in `pipeline.rs`.
-pub(crate) fn encode_field(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
-    encode_field_into(&mut out, s);
-    out
-}
-
-/// Same encoding as `encode_field`, writing into an existing buffer instead
-/// of allocating a new one — lets a multi-field key build in a single
-/// `String`.
+/// Length-prefix a field (`len:content`) into an existing buffer so
+/// concatenating several fields into a cache key can never collide across
+/// differing field boundaries, regardless of what characters the fields
+/// themselves contain. Shared by `tool_key`/`query_key` below and the
+/// retrieval-leg keys in `pipeline.rs`.
 pub(crate) fn encode_field_into(out: &mut String, s: &str) {
     let _ = write!(out, "{}:", s.len());
     out.push_str(s);

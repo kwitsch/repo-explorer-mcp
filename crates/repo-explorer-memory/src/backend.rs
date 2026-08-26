@@ -19,9 +19,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A `MemoryBackend` backed by a live `rmcp` client. Holds the staleness
 /// threshold from config so `ensure_fresh_index` needs no extra arguments.
+/// `client` is `None` only after `close()` (explicit or via `Drop`) has taken
+/// it; every other method requires it present.
 #[derive(Debug)]
 pub struct MemoryClientBackend {
-    client: MemoryClient,
+    client: Option<MemoryClient>,
     staleness: Duration,
 }
 
@@ -30,14 +32,27 @@ impl MemoryClientBackend {
     pub async fn connect(config: &CodebaseMemoryConfig) -> Result<Self, MemoryError> {
         let client = MemoryClient::connect(config).await?;
         Ok(Self {
-            client,
+            client: Some(client),
             staleness: Duration::from_secs(config.staleness_seconds),
         })
     }
 
-    /// Best-effort graceful shutdown.
+    /// Best-effort graceful shutdown. Idempotent: a second call (or a
+    /// subsequent `Drop`) finds `client` already taken and does nothing.
     pub async fn close(&mut self) {
-        self.client.close().await;
+        if let Some(mut client) = self.client.take() {
+            client.close().await;
+        }
+    }
+
+    /// The connected client, for every call site that isn't `close()`
+    /// itself. Panics if called after `close()` has run — every other method
+    /// on this type is used-before-close by construction; a call afterward
+    /// is a caller bug, not a recoverable runtime condition.
+    fn client(&self) -> &MemoryClient {
+        self.client
+            .as_ref()
+            .expect("MemoryClientBackend used after close()")
     }
 
     /// Shared `client.call -> decode_result` sequence used by every tool call
@@ -49,8 +64,19 @@ impl MemoryClientBackend {
         tool: &'static str,
         args: Map<String, Value>,
     ) -> Result<Value, MemoryError> {
-        let result = self.client.call(tool, args).await?;
+        let result = self.client().call(tool, args).await?;
         decode_result(result)
+    }
+
+    /// Shared `call_and_decode` invocation for a project-scoped probe (the
+    /// tail `probe_status`/`probe_changes` share): both differ only in which
+    /// tool name they call against `{"project": ...}` — one place that
+    /// builds and sends that call, so a future change to how a probe call is
+    /// assembled (an added shared argument, a different project encoding)
+    /// only needs to be made here, not hand-kept in sync at each call site.
+    async fn probe(&self, tool: &'static str, project: &str) -> Result<Value, MemoryError> {
+        self.call_and_decode(tool, base_args(project.to_string()))
+            .await
     }
 
     /// Probe `index_status` for the project, returning `(exists,
@@ -59,10 +85,7 @@ impl MemoryClientBackend {
     /// this call's to know, so the full `IndexProbe` is assembled by
     /// `ensure_fresh_index` instead of being returned half-filled here.
     async fn probe_status(&self, project: &str) -> Result<(bool, Option<SystemTime>), MemoryError> {
-        match self
-            .call_and_decode("index_status", base_args(project.to_string()))
-            .await
-        {
+        match self.probe("index_status", project).await {
             Ok(json) => {
                 // An unrecognized/empty response must NOT be optimistically
                 // treated as "already indexed" — default to `false` so an
@@ -90,10 +113,7 @@ impl MemoryClientBackend {
 
     /// Fill `changed_files` from `detect_changes` for an existing project.
     async fn probe_changes(&self, project: &str) -> Result<ChangeCount, MemoryError> {
-        match self
-            .call_and_decode("detect_changes", base_args(project.to_string()))
-            .await
-        {
+        match self.probe("detect_changes", project).await {
             Ok(json) => {
                 // Only a shape we actually understand yields a `Known` count.
                 // An absent field, an unexpected type, or a number that is not
@@ -137,7 +157,7 @@ impl MemoryClientBackend {
     async fn run_index(&self, abs_repo_root: &Path) -> Result<IndexStatus, MemoryError> {
         let mut args = Map::new();
         insert_path(&mut args, "path", abs_repo_root);
-        match self.client.call("index_repository", args).await {
+        match self.client().call("index_repository", args).await {
             Ok(_) => Ok(IndexStatus::Reindexed),
             Err(MemoryError::ToolFailed { message, .. }) => {
                 Ok(IndexStatus::IndexingFailed { reason: message })
@@ -177,6 +197,30 @@ impl MemoryClientBackend {
     ) -> Result<ExplorationResult, MemoryError> {
         self.call_memory_tool_with(tool, repo_root, build_args, findings_and_summary)
             .await
+    }
+}
+
+impl Drop for MemoryClientBackend {
+    /// The only path through which `close()`'s handshake actually runs in
+    /// the shipped binary: `main.rs` moves this by value into `AgentLoop`
+    /// (generic over `M: MemoryBackend`, a trait with no shutdown hook), so
+    /// nothing outside this module can ever get a `&mut MemoryClientBackend`
+    /// back to call `close()` on directly — but `Drop` still runs wherever
+    /// the value ends up, `Arc<AgentLoop<...>>` included. Spawns the close
+    /// handshake onto the ambient runtime rather than blocking here (`Drop`
+    /// cannot `.await`), which keeps this best-effort exactly as `close()`
+    /// already documents; with no ambient runtime (no `Handle::try_current`)
+    /// this is a silent no-op, same as never calling `close()` at all.
+    fn drop(&mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut client = client;
+                client.close().await;
+            });
+        }
     }
 }
 
