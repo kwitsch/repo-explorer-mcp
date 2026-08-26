@@ -205,9 +205,36 @@ fn validate_scope(scope: Option<&str>) -> Result<Option<PathBuf>, String> {
     scope.map(|s| reject_escaping_path("scope", s)).transpose()
 }
 
-/// Also used directly by the verification stage's `expand` handler.
+/// Resolve `repo_root` to its canonical form. Callers that read several files
+/// against the same root in a loop — e.g. verify's `expand_content`, which
+/// batches a whole `expand` call's candidate ids — should call this once and
+/// reuse the result via [`read_file_canonical`] instead of re-canonicalizing
+/// `repo_root` per file.
+pub(crate) fn canonical_repo_root(repo_root: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(repo_root).map_err(|e| format!("failed to resolve repo root: {e}"))
+}
+
+/// Single-file convenience over [`canonical_repo_root`] + [`read_file_canonical`];
+/// used by the `read_file` tool dispatch, which only ever reads one file per call.
+/// Runs the lexical escape check before resolving `repo_root` so a malformed
+/// `path` is rejected fast, without depending on `repo_root` existing on disk.
 pub(crate) fn read_file(
     repo_root: &Path,
+    path: &str,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+) -> Result<String, String> {
+    reject_escaping_path("read_file path", path)?;
+    let canonical_root = canonical_repo_root(repo_root)?;
+    read_file_canonical(repo_root, &canonical_root, path, start_line, end_line)
+}
+
+/// [`read_file`] taking an already-canonicalized `repo_root`. Also used
+/// directly by the verification stage's `expand` handler, which resolves
+/// `repo_root` once per batch via [`canonical_repo_root`].
+pub(crate) fn read_file_canonical(
+    repo_root: &Path,
+    canonical_root: &Path,
     path: &str,
     start_line: Option<u32>,
     end_line: Option<u32>,
@@ -216,9 +243,7 @@ pub(crate) fn read_file(
     let full = repo_root.join(rel);
     let canonical_full =
         std::fs::canonicalize(&full).map_err(|e| format!("read_file failed for `{path}`: {e}"))?;
-    let canonical_root = std::fs::canonicalize(repo_root)
-        .map_err(|e| format!("read_file failed for `{path}`: {e}"))?;
-    if !canonical_full.starts_with(&canonical_root) {
+    if !canonical_full.starts_with(canonical_root) {
         return Err(format!(
             "read_file path `{path}` escapes the repository root"
         ));

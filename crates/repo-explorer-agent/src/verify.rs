@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::agent::{TokenBudget, push_nudge};
-use crate::dispatch::{parse_args, read_file};
+use crate::dispatch::{canonical_repo_root, parse_args, read_file_canonical};
 use crate::render::{RenderCaps, cap_file_lines, cap_snippet};
 use crate::skeleton::skeleton_for;
 use crate::tools::{ExpandArgs, resolve_finish, verify_catalog};
@@ -204,6 +204,10 @@ fn expand_content(
     if args.candidate_ids.is_empty() {
         return "invalid arguments: candidate_ids must be non-empty".to_string();
     }
+    // Resolved lazily on the first id that actually needs a file read, then
+    // reused for the rest of the batch instead of re-canonicalizing
+    // `repo_root` per id.
+    let mut canonical_root: Option<Result<PathBuf, String>> = None;
     let mut sections = Vec::new();
     for id in args.candidate_ids {
         let Some(candidate) = (id as usize).checked_sub(1).and_then(|i| candidates.get(i)) else {
@@ -220,7 +224,12 @@ fn expand_content(
             .location
             .line_end
             .saturating_add(EXPAND_CONTEXT_AFTER);
-        match read_file(repo_root, &path, Some(start), Some(end)) {
+        let root = canonical_root
+            .get_or_insert_with(|| canonical_repo_root(repo_root))
+            .clone();
+        let result =
+            root.and_then(|r| read_file_canonical(repo_root, &r, &path, Some(start), Some(end)));
+        match result {
             Ok(body) => sections.push(format!(
                 "[{id}] {path}:{start}-{end}\n{}",
                 cap_file_lines(body, caps.read_file_max_lines)

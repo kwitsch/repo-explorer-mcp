@@ -96,9 +96,9 @@ fn find_sep_run(bytes: &[u8], sep: u8, start: usize, end: usize) -> Option<(usiz
 /// `src/log.rs-69-status:42:ok`) sits after a path that already carries its
 /// own extension (`.rs`), while an extension-less file's trailing segment
 /// (`fix` in `issue-42-fix`) sits after a path prefix (`issue`) with none.
-/// So a bare-letters trailing token (`trailing_token_is_bare_word`) only
-/// flips the verdict to `:` when the path before the dash run also has no
-/// `.` anywhere.
+/// So a bare-letters trailing token (`token_is_bare_word`) only flips the
+/// verdict to `:` when the path before the dash run also has no `.`
+/// anywhere.
 fn trailing_token(bytes: &[u8], start: usize, end: usize) -> &[u8] {
     let span = &bytes[start..end];
     let token_start = span
@@ -108,8 +108,7 @@ fn trailing_token(bytes: &[u8], start: usize, end: usize) -> &[u8] {
     &span[token_start..]
 }
 
-fn trailing_token_has_extension(bytes: &[u8], start: usize, end: usize) -> bool {
-    let token = trailing_token(bytes, start, end);
+fn token_has_extension(token: &[u8]) -> bool {
     match token.iter().rposition(|&b| b == b'.') {
         Some(dot) => {
             let ext = &token[dot + 1..];
@@ -117,6 +116,10 @@ fn trailing_token_has_extension(bytes: &[u8], start: usize, end: usize) -> bool 
         }
         None => false,
     }
+}
+
+fn trailing_token_has_extension(bytes: &[u8], start: usize, end: usize) -> bool {
+    token_has_extension(trailing_token(bytes, start, end))
 }
 
 /// True when the trailing token (see `trailing_token`) is a non-empty run of
@@ -128,8 +131,7 @@ fn trailing_token_has_extension(bytes: &[u8], start: usize, end: usize) -> bool 
 /// dash-delimited content -- so `split_grep_line` only acts on it once the
 /// path *before* the dash run also carries no extension of its own (see
 /// there for why).
-fn trailing_token_is_bare_word(bytes: &[u8], start: usize, end: usize) -> bool {
-    let token = trailing_token(bytes, start, end);
+fn token_is_bare_word(token: &[u8]) -> bool {
     !token.is_empty() && token.iter().all(u8::is_ascii_alphabetic)
 }
 
@@ -158,6 +160,14 @@ fn trailing_token_is_bare_word(bytes: &[u8], start: usize, end: usize) -> bool {
 /// leftmost run itself: if the token before *it* already looks like a real
 /// extension (e.g. `src/log.rs-69-...`, where `log.rs` precedes `-69-`), it
 /// is already the genuine separator and the walk never starts.
+///
+/// If the walk exhausts every later run without any preceding token ever
+/// looking extension-shaped -- a wholly extension-less file, e.g.
+/// `issue-42-fix-1-line one context` -- `candidate` has been advanced to
+/// each run in turn regardless, so it ends up the *last* (rightmost) run
+/// seen rather than snapping back to the leftmost, coincidental one: for an
+/// extension-less path the genuine separator is the one immediately before
+/// the real content, not the first digit-dash segment in the name.
 fn resolve_dash_sep_run(bytes: &[u8], first: (usize, usize)) -> (usize, usize) {
     if trailing_token_has_extension(bytes, 0, first.0) {
         return first;
@@ -165,8 +175,8 @@ fn resolve_dash_sep_run(bytes: &[u8], first: (usize, usize)) -> (usize, usize) {
     let mut candidate = first;
     let mut cursor = first.1 + 1;
     while let Some(next) = find_sep_run(bytes, b'-', cursor, bytes.len()) {
+        candidate = next;
         if trailing_token_has_extension(bytes, cursor, next.0) {
-            candidate = next;
             break;
         }
         cursor = next.1 + 1;
@@ -183,10 +193,13 @@ fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
     let dash = find_sep_run(bytes, b'-', 0, dash_end);
     let (sep, i, j) = match (colon, dash) {
         (Some(c), Some(d))
-            if d.0 < c.0
-                && !trailing_token_has_extension(bytes, d.1 + 1, c.0)
-                && !(trailing_token_is_bare_word(bytes, d.1 + 1, c.0)
-                    && !bytes[..d.0].contains(&b'.')) =>
+            if d.0 < c.0 && {
+                // Computed once and reused by both checks below instead of
+                // each re-deriving the same trailing_token(bytes, d.1+1, c.0).
+                let token = trailing_token(bytes, d.1 + 1, c.0);
+                !token_has_extension(token)
+                    && !(token_is_bare_word(token) && !bytes[..d.0].contains(&b'.'))
+            } =>
         {
             let d = resolve_dash_sep_run(bytes, d);
             (b'-', d.0, d.1)
@@ -492,6 +505,19 @@ mod tests {
         assert_eq!(
             result,
             Some(("component-2-renderer.tsx", 45, "body", false))
+        );
+    }
+
+    #[test]
+    fn split_grep_line_handles_extensionless_file_in_context_line() {
+        // No colon anywhere (a context row) and the file itself has no
+        // extension, so no run's preceding token is ever extension-shaped;
+        // the real `-1-` separator (rightmost) must still win over the
+        // coincidental `-42-` run (leftmost) embedded in the file name.
+        let result = split_grep_line("./issue-42-fix-1-line one context");
+        assert_eq!(
+            result,
+            Some(("./issue-42-fix", 1, "line one context", false))
         );
     }
 
