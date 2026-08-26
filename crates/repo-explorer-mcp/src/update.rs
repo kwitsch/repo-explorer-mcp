@@ -468,6 +468,9 @@ fn arch_keywords() -> Vec<&'static str> {
 fn pick_asset(assets: &[Asset]) -> Option<&Asset> {
     let os = current_os_keyword();
     let arch_keywords = arch_keywords();
+    // Only Windows has an MSVC-vs-GNU choice to break; on every other OS
+    // this must never penalize `-gnu` (e.g. Linux's gnu vs musl builds).
+    let windows = cfg!(target_os = "windows");
     assets
         .iter()
         .filter_map(|a| {
@@ -478,7 +481,7 @@ fn pick_asset(assets: &[Asset]) -> Option<&Asset> {
                 && !name.contains("-ui-");
             matches.then_some((a, name))
         })
-        .min_by_key(|(_, name)| (name.contains("portable"), name.contains("-gnu")))
+        .min_by_key(|(_, name)| (name.contains("portable"), windows && name.contains("-gnu")))
         .map(|(a, _)| a)
 }
 
@@ -816,16 +819,16 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn pick_asset_prefers_msvc_over_gnu_on_a_tie() {
         // Regression: when a release publishes both toolchain variants for
-        // the same OS/arch (e.g. ripgrep's Windows gnu and msvc zips), the
-        // pick must be deterministic and favor msvc, not whichever happens
-        // to come first in GitHub's asset list. Built from the current
-        // host's own OS/arch keywords so the test matches on any runner.
-        let os = current_os_keyword();
+        // Windows (e.g. ripgrep's `-pc-windows-gnu` and `-pc-windows-msvc`
+        // zips), the pick must be deterministic and favor msvc, not whichever
+        // happens to come first in GitHub's asset list. Built from the
+        // current host's own arch keyword so the test matches on any runner.
         let arch = arch_keywords()[0];
-        let gnu = format!("tool-15.2.0-{arch}-{os}-gnu.zip");
-        let msvc = format!("tool-15.2.0-{arch}-{os}-msvc.zip");
+        let gnu = format!("tool-15.2.0-{arch}-windows-gnu.zip");
+        let msvc = format!("tool-15.2.0-{arch}-windows-msvc.zip");
 
         let assets = vec![asset(&gnu), asset(&msvc)];
         let picked = pick_asset(&assets).expect("an asset should match this platform");
@@ -836,6 +839,27 @@ mod tests {
         let picked_reversed =
             pick_asset(&assets_reversed).expect("an asset should match this platform");
         assert_eq!(picked_reversed.name, msvc);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn pick_asset_does_not_deprioritize_gnu_off_windows() {
+        // Regression: the MSVC-over-GNU tiebreak is Windows-only. Off
+        // Windows it must never penalize `-gnu` -- e.g. ripgrep's Linux
+        // release publishes both `-unknown-linux-gnu` and
+        // `-unknown-linux-musl` archives, and the old unscoped tiebreak
+        // silently installed musl every time regardless of list order.
+        let os = current_os_keyword();
+        let arch = arch_keywords()[0];
+        let gnu = format!("tool-15.2.0-{arch}-{os}-gnu.tar.gz");
+        let musl = format!("tool-15.2.0-{arch}-{os}-musl.tar.gz");
+
+        let assets = vec![asset(&gnu), asset(&musl)];
+        let picked = pick_asset(&assets).expect("an asset should match this platform");
+        assert_eq!(
+            picked.name, gnu,
+            "gnu must not be deprioritized off Windows"
+        );
     }
 
     #[test]

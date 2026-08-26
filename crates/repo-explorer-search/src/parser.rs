@@ -4,6 +4,9 @@
 //! for matches, `path-line-content` for context); `parse_rg_json` reads
 //! `rg --json` JSON-lines. Both are tolerant of malformed individual rows (skip,
 //! not fatal) and saturate `u64`->`u32` line numbers (never a bare `as` cast).
+//! The one row `parse_rtk` does *not* tolerate is rtk's own truncation-footer
+//! line (see `is_truncation_marker`): that line is proof rtk silently dropped
+//! real matches for a file, so it is a decode error, not a skippable row.
 
 use repo_explorer_core::domain::{ExplorationFinding, FileLocation, saturate_u32};
 use repo_explorer_core::search::SearchError;
@@ -305,13 +308,40 @@ fn handle_context_line(
     }
 }
 
+/// True for rtk's own truncation-footer line, e.g. `  +35 more in many.txt
+/// [see remaining: tail -n +26 ~/.local/share/rtk/tee/....log]`, emitted in
+/// place of the remaining match lines once a file's real match count exceeds
+/// rtk's undocumented, non-configurable per-file cap. This shape never
+/// matches `split_grep_line`'s `path:line:content` / `path-line-content`
+/// grammar (no plausible `<sep><digits><sep>` run exists in it), so it must
+/// be recognized explicitly -- see `parse_rtk` for why silently falling
+/// through to its catch-all `None` arm, as for ordinary unparsable garbage,
+/// is wrong here specifically: unlike garbage, this line is proof that real
+/// matches were dropped before `parse_rtk` ever saw them.
+fn is_truncation_marker(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix('+') else {
+        return false;
+    };
+    let digits_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    digits_end > 0 && rest[digits_end..].starts_with(" more in ")
+}
+
 /// Parse `rtk rg -H -n` output. Each match line becomes one finding. A context
 /// line before any group boundary (`--`) appends to the previous finding's
 /// snippet; a context line after a boundary -- including before the very
 /// first match, since the stream starts at a boundary -- is buffered and
 /// prepended to the next finding instead, since it leads that match rather
 /// than trailing the one before the boundary.
-pub(crate) fn parse_rtk(stdout: &str) -> Vec<ExplorationFinding> {
+///
+/// Errors with `SearchError::Decode` -- mirroring `parse_rg_json`'s reaction
+/// to a line that violates rg's JSON grammar -- the moment a truncation-
+/// footer line (see `is_truncation_marker`) is seen: that line means rtk
+/// itself dropped real matches for a file, so the findings collected so far
+/// (from this file and any other) are known-incomplete and must not be
+/// reported as a complete, silent `Ok` result.
+pub(crate) fn parse_rtk(stdout: &str) -> Result<Vec<ExplorationFinding>, SearchError> {
     let mut findings: Vec<ExplorationFinding> = Vec::new();
     let mut pending_before: Vec<String> = Vec::new();
     // Starts true, mirroring parse_rg_json: any context before the first
@@ -325,6 +355,12 @@ pub(crate) fn parse_rtk(stdout: &str) -> Vec<ExplorationFinding> {
             at_boundary = true;
             continue;
         }
+        if is_truncation_marker(line) {
+            return Err(SearchError::Decode {
+                backend: "rtk",
+                message: format!("rtk truncated its own results and dropped matches: {line}"),
+            });
+        }
         match split_grep_line(line) {
             Some((path, num, content, true)) => {
                 push_finding(&mut findings, &mut pending_before, path, num, Some(content));
@@ -336,7 +372,7 @@ pub(crate) fn parse_rtk(stdout: &str) -> Vec<ExplorationFinding> {
             None => {}
         }
     }
-    findings
+    Ok(findings)
 }
 
 /// Parse `rg --json` JSON-lines output. Each non-empty line must be valid JSON
@@ -471,7 +507,7 @@ mod tests {
 
     #[test]
     fn parse_rtk_extracts_matches_and_appends_context() {
-        let findings = parse_rtk(&fixture("rtk_rg_output.txt"));
+        let findings = parse_rtk(&fixture("rtk_rg_output.txt")).unwrap();
         // Two match lines (70, 71); the leading context line (69), coming
         // before any "--" boundary, is prepended as findings[0]'s leading
         // context, and the trailing context line (72) appends to 71.
@@ -495,10 +531,53 @@ mod tests {
     #[test]
     fn parse_rtk_skips_group_separators_and_garbage() {
         let input = "--\nnotavalidline\nsrc/x.rs:5:hello\n";
-        let findings = parse_rtk(input);
+        let findings = parse_rtk(input).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].location.line_start, 5);
         assert_eq!(findings[0].snippet.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn parse_rtk_errors_on_truncation_footer() {
+        // Real rtk shape: a header, 25 real match rows (elided here), then a
+        // footer in place of the remaining rows once a file's match count
+        // exceeds rtk's internal per-file cap. The footer must not be
+        // silently dropped like ordinary garbage -- it is proof matches were
+        // lost, so it must surface as an error instead of a falsely-complete
+        // `Ok` result.
+        let input = "60 matches in 1 files:\nmany.txt:1:needle\n  +35 more in many.txt [see remaining: tail -n +26 ~/.local/share/rtk/tee/x.log]\n";
+        let err = parse_rtk(input).unwrap_err();
+        assert_eq!(
+            err,
+            SearchError::Decode {
+                backend: "rtk",
+                message: "rtk truncated its own results and dropped matches:   \
+                          +35 more in many.txt [see remaining: tail -n +26 ~/.local/share/rtk/tee/x.log]"
+                    .to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn is_truncation_marker_matches_rtk_footer_shape() {
+        assert!(is_truncation_marker(
+            "  +35 more in many.txt [see remaining: tail -n +26 ~/x.log]"
+        ));
+        assert!(is_truncation_marker("+1 more in a.rs"));
+    }
+
+    #[test]
+    fn is_truncation_marker_rejects_non_footer_lines() {
+        // The summary header shares the digits-then-word shape but not the
+        // `+N more in ` prefix, and must stay a tolerated, skippable row.
+        assert!(!is_truncation_marker("60 matches in 1 files:"));
+        assert!(!is_truncation_marker("src/x.rs:5:hello"));
+        assert!(!is_truncation_marker(""));
+        assert!(!is_truncation_marker("notavalidline"));
+        // A `+`-prefixed content line whose digits aren't followed by the
+        // exact `" more in "` marker must not false-positive.
+        assert!(!is_truncation_marker("+35 more info"));
+        assert!(!is_truncation_marker("+more in x.rs"));
     }
 
     #[test]

@@ -99,7 +99,7 @@ impl SearchBackend for CliSearchBackend {
         let stdout = run(&spec).await?;
 
         let mut findings = match resolved.tool {
-            Tool::Rtk => parse_rtk(&stdout),
+            Tool::Rtk => parse_rtk(&stdout)?,
             Tool::Ripgrep => parse_rg_json(&stdout)?,
         };
         if let Some(max) = options.max_results {

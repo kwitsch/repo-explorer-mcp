@@ -347,6 +347,34 @@ async fn medium_confidence_verifies_in_one_turn() {
 }
 
 #[tokio::test]
+async fn verify_finish_is_capped_by_max_results() {
+    // Regression: `max_results` must bound the verify stage's finish, not
+    // just the deterministic early-exit path.
+    let provider = MockLlmProvider::new().with_responses(vec![ok_calls(vec![tc(
+        "v1",
+        "finish",
+        r#"{"findings":[{"location":{"path":"src/fresh_a.rs","line_start":10,"line_end":20},"note":"one"},{"location":{"path":"src/fresh_b.rs","line_start":10,"line_end":20},"note":"two"}],"summary":"verified"}"#,
+    )])]);
+    let agent = AgentLoop::new(
+        ambiguous_memory(),
+        MockSearchBackend::new(),
+        single_router(provider),
+        MockRepoStateProbe::new(),
+        AgentSettings::default(),
+        CacheSettings::default(),
+    );
+    let mut q = query("decide_freshness");
+    q.max_results = Some(1);
+    let result = agent.run(&PathBuf::from("/repo"), &q).await.unwrap();
+
+    assert_eq!(result.findings.len(), 1, "capped to max_results");
+    assert_eq!(
+        result.findings[0].location.path,
+        PathBuf::from("src/fresh_a.rs")
+    );
+}
+
+#[tokio::test]
 async fn verify_expand_turn_then_forced_finish() {
     let provider = MockLlmProvider::new().with_responses(vec![
         ok_calls(vec![tc("v1", "expand", r#"{"candidate_ids":[1,2]}"#)]),

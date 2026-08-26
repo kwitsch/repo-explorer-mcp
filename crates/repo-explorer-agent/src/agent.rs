@@ -209,6 +209,7 @@ where
                 return Ok(self.finalize_and_complete(
                     "verify",
                     result,
+                    query.max_results,
                     &budget,
                     &query_key,
                     fingerprint,
@@ -228,13 +229,31 @@ where
                 &mut budget,
             )
             .await?;
-        Ok(self.finalize_and_complete("fallback", result, &budget, &query_key, fingerprint))
+        Ok(self.finalize_and_complete(
+            "fallback",
+            result,
+            query.max_results,
+            &budget,
+            &query_key,
+            fingerprint,
+        ))
     }
 
     /// Normalize/dedupe/cap the final findings once, whatever stage produced
     /// them — preserving their order (rank order / the model's finish order).
-    fn finalize(&self, mut result: ExplorationResult) -> ExplorationResult {
+    /// `max_results` is enforced here (after dedupe) so it bounds every path
+    /// that doesn't early-exit: verify's finish, the fallback loop's finish,
+    /// its forced finish, and its no-finish synthesis all funnel through this
+    /// single choke point via `finalize_and_complete`.
+    fn finalize(
+        &self,
+        mut result: ExplorationResult,
+        max_results: Option<u32>,
+    ) -> ExplorationResult {
         result.findings = tidy_findings(result.findings, &self.caps);
+        if let Some(max) = max_results {
+            result.findings.truncate(max as usize);
+        }
         result
     }
 
@@ -260,11 +279,12 @@ where
         &self,
         stage: &'static str,
         result: ExplorationResult,
+        max_results: Option<u32>,
         budget: &TokenBudget,
         query_key: &str,
         fingerprint: Option<RepoFingerprint>,
     ) -> ExplorationResult {
-        let result = self.finalize(result);
+        let result = self.finalize(result, max_results);
         self.complete_run(stage, budget.spent(), query_key, fingerprint, result)
     }
 
@@ -698,6 +718,30 @@ mod tests {
         assert_eq!(got.summary, "done");
         assert_eq!(got.findings.len(), 1);
         assert_eq!(got.findings[0].location.line_start, 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_finish_is_capped_by_max_results() {
+        // Regression: `max_results` must bound the fallback loop's own
+        // `finish`, not just the deterministic early-exit path.
+        let two_findings = ToolCall {
+            id: "c1".to_string(),
+            name: "finish".to_string(),
+            arguments_json:
+                r#"{"findings":[{"location":{"path":"src/lib.rs","line_start":1,"line_end":2},"note":"one"},{"location":{"path":"src/other.rs","line_start":3,"line_end":4},"note":"two"}],"summary":"done"}"#
+                    .to_string(),
+            thought_signatures: None,
+        };
+        let provider = MockLlmProvider::new().with_responses(vec![tool_calls(vec![two_findings])]);
+        let agent = agent_with(provider);
+        let query = ExplorationQuery {
+            text: "where is main".to_string(),
+            scope_hint: None,
+            max_results: Some(1),
+        };
+        let got = agent.run(&PathBuf::from("/repo"), &query).await.unwrap();
+        assert_eq!(got.findings.len(), 1, "capped to max_results");
+        assert_eq!(got.findings[0].location.path, PathBuf::from("src/lib.rs"));
     }
 
     #[tokio::test]
