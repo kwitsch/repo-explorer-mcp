@@ -90,9 +90,16 @@ impl MemoryClientBackend {
                 // An unrecognized/empty response must NOT be optimistically
                 // treated as "already indexed" — default to `false` so an
                 // unknown shape forces a (safe) reindex instead of skipping one.
-                let exists = first_field(&json, &["indexed", "exists"])
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                // The real tool reports a `status` string (e.g. "ready"), not a
+                // boolean `indexed`/`exists`; the latter are kept as a fallback
+                // in case another response shape ever uses them.
+                let exists = json
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.trim().is_empty())
+                    || first_field(&json, &["indexed", "exists"])
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                 let last_indexed_at = json
                     .get("last_indexed_at")
                     .and_then(Value::as_i64)
@@ -122,17 +129,28 @@ impl MemoryClientBackend {
                 // would optimistically skip a needed reindex (same rule as
                 // `probe_status`: an unrecognized response must not be treated
                 // as "already indexed").
-                let changed = match first_field(&json, &["changed_files", "changed_count"]) {
-                    Some(Value::Array(a)) => ChangeCount::Known(a.len()),
-                    // Saturate rather than `as`-truncate: on a platform where
-                    // `usize` is narrower than `u64`, a huge count must clamp,
-                    // not wrap to a small, wrong value (matches the
-                    // `line_start`/`line_end` saturating casts in this module).
-                    Some(Value::Number(n)) => match n.as_u64() {
-                        Some(n) => ChangeCount::Known(n.min(usize::MAX as u64) as usize),
-                        None => ChangeCount::Unknown,
+                //
+                // The real tool answers with a plain-text block (a `changed_files:
+                // N` line followed by the changed paths), decoded as
+                // `Value::String` — `Value::get`/`first_field` never match a
+                // string, so that shape needs its own parse ahead of the
+                // structured-JSON fallback below.
+                let changed = match &json {
+                    Value::String(text) => parse_changed_count(text)
+                        .map(ChangeCount::Known)
+                        .unwrap_or(ChangeCount::Unknown),
+                    _ => match first_field(&json, &["changed_files", "changed_count"]) {
+                        Some(Value::Array(a)) => ChangeCount::Known(a.len()),
+                        // Saturate rather than `as`-truncate: on a platform where
+                        // `usize` is narrower than `u64`, a huge count must clamp,
+                        // not wrap to a small, wrong value (matches the
+                        // `line_start`/`line_end` saturating casts in this module).
+                        Some(Value::Number(n)) => match n.as_u64() {
+                            Some(n) => ChangeCount::Known(n.min(usize::MAX as u64) as usize),
+                            None => ChangeCount::Unknown,
+                        },
+                        _ => ChangeCount::Unknown,
                     },
-                    _ => ChangeCount::Unknown,
                 };
                 Ok(changed)
             }
@@ -212,12 +230,11 @@ impl Drop for MemoryClientBackend {
     /// already documents; with no ambient runtime (no `Handle::try_current`)
     /// this is a silent no-op, same as never calling `close()` at all.
     fn drop(&mut self) {
-        let Some(client) = self.client.take() else {
+        let Some(mut client) = self.client.take() else {
             return;
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let mut client = client;
                 client.close().await;
             });
         }
@@ -237,6 +254,15 @@ fn base_args(project: String) -> Map<String, Value> {
 /// through, instead of a separate `.or_else()` chain per call site.
 fn first_field<'a>(json: &'a Value, keys: &[&str]) -> Option<&'a Value> {
     keys.iter().find_map(|k| json.get(*k))
+}
+
+/// Parse `detect_changes`' plain-text response for its `changed_files: N`
+/// line (the count the tool reports up front, ahead of the indented list of
+/// changed paths); `None` when no such line is present.
+fn parse_changed_count(text: &str) -> Option<usize> {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("changed_files:"))
+        .and_then(|rest| rest.trim().parse::<usize>().ok())
 }
 
 /// Insert `key: v` into `args` when `v` is `Some` — the single place every
@@ -787,6 +813,24 @@ repo.crates.repo-explorer-core.src.lib.run crates/repo-explorer-core/src/lib.rs\
         assert_eq!(res.findings.len(), 1);
         assert_eq!(res.findings[0].note.as_deref(), Some("foo"));
         assert!(res.summary.contains("2 row(s), 1 locatable finding(s)"));
+    }
+
+    /// Real `detect_changes` payload shape (plain-text block via `Value::String`).
+    #[test]
+    fn parse_changed_count_reads_real_detect_changes_text() {
+        let text = "base: main\nmerge_base: abc123\ndirection: inbound\nchanged_files: 2\n  \
+docs/project-plan/9-custom_model_training.md\n  \
+docs/project-plan/9b-open_weights_finetune.md\nseed_symbols: 0\n";
+        assert_eq!(parse_changed_count(text), Some(2));
+    }
+
+    #[test]
+    fn parse_changed_count_zero_and_missing() {
+        assert_eq!(parse_changed_count("changed_files: 0\n"), Some(0));
+        assert_eq!(
+            parse_changed_count("base: main\ndirection: inbound\n"),
+            None
+        );
     }
 
     #[test]

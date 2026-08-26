@@ -164,12 +164,15 @@ fn token_is_bare_word(token: &[u8]) -> bool {
 /// extension (e.g. `src/log.rs-69-...`, where `log.rs` precedes `-69-`), it
 /// is already the genuine separator and the walk never starts.
 ///
-/// The walk is bounded to the line's first whitespace byte: a real path
-/// never contains whitespace (these tools always print `path<sep>line<sep>
-/// content`, and the path portion is exactly what `find_sep_run`/this walk
-/// are trying to delimit), so any `-N-` run at or after that point is
-/// definitely inside free-text content, not a candidate separator at all --
-/// e.g. `README-1-see item-2-here`: the coincidental `-2-` run sits inside
+/// The walk is bounded to the first whitespace byte at or after the
+/// leftmost candidate run's own end -- not the line's first whitespace
+/// overall, since a real path can itself contain a space (e.g.
+/// `my issue-42-notes-7-done` for the extensionless file `my issue-42-notes`
+/// at line 7; bounding from byte 0 would stop at the space inside `my
+/// issue`, before the walk even starts, and wrongly return the coincidental
+/// `-42-` run untouched). Any `-N-` run at or after that bound is definitely
+/// inside free-text content, not a candidate separator at all -- e.g.
+/// `README-1-see item-2-here`: the coincidental `-2-` run sits inside
 /// `item-2-here`, which only appears after the space following `see`, so it
 /// is never even examined and the genuine `-1-` run is returned untouched.
 ///
@@ -188,12 +191,12 @@ fn resolve_dash_sep_run(bytes: &[u8], first: (usize, usize)) -> (usize, usize) {
     if trailing_token_has_extension(bytes, 0, first.0) {
         return first;
     }
-    let ws_bound = bytes
-        .iter()
-        .position(u8::is_ascii_whitespace)
-        .unwrap_or(bytes.len());
     let mut candidate = first;
     let mut cursor = first.1 + 1;
+    let ws_bound = bytes[cursor..]
+        .iter()
+        .position(u8::is_ascii_whitespace)
+        .map_or(bytes.len(), |p| cursor + p);
     while let Some(next) = find_sep_run(bytes, b'-', cursor, ws_bound) {
         candidate = next;
         if trailing_token_has_extension(bytes, cursor, next.0) {
@@ -651,6 +654,19 @@ mod tests {
             result,
             Some(("run-tests-3-step", 2, "verify output", false))
         );
+    }
+
+    #[test]
+    fn split_grep_line_handles_extensionless_path_containing_whitespace() {
+        // No colon anywhere and the extensionless file's own name contains a
+        // space (`my issue-42-notes`). The whitespace bound must be measured
+        // from the leftmost candidate run's end onward, not from the start
+        // of the line -- bounding from byte 0 would land on the space inside
+        // `my issue`, before the walk even starts, and wrongly return the
+        // coincidental `-42-` run untouched instead of walking on to the
+        // genuine `-7-` separator.
+        let result = split_grep_line("my issue-42-notes-7-done");
+        assert_eq!(result, Some(("my issue-42-notes", 7, "done", false)));
     }
 
     #[test]

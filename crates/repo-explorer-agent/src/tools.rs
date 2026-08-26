@@ -4,6 +4,7 @@
 
 use repo_explorer_core::domain::{ExplorationFinding, ExplorationResult, FileLocation};
 use repo_explorer_core::llm::{Message, Tool, ToolCall};
+use repo_explorer_core::retrieval::normalize_location;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
@@ -355,8 +356,11 @@ pub(crate) struct FinishLocation {
 /// Deserialize and hand-validate `finish` arguments into an `ExplorationResult`.
 /// `deny_unknown_fields` plus the required `summary`/`line_start`/`line_end`
 /// keys reject malformed payloads at parse time; the explicit non-empty-path
-/// check covers the one rule serde cannot express. Returns a human-readable
-/// reason string on rejection so the loop can feed it back to the model.
+/// check covers the one rule serde cannot express. Each location is run
+/// through the deterministic pipeline's `normalize_location`, so an inverted
+/// or zero-end range from the model comes out fixed like a retrieved
+/// candidate's would. Returns a human-readable reason string on rejection so
+/// the loop can feed it back to the model.
 pub(crate) fn parse_finish(arguments_json: &str) -> Result<ExplorationResult, String> {
     let args: FinishArgs = serde_json::from_str(arguments_json)
         .map_err(|e| format!("could not parse finish arguments: {e}"))?;
@@ -366,11 +370,11 @@ pub(crate) fn parse_finish(arguments_json: &str) -> Result<ExplorationResult, St
             return Err("finding location.path must be non-empty".to_string());
         }
         findings.push(ExplorationFinding {
-            location: FileLocation {
+            location: normalize_location(FileLocation {
                 path: PathBuf::from(f.location.path),
                 line_start: f.location.line_start,
                 line_end: f.location.line_end,
-            },
+            }),
             snippet: f.snippet,
             note: f.note,
         });
@@ -512,5 +516,21 @@ mod tests {
     fn parse_finish_rejects_missing_line_numbers() {
         let json = r#"{"findings":[{"location":{"path":"a.rs"}}],"summary":"s"}"#;
         assert!(parse_finish(json).is_err());
+    }
+
+    #[test]
+    fn parse_finish_normalizes_inverted_range() {
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":50,"line_end":10}}],"summary":"done"}"#;
+        let result = parse_finish(json).unwrap();
+        assert_eq!(result.findings[0].location.line_start, 10);
+        assert_eq!(result.findings[0].location.line_end, 50);
+    }
+
+    #[test]
+    fn parse_finish_widens_zero_end_to_start() {
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":7,"line_end":0}}],"summary":"done"}"#;
+        let result = parse_finish(json).unwrap();
+        assert_eq!(result.findings[0].location.line_start, 7);
+        assert_eq!(result.findings[0].location.line_end, 7);
     }
 }

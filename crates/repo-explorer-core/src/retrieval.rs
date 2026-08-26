@@ -221,8 +221,10 @@ fn coverage(candidate: &Candidate, lowered_patterns: &[String]) -> u32 {
 }
 
 /// Normalize a location: strip `./`, swap an inverted line range, and widen a
-/// zero `line_end` to `line_start`.
-fn normalize_location(location: FileLocation) -> FileLocation {
+/// zero `line_end` to `line_start`. `pub` so callers outside the deterministic
+/// retrieval path (e.g. the agent crate's `finish`-argument parsing) can apply
+/// the same normalization to model-supplied locations.
+pub fn normalize_location(location: FileLocation) -> FileLocation {
     let path = normalize_rel_path(location.path);
     let (mut start, mut end) = (location.line_start, location.line_end);
     if end == 0 {
