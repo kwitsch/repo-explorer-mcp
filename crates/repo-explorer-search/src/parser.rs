@@ -5,7 +5,7 @@
 //! `rg --json` JSON-lines. Both are tolerant of malformed individual rows (skip,
 //! not fatal) and saturate `u64`->`u32` line numbers (never a bare `as` cast).
 
-use repo_explorer_core::domain::{saturate_u32, ExplorationFinding, FileLocation};
+use repo_explorer_core::domain::{ExplorationFinding, FileLocation, saturate_u32};
 use repo_explorer_core::search::SearchError;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -214,8 +214,13 @@ fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
                 // Computed once and reused by both checks below instead of
                 // each re-deriving the same trailing_token(bytes, d.1+1, c.0).
                 let token = trailing_token(bytes, d.1 + 1, c.0);
+                // Strip a leading `./` before checking for an extension dot: it's
+                // the tools' relative-prefix marker, not evidence of a real
+                // extension elsewhere in the path (see `split_grep_line_handles_*`
+                // extensionless-path tests with a `./` prefix).
+                let prefix = bytes[..d.0].strip_prefix(b"./").unwrap_or(&bytes[..d.0]);
                 !token_has_extension(token)
-                    && !(token_is_bare_word(token) && !bytes[..d.0].contains(&b'.'))
+                    && !(token_is_bare_word(token) && !prefix.contains(&b'.'))
             } =>
         {
             let d = resolve_dash_sep_run(bytes, d);
@@ -586,6 +591,17 @@ mod tests {
         // `-42-` run must still lose to the real `:10:` match separator.
         let result = split_grep_line("issue-42-fix:10:the fix");
         assert_eq!(result, Some(("issue-42-fix", 10, "the fix", true)));
+    }
+
+    #[test]
+    fn split_grep_line_handles_unpadded_dash_numbered_extensionless_path_with_relative_prefix() {
+        // Same shape as above, but with the `./` relative prefix these tools
+        // always print (target is always `.`, see backend.rs). The leading
+        // `.` in `./` must not be mistaken for a real extension dot earlier
+        // in the path, or the `-42-` run wrongly wins over the real `:10:`
+        // match separator.
+        let result = split_grep_line("./issue-42-fix:10:the fix");
+        assert_eq!(result, Some(("./issue-42-fix", 10, "the fix", true)));
     }
 
     #[test]

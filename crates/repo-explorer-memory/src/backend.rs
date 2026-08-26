@@ -136,10 +136,7 @@ impl MemoryClientBackend {
     /// duplicate a blocking filesystem syscall for no benefit.
     async fn run_index(&self, abs_repo_root: &Path) -> Result<IndexStatus, MemoryError> {
         let mut args = Map::new();
-        args.insert(
-            "path".to_string(),
-            Value::String(abs_repo_root.to_string_lossy().into_owned()),
-        );
+        insert_path(&mut args, "path", abs_repo_root);
         match self.client.call("index_repository", args).await {
             Ok(_) => Ok(IndexStatus::Reindexed),
             Err(MemoryError::ToolFailed { message, .. }) => {
@@ -213,6 +210,16 @@ fn insert_opt_str(args: &mut Map<String, Value>, key: &str, v: &Option<String>) 
     if let Some(v) = v {
         args.insert(key.to_string(), Value::String(v.clone()));
     }
+}
+
+/// Insert `key: path` into `args` as its lossy string form — the single place
+/// every `Path`-to-JSON-string tool arg goes through, instead of a repeated
+/// `Value::String(path.to_string_lossy().into_owned())` at each call site.
+fn insert_path(args: &mut Map<String, Value>, key: &str, path: &Path) {
+    args.insert(
+        key.to_string(),
+        Value::String(path.to_string_lossy().into_owned()),
+    );
 }
 
 /// Does a tool-failure message indicate "this project is not indexed yet"
@@ -510,10 +517,7 @@ impl MemoryBackend for MemoryClientBackend {
         self.call_memory_tool("search_code", repo_root, |args| {
             args.insert("pattern".to_string(), Value::String(query.text.clone()));
             if let Some(scope) = &query.scope_hint {
-                args.insert(
-                    "file_pattern".to_string(),
-                    Value::String(scope.to_string_lossy().into_owned()),
-                );
+                insert_path(args, "file_pattern", scope);
             }
             insert_opt_u32(args, "limit", query.max_results);
         })
@@ -591,10 +595,7 @@ impl MemoryBackend for MemoryClientBackend {
                     start_line,
                     end_line,
                 } => {
-                    args.insert(
-                        "file".to_string(),
-                        Value::String(file.to_string_lossy().into_owned()),
-                    );
+                    insert_path(args, "file", file);
                     insert_opt_u32(args, "start_line", *start_line);
                     insert_opt_u32(args, "end_line", *end_line);
                 }

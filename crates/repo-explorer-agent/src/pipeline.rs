@@ -12,10 +12,10 @@ use repo_explorer_core::memory::{GraphQuery, MemoryBackend};
 use repo_explorer_core::retrieval::{confidence, derive_patterns, merge_and_rank};
 use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use std::collections::HashSet;
-use std::path::{Component, Path};
+use std::path::Path;
 
 use crate::cache::{ResultCache, encode_field, opt_to_string, scope_display};
-use crate::dispatch::MATCH_ANY_NON_EMPTY_LINE;
+use crate::dispatch::{MATCH_ANY_NON_EMPTY_LINE, escapes_repo_root};
 
 /// How many identifier tokens get their own symbol-lookup leg.
 const SYMBOL_LOOKUP_TOKENS: usize = 4;
@@ -90,10 +90,19 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
             )
         },
         async move {
+            // Reuses `query.text`/`max_results` but swaps in the already-
+            // filtered `scope`, not `query.scope_hint` — an escaping hint
+            // must not reach `search_code`'s RPC any more than it reaches
+            // `search.search` in the other three legs.
+            let sanitized_query = ExplorationQuery {
+                text: query.text.clone(),
+                scope_hint: scope.map(Path::to_path_buf),
+                max_results: query.max_results,
+            };
             soft_leg(
                 "semantic",
                 query.text.as_str(),
-                memory.search_code(repo_root, query),
+                memory.search_code(repo_root, &sanitized_query),
                 |res| candidates_of_kind(res.findings, CandidateKind::SemanticHit),
             )
             .await
@@ -290,17 +299,6 @@ fn file_candidates(findings: Vec<ExplorationFinding>) -> Vec<Candidate> {
             snippet: None,
         })
         .collect()
-}
-
-/// Mirrors dispatch.rs's `reject_escaping_path` lexical check: true if `scope`
-/// is absolute, walks out via a `..` component, or (on Windows) names a drive
-/// via a prefix component.
-fn escapes_repo_root(scope: &Path) -> bool {
-    scope.is_absolute()
-        || scope.has_root()
-        || scope
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
 }
 
 /// Glob for a path-like token: a bare file name matches by basename; a token
@@ -576,6 +574,7 @@ mod tests {
                 "escaping scope_hint must not reach the search backend"
             );
         }
+        assert_escaping_scope_hint_dropped_from_memory(&memory);
     }
 
     #[tokio::test]
@@ -595,6 +594,33 @@ mod tests {
             assert_eq!(
                 scope, &None,
                 "escaping scope_hint must not reach the search backend"
+            );
+        }
+        assert_escaping_scope_hint_dropped_from_memory(&memory);
+    }
+
+    /// Regression for the semantic leg forwarding the raw, unsanitized
+    /// `query.scope_hint` to `memory.search_code` (it must instead see the
+    /// same filtered `scope` the other three legs get).
+    fn assert_escaping_scope_hint_dropped_from_memory(memory: &MockMemoryBackend) {
+        let calls = memory.calls();
+        let search_code_calls: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                repo_explorer_core::memory::mock::Call::SearchCode { query, .. } => {
+                    Some(query.scope_hint.as_ref())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !search_code_calls.is_empty(),
+            "semantic leg never called search_code"
+        );
+        for scope_hint in search_code_calls {
+            assert_eq!(
+                scope_hint, None,
+                "escaping scope_hint must not reach memory.search_code"
             );
         }
     }

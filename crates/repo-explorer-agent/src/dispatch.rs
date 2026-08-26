@@ -177,23 +177,28 @@ fn snippet_target(args: GetCodeSnippetArgs) -> Result<SnippetTarget, String> {
     }
 }
 
-/// The one lexical "stays inside the repository" check: reject a
-/// model-supplied path that is absolute, walks out via a `..` component, or
-/// (on Windows) names a drive via a prefix component — `Component::Prefix`
-/// also catches a drive-relative path like `C:foo`, which is neither
-/// `is_absolute()` nor `has_root()` since it resolves against that drive's
-/// own current directory rather than `repo_root`.
+/// The one lexical "stays inside the repository" check: true if `path` is
+/// absolute, walks out via a `..` component, or (on Windows) names a drive
+/// via a prefix component — `Component::Prefix` also catches a drive-relative
+/// path like `C:foo`, which is neither `is_absolute()` nor `has_root()` since
+/// it resolves against that drive's own current directory rather than
+/// `repo_root`. Shared with `pipeline`'s top-level query `scope_hint` check so
+/// the two call sites can't drift apart on what counts as an escape.
+pub(crate) fn escapes_repo_root(path: &Path) -> bool {
+    path.is_absolute()
+        || path.has_root()
+        || path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+}
+
+/// [`escapes_repo_root`] plus error formatting for a model-supplied path.
 /// `label` names the offending input in the error (`scope`, `read_file path`).
 /// `read_file` additionally verifies the *resolved* path; a `SearchBackend`
 /// scope is only checked lexically because it need not exist yet.
 fn reject_escaping_path(label: &str, raw: &str) -> Result<PathBuf, String> {
     let rel = Path::new(raw);
-    if rel.is_absolute()
-        || rel.has_root()
-        || rel
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
-    {
+    if escapes_repo_root(rel) {
         return Err(format!("{label} `{raw}` escapes the repository root"));
     }
     Ok(rel.to_path_buf())
