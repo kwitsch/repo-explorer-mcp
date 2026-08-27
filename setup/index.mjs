@@ -318,6 +318,28 @@ function reportOnlyDep(name, plat, pointer) {
   return MISSING;
 }
 
+// Provision the private codebase-memory-mcp copy by invoking the freshly
+// installed repo-explorer-mcp's `--update`. Best-effort: a spawn failure or
+// non-zero exit warns and returns a note instead of failing the install, so
+// an offline machine can still complete the binary install and provision
+// later.
+function provisionMemoryBinary(binPath) {
+  console.log(
+    "\nProvisioning the private codebase-memory-mcp copy via `repo-explorer-mcp --update`...",
+  );
+  const r = spawnSync(binPath, ["--update"], {
+    stdio: "inherit",
+    timeout: 120_000,
+  });
+  if (r.error || r.status !== 0) {
+    console.warn(
+      "Failed to provision codebase-memory-mcp automatically; run `repo-explorer-mcp --update` (or `repo-explorer-mcp setup`) later to provision it.",
+    );
+    return "provision failed (run --update later)";
+  }
+  return "private copy provisioned via --update";
+}
+
 export function mcpSnippet(binPath) {
   return JSON.stringify(
     {
@@ -364,12 +386,6 @@ async function main() {
     "Install rtk from its upstream distribution; it is optional (search falls back to plain ripgrep).",
   );
   console.log(`  rtk: ${rtkVer}`);
-  const cmVer = reportOnlyDep(
-    "codebase-memory-mcp",
-    plat,
-    "Install codebase-memory-mcp from its upstream distribution; it is required at runtime.",
-  );
-  console.log(`  codebase-memory-mcp: ${cmVer}`);
 
   // Resolve version + install dir.
   const version = await resolveVersion(opts.version);
@@ -377,8 +393,6 @@ async function main() {
   fs.mkdirSync(dir, { recursive: true });
   const binName = binaryName(plat.osKind);
   const binPath = path.join(dir, binName);
-
-  const deps = { rgVer, rtkVer, cmVer };
 
   // Idempotency check.
   if (!opts.force && fs.existsSync(binPath)) {
@@ -394,7 +408,8 @@ async function main() {
       // PATH status is reported on every run, including this one: the install
       // dir can drop off PATH long after the binary was installed.
       reportPathStatus(dir, plat.osKind);
-      printSummary(binPath, version, deps);
+      const cmVer = provisionMemoryBinary(binPath);
+      printSummary(binPath, version, { rgVer, rtkVer, cmVer });
       return;
     }
   }
@@ -450,7 +465,8 @@ async function main() {
   }
 
   reportPathStatus(dir, plat.osKind);
-  printSummary(binPath, version, deps);
+  const cmVer = provisionMemoryBinary(binPath);
+  printSummary(binPath, version, { rgVer, rtkVer, cmVer });
 }
 
 // PATH reporting (detect, never modify).
