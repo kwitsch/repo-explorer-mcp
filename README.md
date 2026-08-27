@@ -3,7 +3,8 @@
 A Rust MCP server that exposes the `explore_repository` tool over an rmcp stdio
 transport, shipped for Linux (`x86_64-unknown-linux-gnu`) and Windows
 (`x86_64-pc-windows-msvc`). It drives an internal LLM exploration loop over a
-`codebase-memory-mcp` backend and ripgrep/rtk text search.
+privately-managed `codebase-memory-mcp` backend (a per-user copy provisioned by
+`repo-explorer-mcp --update`, never a global PATH install) and ripgrep/rtk text search.
 
 ## Install (recommended: npx setup script)
 
@@ -29,10 +30,12 @@ The script installs into `~/.local/bin` (Linux) or
 or system PATH — it only reports whether the install directory is on PATH.
 `ripgrep` is installed automatically via `apt`/`dnf`/`pacman` on Linux or
 `winget` on Windows; if none of those is available, the script warns and
-points at ripgrep's own install docs instead of installing it itself. `rtk` and
-`codebase-memory-mcp` are report-only: if missing, the script tells you and
-points at their upstream install docs (`rtk` is optional; search falls back to
-plain ripgrep).
+points at ripgrep's own install docs instead of installing it itself. `rtk` is
+report-only: if missing, the script tells you and points at its upstream install
+docs (`rtk` is optional; search falls back to plain ripgrep). `codebase-memory-mcp`
+is not taken from PATH: the installer invokes `repo-explorer-mcp --update` to
+install a private per-user copy at `<data dir>/repo-explorer/bin/codebase-memory-mcp`
+(best-effort; if that step fails, run `repo-explorer-mcp --update` later).
 
 ## Install (manual fallback)
 
@@ -115,8 +118,11 @@ api_key_env = "OPENAI_API_KEY"
 models = ["gpt-4o"]
 
 # Exactly one of `command`+`args` (stdio) XOR `endpoint` (network).
+# `setup` writes the absolute path of the private codebase-memory-mcp copy
+# (provisioned by `repo-explorer-mcp --update`) into `command`; the path
+# below is illustrative and machine-specific.
 [codebase_memory]
-command = "codebase-memory-mcp"
+command = "/home/you/.local/share/repo-explorer/bin/codebase-memory-mcp"
 args = ["--stdio"]
 
 [search]
