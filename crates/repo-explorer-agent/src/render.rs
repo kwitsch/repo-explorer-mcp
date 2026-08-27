@@ -56,7 +56,7 @@ pub(crate) fn cap_file_lines(contents: String, max_lines: usize) -> String {
 /// same-file candidates with unknown lines separate (see
 /// `unknown_location_sentinels_do_not_merge_distinct_symbols`), so their
 /// findings must not be collapsed here just because they share `(0, 0)`.
-fn dedupe_key(f: &ExplorationFinding) -> (FileLocation, Option<String>) {
+pub(crate) fn dedupe_key(f: &ExplorationFinding) -> (FileLocation, Option<String>) {
     let note = is_unknown_location(&f.location)
         .then(|| f.note.clone())
         .flatten();

@@ -115,7 +115,13 @@ fn token_has_extension(token: &[u8]) -> bool {
     match token.iter().rposition(|&b| b == b'.') {
         Some(dot) => {
             let ext = &token[dot + 1..];
-            !ext.is_empty() && ext.iter().all(u8::is_ascii_alphabetic)
+            // Alphanumeric (not just alphabetic) so digit-bearing real
+            // extensions (`mp3`, `mp4`, `m4a`, `h5`, `json5`, `utf8`) count;
+            // still require at least one letter so a bare numeric suffix
+            // (ambiguous with a line number) isn't mistaken for one.
+            !ext.is_empty()
+                && ext.iter().all(u8::is_ascii_alphanumeric)
+                && ext.iter().any(u8::is_ascii_alphabetic)
         }
         None => false,
     }
@@ -667,6 +673,27 @@ mod tests {
         // genuine `-7-` separator.
         let result = split_grep_line("my issue-42-notes-7-done");
         assert_eq!(result, Some(("my issue-42-notes", 7, "done", false)));
+    }
+
+    #[test]
+    fn split_grep_line_handles_digit_bearing_extension_in_context_line() {
+        // `token_has_extension` must recognize real extensions containing
+        // digits (mp3, mp4, ...), not just alphabetic ones -- otherwise
+        // `song.mp3` isn't recognized as already having its genuine
+        // extension, and the walk keeps going past the real `-5-` separator
+        // to the coincidental `-20-` run inside the trailing content.
+        let result = split_grep_line("song.mp3-5-readme.md-20-line");
+        assert_eq!(result, Some(("song.mp3", 5, "readme.md-20-line", false)));
+    }
+
+    #[test]
+    fn split_grep_line_handles_digit_bearing_extension_in_match_line() {
+        // Same fix, but for a match line (colon-separated) where the
+        // coincidental dash-numbered segment precedes the digit-bearing
+        // extension: `clip-3-video.mp4` must be recognized as one filename,
+        // not split at the coincidental `-3-` run.
+        let result = split_grep_line("clip-3-video.mp4:10:content");
+        assert_eq!(result, Some(("clip-3-video.mp4", 10, "content", true)));
     }
 
     #[test]

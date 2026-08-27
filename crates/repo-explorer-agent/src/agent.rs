@@ -33,7 +33,7 @@ use std::path::Path;
 use crate::cache::{QueryEntry, ResultCache};
 use crate::dispatch::dispatch_inner;
 use crate::pipeline;
-use crate::render::{RenderCaps, tidy_findings};
+use crate::render::{RenderCaps, dedupe_key, tidy_findings};
 use crate::tools::{finish_only_catalog, parse_finish, resolve_finish, tool_catalog};
 use crate::verify::{VerifyOutcome, verify};
 
@@ -352,24 +352,22 @@ where
     }
 
     /// Build the early-exit result straight from the ranked candidates.
+    /// Dedupes before truncating to `max_results` — same order as
+    /// `finalize()` — so a run of colliding-sentinel candidates can't push a
+    /// legitimate distinct candidate out of the cap.
     fn result_from_candidates(
         &self,
         candidates: Vec<Candidate>,
         query: &ExplorationQuery,
         confidence: u32,
     ) -> ExplorationResult {
-        let take = query
-            .max_results
-            .map(|m| m as usize)
-            .unwrap_or(candidates.len());
-        let findings = tidy_findings(
-            candidates
-                .into_iter()
-                .take(take)
-                .map(finding_from_candidate)
-                .collect(),
+        let mut findings = tidy_findings(
+            candidates.into_iter().map(finding_from_candidate).collect(),
             &self.caps,
         );
+        if let Some(max) = query.max_results {
+            findings.truncate(max as usize);
+        }
         let summary = format!(
             "Resolved deterministically by the retrieval pre-stage (confidence {confidence}/100, no LLM involved): {} location(s) matching \"{}\".",
             findings.len(),
@@ -397,7 +395,7 @@ where
         ];
 
         let mut findings: Vec<ExplorationFinding> = Vec::new();
-        let mut seen: HashSet<FileLocation> = HashSet::new();
+        let mut seen: HashSet<(FileLocation, Option<String>)> = HashSet::new();
         let mut single_call_rejections = 0u32;
         let mut turn_limit_hit = true;
 
@@ -573,16 +571,19 @@ where
     }
 }
 
-/// Push `f` unless a finding with the same `FileLocation` is already present
-/// (dedupe by location; first-seen snippet/note wins). `seen` mirrors the
-/// locations already in `findings`, so the check is O(1) rather than a linear
-/// scan per incoming finding.
+/// Push `f` unless a finding with the same dedupe key is already present
+/// (first-seen snippet/note wins). Keys on `render::dedupe_key` — location,
+/// disambiguated by note for the "unknown location" `(0, 0)` sentinel — so
+/// this can't diverge from `tidy_findings`'s later, note-aware dedup and
+/// collapse distinct same-file findings that only lack line info. `seen`
+/// mirrors the keys already in `findings`, so the check is O(1) rather than a
+/// linear scan per incoming finding.
 fn accumulate(
     findings: &mut Vec<ExplorationFinding>,
-    seen: &mut HashSet<FileLocation>,
+    seen: &mut HashSet<(FileLocation, Option<String>)>,
     f: ExplorationFinding,
 ) {
-    if seen.insert(f.location.clone()) {
+    if seen.insert(dedupe_key(&f)) {
         findings.push(f);
     }
 }
@@ -655,6 +656,7 @@ fn user_prompt(
 mod tests {
     use super::*;
     use repo_explorer_core::config::AgentSettings;
+    use repo_explorer_core::domain::CandidateKind;
     use repo_explorer_core::fingerprint::RepoFingerprint;
     use repo_explorer_core::fingerprint::mock::MockRepoStateProbe;
     use repo_explorer_core::llm::mock::{FakeClock, MockLlmProvider};
@@ -744,6 +746,90 @@ mod tests {
         assert_eq!(got.findings[0].location.path, PathBuf::from("src/lib.rs"));
     }
 
+    #[test]
+    fn early_exit_dedupes_before_truncating_to_max_results() {
+        // Regression: result_from_candidates must dedupe (collapsing true
+        // duplicates at the "unknown location" (0, 0) sentinel) before
+        // truncating to max_results, matching finalize()'s dedupe-then-
+        // truncate contract — otherwise a duplicate consumes a truncation
+        // slot a distinct 4th candidate should have had.
+        fn candidate(
+            path: &str,
+            line_start: u32,
+            line_end: u32,
+            symbol: &str,
+            kind: CandidateKind,
+            score: u32,
+        ) -> Candidate {
+            Candidate {
+                location: FileLocation {
+                    path: PathBuf::from(path),
+                    line_start,
+                    line_end,
+                },
+                symbol: Some(symbol.to_string()),
+                kind,
+                score,
+                snippet: None,
+            }
+        }
+        let candidates = vec![
+            candidate(
+                "a.rs",
+                10,
+                20,
+                "decide_freshness",
+                CandidateKind::SymbolExact,
+                900,
+            ),
+            candidate(
+                "b.rs",
+                0,
+                0,
+                "helper_thing",
+                CandidateKind::SymbolFuzzy,
+                430,
+            ),
+            candidate(
+                "b.rs",
+                0,
+                0,
+                "helper_thing",
+                CandidateKind::SymbolFuzzy,
+                430,
+            ),
+            candidate(
+                "another.rs",
+                5,
+                5,
+                "unrelated",
+                CandidateKind::ContentHit,
+                200,
+            ),
+        ];
+        let agent = agent_with(MockLlmProvider::new());
+        let query = ExplorationQuery {
+            text: "x".to_string(),
+            scope_hint: None,
+            max_results: Some(3),
+        };
+        let result = agent.result_from_candidates(candidates, &query, 100);
+        assert_eq!(
+            result.findings.len(),
+            3,
+            "the distinct 4th candidate must survive once the true duplicate is collapsed"
+        );
+        let paths: Vec<_> = result
+            .findings
+            .iter()
+            .map(|f| f.location.path.clone())
+            .collect();
+        assert!(
+            paths.contains(&PathBuf::from("another.rs")),
+            "pre-dedupe truncation must not drop the distinct 4th candidate"
+        );
+    }
+
     #[tokio::test]
     async fn router_error_is_hard_fail() {
         // Empty provider list -> RouterError::NoProviders on the first turn.
@@ -813,6 +899,42 @@ mod tests {
             .cache_for(Some(&fp))
             .and_then(|(cache, _)| cache.get_tool(&key));
         assert!(cached.is_none(), "a failed tool call must not be memoized");
+    }
+
+    #[test]
+    fn accumulate_keeps_distinct_unknown_location_findings_separate() {
+        // Regression: accumulate's dedup key must match render::dedupe_key's
+        // note-based disambiguation at the "unknown location" (0, 0)
+        // sentinel, or two genuinely distinct same-file findings that only
+        // lack line info collide and the second is silently dropped before
+        // finalize()'s later, note-aware dedup ever sees it.
+        let mut findings = Vec::new();
+        let mut seen = HashSet::new();
+        let foo = ExplorationFinding {
+            location: FileLocation {
+                path: PathBuf::from("a.rs"),
+                line_start: 0,
+                line_end: 0,
+            },
+            snippet: None,
+            note: Some("Foo".to_string()),
+        };
+        let bar = ExplorationFinding {
+            location: foo.location.clone(),
+            snippet: None,
+            note: Some("Bar".to_string()),
+        };
+        accumulate(&mut findings, &mut seen, foo.clone());
+        accumulate(&mut findings, &mut seen, bar);
+        assert_eq!(
+            findings.len(),
+            2,
+            "distinct notes at the unknown-location sentinel must not collide"
+        );
+
+        // True duplicates (same location AND note) must still collapse.
+        accumulate(&mut findings, &mut seen, foo);
+        assert_eq!(findings.len(), 2, "a true duplicate must still be dropped");
     }
 
     #[test]
