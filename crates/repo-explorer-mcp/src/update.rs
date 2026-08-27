@@ -309,7 +309,9 @@ async fn read_installed_version_blocking(path: std::path::PathBuf) -> Option<sem
 /// preferring a match on the first line — a tool's own version conventionally
 /// leads its `--version` banner, ahead of any bundled library versions it
 /// might also print — and falling back to the rest of the text otherwise.
-/// A bare `MAJOR.MINOR` is accepted too, treated as `MAJOR.MINOR.0`.
+/// A bare `MAJOR.MINOR` is accepted too, treated as `MAJOR.MINOR.0`, and a
+/// run of 4+ components (e.g. a VCS-revision-suffixed `1.2.3.4`) is read as
+/// its leading `MAJOR.MINOR.PATCH`.
 fn extract_semver(text: &str) -> Option<semver::Version> {
     let first_line = text.lines().next().unwrap_or("");
     scan_for_semver(first_line).or_else(|| scan_for_semver(text))
@@ -328,10 +330,17 @@ fn scan_for_semver(text: &str) -> Option<semver::Version> {
             if let Ok(v) = semver::Version::parse(candidate) {
                 return Some(v);
             }
-            if candidate.matches('.').count() == 1
+            let dot_count = candidate.matches('.').count();
+            if dot_count == 1
                 && let Ok(v) = semver::Version::parse(&format!("{candidate}.0"))
             {
                 return Some(v);
+            }
+            if dot_count >= 3 {
+                let leading = candidate.split('.').take(3).collect::<Vec<_>>().join(".");
+                if let Ok(v) = semver::Version::parse(&leading) {
+                    return Some(v);
+                }
             }
         } else {
             i += 1;
@@ -755,6 +764,16 @@ mod tests {
     #[test]
     fn extract_semver_none_when_absent() {
         assert!(extract_semver("no version here").is_none());
+    }
+
+    #[test]
+    fn extract_semver_reads_leading_triple_from_four_component_version() {
+        // Regression: a 4+ component version-like run (e.g. a VCS-revision
+        // suffix) must not be skipped in favor of a later, unrelated number.
+        assert_eq!(
+            extract_semver("tool 1.2.3.4 (rev 5.6.7)").unwrap(),
+            semver::Version::parse("1.2.3").unwrap()
+        );
     }
 
     #[test]

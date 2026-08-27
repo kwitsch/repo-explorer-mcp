@@ -61,6 +61,22 @@ fn is_identifier_like(token: &str) -> bool {
     token.len() >= 4
 }
 
+/// Strip up to two trailing `:<digits>` groups (a `:line` or `:line:col`
+/// suffix) so a pasted location like `search.rs:120` or `search.rs:120:5`
+/// resolves to the plain path `search.rs`.
+fn strip_location_suffix(token: &str) -> &str {
+    let mut s = token;
+    for _ in 0..2 {
+        match s.rsplit_once(':') {
+            Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => {
+                s = head;
+            }
+            _ => break,
+        }
+    }
+    s
+}
+
 /// Escape a literal so grep backends treat it verbatim. Hand-rolled: core has
 /// no regex dependency, and the target dialect (rust/regex via ripgrep) treats
 /// exactly these ASCII metacharacters specially.
@@ -161,12 +177,19 @@ pub fn derive_patterns(query: &str) -> QueryPatterns {
         if trimmed.is_empty() {
             continue;
         }
-        let looks_like_path = trimmed.contains('/')
-            || Path::new(trimmed)
+        // Drop a trailing `:line` or `:line:col` suffix (the location format
+        // ripgrep/compilers emit, and how users paste a hit) before judging
+        // path-ness: otherwise `Path::extension()` folds it into the
+        // extension (`search.rs:120` -> `rs:120`) and the stripped-down
+        // token — the one that actually names a real file — never reaches
+        // `path_tokens`.
+        let path_candidate = strip_location_suffix(trimmed);
+        let looks_like_path = path_candidate.contains('/')
+            || Path::new(path_candidate)
                 .extension()
                 .is_some_and(|e| e.to_str().is_some_and(|e| !e.is_empty()));
         if looks_like_path {
-            push_unique(&mut patterns.path_tokens, trimmed.to_string());
+            push_unique(&mut patterns.path_tokens, path_candidate.to_string());
         }
         for segment in trimmed.split(|c: char| !is_word_char(c)) {
             if is_identifier_like(segment) {
@@ -457,6 +480,28 @@ mod tests {
         );
         assert!(p.identifiers.contains(&"freshness".to_string()));
         assert!(p.identifiers.contains(&"memory".to_string()));
+    }
+
+    #[test]
+    fn file_line_reference_strips_line_suffix_from_path_token() {
+        let p = derive_patterns("why does search.rs:120 call decide_freshness");
+        assert!(
+            p.path_tokens.contains(&"search.rs".to_string()),
+            "got {:?}",
+            p.path_tokens
+        );
+        assert!(
+            !p.path_tokens.iter().any(|t| t.contains(':')),
+            "got {:?}",
+            p.path_tokens
+        );
+
+        let p = derive_patterns("see config.rs:42:5 for the fix");
+        assert!(
+            p.path_tokens.contains(&"config.rs".to_string()),
+            "got {:?}",
+            p.path_tokens
+        );
     }
 
     #[test]

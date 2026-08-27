@@ -12,6 +12,7 @@ use repo_explorer_core::memory::{GraphQuery, MemoryBackend, SnippetTarget};
 use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use std::path::{Component, Path, PathBuf};
 
+use crate::pipeline::file_glob_for;
 use crate::render::{RenderCaps, cap_file_lines, render_findings, render_result};
 use crate::tools::{
     GetArchitectureArgs, GetCodeSnippetArgs, PatternArgs, QueryGraphArgs, ReadFileArgs,
@@ -127,9 +128,11 @@ pub(crate) async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
             // `find` has no dedicated backend capability: the real
             // `SearchBackend` only exposes a content search, so a filename
             // search is approximated by matching any non-empty line (pattern
-            // `.`) restricted to files matching `pattern` as a glob.
+            // `.`) restricted to files matching `pattern` as a glob — run
+            // through `file_glob_for` so a bare, extension-less pattern still
+            // matches a basename instead of only an exact filename.
             let (pattern, file_glob) = if name == "find" {
-                (MATCH_ANY_NON_EMPTY_LINE, Some(args.pattern))
+                (MATCH_ANY_NON_EMPTY_LINE, Some(file_glob_for(&args.pattern)))
             } else {
                 (args.pattern.as_str(), None)
             };
@@ -147,7 +150,7 @@ pub(crate) async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
         }
         "read_file" => {
             let args: ReadFileArgs = parse_args(&call.arguments_json)?;
-            let content = read_file(repo_root, &args.path, args.start_line, args.end_line)?;
+            let content = read_file(repo_root, &args.path, args.start_line, args.end_line).await?;
             Ok((
                 cap_file_lines(content, caps.read_file_max_lines),
                 Vec::new(),
@@ -222,34 +225,45 @@ fn validate_scope(scope: Option<&str>) -> Result<Option<PathBuf>, String> {
     scope.map(|s| reject_escaping_path("scope", s)).transpose()
 }
 
-/// Resolve `repo_root` to its canonical form. Callers that read several files
-/// against the same root in a loop — e.g. verify's `expand_content`, which
-/// batches a whole `expand` call's candidate ids — should call this once and
-/// reuse the result via [`read_file_canonical`] instead of re-canonicalizing
+/// Resolve `repo_root` to its canonical form, off the async runtime thread
+/// (`std::fs::canonicalize` runs via `spawn_blocking`, like the identical
+/// syscall in `repo-explorer-memory`'s `canonicalize_repo_root`) so a slow
+/// syscall never stalls the worker thread running other tool-call futures
+/// batched alongside it. Callers that read several files against the same
+/// root in a loop — e.g. verify's `expand_content`, which batches a whole
+/// `expand` call's candidate ids — should call this once and reuse the
+/// result via [`read_file_canonical`] instead of re-canonicalizing
 /// `repo_root` per file.
-pub(crate) fn canonical_repo_root(repo_root: &Path) -> Result<PathBuf, String> {
-    std::fs::canonicalize(repo_root).map_err(|e| format!("failed to resolve repo root: {e}"))
+pub(crate) async fn canonical_repo_root(repo_root: &Path) -> Result<PathBuf, String> {
+    let owned = repo_root.to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::canonicalize(&owned))
+        .await
+        .map_err(|e| format!("failed to resolve repo root: {e}"))?
+        .map_err(|e| format!("failed to resolve repo root: {e}"))
 }
 
 /// Single-file convenience over [`canonical_repo_root`] + [`read_file_canonical`];
 /// used by the `read_file` tool dispatch, which only ever reads one file per call.
 /// Runs the lexical escape check before resolving `repo_root` so a malformed
 /// `path` is rejected fast, without depending on `repo_root` existing on disk.
-pub(crate) fn read_file(
+pub(crate) async fn read_file(
     repo_root: &Path,
     path: &str,
     start_line: Option<u32>,
     end_line: Option<u32>,
 ) -> Result<String, String> {
     reject_escaping_path("read_file path", path)?;
-    let canonical_root = canonical_repo_root(repo_root)?;
-    read_file_canonical(repo_root, &canonical_root, path, start_line, end_line)
+    let canonical_root = canonical_repo_root(repo_root).await?;
+    read_file_canonical(repo_root, &canonical_root, path, start_line, end_line).await
 }
 
 /// [`read_file`] taking an already-canonicalized `repo_root`. Also used
 /// directly by the verification stage's `expand` handler, which resolves
-/// `repo_root` once per batch via [`canonical_repo_root`].
-pub(crate) fn read_file_canonical(
+/// `repo_root` once per batch via [`canonical_repo_root`]. The resolve-and-read
+/// (`canonicalize` + `read_to_string`) both run inside one `spawn_blocking`
+/// so neither blocking syscall runs on the async runtime thread — see
+/// [`canonical_repo_root`].
+pub(crate) async fn read_file_canonical(
     repo_root: &Path,
     canonical_root: &Path,
     path: &str,
@@ -258,15 +272,21 @@ pub(crate) fn read_file_canonical(
 ) -> Result<String, String> {
     let rel = reject_escaping_path("read_file path", path)?;
     let full = repo_root.join(rel);
-    let canonical_full =
-        std::fs::canonicalize(&full).map_err(|e| format!("read_file failed for `{path}`: {e}"))?;
-    if !canonical_full.starts_with(canonical_root) {
-        return Err(format!(
-            "read_file path `{path}` escapes the repository root"
-        ));
-    }
-    let contents = std::fs::read_to_string(&canonical_full)
-        .map_err(|e| format!("read_file failed for `{path}`: {e}"))?;
+    let canonical_root = canonical_root.to_path_buf();
+    let path_owned = path.to_string();
+    let contents = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let canonical_full = std::fs::canonicalize(&full)
+            .map_err(|e| format!("read_file failed for `{path_owned}`: {e}"))?;
+        if !canonical_full.starts_with(&canonical_root) {
+            return Err(format!(
+                "read_file path `{path_owned}` escapes the repository root"
+            ));
+        }
+        std::fs::read_to_string(&canonical_full)
+            .map_err(|e| format!("read_file failed for `{path_owned}`: {e}"))
+    })
+    .await
+    .map_err(|e| format!("read_file failed for `{path}`: internal error: {e}"))??;
     Ok(slice_lines(contents, start_line, end_line))
 }
 

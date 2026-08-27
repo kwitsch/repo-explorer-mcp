@@ -92,12 +92,15 @@ where
                         };
                         for call in calls.iter().filter(|c| c.name != "finish") {
                             let content = match call.name.as_str() {
-                                "expand" => expand_content(
-                                    repo_root,
-                                    candidates,
-                                    &call.arguments_json,
-                                    caps,
-                                ),
+                                "expand" => {
+                                    expand_content(
+                                        repo_root,
+                                        candidates,
+                                        &call.arguments_json,
+                                        caps,
+                                    )
+                                    .await
+                                }
                                 other => format!("unknown tool: {other}"),
                             };
                             responses.push(Message::tool(&call.id, content));
@@ -191,7 +194,7 @@ async fn candidates_block<M: MemoryBackend>(
 
 /// Bodies for the requested candidate ids, read deterministically from disk
 /// with context around each candidate's range.
-fn expand_content(
+async fn expand_content(
     repo_root: &Path,
     candidates: &[Candidate],
     arguments_json: &str,
@@ -224,8 +227,11 @@ fn expand_content(
             .location
             .line_end
             .saturating_add(EXPAND_CONTEXT_AFTER);
-        let result = match canonical_root.get_or_insert_with(|| canonical_repo_root(repo_root)) {
-            Ok(r) => read_file_canonical(repo_root, r, &path, Some(start), Some(end)),
+        if canonical_root.is_none() {
+            canonical_root = Some(canonical_repo_root(repo_root).await);
+        }
+        let result = match canonical_root.as_ref().unwrap() {
+            Ok(r) => read_file_canonical(repo_root, r, &path, Some(start), Some(end)).await,
             Err(e) => Err(e.clone()),
         };
         match result {
@@ -275,31 +281,33 @@ mod tests {
         assert!(block.contains("fn sym() {}"));
     }
 
-    #[test]
-    fn expand_reports_unknown_ids_and_bad_args() {
+    #[tokio::test]
+    async fn expand_reports_unknown_ids_and_bad_args() {
         let caps = RenderCaps::default();
         let out = expand_content(
             Path::new("/repo"),
             &[candidate("a.rs", 1, 2)],
             r#"{"candidate_ids":[7]}"#,
             &caps,
-        );
+        )
+        .await;
         assert!(out.contains("[7] no such candidate"));
-        let out = expand_content(Path::new("/repo"), &[], r#"{"bogus":1}"#, &caps);
+        let out = expand_content(Path::new("/repo"), &[], r#"{"bogus":1}"#, &caps).await;
         assert!(out.contains("invalid arguments"));
-        let out = expand_content(Path::new("/repo"), &[], r#"{"candidate_ids":[]}"#, &caps);
+        let out = expand_content(Path::new("/repo"), &[], r#"{"candidate_ids":[]}"#, &caps).await;
         assert!(out.contains("must be non-empty"));
     }
 
-    #[test]
-    fn expand_id_zero_is_not_a_candidate() {
+    #[tokio::test]
+    async fn expand_id_zero_is_not_a_candidate() {
         let caps = RenderCaps::default();
         let out = expand_content(
             Path::new("/repo"),
             &[candidate("a.rs", 1, 2)],
             r#"{"candidate_ids":[0]}"#,
             &caps,
-        );
+        )
+        .await;
         assert!(out.contains("[0] no such candidate"));
     }
 }

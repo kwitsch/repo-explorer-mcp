@@ -48,10 +48,10 @@ impl<V: Clone> CappedMap<V> {
             Entry::Vacant(e) => {
                 self.order.push_back(e.key().clone());
                 e.insert(value);
-                while self.map.len() > self.cap {
-                    if let Some(oldest) = self.order.pop_front() {
-                        self.map.remove(&oldest);
-                    }
+                if self.map.len() > self.cap
+                    && let Some(oldest) = self.order.pop_front()
+                {
+                    self.map.remove(&oldest);
                 }
             }
         }

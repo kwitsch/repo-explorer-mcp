@@ -301,8 +301,10 @@ fn file_candidates(findings: Vec<ExplorationFinding>) -> Vec<Candidate> {
 }
 
 /// Glob for a path-like token: a bare file name matches by basename; a token
-/// without an extension matches as a substring.
-fn file_glob_for(token: &str) -> String {
+/// without an extension matches as a substring. Shared with `dispatch`'s
+/// `find` tool, which emulates the same filename search over an LLM-supplied
+/// pattern.
+pub(crate) fn file_glob_for(token: &str) -> String {
     // rsplit always yields at least the whole string, so this is infallible.
     let name = token.rsplit('/').next().unwrap();
     if name.contains('.') {

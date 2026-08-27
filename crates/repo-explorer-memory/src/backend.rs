@@ -655,6 +655,11 @@ impl MemoryBackend for MemoryClientBackend {
         // second time inside `run_index`.
         let abs = canonicalize_repo_root(repo_root).await;
         let project = project_name_from_abs(repo_root, &abs)?;
+        // Seed the cache now (keyed on the raw `repo_root`, same as
+        // `cached_project_name` compares against) so the retrieval calls that
+        // immediately follow this in `AgentLoop::run` skip the redundant
+        // canonicalize + project-name round trip on their first call.
+        *self.project_name_cache.lock().unwrap() = Some((repo_root.to_path_buf(), project.clone()));
         let exists = self.probe_status(&project).await?;
         // `detect_changes` is only meaningful for a project that exists.
         let changed_files = if exists {
@@ -727,12 +732,21 @@ impl MemoryBackend for MemoryClientBackend {
         &self,
         repo_root: &Path,
         from: &str,
-        to: &str,
+        _to: &str,
         max_depth: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
+        // The connected `trace_path` tool has no two-endpoint path concept:
+        // it requires `function_name` and reports that single function's
+        // callers/callees, ignoring `from`/`to` entirely (live-verified:
+        // sending `{from, to}` alone fails with "function_name is required",
+        // and once `function_name` is supplied, varying `to` leaves the
+        // result unchanged). Map `from` onto `function_name` and request
+        // both directions -- the closest this shape gets to the caller's
+        // two-endpoint intent -- and drop `to`, which the tool has nowhere
+        // to put.
         self.call_memory_tool("trace_path", repo_root, |args| {
-            args.insert("from".to_string(), Value::String(from.to_string()));
-            args.insert("to".to_string(), Value::String(to.to_string()));
+            args.insert("function_name".to_string(), Value::String(from.to_string()));
+            args.insert("direction".to_string(), Value::String("both".to_string()));
             insert_opt_u32(args, "max_depth", max_depth);
         })
         .await

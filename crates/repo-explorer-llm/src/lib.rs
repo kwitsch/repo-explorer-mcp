@@ -388,7 +388,10 @@ fn to_genai_message(
             Ok(ChatMessage::assistant(MessageContent::from_parts(parts)))
         }
         Role::Tool => {
-            let call_id = message.tool_call_id.as_deref().unwrap_or("");
+            let call_id = message
+                .tool_call_id
+                .as_deref()
+                .expect("Role::Tool message always carries tool_call_id");
             let mut response = ToolResponse::new(call_id.to_string(), message.content.clone());
             if let Some(fn_name) = call_id_to_fn_name.get(call_id) {
                 response = response.with_fn_name(*fn_name);

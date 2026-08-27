@@ -186,7 +186,12 @@ where
         if outcome.confidence >= self.settings.early_exit_confidence
             && !outcome.candidates.is_empty()
         {
-            let result = self.result_from_candidates(outcome.candidates, query, outcome.confidence);
+            let result = self.result_from_candidates(
+                outcome.candidates,
+                query,
+                outcome.confidence,
+                index_note.as_deref(),
+            );
             return Ok(self.complete_run("early-exit", 0, &query_key, fingerprint, result));
         }
 
@@ -239,6 +244,23 @@ where
         ))
     }
 
+    /// The shared dedupe-then-truncate contract: dedupe first so a run of
+    /// colliding-sentinel findings can't push a legitimate distinct finding
+    /// out of the `max_results` cap. Used by both `finalize` (verify/fallback
+    /// results) and `result_from_candidates` (the early-exit path) so the two
+    /// can't silently diverge.
+    fn tidy_and_truncate(
+        &self,
+        findings: Vec<ExplorationFinding>,
+        max_results: Option<u32>,
+    ) -> Vec<ExplorationFinding> {
+        let mut findings = tidy_findings(findings, &self.caps);
+        if let Some(max) = max_results {
+            findings.truncate(max as usize);
+        }
+        findings
+    }
+
     /// Normalize/dedupe/cap the final findings once, whatever stage produced
     /// them — preserving their order (rank order / the model's finish order).
     /// `max_results` is enforced here (after dedupe) so it bounds every path
@@ -250,10 +272,7 @@ where
         mut result: ExplorationResult,
         max_results: Option<u32>,
     ) -> ExplorationResult {
-        result.findings = tidy_findings(result.findings, &self.caps);
-        if let Some(max) = max_results {
-            result.findings.truncate(max as usize);
-        }
+        result.findings = self.tidy_and_truncate(result.findings, max_results);
         result
     }
 
@@ -351,28 +370,32 @@ where
         );
     }
 
-    /// Build the early-exit result straight from the ranked candidates.
-    /// Dedupes before truncating to `max_results` — same order as
-    /// `finalize()` — so a run of colliding-sentinel candidates can't push a
-    /// legitimate distinct candidate out of the cap.
+    /// Build the early-exit result straight from the ranked candidates, via
+    /// the same dedupe-then-truncate contract as `finalize()`. `index_note`
+    /// (e.g. a failed reindex) is appended to the summary — this is the only
+    /// stage that doesn't already thread it into an LLM prompt, so it must be
+    /// surfaced here or a confident answer from a stale index would carry no
+    /// warning at all.
     fn result_from_candidates(
         &self,
         candidates: Vec<Candidate>,
         query: &ExplorationQuery,
         confidence: u32,
+        index_note: Option<&str>,
     ) -> ExplorationResult {
-        let mut findings = tidy_findings(
+        let findings = self.tidy_and_truncate(
             candidates.into_iter().map(finding_from_candidate).collect(),
-            &self.caps,
+            query.max_results,
         );
-        if let Some(max) = query.max_results {
-            findings.truncate(max as usize);
-        }
-        let summary = format!(
+        let mut summary = format!(
             "Resolved deterministically by the retrieval pre-stage (confidence {confidence}/100, no LLM involved): {} location(s) matching \"{}\".",
             findings.len(),
             query.text
         );
+        if let Some(note) = index_note {
+            summary.push(' ');
+            summary.push_str(note);
+        }
         ExplorationResult { findings, summary }
     }
 
@@ -813,7 +836,7 @@ mod tests {
             scope_hint: None,
             max_results: Some(3),
         };
-        let result = agent.result_from_candidates(candidates, &query, 100);
+        let result = agent.result_from_candidates(candidates, &query, 100, None);
         assert_eq!(
             result.findings.len(),
             3,
@@ -827,6 +850,57 @@ mod tests {
         assert!(
             paths.contains(&PathBuf::from("another.rs")),
             "pre-dedupe truncation must not drop the distinct 4th candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn early_exit_surfaces_stale_index_note_in_summary() {
+        // Regression: Stage 3's early exit must not silently drop Stage 1's
+        // index-freshness note — a confident answer served from a stale
+        // index (reindex failed, memory backend still answers from the
+        // previous index) must still say so.
+        let memory = MockMemoryBackend::new()
+            .with_ensure_fresh_index_result(Ok(IndexStatus::IndexingFailed {
+                reason: "boom".to_string(),
+            }))
+            .with_search_graph_result(Ok(ExplorationResult {
+                findings: vec![ExplorationFinding {
+                    location: FileLocation {
+                        path: PathBuf::from("crates/x/src/freshness.rs"),
+                        line_start: 12,
+                        line_end: 12,
+                    },
+                    snippet: None,
+                    note: Some("decide_freshness".to_string()),
+                }],
+                summary: "1 row".to_string(),
+            }));
+        let router = ProviderRouter::with_clock(
+            vec![(
+                "primary".to_string(),
+                vec![("m".to_string(), MockLlmProvider::new())],
+            )],
+            60,
+            FakeClock::new(),
+        );
+        let agent = AgentLoop::new(
+            memory,
+            MockSearchBackend::new(),
+            router,
+            MockRepoStateProbe::new(),
+            AgentSettings::default(),
+            CacheSettings::default(),
+        );
+        let query = ExplorationQuery {
+            text: "decide_freshness".to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let got = agent.run(&PathBuf::from("/repo"), &query).await.unwrap();
+        assert!(
+            got.summary.contains("memory index could not be refreshed"),
+            "early-exit summary must surface the index-freshness note: {}",
+            got.summary
         );
     }
 

@@ -5,7 +5,6 @@
 use crate::process::{SpawnSpec, run};
 use repo_explorer_core::fingerprint::{RepoFingerprint, RepoStateProbe};
 use sha2::{Digest, Sha256};
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -42,12 +41,7 @@ fn sha256_hex(parts: &[&str]) -> String {
         hasher.update(part.as_bytes());
         hasher.update([0u8]);
     }
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(out, "{byte:02x}").unwrap();
-    }
-    out
+    hex::encode(hasher.finalize())
 }
 
 impl RepoStateProbe for GitStateProbe {
