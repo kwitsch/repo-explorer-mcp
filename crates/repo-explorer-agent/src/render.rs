@@ -92,6 +92,8 @@ pub(crate) fn tidy_findings(
     let mut out: Vec<ExplorationFinding> = Vec::with_capacity(findings.len());
     for mut f in findings {
         f.location.path = normalize_rel_path(f.location.path);
+        // Normalize before keying so whitespace-only and absent notes dedupe together.
+        f.note = f.note.filter(|n| !n.trim().is_empty());
         if !seen.insert(dedupe_key(&f)) {
             continue;
         }
@@ -99,7 +101,6 @@ pub(crate) fn tidy_findings(
             .snippet
             .map(|s| cap_snippet(s, caps.snippet_max_chars))
             .filter(|s| !s.is_empty());
-        f.note = f.note.filter(|n| !n.trim().is_empty());
         out.push(f);
     }
     out
@@ -270,6 +271,19 @@ mod tests {
         let b = a.clone();
         let out = tidy_findings(vec![a, b], &caps);
         assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn unknown_location_sentinel_dedupes_whitespace_only_note_against_none() {
+        // Note normalization (whitespace-only -> None) must feed the dedupe
+        // key, not run after it, or these two collapse to zero instead of one.
+        let caps = RenderCaps::default();
+        let a = finding("a.rs", 0, None);
+        let mut b = finding("a.rs", 0, None);
+        b.note = Some("   ".to_string());
+        let out = tidy_findings(vec![a, b], &caps);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].note, None);
     }
 
     #[test]

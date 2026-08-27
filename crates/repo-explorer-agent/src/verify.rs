@@ -193,7 +193,10 @@ async fn candidates_block<M: MemoryBackend>(
 }
 
 /// Bodies for the requested candidate ids, read deterministically from disk
-/// with context around each candidate's range.
+/// with context around each candidate's range. Ids that don't resolve to a
+/// candidate become immediate errors; the rest are read concurrently (like
+/// every other fanout in this crate) against `repo_root` canonicalized once
+/// up front, then reassembled in the model's requested order.
 async fn expand_content(
     repo_root: &Path,
     candidates: &[Candidate],
@@ -207,42 +210,58 @@ async fn expand_content(
     if args.candidate_ids.is_empty() {
         return "invalid arguments: candidate_ids must be non-empty".to_string();
     }
-    // Resolved lazily on the first id that actually needs a file read, then
-    // reused for the rest of the batch instead of re-canonicalizing
-    // `repo_root` per id.
-    let mut canonical_root: Option<Result<PathBuf, String>> = None;
-    let mut sections = Vec::new();
-    for id in args.candidate_ids {
-        let Some(candidate) = (id as usize).checked_sub(1).and_then(|i| candidates.get(i)) else {
-            sections.push(format!("[{id}] no such candidate"));
-            continue;
-        };
-        let path = candidate.location.path.to_string_lossy();
-        let start = candidate
-            .location
-            .line_start
-            .saturating_sub(EXPAND_CONTEXT_BEFORE)
-            .max(1);
-        let end = candidate
-            .location
-            .line_end
-            .saturating_add(EXPAND_CONTEXT_AFTER);
-        if canonical_root.is_none() {
-            canonical_root = Some(canonical_repo_root(repo_root).await);
-        }
-        let result = match canonical_root.as_ref().unwrap() {
-            Ok(r) => read_file_canonical(repo_root, r, &path, Some(start), Some(end)).await,
-            Err(e) => Err(e.clone()),
-        };
-        match result {
-            Ok(body) => sections.push(format!(
-                "[{id}] {path}:{start}-{end}\n{}",
-                cap_file_lines(body, caps.read_file_max_lines)
-            )),
-            Err(e) => sections.push(format!("[{id}] {e}")),
+
+    let mut sections: Vec<Option<String>> = vec![None; args.candidate_ids.len()];
+    let mut reads = Vec::new();
+    for (pos, id) in args.candidate_ids.into_iter().enumerate() {
+        match (id as usize).checked_sub(1).and_then(|i| candidates.get(i)) {
+            None => sections[pos] = Some(format!("[{id}] no such candidate")),
+            Some(candidate) => {
+                let path = candidate.location.path.to_string_lossy().into_owned();
+                let start = candidate
+                    .location
+                    .line_start
+                    .saturating_sub(EXPAND_CONTEXT_BEFORE)
+                    .max(1);
+                let end = candidate
+                    .location
+                    .line_end
+                    .saturating_add(EXPAND_CONTEXT_AFTER);
+                reads.push((pos, id, path, start, end));
+            }
         }
     }
-    sections.join("\n\n")
+
+    if !reads.is_empty() {
+        let canonical_root = canonical_repo_root(repo_root).await;
+        let results = join_all(reads.iter().map(|(_, id, path, start, end)| {
+            let (id, start, end) = (*id, *start, *end);
+            let canonical_root = &canonical_root;
+            async move {
+                let result = match canonical_root {
+                    Ok(r) => read_file_canonical(repo_root, r, path, Some(start), Some(end)).await,
+                    Err(e) => Err(e.clone()),
+                };
+                match result {
+                    Ok(body) => format!(
+                        "[{id}] {path}:{start}-{end}\n{}",
+                        cap_file_lines(body, caps.read_file_max_lines)
+                    ),
+                    Err(e) => format!("[{id}] {e}"),
+                }
+            }
+        }))
+        .await;
+        for ((pos, ..), section) in reads.iter().zip(results) {
+            sections[*pos] = Some(section);
+        }
+    }
+
+    sections
+        .into_iter()
+        .map(|s| s.expect("every position filled by an error or a read"))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 #[cfg(test)]

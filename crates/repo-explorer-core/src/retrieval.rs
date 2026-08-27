@@ -268,13 +268,15 @@ pub fn normalize_location(location: FileLocation) -> FileLocation {
     }
 }
 
-/// `(0, 0)` is `normalize_location`'s "location unknown" sentinel, not a real
-/// one-line span at line 0 — two candidates that both merely lack line data
-/// must not be treated as overlapping just because they share that sentinel.
-/// `pub` so callers outside this module (e.g. the agent crate's finding
-/// dedupe) can apply the same "unknown" test instead of reimplementing it.
+/// Line numbers are 1-indexed, so `line_start == 0` is never a real start —
+/// it's the "location unknown" placeholder, whether or not `line_end` also
+/// carries real data (e.g. a source that reports only an end line). Two
+/// candidates that both merely lack a known start must not be treated as
+/// overlapping just because they share that placeholder. `pub` so callers
+/// outside this module (e.g. the agent crate's finding dedupe) can apply the
+/// same "unknown" test instead of reimplementing it.
 pub fn is_unknown_location(loc: &FileLocation) -> bool {
-    loc.line_start == 0 && loc.line_end == 0
+    loc.line_start == 0
 }
 
 fn overlaps(a: &FileLocation, b: &FileLocation) -> bool {
@@ -617,6 +619,25 @@ mod tests {
         let symbols: Vec<_> = ranked.iter().map(|c| c.symbol.as_deref()).collect();
         assert!(symbols.contains(&Some("decide_freshness")));
         assert!(symbols.contains(&Some("StalenessWindow")));
+    }
+
+    #[test]
+    fn partial_unknown_start_sentinels_do_not_merge_distinct_symbols() {
+        // A backend that reports only an end line (e.g. `location_from`
+        // seeing "line_end" but not "line_start" in the JSON) leaves
+        // line_start at its 0 default while line_end carries real, differing
+        // data. That placeholder start must not make the two look like an
+        // overlapping range and merge them into one.
+        let p = QueryPatterns::default();
+        let mut a = candidate("a.rs", 0, 10, CandidateKind::SymbolExact);
+        a.symbol = Some("foo".to_string());
+        let mut b = candidate("a.rs", 0, 20, CandidateKind::SymbolExact);
+        b.symbol = Some("bar".to_string());
+        let ranked = merge_and_rank(vec![a, b], &p, 10);
+        assert_eq!(ranked.len(), 2);
+        let symbols: Vec<_> = ranked.iter().map(|c| c.symbol.as_deref()).collect();
+        assert!(symbols.contains(&Some("foo")));
+        assert!(symbols.contains(&Some("bar")));
     }
 
     #[test]

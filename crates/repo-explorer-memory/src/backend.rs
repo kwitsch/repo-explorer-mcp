@@ -622,13 +622,33 @@ fn text_table_findings(text: &str) -> Vec<ExplorationFinding> {
 /// file stem -- is snake_case/kebab-case, so the first uppercase-led segment
 /// unambiguously starts the type qualifier instead of the file path).
 /// `None` when no module segment is left to build a file from.
+///
+/// Only a segment sequence containing a literal `src` component follows
+/// Cargo's crate-dir/src/file-stem convention (`.rs` mirrors the real file
+/// stem there, e.g. `crates.repo-explorer-mcp.src.main` ->
+/// `crates/repo-explorer-mcp/src/main.rs`); appending `.rs` there is
+/// therefore exact. A non-Rust module the connected `codebase-memory-mcp`
+/// indexes has no `src` segment and collapses to just its containing
+/// directory with the actual file stem dropped entirely (live-verified: the
+/// JS entry point `setup/index.mjs` groups under prefix `<project>.setup`,
+/// with no `index` segment anywhere to recover) -- guessing `.rs` there would
+/// name a Rust file that doesn't exist, so fall back to the bare directory
+/// path instead of fabricating an extension.
 fn trace_path_group_file(qn_prefix: &str) -> Option<String> {
     let mut segments = qn_prefix.split('.');
     segments.next()?;
     let module_segments: Vec<&str> = segments
         .take_while(|s| !s.starts_with(|c: char| c.is_ascii_uppercase()))
         .collect();
-    (!module_segments.is_empty()).then(|| format!("{}.rs", module_segments.join("/")))
+    if module_segments.is_empty() {
+        return None;
+    }
+    let path = module_segments.join("/");
+    if module_segments.contains(&"src") {
+        Some(format!("{path}.rs"))
+    } else {
+        Some(path)
+    }
 }
 
 /// Parse the connected `trace_path` tool's plain-text response: a
@@ -1025,6 +1045,38 @@ project_name_root_path_errors 2\n";
             )
         );
         assert!(res.summary.contains("6 locatable finding"));
+    }
+
+    /// Live-verified `trace_path` group prefix for a non-Rust (JS) module --
+    /// no `src` segment, so [`trace_path_group_file`] must not append `.rs`
+    /// and fabricate a `setup.rs` file that doesn't exist; the real source is
+    /// `setup/index.mjs`, which the qn segments alone can't recover, so the
+    /// bare directory is the honest fallback.
+    #[test]
+    fn text_table_trace_path_non_rust_group_omits_rs_extension() {
+        let text = "function: parseArgs\n\
+direction: both\n\
+callees_total: 0\n\
+callees: 0  (rows: name hop; qn = group prefix + \".\" + name)\n\
+callers_total: 2\n\
+callers: 2  (rows: name hop; qn = group prefix + \".\" + name)\n\
+home-kwitsch-repos-repo-explorer-mcp.setup:\n  \
+index 2\n  \
+main 1\n";
+        let res = findings_and_summary(
+            "trace_path",
+            &Value::String(text.to_string()),
+            Path::new("/repo"),
+        );
+        assert_eq!(res.findings.len(), 2);
+        assert_eq!(
+            res.findings[0].location.path,
+            std::path::PathBuf::from("setup")
+        );
+        assert_eq!(
+            res.findings[0].note.as_deref(),
+            Some("home-kwitsch-repos-repo-explorer-mcp.setup.index")
+        );
     }
 
     /// Live-verified `query_graph` payload shape: `RETURN` column names are
