@@ -156,16 +156,13 @@ fn build_catalog() -> Vec<Tool> {
         ),
         tool(
             "get_code_snippet",
-            "PRIMARY: fetch a code snippet from memory, either by qualified_name or by file plus optional start_line/end_line. Provide qualified_name OR file (qualified_name wins if both are present).",
+            "PRIMARY: fetch a code snippet from memory by qualified_name. The connected backend requires qualified_name unconditionally — a file plus start_line/end_line alone is not supported and always fails; use read_file for a path/line-range read instead.",
             json!({
                 "type": "object",
                 "properties": {
-                    "qualified_name": {"type": "string"},
-                    "file": {"type": "string"},
-                    "start_line": {"type": "integer"},
-                    "end_line": {"type": "integer"}
+                    "qualified_name": {"type": "string"}
                 },
-                "required": [],
+                "required": ["qualified_name"],
                 "additionalProperties": false
             }),
         ),

@@ -635,12 +635,16 @@ fn text_table_findings(text: &str) -> Vec<ExplorationFinding> {
 /// unambiguously starts the type qualifier instead of the file path).
 /// `None` when no module segment is left to build a file from.
 ///
-/// Only a segment sequence containing a literal `src` component follows
-/// Cargo's crate-dir/src/file-stem convention (`.rs` mirrors the real file
-/// stem there, e.g. `crates.repo-explorer-mcp.src.main` ->
-/// `crates/repo-explorer-mcp/src/main.rs`); appending `.rs` there is
-/// therefore exact. A non-Rust module the connected `codebase-memory-mcp`
-/// indexes has no `src` segment and collapses to just its containing
+/// A segment sequence containing a literal `src`, `tests`, `benches`, or
+/// `examples` component follows Cargo's crate-dir/{dir}/file-stem convention
+/// (`.rs` mirrors the real file stem there, e.g.
+/// `crates.repo-explorer-mcp.src.main` -> `crates/repo-explorer-mcp/src/main.rs`,
+/// and, live-verified against this workspace's own
+/// `crates/repo-explorer-memory/tests/integration.rs`,
+/// `crates.repo-explorer-memory.tests.integration` ->
+/// `crates/repo-explorer-memory/tests/integration.rs`); appending `.rs` there
+/// is therefore exact. A non-Rust module the connected `codebase-memory-mcp`
+/// indexes has none of those segments and collapses to just its containing
 /// directory with the actual file stem dropped entirely (live-verified: the
 /// JS entry point `setup/index.mjs` groups under prefix `<project>.setup`,
 /// with no `index` segment anywhere to recover) -- guessing `.rs` there would
@@ -656,7 +660,10 @@ fn trace_path_group_file(qn_prefix: &str) -> Option<String> {
         return None;
     }
     let path = module_segments.join("/");
-    if module_segments.contains(&"src") {
+    let is_rust_layout = ["src", "tests", "benches", "examples"]
+        .iter()
+        .any(|dir| module_segments.contains(dir));
+    if is_rust_layout {
         Some(format!("{path}.rs"))
     } else {
         Some(path)
@@ -717,11 +724,43 @@ fn result_with_finding_count(
     ExplorationResult { findings, summary }
 }
 
+/// Decode a `{"status":"ambiguous","message":...,"suggestions":[{"qualified_name":...},...]}`
+/// success payload -- live-verified as `trace_path`'s response to a
+/// `function_name` that matches more than one symbol (e.g. `"connect"` or
+/// `"new"` in this workspace) -- into a summary carrying the tool's own
+/// message plus every suggested qualified name. Without this, the payload
+/// has none of "results"/"rows"/"hits" and no "cols" array, so
+/// `columnar_findings` returns `None` and the disambiguation prompt is
+/// silently discarded as an indistinguishable "0 locatable findings". `None`
+/// for every other shape.
+fn ambiguous_summary(json: &Value) -> Option<String> {
+    if json.get("status").and_then(Value::as_str) != Some("ambiguous") {
+        return None;
+    }
+    let message = json
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("ambiguous match");
+    let suggestions: Vec<&str> = json
+        .get("suggestions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.get("qualified_name").and_then(Value::as_str))
+        .collect();
+    Some(if suggestions.is_empty() {
+        message.to_string()
+    } else {
+        format!("{message} Candidates: {}", suggestions.join(", "))
+    })
+}
+
 /// Turn a tool response into findings plus a compact summary string. Handles
-/// the four shapes `codebase-memory-mcp` actually produces: an array of
+/// the five shapes `codebase-memory-mcp` actually produces: an array of
 /// object rows (`results`/`rows`/`hits`), the columnar `{cols, groups}` JSON,
-/// the plain-text table (reaching here as `Value::String`), and `trace_path`'s
-/// own plain-text shape (grouped, columnless -- see [`trace_path_findings`]).
+/// the plain-text table (reaching here as `Value::String`), `trace_path`'s own
+/// plain-text shape (grouped, columnless -- see [`trace_path_findings`]), and
+/// `trace_path`'s ambiguous-match success payload (see [`ambiguous_summary`]).
 fn findings_and_summary(tool: &'static str, json: &Value, repo_root: &Path) -> ExplorationResult {
     if let Value::String(text) = json {
         let findings = if tool == "trace_path" {
@@ -730,6 +769,12 @@ fn findings_and_summary(tool: &'static str, json: &Value, repo_root: &Path) -> E
             text_table_findings(text)
         };
         return result_with_finding_count(tool, findings);
+    }
+    if let Some(message) = ambiguous_summary(json) {
+        return ExplorationResult {
+            findings: Vec::new(),
+            summary: format!("{tool}: {message}"),
+        };
     }
     let mut findings = Vec::new();
     if let Some(rows) = first_field(json, &["results", "rows", "hits"]).and_then(Value::as_array) {
@@ -756,11 +801,6 @@ impl MemoryBackend for MemoryClientBackend {
         // second time inside `run_index`.
         let abs = canonicalize_repo_root(repo_root).await;
         let project = project_name_from_abs(repo_root, &abs)?;
-        // Seed the cache now (keyed on the raw `repo_root`, same as
-        // `cached_project_name` compares against) so the retrieval calls that
-        // immediately follow this in `AgentLoop::run` skip the redundant
-        // canonicalize + project-name round trip on their first call.
-        *self.project_name_cache.lock().unwrap() = Some((repo_root.to_path_buf(), project.clone()));
         let exists = self.probe_status(&project).await?;
         // `detect_changes` is only meaningful for a project that exists.
         let changed_files = if exists {
@@ -768,6 +808,13 @@ impl MemoryBackend for MemoryClientBackend {
         } else {
             ChangeCount::Known(0)
         };
+        // Seed the cache now, after `project`'s last borrow (keyed on the raw
+        // `repo_root`, same as `cached_project_name` compares against) so the
+        // retrieval calls that immediately follow this in `AgentLoop::run`
+        // skip the redundant canonicalize + project-name round trip on their
+        // first call -- moving `project` by value instead of cloning it, since
+        // nothing below needs it anymore.
+        *self.project_name_cache.lock().unwrap() = Some((repo_root.to_path_buf(), project));
         // Only meaningful once this project has been indexed; irrelevant
         // (and forced to `Reindex` regardless) when `exists` is false.
         let last_indexed_at = if exists {
@@ -1217,6 +1264,41 @@ repo.crates.a.src.f.decide_freshness crates/a/src/f.rs 40 60\n";
         assert_eq!(res.findings.len(), 1);
         assert_eq!(res.findings[0].note.as_deref(), Some("foo"));
         assert!(res.summary.contains("2 row(s), 1 locatable finding(s)"));
+    }
+
+    /// Live-verified `trace_path` response to a non-unique `function_name`
+    /// (e.g. `"new"` in this workspace): a success payload, not a tool error,
+    /// that must surface its disambiguation message and suggestions instead
+    /// of being silently read as "0 locatable findings".
+    #[test]
+    fn trace_path_ambiguous_status_surfaces_message_and_suggestions() {
+        let payload = json!({
+            "status": "ambiguous",
+            "message": "13 matches for \"new\". Pick a qualified_name from suggestions below...",
+            "suggestions": [
+                {"qualified_name": "repo.crates.a.src.f.Foo.new"},
+                {"qualified_name": "repo.crates.b.src.g.Bar.new"}
+            ]
+        });
+        let res = findings_and_summary("trace_path", &payload, Path::new("/repo"));
+        assert!(res.findings.is_empty());
+        assert!(res.summary.contains("13 matches for \"new\""));
+        assert!(res.summary.contains("repo.crates.a.src.f.Foo.new"));
+        assert!(res.summary.contains("repo.crates.b.src.g.Bar.new"));
+    }
+
+    /// Live-verified `trace_path` group prefix for a Rust file outside
+    /// `src/` (this workspace's own `crates/repo-explorer-memory/tests/integration.rs`)
+    /// -- `trace_path_group_file` must append `.rs` here too, not just for
+    /// `src`, or it fabricates a path with no extension that doesn't exist.
+    #[test]
+    fn trace_path_group_file_appends_rs_for_tests_dir() {
+        assert_eq!(
+            trace_path_group_file(
+                "home-kwitsch-repos-repo-explorer-mcp.crates.repo-explorer-memory.tests.integration"
+            ),
+            Some("crates/repo-explorer-memory/tests/integration.rs".to_string())
+        );
     }
 
     /// Real `detect_changes` payload shape (plain-text block via `Value::String`).
