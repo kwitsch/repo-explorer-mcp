@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -47,6 +47,37 @@ const DEPENDENCY_BINARIES: &[DependencyBinary] = &[
         repo: "codebase-memory-mcp",
     },
 ];
+
+/// File name of the private `codebase-memory-mcp` copy, with the platform's
+/// executable suffix on Windows.
+fn memory_binary_file_name() -> &'static str {
+    if cfg!(windows) {
+        "codebase-memory-mcp.exe"
+    } else {
+        "codebase-memory-mcp"
+    }
+}
+
+/// Compose the private binary path under a given data dir. Pure and testable:
+/// takes the data dir explicitly so tests need no real directories.
+fn memory_binary_path_in(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("repo-explorer")
+        .join("bin")
+        .join(memory_binary_file_name())
+}
+
+/// Absolute path of the private, repo-explorer-owned `codebase-memory-mcp`
+/// copy: `<data_dir>/repo-explorer/bin/codebase-memory-mcp[.exe]`. Errors when
+/// no data dir is resolvable (e.g. no HOME). Never consults PATH.
+pub(crate) fn dedicated_memory_binary_path() -> Result<PathBuf> {
+    let data_dir = dirs::data_dir().ok_or_else(|| {
+        anyhow!(
+            "no data directory available to place the codebase-memory-mcp binary (is HOME set?)"
+        )
+    })?;
+    Ok(memory_binary_path_in(&data_dir))
+}
 
 /// True when `--update` is present among the raw CLI args.
 pub fn wants_update(args: &[String]) -> bool {
@@ -907,5 +938,24 @@ mod tests {
         let data = b"plain-binary-bytes".to_vec();
         let result = extract_binary("codebase-memory-mcp", &data, "codebase-memory-mcp").unwrap();
         assert_eq!(result, data);
+    }
+
+    #[test]
+    fn memory_binary_path_composes_under_data_dir() {
+        let base = Path::new("/data");
+        let p = memory_binary_path_in(base);
+        let file = if cfg!(windows) {
+            "codebase-memory-mcp.exe"
+        } else {
+            "codebase-memory-mcp"
+        };
+        assert_eq!(
+            p,
+            Path::new("/data")
+                .join("repo-explorer")
+                .join("bin")
+                .join(file)
+        );
+        assert_eq!(memory_binary_file_name(), file);
     }
 }
