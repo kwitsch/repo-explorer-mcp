@@ -532,13 +532,9 @@ where
         messages.push(Message::user(
             "The exploration budget is exhausted. Call finish NOW with the best findings gathered so far.",
         ));
-        let options = CallOptions {
-            force_tool: Some("finish".to_string()),
-            max_tokens: None,
-        };
         match self
             .router
-            .complete_with_tools(messages, finish_only_catalog(), &options)
+            .complete_with_tools(messages, finish_only_catalog(), &force_finish_options())
             .await
         {
             Ok(completion) => {
@@ -629,6 +625,15 @@ const SEED_CANDIDATES: usize = 8;
 pub(crate) fn push_nudge(messages: &mut Vec<Message>, assistant: Message, nudge: &str) {
     messages.push(assistant);
     messages.push(Message::user(nudge));
+}
+
+/// Call options that force the `finish` tool — the shape shared by this
+/// loop's `forced_finish` and the verification stage's last-turn call.
+pub(crate) fn force_finish_options() -> CallOptions {
+    CallOptions {
+        force_tool: Some("finish".to_string()),
+        max_tokens: None,
+    }
 }
 
 /// The 4-part preamble shared by the fallback loop's and the verification

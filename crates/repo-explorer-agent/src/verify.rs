@@ -10,11 +10,11 @@ use repo_explorer_core::llm::{
     CallOptions, Clock, LlmProvider, Message, ProviderResponse, ProviderRouter,
 };
 use repo_explorer_core::memory::MemoryBackend;
-use repo_explorer_core::retrieval::kind_label;
+use repo_explorer_core::retrieval::{is_unknown_location, kind_label};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::agent::{TokenBudget, push_nudge};
+use crate::agent::{TokenBudget, force_finish_options, push_nudge};
 use crate::dispatch::{canonical_repo_root, parse_args, read_file_canonical};
 use crate::render::{RenderCaps, cap_file_lines, cap_snippet};
 use crate::skeleton::skeleton_for;
@@ -69,10 +69,7 @@ where
     for turn in 0..turns {
         let last = turn + 1 == turns || budget.exhausted();
         let options = if last {
-            CallOptions {
-                force_tool: Some("finish".to_string()),
-                max_tokens: None,
-            }
+            force_finish_options()
         } else {
             CallOptions::default()
         };
@@ -216,6 +213,12 @@ async fn expand_content(
     for (pos, id) in args.candidate_ids.into_iter().enumerate() {
         match (id as usize).checked_sub(1).and_then(|i| candidates.get(i)) {
             None => sections[pos] = Some(format!("[{id}] no such candidate")),
+            Some(candidate) if is_unknown_location(&candidate.location) => {
+                let path = candidate.location.path.to_string_lossy().into_owned();
+                sections[pos] = Some(format!(
+                    "[{id}] {path}: location unknown, no snippet available"
+                ));
+            }
             Some(candidate) => {
                 let path = candidate.location.path.to_string_lossy().into_owned();
                 let start = candidate
@@ -315,6 +318,23 @@ mod tests {
         assert!(out.contains("invalid arguments"));
         let out = expand_content(Path::new("/repo"), &[], r#"{"candidate_ids":[]}"#, &caps).await;
         assert!(out.contains("must be non-empty"));
+    }
+
+    #[tokio::test]
+    async fn expand_reports_unknown_location_instead_of_fabricating_a_range() {
+        let caps = RenderCaps::default();
+        // (0, *) is core's "unknown location" sentinel — see
+        // `is_unknown_location` — reachable here via a SymbolFuzzy/SymbolExact
+        // candidate whose retrieval leg never resolved a line number.
+        let out = expand_content(
+            Path::new("/repo"),
+            &[candidate("a.rs", 0, 0)],
+            r#"{"candidate_ids":[1]}"#,
+            &caps,
+        )
+        .await;
+        assert!(out.contains("[1] a.rs: location unknown, no snippet available"));
+        assert!(!out.contains(":1-20"));
     }
 
     #[tokio::test]
