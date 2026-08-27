@@ -334,6 +334,18 @@ fn insert_path(args: &mut Map<String, Value>, key: &str, path: &Path) {
     );
 }
 
+/// Turn a bare directory path prefix (the shape `scope_hint` is documented
+/// and constructed as everywhere else in this codebase — e.g. `"crates/api"`)
+/// into the real glob the connected `search_code` tool's `file_pattern`
+/// requires. Unlike `search_graph`'s `file_pattern`, `search_code`'s does not
+/// do prefix matching on its own — a bare prefix silently matches zero files
+/// there — so this appends `/**` to scope the search to that directory.
+fn scope_glob(path: &Path) -> String {
+    let prefix = path.to_string_lossy();
+    let prefix = prefix.trim_end_matches(['/', '\\']);
+    format!("{prefix}/**")
+}
+
 /// Does a tool-failure message indicate "this project is not indexed yet"
 /// (as opposed to some other recoverable-or-not failure)? Matches the
 /// observed `codebase-memory-mcp` phrasing ("project not found or not
@@ -782,7 +794,7 @@ impl MemoryBackend for MemoryClientBackend {
         self.call_memory_tool("search_code", repo_root, |args| {
             args.insert("pattern".to_string(), Value::String(query.text.clone()));
             if let Some(scope) = &query.scope_hint {
-                insert_path(args, "file_pattern", scope);
+                args.insert("file_pattern".to_string(), Value::String(scope_glob(scope)));
             }
             insert_opt_u32(args, "limit", query.max_results);
         })
@@ -1222,6 +1234,22 @@ docs/project-plan/9b-open_weights_finetune.md\nseed_symbols: 0\n";
         assert_eq!(
             parse_changed_count("base: main\ndirection: inbound\n"),
             None
+        );
+    }
+
+    /// `search_code`'s `file_pattern` needs real glob syntax, unlike the bare
+    /// prefix `scope_hint` is built from everywhere else — verifies the
+    /// conversion, trailing-slash-or-not alike.
+    #[test]
+    fn scope_glob_appends_recursive_glob_to_bare_prefix() {
+        assert_eq!(scope_glob(Path::new("crates")), "crates/**");
+        assert_eq!(
+            scope_glob(Path::new("crates/repo-explorer-memory")),
+            "crates/repo-explorer-memory/**"
+        );
+        assert_eq!(
+            scope_glob(Path::new("crates/repo-explorer-memory/")),
+            "crates/repo-explorer-memory/**"
         );
     }
 

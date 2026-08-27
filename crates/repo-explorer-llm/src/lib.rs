@@ -457,11 +457,7 @@ fn from_genai_response(
     provider: &str,
     response: genai::chat::ChatResponse,
 ) -> Result<ProviderResponse, ProviderError> {
-    let has_tool_calls = response
-        .content
-        .iter()
-        .any(|p| matches!(p, genai::chat::ContentPart::ToolCall(_)));
-    if has_tool_calls {
+    if response.content.contains_tool_call() {
         let mapped = response
             .into_tool_calls()
             .into_iter()

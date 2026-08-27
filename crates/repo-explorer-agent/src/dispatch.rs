@@ -97,9 +97,11 @@ pub(crate) async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
         }
         "trace_path" => {
             let args: TracePathArgs = parse_args(&call.arguments_json)?;
+            // No `to` arg to pass on: the connected backend has no
+            // two-endpoint concept and ignores it (see MemoryBackend::trace_path).
             call_and_render(
                 "trace_path",
-                memory.trace_path(repo_root, &args.from, &args.to, args.max_depth),
+                memory.trace_path(repo_root, &args.from, "", args.max_depth),
                 caps,
             )
             .await
@@ -200,8 +202,7 @@ fn snippet_target(args: GetCodeSnippetArgs) -> Result<SnippetTarget, String> {
 /// `repo_root`. Shared with `pipeline`'s top-level query `scope_hint` check so
 /// the two call sites can't drift apart on what counts as an escape.
 pub(crate) fn escapes_repo_root(path: &Path) -> bool {
-    path.is_absolute()
-        || path.has_root()
+    path.has_root()
         || path
             .components()
             .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))

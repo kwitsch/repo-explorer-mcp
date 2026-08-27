@@ -131,15 +131,14 @@ fn build_catalog() -> Vec<Tool> {
         ),
         tool(
             "trace_path",
-            "PRIMARY: trace a dependency/reference path between two symbols in the memory graph. Args: from (required), to (required), optional max_depth.",
+            "PRIMARY: report a single function's callers and callees (both directions) in the memory graph — not a path between two symbols; the connected backend has no two-endpoint concept and takes no `to` argument. Args: from (required, the function name), optional max_depth.",
             json!({
                 "type": "object",
                 "properties": {
                     "from": {"type": "string"},
-                    "to": {"type": "string"},
                     "max_depth": {"type": "integer"}
                 },
-                "required": ["from", "to"],
+                "required": ["from"],
                 "additionalProperties": false
             }),
         ),
@@ -272,7 +271,6 @@ pub(crate) struct QueryGraphArgs {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TracePathArgs {
     pub from: String,
-    pub to: String,
     #[serde(default)]
     pub max_depth: Option<u32>,
 }

@@ -165,14 +165,23 @@ async fn candidates_block<M: MemoryBackend>(
             .as_deref()
             .map(|s| format!(", symbol `{s}`"))
             .unwrap_or_default();
-        out.push_str(&format!(
-            "[{}] {}:{}-{} ({}{symbol})\n",
-            idx + 1,
-            c.location.path.display(),
-            c.location.line_start,
-            c.location.line_end,
-            kind_label(c.kind),
-        ));
+        if is_unknown_location(&c.location) {
+            out.push_str(&format!(
+                "[{}] {} (location unknown, {}{symbol})\n",
+                idx + 1,
+                c.location.path.display(),
+                kind_label(c.kind),
+            ));
+        } else {
+            out.push_str(&format!(
+                "[{}] {}:{}-{} ({}{symbol})\n",
+                idx + 1,
+                c.location.path.display(),
+                c.location.line_start,
+                c.location.line_end,
+                kind_label(c.kind),
+            ));
+        }
         if let Some(outline) = skeletons.get(&c.location.path) {
             if shown_outline.insert(&c.location.path) {
                 out.push_str(outline);
