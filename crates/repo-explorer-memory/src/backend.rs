@@ -629,45 +629,71 @@ fn text_table_findings(text: &str) -> Vec<ExplorationFinding> {
 /// group's file: drop the leading project segment (live-verified against
 /// `search_graph`'s parallel `qn_prefix`/`file` pair for the same symbols --
 /// the group prefix always echoes the `project` argument the call was scoped
-/// to), then drop any trailing segment(s) that start with an uppercase ASCII
-/// letter (a Rust type name; every module-path segment -- crate dir, `src`,
-/// file stem -- is snake_case/kebab-case, so the first uppercase-led segment
-/// unambiguously starts the type qualifier instead of the file path).
-/// `None` when no module segment is left to build a file from.
+/// to). `None` when no module segment is left to build a file from.
 ///
 /// A segment sequence containing a literal `src`, `tests`, `benches`, or
-/// `examples` component follows Cargo's crate-dir/{dir}/file-stem convention
-/// (`.rs` mirrors the real file stem there, e.g.
+/// `examples` component follows Cargo's crate-dir/{dir}/file-stem convention:
+/// drop any trailing segment(s) that start with an uppercase ASCII letter (a
+/// Rust type name; every module-path segment -- crate dir, `src`, file stem
+/// -- is snake_case/kebab-case, so the first uppercase-led segment
+/// unambiguously starts the type qualifier instead of the file path), then
+/// append `.rs`, which mirrors the real file stem there (e.g.
 /// `crates.repo-explorer-mcp.src.main` -> `crates/repo-explorer-mcp/src/main.rs`,
 /// and, live-verified against this workspace's own
 /// `crates/repo-explorer-memory/tests/integration.rs`,
 /// `crates.repo-explorer-memory.tests.integration` ->
-/// `crates/repo-explorer-memory/tests/integration.rs`); appending `.rs` there
-/// is therefore exact. A non-Rust module the connected `codebase-memory-mcp`
-/// indexes has none of those segments and collapses to just its containing
-/// directory with the actual file stem dropped entirely (live-verified: the
-/// JS entry point `setup/index.mjs` groups under prefix `<project>.setup`,
-/// with no `index` segment anywhere to recover) -- guessing `.rs` there would
-/// name a Rust file that doesn't exist, so fall back to the bare directory
-/// path instead of fabricating an extension.
+/// `crates/repo-explorer-memory/tests/integration.rs`).
+///
+/// Outside that Rust src layout, an uppercase-led segment is never a type
+/// qualifier to strip -- that rule only holds once a `src`/`tests`/etc root
+/// is already established, so every remaining segment is kept (live-verified
+/// against this workspace's own `crates/repo-explorer-search/Cargo.toml`:
+/// group prefix `crates.repo-explorer-search.Cargo`, where the old
+/// uppercase-strip rule discarded `Cargo` and pointed at the bare crate
+/// directory instead). A non-Rust module the connected `codebase-memory-mcp`
+/// indexes otherwise collapses to just its containing directory with the
+/// actual file stem dropped entirely (live-verified: the JS entry point
+/// `setup/index.mjs` groups under prefix `<project>.setup`, with no `index`
+/// segment anywhere to recover) -- so two filenames this workspace's own
+/// tooling is guaranteed to surface are special-cased instead of guessed: a
+/// trailing `Cargo` segment is always that crate's `Cargo.toml` (a manifest
+/// never lives under `src`/`tests`/etc, so it can't already have been
+/// handled above), and the qn segment `mcp` alone is always the repo-root
+/// `.mcp.json` (live-verified: group prefix `<project>.mcp`) -- the qn
+/// format has no way to represent a dotfile's leading `.`, so the bare
+/// segment is otherwise indistinguishable from a same-named directory (the
+/// `setup` case above). Anything else falls back to the bare directory path
+/// instead of fabricating an extension.
 fn trace_path_group_file(qn_prefix: &str) -> Option<String> {
     let mut segments = qn_prefix.split('.');
     segments.next()?;
-    let module_segments: Vec<&str> = segments
-        .take_while(|s| !s.starts_with(|c: char| c.is_ascii_uppercase()))
-        .collect();
-    if module_segments.is_empty() {
+    let segments: Vec<&str> = segments.collect();
+    if segments.is_empty() {
         return None;
     }
-    let path = module_segments.join("/");
     let is_rust_layout = ["src", "tests", "benches", "examples"]
         .iter()
-        .any(|dir| module_segments.contains(dir));
+        .any(|dir| segments.contains(dir));
     if is_rust_layout {
-        Some(format!("{path}.rs"))
-    } else {
-        Some(path)
+        let module_segments: Vec<&str> = segments
+            .iter()
+            .copied()
+            .take_while(|s| !s.starts_with(|c: char| c.is_ascii_uppercase()))
+            .collect();
+        return if module_segments.is_empty() {
+            None
+        } else {
+            Some(format!("{}.rs", module_segments.join("/")))
+        };
     }
+    let path = segments.join("/");
+    if segments.last() == Some(&"Cargo") {
+        return Some(format!("{path}.toml"));
+    }
+    if path == "mcp" {
+        return Some(".mcp.json".to_string());
+    }
+    Some(path)
 }
 
 /// Parse the connected `trace_path` tool's plain-text response: a
@@ -1298,6 +1324,37 @@ repo.crates.a.src.f.decide_freshness crates/a/src/f.rs 40 60\n";
                 "home-kwitsch-repos-repo-explorer-mcp.crates.repo-explorer-memory.tests.integration"
             ),
             Some("crates/repo-explorer-memory/tests/integration.rs".to_string())
+        );
+    }
+
+    /// Live-verified `trace_path` group prefix for a non-`src` `Cargo.toml`
+    /// dependency (this workspace's own `crates/repo-explorer-search/Cargo.toml`,
+    /// confirmed against `search_graph`'s parallel `qn_prefix`/`file` pair for
+    /// its `which` dependency) -- the trailing uppercase-led `Cargo` segment
+    /// must not be mistaken for a Rust type-name qualifier and stripped, or
+    /// it fabricates a path pointing at the bare crate directory with
+    /// `Cargo.toml` silently dropped.
+    #[test]
+    fn trace_path_group_file_resolves_cargo_toml() {
+        assert_eq!(
+            trace_path_group_file(
+                "home-kwitsch-repos-repo-explorer-mcp.crates.repo-explorer-search.Cargo"
+            ),
+            Some("crates/repo-explorer-search/Cargo.toml".to_string())
+        );
+    }
+
+    /// Live-verified `trace_path` group prefix for the repo-root `.mcp.json`
+    /// dotfile (confirmed against `search_graph`'s parallel `qn_prefix`/`file`
+    /// pair for its `env` field) -- the qn strips the leading `.` a
+    /// dotfile's basename starts with, so the bare segment `mcp` must not be
+    /// treated as a same-named directory (contrast the `setup` case above)
+    /// or it fabricates a path (`mcp`) that exists nowhere in the repo.
+    #[test]
+    fn trace_path_group_file_resolves_mcp_json_dotfile() {
+        assert_eq!(
+            trace_path_group_file("home-kwitsch-repos-repo-explorer-mcp.mcp"),
+            Some(".mcp.json".to_string())
         );
     }
 

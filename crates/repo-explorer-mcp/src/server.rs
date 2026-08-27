@@ -119,7 +119,9 @@ impl RepoExplorerServer {
     #[tool(
         name = "explore_repository",
         description = "Explore the repository for the given request and return \
-                       matching file locations (with line numbers and optional \
+                       matching file locations (path always present; line \
+                       numbers included when resolvable, omitted entirely for \
+                       an unresolved/symbol-only match, plus optional \
                        snippet/context) plus a summary. Args: query (required), \
                        optional scope_hint (path prefix), optional max_results."
     )]

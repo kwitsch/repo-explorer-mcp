@@ -355,7 +355,7 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
                     Ok(resp) => return Ok(resp),
                     Err(e) if e.is_failover_trigger() => {
                         let mut guard = slot.lock_cooling();
-                        *guard = Some(now + self.cooldown);
+                        *guard = Some(self.clock.now() + self.cooldown);
                         limited.push(format!("{}/{}", entry.name, slot.model));
                         continue;
                     }

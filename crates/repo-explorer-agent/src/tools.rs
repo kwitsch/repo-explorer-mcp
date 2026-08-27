@@ -282,14 +282,7 @@ pub(crate) struct GetArchitectureArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GetCodeSnippetArgs {
-    #[serde(default)]
-    pub qualified_name: Option<String>,
-    #[serde(default)]
-    pub file: Option<String>,
-    #[serde(default)]
-    pub start_line: Option<u32>,
-    #[serde(default)]
-    pub end_line: Option<u32>,
+    pub qualified_name: String,
 }
 
 /// Arguments of both `grep` (content pattern) and `find` (file-name glob) —
@@ -454,15 +447,10 @@ mod tests {
     }
 
     #[test]
-    fn get_code_snippet_args_parse_both_modes() {
+    fn get_code_snippet_args_parse_qualified_name() {
         let a: GetCodeSnippetArgs =
             serde_json::from_str(r#"{"qualified_name":"foo::bar"}"#).unwrap();
-        assert_eq!(a.qualified_name, Some("foo::bar".to_string()));
-        let b: GetCodeSnippetArgs =
-            serde_json::from_str(r#"{"file":"src/lib.rs","start_line":1,"end_line":9}"#).unwrap();
-        assert_eq!(b.file, Some("src/lib.rs".to_string()));
-        assert_eq!(b.start_line, Some(1));
-        assert_eq!(b.end_line, Some(9));
+        assert_eq!(a.qualified_name, "foo::bar");
     }
 
     #[test]

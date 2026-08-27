@@ -354,16 +354,22 @@ fn handle_context_line(
     }
 }
 
-/// True for rtk's own truncation-footer line, e.g. `  +35 more in many.txt
-/// [see remaining: tail -n +26 ~/.local/share/rtk/tee/....log]`, emitted in
-/// place of the remaining match lines once a file's real match count exceeds
-/// rtk's undocumented, non-configurable per-file cap. This shape never
-/// matches `split_grep_line`'s `path:line:content` / `path-line-content`
-/// grammar (no plausible `<sep><digits><sep>` run exists in it), so it must
-/// be recognized explicitly -- see `parse_rtk` for why silently falling
-/// through to its catch-all `None` arm, as for ordinary unparsable garbage,
-/// is wrong here specifically: unlike garbage, this line is proof that real
-/// matches were dropped before `parse_rtk` ever saw them.
+/// True for either of rtk's own truncation-footer lines: the per-file footer,
+/// e.g. `  +35 more in many.txt [see remaining: tail -n +26
+/// ~/.local/share/rtk/tee/....log]`, emitted in place of a file's remaining
+/// match lines once its real match count exceeds rtk's undocumented,
+/// non-configurable per-file cap; and the whole-files-skipped footer, e.g.
+/// `+21 more files [see remaining: tail -n +1
+/// ~/.local/share/rtk/tee/..._grep_skipped.log]`, emitted once the number of
+/// matching files exceeds rtk's separate, also non-configurable total-files
+/// cap -- dropping entire files' worth of matches that never appear in stdout
+/// at all. Neither shape matches `split_grep_line`'s `path:line:content` /
+/// `path-line-content` grammar (no plausible `<sep><digits><sep>` run exists
+/// in either), so both must be recognized explicitly -- see `parse_rtk` for
+/// why silently falling through to its catch-all `None` arm, as for ordinary
+/// unparsable garbage, is wrong here specifically: unlike garbage, these
+/// lines are proof that real matches were dropped before `parse_rtk` ever saw
+/// them.
 fn is_truncation_marker(line: &str) -> bool {
     let Some(rest) = line.trim_start().strip_prefix('+') else {
         return false;
@@ -371,7 +377,9 @@ fn is_truncation_marker(line: &str) -> bool {
     let digits_end = rest
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(rest.len());
-    digits_end > 0 && rest[digits_end..].starts_with(" more in ")
+    digits_end > 0
+        && (rest[digits_end..].starts_with(" more in ")
+            || rest[digits_end..].starts_with(" more files "))
 }
 
 /// Parse `rtk rg -H -n` output. Each match line becomes one finding. A context
@@ -605,11 +613,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_rtk_errors_on_files_skipped_footer() {
+        // Real rtk shape: a header, real match rows across many files
+        // (elided here), then a second, distinct footer -- once the number
+        // of matching files exceeds rtk's separate total-files cap -- that
+        // drops entire files' worth of matches never shown in stdout at all.
+        // This must surface as an error just like the per-file footer above,
+        // not fall through to the catch-all `None` arm as ordinary garbage.
+        let input = "many.txt:1:needle\n+21 more files [see remaining: tail -n +1 ~/.local/share/rtk/tee/x_skipped.log]\n";
+        let err = parse_rtk(input).unwrap_err();
+        assert_eq!(
+            err,
+            SearchError::Decode {
+                backend: "rtk",
+                message: "rtk truncated its own results and dropped matches: +21 more files \
+                          [see remaining: tail -n +1 ~/.local/share/rtk/tee/x_skipped.log]"
+                    .to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn is_truncation_marker_matches_rtk_footer_shape() {
         assert!(is_truncation_marker(
             "  +35 more in many.txt [see remaining: tail -n +26 ~/x.log]"
         ));
         assert!(is_truncation_marker("+1 more in a.rs"));
+    }
+
+    #[test]
+    fn is_truncation_marker_matches_rtk_files_skipped_footer_shape() {
+        // rtk's separate, total-files cap footer -- distinct from the
+        // per-file `+N more in <file>` footer above -- drops entire files'
+        // worth of matches and must be recognized too.
+        assert!(is_truncation_marker(
+            "+21 more files [see remaining: tail -n +1 ~/.local/share/rtk/tee/x_skipped.log]"
+        ));
+        assert!(is_truncation_marker("+1 more files [see remaining: x]"));
     }
 
     #[test]
@@ -624,6 +664,10 @@ mod tests {
         // exact `" more in "` marker must not false-positive.
         assert!(!is_truncation_marker("+35 more info"));
         assert!(!is_truncation_marker("+more in x.rs"));
+        // Same for the `" more files "` marker: a merely similar word must
+        // not false-positive.
+        assert!(!is_truncation_marker("+21 more filesystems"));
+        assert!(!is_truncation_marker("+more files x"));
     }
 
     #[test]

@@ -117,7 +117,7 @@ pub(crate) async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
         }
         "get_code_snippet" => {
             let args: GetCodeSnippetArgs = parse_args(&call.arguments_json)?;
-            let target = snippet_target(args)?;
+            let target = snippet_target(args);
             call_and_render(
                 "get_code_snippet",
                 memory.get_code_snippet(repo_root, &target),
@@ -179,19 +179,8 @@ pub(crate) fn parse_args<T: serde::de::DeserializeOwned>(json: &str) -> Result<T
     serde_json::from_str(json).map_err(|e| format!("invalid arguments: {e}"))
 }
 
-fn snippet_target(args: GetCodeSnippetArgs) -> Result<SnippetTarget, String> {
-    if let Some(name) = args.qualified_name {
-        Ok(SnippetTarget::QualifiedName(name))
-    } else if let Some(file) = args.file {
-        let file = reject_escaping_path("get_code_snippet file", &file)?;
-        Ok(SnippetTarget::FileRange {
-            file,
-            start_line: args.start_line,
-            end_line: args.end_line,
-        })
-    } else {
-        Err("get_code_snippet requires either qualified_name or file".to_string())
-    }
+fn snippet_target(args: GetCodeSnippetArgs) -> SnippetTarget {
+    SnippetTarget::QualifiedName(args.qualified_name)
 }
 
 /// The one lexical "stays inside the repository" check: true if `path` is
@@ -431,32 +420,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_code_snippet_qualified_name_takes_precedence() {
-        let memory = MockMemoryBackend::new();
-        let root = PathBuf::from("/repo");
-        let c = call(
-            "c4",
-            "get_code_snippet",
-            r#"{"qualified_name":"a::b","file":"x.rs"}"#,
-        );
-        let _ = dispatch_call(
-            &memory,
-            &MockSearchBackend::new(),
-            &root,
-            &c,
-            &RenderCaps::default(),
-        )
-        .await;
-        assert_eq!(
-            memory.calls()[0],
-            MemCall::GetCodeSnippet {
-                repo_root: PathBuf::from("/repo"),
-                target: SnippetTarget::QualifiedName("a::b".to_string()),
-            }
-        );
-    }
-
-    #[tokio::test]
     async fn get_code_snippet_without_either_is_error_message() {
         let memory = MockMemoryBackend::new();
         let root = PathBuf::from("/repo");
@@ -611,26 +574,6 @@ mod tests {
     async fn search_graph_rejects_escaping_file_pattern() {
         let memory = MockMemoryBackend::new();
         let c = call("c12", "search_graph", r#"{"file_pattern":"/etc"}"#);
-        let (message, _) = dispatch_call(
-            &memory,
-            &MockSearchBackend::new(),
-            &PathBuf::from("/repo"),
-            &c,
-            &RenderCaps::default(),
-        )
-        .await;
-        assert!(message.content.contains("escapes the repository root"));
-        assert!(memory.calls().is_empty());
-    }
-
-    #[tokio::test]
-    async fn get_code_snippet_rejects_escaping_file() {
-        let memory = MockMemoryBackend::new();
-        let c = call(
-            "c13",
-            "get_code_snippet",
-            r#"{"file":"../../../../etc/passwd"}"#,
-        );
         let (message, _) = dispatch_call(
             &memory,
             &MockSearchBackend::new(),
