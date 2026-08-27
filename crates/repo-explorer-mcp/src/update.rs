@@ -41,11 +41,6 @@ const DEPENDENCY_BINARIES: &[DependencyBinary] = &[
         owner: "BurntSushi",
         repo: "ripgrep",
     },
-    DependencyBinary {
-        command: "codebase-memory-mcp",
-        owner: "DeusData",
-        repo: "codebase-memory-mcp",
-    },
 ];
 
 /// File name of the private `codebase-memory-mcp` copy, with the platform's
@@ -77,6 +72,117 @@ pub(crate) fn dedicated_memory_binary_path() -> Result<PathBuf> {
         )
     })?;
     Ok(memory_binary_path_in(&data_dir))
+}
+
+/// Install-if-absent / update-if-stale the private `codebase-memory-mcp`
+/// copy at [`dedicated_memory_binary_path`], via the same
+/// fetch/verify/extract/atomic-rename pipeline the other components use.
+/// Unlike `check_and_install`, a *missing* binary is installed (not
+/// "skipped"): repo-explorer-mcp owns this copy outright and never falls
+/// back to a PATH/global install.
+async fn provision_or_update_memory_binary(client: &reqwest::Client) -> ComponentReport {
+    let name = "codebase-memory-mcp".to_string();
+
+    let path = match dedicated_memory_binary_path() {
+        Ok(p) => p,
+        Err(e) => {
+            return ComponentReport {
+                name,
+                current_version: None,
+                latest_version: None,
+                action: "error",
+                detail: Some(e.to_string()),
+            };
+        }
+    };
+
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return ComponentReport {
+            name,
+            current_version: None,
+            latest_version: None,
+            action: "error",
+            detail: Some(format!(
+                "failed to create binary directory {}: {e}",
+                parent.display()
+            )),
+        };
+    }
+
+    let (release, latest) = match fetch_latest_release(client, "DeusData", "codebase-memory-mcp")
+        .await
+        .and_then(|r| parse_tag_version(&r.tag_name).map(|v| (r, v)))
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            return ComponentReport {
+                name,
+                current_version: None,
+                latest_version: None,
+                action: "error",
+                detail: Some(e.to_string()),
+            };
+        }
+    };
+
+    let current = if path.exists() {
+        read_installed_version_blocking(path.clone()).await
+    } else {
+        None
+    };
+
+    if let Some(v) = &current
+        && *v >= latest
+    {
+        return ComponentReport {
+            name,
+            current_version: Some(v.to_string()),
+            latest_version: Some(latest.to_string()),
+            action: "current",
+            detail: None,
+        };
+    }
+
+    let Some(asset) = pick_asset(&release.assets) else {
+        return ComponentReport {
+            name,
+            current_version: current.as_ref().map(|v| v.to_string()),
+            latest_version: Some(latest.to_string()),
+            action: "error",
+            detail: Some(format!(
+                "no release asset matched this platform ({})",
+                current_os_keyword()
+            )),
+        };
+    };
+
+    let was_present = current.is_some();
+    match install_from_asset(
+        client,
+        &release.assets,
+        asset,
+        "codebase-memory-mcp",
+        InstallTarget::Path(&path),
+    )
+    .await
+    {
+        Ok(note) => ComponentReport {
+            name,
+            current_version: current.as_ref().map(|v| v.to_string()),
+            latest_version: Some(latest.to_string()),
+            action: if was_present { "updated" } else { "installed" },
+            detail: note.map(str::to_string),
+        },
+        Err(e) => ComponentReport {
+            name,
+            current_version: current.as_ref().map(|v| v.to_string()),
+            latest_version: Some(latest.to_string()),
+            action: "error",
+            detail: Some(e.to_string()),
+        },
+    }
 }
 
 /// True when `--update` is present among the raw CLI args.
@@ -125,7 +231,7 @@ pub async fn run_update() -> ExitCode {
         }
     };
 
-    let mut handles = Vec::with_capacity(1 + DEPENDENCY_BINARIES.len());
+    let mut handles = Vec::with_capacity(2 + DEPENDENCY_BINARIES.len());
     let self_client = client.clone();
     handles.push((
         SELF_REPO,
@@ -138,6 +244,12 @@ pub async fn run_update() -> ExitCode {
             tokio::spawn(async move { update_dependency(&client, dep).await }),
         ));
     }
+
+    let memory_client = client.clone();
+    handles.push((
+        "codebase-memory-mcp",
+        tokio::spawn(async move { provision_or_update_memory_binary(&memory_client).await }),
+    ));
 
     let mut components = Vec::with_capacity(handles.len());
     for (name, handle) in handles {
@@ -957,5 +1069,20 @@ mod tests {
                 .join(file)
         );
         assert_eq!(memory_binary_file_name(), file);
+    }
+
+    #[test]
+    fn codebase_memory_removed_from_dependency_binaries() {
+        // Regression: the private copy is provisioned by
+        // `provision_or_update_memory_binary`, never via the which-based
+        // DEPENDENCY_BINARIES loop.
+        assert!(
+            DEPENDENCY_BINARIES
+                .iter()
+                .all(|d| d.command != "codebase-memory-mcp"),
+            "codebase-memory-mcp must not be a which-resolved dependency"
+        );
+        assert!(DEPENDENCY_BINARIES.iter().any(|d| d.command == "rtk"));
+        assert!(DEPENDENCY_BINARIES.iter().any(|d| d.command == "rg"));
     }
 }
