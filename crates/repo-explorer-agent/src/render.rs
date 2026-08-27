@@ -29,26 +29,43 @@ const TRUNCATION_MARKER: &str = "…[truncated]";
 /// Cap `s` to at most `max_chars` characters (char-boundary safe), appending a
 /// marker when anything was cut. `max_chars == 0` disables the cap. Takes
 /// ownership so the common (already-owned, under-cap) case returns `s`
-/// unchanged instead of reallocating — mirrors `cap_file_lines` below.
+/// unchanged instead of reallocating — mirrors `cap_file_lines` below. A
+/// single bounded pass over `s` (via `nth`, which stops at `max_chars + 1`
+/// characters) both decides whether to cut and finds the cut point — no
+/// separate full-length scan first.
 pub(crate) fn cap_snippet(s: String, max_chars: usize) -> String {
-    if max_chars == 0 || s.chars().count() <= max_chars {
+    if max_chars == 0 {
         return s;
     }
-    let mut out: String = s.chars().take(max_chars).collect();
-    out.push_str(TRUNCATION_MARKER);
-    out
+    match s.char_indices().nth(max_chars) {
+        None => s,
+        Some((cut_at, _)) => {
+            let mut out = s[..cut_at].to_string();
+            out.push_str(TRUNCATION_MARKER);
+            out
+        }
+    }
 }
 
 /// Cap file contents to `max_lines` lines, appending an explicit marker so the
-/// model knows to request a narrower range instead of assuming EOF.
+/// model knows to request a narrower range instead of assuming EOF. A single
+/// bounded pass: take up to `max_lines` lines, then peek one more to learn
+/// whether anything was cut — never scans past `max_lines + 1` lines
+/// regardless of total file size.
 pub(crate) fn cap_file_lines(contents: String, max_lines: usize) -> String {
-    if max_lines == 0 || contents.lines().count() <= max_lines {
+    if max_lines == 0 {
         return contents;
     }
-    let mut out: Vec<&str> = contents.lines().take(max_lines).collect();
+    let mut lines = contents.lines();
+    let kept: Vec<&str> = lines.by_ref().take(max_lines).collect();
+    if lines.next().is_none() {
+        return contents;
+    }
     let marker = format!("…[truncated after {max_lines} lines; request a narrower line range]");
-    out.push(&marker);
-    out.join("\n")
+    let mut out = kept.join("\n");
+    out.push('\n');
+    out.push_str(&marker);
+    out
 }
 
 /// Dedupe key: the location, plus the note when the location is the

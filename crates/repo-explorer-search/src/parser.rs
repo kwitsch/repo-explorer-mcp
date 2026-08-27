@@ -193,6 +193,18 @@ fn token_is_bare_word(token: &[u8]) -> bool {
 /// context"), so both are in-bound candidates, and `-1-` (examined last)
 /// is the genuine separator, not the coincidental `-42-` inside the file
 /// name.
+///
+/// The whitespace bound alone isn't enough, though: whitespace-free content
+/// (e.g. `see10.rs-99-x` in `notes-1-see10.rs-99-x`, the content for the
+/// extensionless file `notes` at line 1) can itself contain a `-N-` run
+/// whose preceding token happens to look extension-shaped (`see10.rs`), and
+/// with no whitespace to stop it the walk would misadopt that coincidental
+/// run instead of returning `first`. So the walk is *also* bounded to the
+/// first digit that doesn't open a `-N-` run (isn't immediately preceded by
+/// `-`, see `first_stray_digit`): every genuine candidate's digits are
+/// already required to start right after a `-` by `find_sep_run` itself, so
+/// a digit that doesn't is proof free-text content has started, and nothing
+/// at or beyond it -- however extension-shaped -- is a real candidate.
 fn resolve_dash_sep_run(bytes: &[u8], first: (usize, usize)) -> (usize, usize) {
     if trailing_token_has_extension(bytes, 0, first.0) {
         return first;
@@ -203,7 +215,8 @@ fn resolve_dash_sep_run(bytes: &[u8], first: (usize, usize)) -> (usize, usize) {
         .iter()
         .position(u8::is_ascii_whitespace)
         .map_or(bytes.len(), |p| cursor + p);
-    while let Some(next) = find_sep_run(bytes, b'-', cursor, ws_bound) {
+    let bound = first_stray_digit(bytes, cursor, ws_bound).unwrap_or(ws_bound);
+    while let Some(next) = find_sep_run(bytes, b'-', cursor, bound) {
         candidate = next;
         if trailing_token_has_extension(bytes, cursor, next.0) {
             return next;
@@ -211,6 +224,30 @@ fn resolve_dash_sep_run(bytes: &[u8], first: (usize, usize)) -> (usize, usize) {
         cursor = next.1 + 1;
     }
     candidate
+}
+
+/// Position of the first digit in `bytes[start..end]` that does not open a
+/// legitimate `-N-` run, i.e. isn't immediately preceded by `-` (a digit
+/// mid-run, like the `5` in `-45-`, doesn't count as its own start). Such a
+/// digit can only come from free-text content -- a mentioned line number,
+/// timestamp, or version string -- never from a real separator candidate,
+/// since `find_sep_run` itself requires every candidate's digit span to
+/// begin right after a `-`.
+fn first_stray_digit(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+    let mut i = start;
+    while i < end {
+        if bytes[i].is_ascii_digit() {
+            if i == 0 || bytes[i - 1] != b'-' {
+                return Some(i);
+            }
+            while i < end && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    None
 }
 
 fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
@@ -842,6 +879,26 @@ mod tests {
             result,
             Some(("src/log.rs", 69, "see other.log-42-more text", false))
         );
+    }
+
+    #[test]
+    fn split_grep_line_handles_extension_shaped_token_reached_via_stray_digit() {
+        // No whitespace anywhere, so the whitespace bound alone can't stop
+        // the walk before the coincidental `-99-` run, whose preceding token
+        // (`see10.rs`) happens to look extension-shaped. The `10` in that
+        // token isn't preceded by `-`, though, so it's a stray digit that
+        // marks the start of free-text content -- the walk must stop there
+        // and return the genuine, leftmost `-1-` separator for the
+        // extensionless file `notes`, not misadopt `-99-`.
+        let result = split_grep_line("notes-1-see10.rs-99-x");
+        assert_eq!(result, Some(("notes", 1, "see10.rs-99-x", false)));
+
+        // Same shape, but with a colon-bearing timestamp inside the content
+        // too, so the split_grep_line's mixed dash/colon guard picks the
+        // dash branch before resolve_dash_sep_run ever gets involved -- the
+        // stray-digit bound must still stop it at the genuine `-1-` run.
+        let result = split_grep_line("notes-1-see10:20:file.rs-99-x");
+        assert_eq!(result, Some(("notes", 1, "see10:20:file.rs-99-x", false)));
     }
 
     #[test]

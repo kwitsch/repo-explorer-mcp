@@ -89,7 +89,7 @@ fn build_catalog() -> Vec<Tool> {
     vec![
         tool(
             "search_code",
-            "PRIMARY/authoritative: semantic code search over the indexed memory graph. Prefer the memory tools first. Args: query (required), optional scope_hint, max_results.",
+            "PRIMARY/authoritative: literal/regex text search (grep-style, not natural language) over the indexed memory graph. Args: query (required, a literal string or regex pattern — not a natural-language question), optional scope_hint, max_results.",
             json!({
                 "type": "object",
                 "properties": {

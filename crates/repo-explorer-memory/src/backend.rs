@@ -612,6 +612,69 @@ fn text_table_findings(text: &str) -> Vec<ExplorationFinding> {
     findings
 }
 
+/// Split a `trace_path` group-prefix line's qn (`<project>.<module path>`,
+/// plus an optional trailing `.<TypeName>` qualifier for a method) into that
+/// group's file: drop the leading project segment (live-verified against
+/// `search_graph`'s parallel `qn_prefix`/`file` pair for the same symbols --
+/// the group prefix always echoes the `project` argument the call was scoped
+/// to), then drop any trailing segment(s) that start with an uppercase ASCII
+/// letter (a Rust type name; every module-path segment -- crate dir, `src`,
+/// file stem -- is snake_case/kebab-case, so the first uppercase-led segment
+/// unambiguously starts the type qualifier instead of the file path).
+/// `None` when no module segment is left to build a file from.
+fn trace_path_group_file(qn_prefix: &str) -> Option<String> {
+    let mut segments = qn_prefix.split('.');
+    segments.next()?;
+    let module_segments: Vec<&str> = segments
+        .take_while(|s| !s.starts_with(|c: char| c.is_ascii_uppercase()))
+        .collect();
+    (!module_segments.is_empty()).then(|| format!("{}.rs", module_segments.join("/")))
+}
+
+/// Parse the connected `trace_path` tool's plain-text response: a
+/// `callees:`/`callers:` header carrying `(rows: name hop; qn = group prefix
+/// + "." + name)` -- not the `(cols: ...)` marker every other text-table
+/// shape uses -- followed by one `<qn_prefix>:` group header per distinct
+/// caller/callee module (and, for a method, its enclosing type), each
+/// followed by its indented `name hop` rows. Unlike every other shape here,
+/// a row carries no `file` cell of its own -- the tool folds each symbol's
+/// location into the group prefix instead of a column, so `file` is derived
+/// from that prefix via [`trace_path_group_file`] and `note` is built
+/// exactly as the tool's own header documents (`qn_prefix + "." + name`).
+fn trace_path_findings(text: &str) -> Vec<ExplorationFinding> {
+    let mut findings = Vec::new();
+    // Whether we're inside a `(rows: ...)` section -- only then does an
+    // unindented, colon-terminated line mean a qn_prefix group header rather
+    // than unrelated metadata (`function:`, `direction:`, the `*_total:`
+    // counters), which must not be misread as one.
+    let mut in_rows_section = false;
+    let mut group: Option<(String, String)> = None;
+    for line in text.lines() {
+        if !line.starts_with(' ') {
+            group = None;
+            match line.split_once(':') {
+                Some((_, rest)) if rest.trim().is_empty() => {
+                    if in_rows_section {
+                        let prefix = line.trim_end_matches(':');
+                        group = trace_path_group_file(prefix).map(|f| (f, prefix.to_string()));
+                    }
+                }
+                Some((_, rest)) => in_rows_section = rest.contains("(rows:"),
+                None => in_rows_section = false,
+            }
+            continue;
+        }
+        let Some((file, qn_prefix)) = &group else {
+            continue;
+        };
+        let Some(name) = line.split_whitespace().next() else {
+            continue;
+        };
+        findings.push(finding(file, 0, 0, Some(format!("{qn_prefix}.{name}"))));
+    }
+    findings
+}
+
 /// Build a result whose summary only reports the finding count, with no
 /// distinct row count of its own (the text-table and columnar-JSON shapes).
 fn result_with_finding_count(
@@ -623,12 +686,18 @@ fn result_with_finding_count(
 }
 
 /// Turn a tool response into findings plus a compact summary string. Handles
-/// the three shapes `codebase-memory-mcp` actually produces: an array of
+/// the four shapes `codebase-memory-mcp` actually produces: an array of
 /// object rows (`results`/`rows`/`hits`), the columnar `{cols, groups}` JSON,
-/// and the plain-text table (reaching here as `Value::String`).
+/// the plain-text table (reaching here as `Value::String`), and `trace_path`'s
+/// own plain-text shape (grouped, columnless -- see [`trace_path_findings`]).
 fn findings_and_summary(tool: &'static str, json: &Value, repo_root: &Path) -> ExplorationResult {
     if let Value::String(text) = json {
-        return result_with_finding_count(tool, text_table_findings(text));
+        let findings = if tool == "trace_path" {
+            trace_path_findings(text)
+        } else {
+            text_table_findings(text)
+        };
+        return result_with_finding_count(tool, findings);
     }
     let mut findings = Vec::new();
     if let Some(rows) = first_field(json, &["results", "rows", "hits"]).and_then(Value::as_array) {
@@ -899,6 +968,63 @@ repo.crates.repo-explorer-core.src.lib.run crates/repo-explorer-core/src/lib.rs\
                 .iter()
                 .all(|f| f.location.path != std::path::Path::new("Function"))
         );
+    }
+
+    /// Live-verified `trace_path` payload shape: no `(cols: ...)` marker and
+    /// no `file` cell per row -- each caller/callee's location rides on its
+    /// `<qn_prefix>:` group header instead, split back into a real file by
+    /// [`trace_path_group_file`].
+    #[test]
+    fn text_table_trace_path_payload_decodes() {
+        let text = "function: canonicalize_repo_root\n\
+direction: both\n\
+callees_total: 0\n\
+callees: 0  (rows: name hop; qn = group prefix + \".\" + name)\n\
+callers_total: 6\n\
+callers: 6  (rows: name hop; qn = group prefix + \".\" + name)\n\
+home-kwitsch-repos-repo-explorer-mcp.crates.repo-explorer-memory.src.backend.MemoryClientBackend:\n  \
+cached_project_name 2\n  \
+call_memory_tool_with 3\n  \
+ensure_fresh_index 1\n\
+home-kwitsch-repos-repo-explorer-mcp.crates.repo-explorer-memory.src.client:\n  \
+project_name 1\n  \
+project_name_from_directory 2\n  \
+project_name_root_path_errors 2\n";
+        let res = findings_and_summary(
+            "trace_path",
+            &Value::String(text.to_string()),
+            Path::new("/repo"),
+        );
+        assert_eq!(res.findings.len(), 6);
+        assert_eq!(
+            res.findings[0].location.path,
+            std::path::PathBuf::from("crates/repo-explorer-memory/src/backend.rs")
+        );
+        // No line info in this shape -- `(0, 0)` is the "unknown location" sentinel.
+        assert_eq!(
+            (
+                res.findings[0].location.line_start,
+                res.findings[0].location.line_end
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            res.findings[0].note.as_deref(),
+            Some(
+                "home-kwitsch-repos-repo-explorer-mcp.crates.repo-explorer-memory.src.backend.MemoryClientBackend.cached_project_name"
+            )
+        );
+        assert_eq!(
+            res.findings[3].location.path,
+            std::path::PathBuf::from("crates/repo-explorer-memory/src/client.rs")
+        );
+        assert_eq!(
+            res.findings[3].note.as_deref(),
+            Some(
+                "home-kwitsch-repos-repo-explorer-mcp.crates.repo-explorer-memory.src.client.project_name"
+            )
+        );
+        assert!(res.summary.contains("6 locatable finding"));
     }
 
     /// Live-verified `query_graph` payload shape: `RETURN` column names are

@@ -51,6 +51,12 @@ fn is_identifier_like(token: &str) -> bool {
     if STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(token)) {
         return false;
     }
+    // Pure numerals (e.g. a stripped line number) carry no lexical identity;
+    // exclude them before the digit check below would otherwise wave them
+    // through as identifiers.
+    if token.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
     let has_underscore = token.contains('_');
     let has_digit = token.chars().any(|c| c.is_ascii_digit());
     let has_lower = token.chars().any(|c| c.is_ascii_lowercase());
@@ -501,6 +507,32 @@ mod tests {
             p.path_tokens.contains(&"config.rs".to_string()),
             "got {:?}",
             p.path_tokens
+        );
+    }
+
+    #[test]
+    fn line_number_is_not_treated_as_an_identifier() {
+        let p = derive_patterns("why does search.rs:120 call decide_freshness");
+        assert!(
+            !p.identifiers.contains(&"120".to_string()),
+            "got {:?}",
+            p.identifiers
+        );
+        assert!(
+            !p.grep_patterns.contains(&"120".to_string()),
+            "got {:?}",
+            p.grep_patterns
+        );
+
+        // A meaningful identifier must not be crowded out of the capped grep
+        // fanout by a numeral leaking in ahead of it.
+        let p = derive_patterns(
+            "why does search.rs:120 call decide_freshness resolve_provider validate_config check_timeout",
+        );
+        assert!(
+            p.grep_patterns.contains(&"check_timeout".to_string()),
+            "got {:?}",
+            p.grep_patterns
         );
     }
 
