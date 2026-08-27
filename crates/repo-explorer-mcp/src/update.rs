@@ -608,11 +608,8 @@ fn extract_from_tar_gz(data: &[u8], command: &str) -> Result<Vec<u8>> {
     let mut archive = tar::Archive::new(decoder);
     for entry in archive.entries().context("failed to read tar.gz archive")? {
         let mut entry = entry.context("failed to read a tar.gz entry")?;
-        let path = entry
-            .path()
-            .context("failed to read a tar.gz entry path")?
-            .to_string_lossy()
-            .into_owned();
+        let path_buf = entry.path().context("failed to read a tar.gz entry path")?;
+        let path = path_buf.to_string_lossy();
         if matches_binary_name(&path, command) {
             let mut buf = Vec::new();
             entry
@@ -632,8 +629,8 @@ fn extract_from_zip(data: &[u8], command: &str) -> Result<Vec<u8>> {
         let mut file = archive
             .by_index(i)
             .context("failed to read a zip archive entry")?;
-        let name = file.name().to_string();
-        if matches_binary_name(&name, command) {
+        let name = file.name();
+        if matches_binary_name(name, command) {
             let mut buf = Vec::new();
             file.read_to_end(&mut buf)
                 .context("failed to read the binary out of the zip archive")?;

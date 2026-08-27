@@ -327,7 +327,6 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
             return Err(RouterError::NoProviders);
         }
 
-        let now = self.clock.now();
         let mut cooling: Vec<String> = Vec::new();
         let mut limited: Vec<String> = Vec::new();
 
@@ -336,7 +335,7 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
                 {
                     let mut guard = slot.lock_cooling();
                     match *guard {
-                        Some(until) if now < until => {
+                        Some(until) if self.clock.now() < until => {
                             cooling.push(format!("{}/{}", entry.name, slot.model));
                             continue;
                         }
