@@ -21,7 +21,7 @@ errors are consumed via `?`/`.context(...)`).
 - The XDG default is `$XDG_CONFIG_HOME/repo-explorer/repo-explorer.toml` on Linux, `%APPDATA%\repo-explorer\repo-explorer.toml` on Windows.
 - The two `exists` gates are load-bearing: the XDG default resolves on essentially every machine, so returning it unconditionally would make the `./repo-explorer.toml` fallback dead code and silently ignore an in-repo config — including `.mcp.json`'s own no-`--config` launch.
 - This crate owns the `dirs` dependency used for XDG resolution; core and the other crates stay free of it.
-- A reachable `codebase-memory-mcp` is required at run time.
+- `codebase-memory-mcp` is a private per-user copy at `<dirs::data_dir()>/repo-explorer/bin/codebase-memory-mcp[.exe]`, provisioned/updated only by `--update` and launched by absolute path — never resolved via PATH/`which`. `setup` writes that absolute path into `[codebase_memory] command`; `run()` fails fast with a `--update` hint if the path is missing and never downloads.
 
 ## Subcommands
 
@@ -36,8 +36,8 @@ errors are consumed via `?`/`.context(...)`).
 
 ## Self-update (`src/update.rs`)
 
-- Tracked components: `repo-explorer-mcp` (`kwitsch/repo-explorer-mcp`), `rtk` (`rtk-ai/rtk`), `rg`/ripgrep (`BurntSushi/ripgrep`), `codebase-memory-mcp` (`DeusData/codebase-memory-mcp`).
+- Tracked components: `repo-explorer-mcp` (`kwitsch/repo-explorer-mcp`), `rtk` (`rtk-ai/rtk`), `rg`/ripgrep (`BurntSushi/ripgrep`) — all resolved on PATH via `which` — and `codebase-memory-mcp` (`DeusData/codebase-memory-mcp`), which is NOT on PATH: it is provisioned install-if-absent / update-if-stale to the private path `<dirs::data_dir()>/repo-explorer/bin/codebase-memory-mcp[.exe]` by `provision_or_update_memory_binary`.
 - Runs instead of the MCP server loop, dispatched before config resolution and before the `setup` dispatch/auto-run.
-- A dependency binary whose installed version can't be determined, or that isn't on `PATH`, is skipped rather than blindly overwritten.
+- A PATH dependency binary (`rtk`, `rg`) whose installed version can't be determined, or that isn't on `PATH`, is skipped rather than blindly overwritten. The private `codebase-memory-mcp` copy is instead installed when absent and updated when stale (`action` `installed`/`updated`/`current`).
 - This crate owns the `reqwest`/`semver`/`sha2`/`hex`/`flate2`/`tar`/`zip`/`self-replace` dependencies; core stays free of them.
 - It also uses `which`, already owned by `repo-explorer-search` — the only dependency this crate shares with another non-core crate rather than owning outright.

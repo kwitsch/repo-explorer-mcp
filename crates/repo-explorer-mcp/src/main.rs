@@ -106,6 +106,18 @@ async fn run(config: repo_explorer_core::config::Config) -> anyhow::Result<()> {
     // The directory the server is launched in = the project root to explore.
     let repo_root = std::env::current_dir().context("failed to determine current directory")?;
 
+    if let Ok(managed) = update::dedicated_memory_binary_path()
+        && managed_binary_missing(config.codebase_memory.command.as_deref(), &managed, |p| {
+            p.exists()
+        })
+    {
+        anyhow::bail!(
+            "dedicated codebase-memory-mcp binary not found at {}; \
+             run `repo-explorer-mcp --update` to provision it",
+            managed.display()
+        );
+    }
+
     let memory = MemoryClientBackend::connect(&config.codebase_memory)
         .await
         .context("failed to connect to codebase-memory-mcp")?;
@@ -153,6 +165,18 @@ fn args_without_config_value(args: &[String]) -> Vec<String> {
 /// True when any of `flags` appears verbatim in `args`.
 fn has_flag(args: &[String], flags: &[&str]) -> bool {
     args.iter().any(|a| flags.contains(&a.as_str()))
+}
+
+/// True only when `command` names the managed private binary path yet that
+/// path does not exist — the single case `run()` refuses to serve. A custom
+/// command (bare name or a hand-picked path) or a `None` command (network
+/// endpoint branch) returns false and falls through to connect unchanged.
+fn managed_binary_missing(
+    command: Option<&str>,
+    managed: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> bool {
+    command.is_some_and(|cmd| Path::new(cmd) == managed) && !exists(managed)
 }
 
 /// Resolve the config path. Precedence: `--config <path>` / `--config=<path>`
@@ -486,6 +510,28 @@ mod tests {
             "test".to_string(),
             "config".to_string()
         ]));
+    }
+
+    #[test]
+    fn managed_binary_missing_truth_table() {
+        let managed = PathBuf::from("/data/repo-explorer/bin/codebase-memory-mcp");
+        let managed_str = "/data/repo-explorer/bin/codebase-memory-mcp";
+        // Managed path configured, file absent -> refuse to serve.
+        assert!(managed_binary_missing(Some(managed_str), &managed, |_| {
+            false
+        }));
+        // Managed path configured, file present -> serve.
+        assert!(!managed_binary_missing(Some(managed_str), &managed, |_| {
+            true
+        }));
+        // Custom command (bare name) -> never special-cased, even if absent.
+        assert!(!managed_binary_missing(
+            Some("codebase-memory-mcp"),
+            &managed,
+            |_| false
+        ));
+        // No command (network endpoint branch) -> not our concern.
+        assert!(!managed_binary_missing(None, &managed, |_| false));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -41,12 +41,96 @@ const DEPENDENCY_BINARIES: &[DependencyBinary] = &[
         owner: "BurntSushi",
         repo: "ripgrep",
     },
-    DependencyBinary {
-        command: "codebase-memory-mcp",
-        owner: "DeusData",
-        repo: "codebase-memory-mcp",
-    },
 ];
+
+/// File name of the private `codebase-memory-mcp` copy, with the platform's
+/// executable suffix on Windows.
+fn memory_binary_file_name() -> &'static str {
+    if cfg!(windows) {
+        "codebase-memory-mcp.exe"
+    } else {
+        "codebase-memory-mcp"
+    }
+}
+
+/// Compose the private binary path under a given data dir. Pure and testable:
+/// takes the data dir explicitly so tests need no real directories.
+fn memory_binary_path_in(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("repo-explorer")
+        .join("bin")
+        .join(memory_binary_file_name())
+}
+
+/// Absolute path of the private, repo-explorer-owned `codebase-memory-mcp`
+/// copy: `<data_dir>/repo-explorer/bin/codebase-memory-mcp[.exe]`. Errors when
+/// no data dir is resolvable (e.g. no HOME). Never consults PATH.
+pub(crate) fn dedicated_memory_binary_path() -> Result<PathBuf> {
+    let data_dir = dirs::data_dir().ok_or_else(|| {
+        anyhow!(
+            "no data directory available to place the codebase-memory-mcp binary (is HOME set?)"
+        )
+    })?;
+    Ok(memory_binary_path_in(&data_dir))
+}
+
+/// Install-if-absent / update-if-stale the private `codebase-memory-mcp`
+/// copy at [`dedicated_memory_binary_path`], via the shared
+/// [`check_and_install`] pipeline. Unlike the `which`-resolved dependency
+/// binaries, a *missing* binary is installed (not "skipped"):
+/// repo-explorer-mcp owns this copy outright and never falls back to a
+/// PATH/global install — see `check_and_install`'s `install_if_missing`.
+async fn provision_or_update_memory_binary(client: &reqwest::Client) -> ComponentReport {
+    let name = "codebase-memory-mcp".to_string();
+
+    let path = match dedicated_memory_binary_path() {
+        Ok(p) => p,
+        Err(e) => {
+            return ComponentReport {
+                name,
+                current_version: None,
+                latest_version: None,
+                action: "error",
+                detail: Some(e.to_string()),
+            };
+        }
+    };
+
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return ComponentReport {
+            name,
+            current_version: None,
+            latest_version: None,
+            action: "error",
+            detail: Some(format!(
+                "failed to create binary directory {}: {e}",
+                parent.display()
+            )),
+        };
+    }
+
+    let current = if path.exists() {
+        read_installed_version_blocking(path.clone()).await
+    } else {
+        None
+    };
+
+    check_and_install(
+        client,
+        name,
+        ReleaseSource {
+            owner: "DeusData",
+            repo: "codebase-memory-mcp",
+            command: "codebase-memory-mcp",
+        },
+        current,
+        InstallTarget::Path(&path),
+        true,
+    )
+    .await
+}
 
 /// True when `--update` is present among the raw CLI args.
 pub fn wants_update(args: &[String]) -> bool {
@@ -94,7 +178,7 @@ pub async fn run_update() -> ExitCode {
         }
     };
 
-    let mut handles = Vec::with_capacity(1 + DEPENDENCY_BINARIES.len());
+    let mut handles = Vec::with_capacity(2 + DEPENDENCY_BINARIES.len());
     let self_client = client.clone();
     handles.push((
         SELF_REPO,
@@ -107,6 +191,12 @@ pub async fn run_update() -> ExitCode {
             tokio::spawn(async move { update_dependency(&client, dep).await }),
         ));
     }
+
+    let memory_client = client.clone();
+    handles.push((
+        "codebase-memory-mcp",
+        tokio::spawn(async move { provision_or_update_memory_binary(&memory_client).await }),
+    ));
 
     let mut components = Vec::with_capacity(handles.len());
     for (name, handle) in handles {
@@ -162,11 +252,14 @@ async fn update_self(client: &reqwest::Client) -> ComponentReport {
     check_and_install(
         client,
         name,
-        SELF_OWNER,
-        SELF_REPO,
-        SELF_REPO,
+        ReleaseSource {
+            owner: SELF_OWNER,
+            repo: SELF_REPO,
+            command: SELF_REPO,
+        },
         Some(current),
         InstallTarget::SelfExe,
+        false,
     )
     .await
 }
@@ -192,30 +285,40 @@ async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> 
     check_and_install(
         client,
         name,
-        dep.owner,
-        dep.repo,
-        dep.command,
+        ReleaseSource {
+            owner: dep.owner,
+            repo: dep.repo,
+            command: dep.command,
+        },
         current,
         InstallTarget::Path(&path),
+        false,
     )
     .await
 }
 
 /// Shared fetch-release -> parse-tag -> compare-versions -> pick-asset ->
-/// install -> [`ComponentReport`] sequence used by both `update_self` and
-/// `update_dependency`, once each has arrived at its own `current` version
-/// (or `None`, if it couldn't be determined but a release lookup is still
-/// worth doing to report the latest version).
+/// install -> [`ComponentReport`] sequence used by `update_self`,
+/// `update_dependency`, and `provision_or_update_memory_binary`, once each
+/// has arrived at its own `current` version (or `None`, if it couldn't be
+/// determined but a release lookup is still worth doing to report the latest
+/// version).
+///
+/// `install_if_missing` controls what a `None` `current` means: for a PATH
+/// dependency (`rtk`, `rg`) it means "unmanaged installation, don't touch
+/// it" (`action: "skipped"`); for the private `codebase-memory-mcp` copy —
+/// which repo-explorer-mcp owns outright and never falls back to a
+/// PATH/global install — it means "not installed yet" and triggers a fresh
+/// install (`action: "installed"`) instead.
 async fn check_and_install(
     client: &reqwest::Client,
     name: String,
-    owner: &str,
-    repo: &str,
-    command: &str,
+    source: ReleaseSource<'_>,
     current: Option<semver::Version>,
     target: InstallTarget<'_>,
+    install_if_missing: bool,
 ) -> ComponentReport {
-    let (release, latest) = match fetch_latest_release(client, owner, repo)
+    let (release, latest) = match fetch_latest_release(client, source.owner, source.repo)
         .await
         .and_then(|r| parse_tag_version(&r.tag_name).map(|v| (r, v)))
     {
@@ -231,18 +334,33 @@ async fn check_and_install(
         }
     };
 
-    let Some(current) = current else {
-        return ComponentReport {
-            name,
-            current_version: None,
-            latest_version: Some(latest.to_string()),
-            action: "skipped",
-            detail: Some(
-                "could not determine the installed version; skipping to avoid overwriting an \
-                 unmanaged installation"
-                    .to_string(),
-            ),
-        };
+    let current = match current {
+        Some(current) => current,
+        None if !install_if_missing => {
+            return ComponentReport {
+                name,
+                current_version: None,
+                latest_version: Some(latest.to_string()),
+                action: "skipped",
+                detail: Some(
+                    "could not determine the installed version; skipping to avoid overwriting \
+                     an unmanaged installation"
+                        .to_string(),
+                ),
+            };
+        }
+        None => {
+            return install_release(
+                client,
+                name,
+                None,
+                &release,
+                &latest,
+                source.command,
+                target,
+            )
+            .await;
+        }
     };
 
     if latest <= current {
@@ -255,10 +373,44 @@ async fn check_and_install(
         };
     }
 
+    install_release(
+        client,
+        name,
+        Some(current),
+        &release,
+        &latest,
+        source.command,
+        target,
+    )
+    .await
+}
+
+/// The GitHub release to check and the executable name to extract from its
+/// assets, grouped so [`check_and_install`] takes one argument instead of
+/// three for this trio.
+struct ReleaseSource<'a> {
+    owner: &'a str,
+    repo: &'a str,
+    command: &'a str,
+}
+
+/// Pick the platform asset out of `release` and install it to `target`,
+/// reporting `action: "installed"` when `current` was `None` (nothing to
+/// replace) or `"updated"` otherwise. Shared tail of [`check_and_install`]'s
+/// two install-triggering branches (stale, and missing-but-owned).
+async fn install_release(
+    client: &reqwest::Client,
+    name: String,
+    current: Option<semver::Version>,
+    release: &Release,
+    latest: &semver::Version,
+    command: &str,
+    target: InstallTarget<'_>,
+) -> ComponentReport {
     let Some(asset) = pick_asset(&release.assets) else {
         return ComponentReport {
             name,
-            current_version: Some(current.to_string()),
+            current_version: current.as_ref().map(|v| v.to_string()),
             latest_version: Some(latest.to_string()),
             action: "error",
             detail: Some(format!(
@@ -271,14 +423,18 @@ async fn check_and_install(
     match install_from_asset(client, &release.assets, asset, command, target).await {
         Ok(note) => ComponentReport {
             name,
-            current_version: Some(current.to_string()),
+            current_version: current.as_ref().map(|v| v.to_string()),
             latest_version: Some(latest.to_string()),
-            action: "updated",
+            action: if current.is_some() {
+                "updated"
+            } else {
+                "installed"
+            },
             detail: note.map(str::to_string),
         },
         Err(e) => ComponentReport {
             name,
-            current_version: Some(current.to_string()),
+            current_version: current.as_ref().map(|v| v.to_string()),
             latest_version: Some(latest.to_string()),
             action: "error",
             detail: Some(e.to_string()),
@@ -907,5 +1063,39 @@ mod tests {
         let data = b"plain-binary-bytes".to_vec();
         let result = extract_binary("codebase-memory-mcp", &data, "codebase-memory-mcp").unwrap();
         assert_eq!(result, data);
+    }
+
+    #[test]
+    fn memory_binary_path_composes_under_data_dir() {
+        let base = Path::new("/data");
+        let p = memory_binary_path_in(base);
+        let file = if cfg!(windows) {
+            "codebase-memory-mcp.exe"
+        } else {
+            "codebase-memory-mcp"
+        };
+        assert_eq!(
+            p,
+            Path::new("/data")
+                .join("repo-explorer")
+                .join("bin")
+                .join(file)
+        );
+        assert_eq!(memory_binary_file_name(), file);
+    }
+
+    #[test]
+    fn codebase_memory_removed_from_dependency_binaries() {
+        // Regression: the private copy is provisioned by
+        // `provision_or_update_memory_binary`, never via the which-based
+        // DEPENDENCY_BINARIES loop.
+        assert!(
+            DEPENDENCY_BINARIES
+                .iter()
+                .all(|d| d.command != "codebase-memory-mcp"),
+            "codebase-memory-mcp must not be a which-resolved dependency"
+        );
+        assert!(DEPENDENCY_BINARIES.iter().any(|d| d.command == "rtk"));
+        assert!(DEPENDENCY_BINARIES.iter().any(|d| d.command == "rg"));
     }
 }

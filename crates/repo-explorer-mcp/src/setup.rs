@@ -131,6 +131,18 @@ fn unique_name(base: &str, used: &std::collections::HashSet<String>) -> String {
     }
 }
 
+/// Build the stdio codebase-memory config from an already-resolved absolute
+/// binary path. Pure/testable; the wizard resolves the path separately via
+/// `update::dedicated_memory_binary_path`.
+fn stdio_memory_config(binary_path: &Path) -> CodebaseMemoryConfig {
+    CodebaseMemoryConfig {
+        command: Some(binary_path.to_string_lossy().into_owned()),
+        args: vec!["--stdio".to_string()],
+        endpoint: None,
+        staleness_seconds: default_staleness_seconds(),
+    }
+}
+
 /// Read one line from stdin, stripping the trailing newline. `None` on EOF.
 fn read_line() -> anyhow::Result<Option<String>> {
     let mut line = String::new();
@@ -302,12 +314,15 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
             staleness_seconds: default_staleness_seconds(),
         }
     } else {
-        CodebaseMemoryConfig {
-            command: Some("codebase-memory-mcp".to_string()),
-            args: vec!["--stdio".to_string()],
-            endpoint: None,
-            staleness_seconds: default_staleness_seconds(),
+        let mem_path = crate::update::dedicated_memory_binary_path()?;
+        if !mem_path.exists() {
+            eprintln!(
+                "  note: the private codebase-memory-mcp binary is not installed yet at {}; \
+                 run `repo-explorer-mcp --update` to provision it.",
+                mem_path.display()
+            );
         }
+        stdio_memory_config(&mem_path)
     };
 
     // HTTPS proxy for model upstream requests (optional).
@@ -483,5 +498,17 @@ mod tests {
         used.insert("gemini-2".to_string());
         assert_eq!(unique_name("gemini", &used), "gemini-3");
         assert_eq!(unique_name("openai", &used), "openai");
+    }
+
+    #[test]
+    fn stdio_memory_config_uses_absolute_path_and_stdio_args() {
+        let path = Path::new("/data/repo-explorer/bin/codebase-memory-mcp");
+        let cfg = stdio_memory_config(path);
+        assert_eq!(
+            cfg.command.as_deref(),
+            Some("/data/repo-explorer/bin/codebase-memory-mcp")
+        );
+        assert_eq!(cfg.args, vec!["--stdio".to_string()]);
+        assert!(cfg.endpoint.is_none());
     }
 }
