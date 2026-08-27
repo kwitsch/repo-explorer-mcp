@@ -3,6 +3,7 @@
 //! symbol name rides on `ExplorationFinding.note` (set by the memory crate).
 
 use repo_explorer_core::memory::{GraphQuery, MemoryBackend};
+use repo_explorer_core::retrieval::is_unknown_location;
 use std::path::Path;
 
 /// Symbols listed per skeleton (files rarely have more worth showing).
@@ -27,10 +28,14 @@ pub(crate) async fn skeleton_for<M: MemoryBackend>(
         .take(MAX_OUTLINE_SYMBOLS)
         .filter_map(|f| {
             f.note.as_deref().map(|name| {
-                format!(
-                    "  {name} @ {}-{}",
-                    f.location.line_start, f.location.line_end
-                )
+                if is_unknown_location(&f.location) {
+                    format!("  {name} (location unknown)")
+                } else {
+                    format!(
+                        "  {name} @ {}-{}",
+                        f.location.line_start, f.location.line_end
+                    )
+                }
             })
         })
         .collect();
@@ -81,6 +86,21 @@ mod tests {
             }
             other => panic!("unexpected call {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn unknown_location_symbol_renders_without_line_range() {
+        let memory = MockMemoryBackend::new().with_search_graph_result(Ok(ExplorationResult {
+            findings: vec![
+                symbol("a.rs", "helper", 12, 30),
+                symbol("a.rs", "unresolved", 0, 0),
+            ],
+            summary: "2 rows".to_string(),
+        }));
+        let got = skeleton_for(&memory, Path::new("/repo"), Path::new("a.rs"))
+            .await
+            .unwrap();
+        assert_eq!(got, "  helper @ 12-30\n  unresolved (location unknown)");
     }
 
     #[tokio::test]

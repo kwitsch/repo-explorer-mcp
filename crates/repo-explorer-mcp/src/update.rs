@@ -234,11 +234,14 @@ async fn check_and_install(
         };
     };
 
+    let current_version = Some(current.to_string());
+    let latest_version = Some(latest.to_string());
+
     if latest <= current {
         return ComponentReport {
             name,
-            current_version: Some(current.to_string()),
-            latest_version: Some(latest.to_string()),
+            current_version,
+            latest_version,
             action: "up-to-date",
             detail: None,
         };
@@ -247,8 +250,8 @@ async fn check_and_install(
     let Some(asset) = pick_asset(&release.assets) else {
         return ComponentReport {
             name,
-            current_version: Some(current.to_string()),
-            latest_version: Some(latest.to_string()),
+            current_version,
+            latest_version,
             action: "error",
             detail: Some(format!(
                 "no release asset matched this platform ({})",
@@ -260,15 +263,15 @@ async fn check_and_install(
     match install_from_asset(client, &release.assets, asset, command, target).await {
         Ok(note) => ComponentReport {
             name,
-            current_version: Some(current.to_string()),
-            latest_version: Some(latest.to_string()),
+            current_version,
+            latest_version,
             action: "updated",
             detail: note.map(str::to_string),
         },
         Err(e) => ComponentReport {
             name,
-            current_version: Some(current.to_string()),
-            latest_version: Some(latest.to_string()),
+            current_version,
+            latest_version,
             action: "error",
             detail: Some(e.to_string()),
         },

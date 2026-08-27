@@ -126,8 +126,12 @@ pub(crate) fn compress_findings(
 #[derive(Serialize)]
 struct FindingDto<'a> {
     path: String,
-    line_start: u32,
-    line_end: u32,
+    /// Omitted (rather than a misleading `0`) when the underlying location is
+    /// core's "unknown" sentinel — see `is_unknown_location`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_start: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_end: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     snippet: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -141,10 +145,11 @@ struct ResultDto<'a> {
 }
 
 fn finding_dto(f: &ExplorationFinding) -> FindingDto<'_> {
+    let known = !is_unknown_location(&f.location);
     FindingDto {
         path: f.location.path.display().to_string(),
-        line_start: f.location.line_start,
-        line_end: f.location.line_end,
+        line_start: known.then_some(f.location.line_start),
+        line_end: known.then_some(f.location.line_end),
         snippet: f.snippet.as_deref(),
         note: f.note.as_deref(),
     }
@@ -284,6 +289,22 @@ mod tests {
         let out = tidy_findings(vec![a, b], &caps);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].note, None);
+    }
+
+    #[test]
+    fn finding_dto_omits_unknown_location_line_numbers() {
+        // The (0, 0) "location unknown" sentinel must never be serialized as
+        // a literal `line_start: 0, line_end: 0` — that reads as a real
+        // match at line 0 to the LLM rather than "location unknown".
+        let unknown = finding("a.rs", 0, None);
+        let value = serde_json::to_value(finding_dto(&unknown)).unwrap();
+        assert!(value.get("line_start").is_none());
+        assert!(value.get("line_end").is_none());
+
+        let known = finding("a.rs", 10, None);
+        let value = serde_json::to_value(finding_dto(&known)).unwrap();
+        assert_eq!(value["line_start"], 10);
+        assert_eq!(value["line_end"], 10);
     }
 
     #[test]

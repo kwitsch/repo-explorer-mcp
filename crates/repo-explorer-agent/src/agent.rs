@@ -25,7 +25,7 @@ use repo_explorer_core::llm::{
     TokenUsage, ToolCall,
 };
 use repo_explorer_core::memory::{IndexStatus, MemoryBackend};
-use repo_explorer_core::retrieval::finding_from_candidate;
+use repo_explorer_core::retrieval::{finding_from_candidate, is_unknown_location};
 use repo_explorer_core::search::SearchBackend;
 use std::collections::HashSet;
 use std::path::Path;
@@ -669,12 +669,19 @@ fn user_prompt(
                 .as_deref()
                 .map(|sym| format!(" `{sym}`"))
                 .unwrap_or_default();
-            s.push_str(&format!(
-                "\n- {}:{}-{}{symbol}",
-                c.location.path.display(),
-                c.location.line_start,
-                c.location.line_end
-            ));
+            if is_unknown_location(&c.location) {
+                s.push_str(&format!(
+                    "\n- {} (location unknown){symbol}",
+                    c.location.path.display(),
+                ));
+            } else {
+                s.push_str(&format!(
+                    "\n- {}:{}-{}{symbol}",
+                    c.location.path.display(),
+                    c.location.line_start,
+                    c.location.line_end
+                ));
+            }
         }
     }
     s
