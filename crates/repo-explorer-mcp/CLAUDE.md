@@ -16,10 +16,9 @@ errors are consumed via `?`/`.context(...)`).
 
 ## Config path resolution
 
-- `.mcp.json` registers `repo-explorer-mcp`, launched via `cargo run --release --quiet`.
 - Precedence: `--config <path>` CLI arg -> `REPO_EXPLORER_CONFIG` env var -> XDG default **if it exists** -> `./repo-explorer.toml` **if it exists** -> the XDG default again, as the wizard's write target.
 - The XDG default is `$XDG_CONFIG_HOME/repo-explorer/repo-explorer.toml` on Linux, `%APPDATA%\repo-explorer\repo-explorer.toml` on Windows.
-- The two `exists` gates are load-bearing: the XDG default resolves on essentially every machine, so returning it unconditionally would make the `./repo-explorer.toml` fallback dead code and silently ignore an in-repo config — including `.mcp.json`'s own no-`--config` launch.
+- The two `exists` gates are load-bearing: the XDG default resolves on essentially every machine, so returning it unconditionally would make the `./repo-explorer.toml` fallback dead code and silently ignore an in-repo config.
 - This crate owns the `dirs` dependency used for XDG resolution; core and the other crates stay free of it.
 - `codebase-memory-mcp` is a private per-user copy at `<dirs::data_dir()>/repo-explorer/bin/codebase-memory-mcp[.exe]`, provisioned/updated only by `--update` and launched by absolute path — never resolved via PATH/`which`. `setup` writes that absolute path into `[codebase_memory] command`; `run()` fails fast with a `--update` hint if the path is missing and never downloads.
 
