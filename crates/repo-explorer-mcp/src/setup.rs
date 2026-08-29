@@ -400,12 +400,12 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
     let toml_string =
         config::to_toml_string(&cfg).context("failed to serialize the generated config as TOML")?;
 
-    if let Some(parent) = config_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-    }
+    crate::ensure_parent_dir(config_path).with_context(|| {
+        format!(
+            "failed to create config directory {}",
+            config_path.parent().unwrap_or(config_path).display()
+        )
+    })?;
     std::fs::write(config_path, &toml_string)
         .with_context(|| format!("failed to write config to {}", config_path.display()))?;
 

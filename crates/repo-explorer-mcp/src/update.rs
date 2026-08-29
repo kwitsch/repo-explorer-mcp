@@ -121,9 +121,7 @@ async fn provision_or_update_memory_binary(client: &reqwest::Client) -> Componen
         }
     };
 
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
+    if let Err(e) = crate::ensure_parent_dir(&path) {
         return ComponentReport {
             name,
             current_version: None,
@@ -131,7 +129,7 @@ async fn provision_or_update_memory_binary(client: &reqwest::Client) -> Componen
             action: "error",
             detail: Some(format!(
                 "failed to create binary directory {}: {e}",
-                parent.display()
+                path.parent().unwrap_or(&path).display()
             )),
         };
     }

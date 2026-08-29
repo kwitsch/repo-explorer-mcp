@@ -123,6 +123,39 @@ fn combined_output(output: &std::process::Output) -> String {
     text.trim().to_string()
 }
 
+/// Build a `StepReport` named `name` from a `run_claude` result: a clean exit
+/// maps to `success_action` (with `success_detail`); a non-zero exit or a
+/// spawn/timeout failure both map to `failure_action`, with the CLI's own
+/// combined output (or the error) surfaced verbatim in `detail`. Shared tail
+/// of `install_mcp_server`/`uninstall_mcp_server`, which differ only in these
+/// action strings and whether a failure is reported as `"error"` or
+/// `"skipped"`.
+fn claude_step_result(
+    result: Result<std::process::Output>,
+    name: &'static str,
+    success_action: &'static str,
+    success_detail: Option<String>,
+    failure_action: &'static str,
+) -> StepReport {
+    match result {
+        Ok(output) if output.status.success() => StepReport {
+            name,
+            action: success_action,
+            detail: success_detail,
+        },
+        Ok(output) => StepReport {
+            name,
+            action: failure_action,
+            detail: Some(combined_output(&output)),
+        },
+        Err(e) => StepReport {
+            name,
+            action: failure_action,
+            detail: Some(format!("{e:#}")),
+        },
+    }
+}
+
 #[derive(serde::Serialize)]
 struct InstallReport {
     status: &'static str,
@@ -192,23 +225,13 @@ fn install_mcp_server(claude: &Path) -> StepReport {
     // ignored.
     let _ = run_claude(claude, &mcp_remove_args());
 
-    match run_claude(claude, &mcp_add_args(&exe)) {
-        Ok(output) if output.status.success() => StepReport {
-            name: "mcp-server",
-            action: "installed",
-            detail: Some(exe.display().to_string()),
-        },
-        Ok(output) => StepReport {
-            name: "mcp-server",
-            action: "error",
-            detail: Some(combined_output(&output)),
-        },
-        Err(e) => StepReport {
-            name: "mcp-server",
-            action: "error",
-            detail: Some(format!("{e:#}")),
-        },
-    }
+    claude_step_result(
+        run_claude(claude, &mcp_add_args(&exe)),
+        "mcp-server",
+        "installed",
+        Some(exe.display().to_string()),
+        "error",
+    )
 }
 
 /// Write (or overwrite) the explore agent file, creating `agents/` if needed.
@@ -224,15 +247,13 @@ fn install_agent_file() -> StepReport {
         }
     };
 
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
+    if let Err(e) = crate::ensure_parent_dir(&path) {
         return StepReport {
             name: "agent-file",
             action: "error",
             detail: Some(format!(
                 "failed to create agent directory {}: {e}",
-                parent.display()
+                path.parent().unwrap_or(&path).display()
             )),
         };
     }
@@ -287,23 +308,13 @@ fn uninstall_mcp_server(claude: Option<&Path>) -> StepReport {
         };
     };
 
-    match run_claude(claude, &mcp_remove_args()) {
-        Ok(output) if output.status.success() => StepReport {
-            name: "mcp-server",
-            action: "removed",
-            detail: None,
-        },
-        Ok(output) => StepReport {
-            name: "mcp-server",
-            action: "skipped",
-            detail: Some(combined_output(&output)),
-        },
-        Err(e) => StepReport {
-            name: "mcp-server",
-            action: "skipped",
-            detail: Some(format!("{e:#}")),
-        },
-    }
+    claude_step_result(
+        run_claude(claude, &mcp_remove_args()),
+        "mcp-server",
+        "removed",
+        None,
+        "skipped",
+    )
 }
 
 /// Delete the explore agent file. Already-absent (`NotFound`) is `skipped`;

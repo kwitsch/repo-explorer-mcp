@@ -192,6 +192,19 @@ fn has_flag(args: &[String], flags: &[&str]) -> bool {
     args.iter().any(|a| flags.contains(&a.as_str()))
 }
 
+/// Create `path`'s parent directory tree if it doesn't already exist,
+/// tolerating a path with no parent component or an empty one (e.g. a bare
+/// relative filename) by treating that as nothing-to-create. Shared by
+/// `setup`/`update`/`install`'s "ensure the directory a file will be written
+/// into exists" step, so a future change to that logic only needs to be made
+/// once.
+fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => std::fs::create_dir_all(parent),
+        _ => Ok(()),
+    }
+}
+
 /// True only when `command` names the managed private binary path yet that
 /// path does not exist — the single case `run()` refuses to serve. A custom
 /// command (bare name or a hand-picked path) or a `None` command (network
