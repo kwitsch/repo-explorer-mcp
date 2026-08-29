@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 /// Upper bound on how long a network request or a `--version` subprocess
 /// check may run before it's treated as failed, so a stalled connection or a
 /// hung/misbehaving binary can't make `--update` block forever.
-const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// GitHub owner/repo for `repo-explorer-mcp` itself.
@@ -605,7 +605,7 @@ fn scan_for_semver(text: &str) -> Option<semver::Version> {
 /// most a few lines) — output isn't drained until the process exits, so a
 /// process that blocks on a full stdout/stderr pipe before exiting would
 /// still hang until the timeout.
-fn run_with_timeout(
+pub(crate) fn run_with_timeout(
     mut command: std::process::Command,
     timeout: Duration,
 ) -> Option<std::process::Output> {

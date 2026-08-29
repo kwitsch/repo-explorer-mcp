@@ -4,6 +4,7 @@
 //! wires the exploration pipeline over rmcp stdio. stdout is reserved for the
 //! MCP protocol stream; every diagnostic goes to stderr.
 
+mod install;
 mod server;
 mod setup;
 mod update;
@@ -28,6 +29,8 @@ Usage:
   repo-explorer-mcp setup               Run the interactive first-run wizard
   repo-explorer-mcp config test         Validate the resolved config only
   repo-explorer-mcp --update            Check for and install updates
+  repo-explorer-mcp --install            Register with Claude Code (user MCP server + explore agent)
+  repo-explorer-mcp --uninstall          Reverse --install
   repo-explorer-mcp --version           Print the version
   repo-explorer-mcp --help              Print this help
 
@@ -53,6 +56,12 @@ async fn main() -> ExitCode {
     }
     if update::wants_update(&subcommand_args) {
         return update::run_update().await;
+    }
+    if install::wants_install(&subcommand_args) {
+        return install::run_install();
+    }
+    if install::wants_uninstall(&subcommand_args) {
+        return install::run_uninstall();
     }
     let config_path = resolve_config_path(
         &argv,
@@ -433,6 +442,21 @@ mod tests {
         // A real subcommand still survives the strip.
         let stripped = args_without_config_value(&args(&["--config", "c.toml", "setup"]));
         assert!(setup::wants_setup(&stripped));
+    }
+
+    #[test]
+    fn config_value_is_never_read_as_install_or_uninstall() {
+        // `--config install` names a config file, not the `--install` flag.
+        let stripped = args_without_config_value(&args(&["--config", "install"]));
+        assert!(!install::wants_install(&stripped));
+        // Same for a file named `uninstall`.
+        let stripped = args_without_config_value(&args(&["--config", "uninstall"]));
+        assert!(!install::wants_uninstall(&stripped));
+        // A real flag still survives the strip.
+        let stripped = args_without_config_value(&args(&["--config", "c.toml", "--install"]));
+        assert!(install::wants_install(&stripped));
+        let stripped = args_without_config_value(&args(&["--config", "c.toml", "--uninstall"]));
+        assert!(install::wants_uninstall(&stripped));
     }
 
     #[test]
