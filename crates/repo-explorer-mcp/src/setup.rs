@@ -329,15 +329,29 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
             staleness_seconds: default_staleness_seconds(),
         }
     } else {
-        let mem_path = crate::update::dedicated_memory_binary_path()?;
-        if !mem_path.exists() {
-            eprintln!(
-                "  note: the private codebase-memory-mcp binary is not installed yet at {}; \
-                 run `repo-explorer-mcp --update` to provision it.",
-                mem_path.display()
-            );
+        match crate::update::dedicated_memory_binary_path() {
+            Ok(mem_path) => {
+                if !mem_path.exists() {
+                    eprintln!(
+                        "  note: the private codebase-memory-mcp binary is not installed yet \
+                         at {}; run `repo-explorer-mcp --update` to provision it.",
+                        mem_path.display()
+                    );
+                }
+                stdio_memory_config(&mem_path)
+            }
+            Err(e) => {
+                // No resolvable data dir (e.g. HOME unset): fall back to a
+                // bare command resolved via PATH rather than propagating the
+                // error via `?`, which would discard every prior answer with
+                // no config written and no way to resume.
+                eprintln!(
+                    "  note: could not resolve the private codebase-memory-mcp path ({e:#}); \
+                     falling back to a bare `codebase-memory-mcp` command resolved via PATH."
+                );
+                stdio_memory_config(Path::new("codebase-memory-mcp"))
+            }
         }
-        stdio_memory_config(&mem_path)
     };
 
     // HTTPS proxy for model upstream requests (optional).

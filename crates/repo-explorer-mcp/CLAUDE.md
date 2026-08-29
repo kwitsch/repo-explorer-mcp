@@ -48,4 +48,4 @@ errors are consumed via `?`/`.context(...)`).
 - `wants_install`/`wants_uninstall` reuse `crate::has_flag` over `args_without_config_value` output, exactly like `update.rs`.
 - The MCP server name (`repo-explorer-mcp`, `--scope user`) and the agent's `tools: mcp__repo-explorer-mcp` line both derive from a single `SERVER_NAME` constant. The registered command is `std::env::current_exe()`.
 - Reuses `update.rs`'s `pub(crate)` `run_with_timeout` + `SUBPROCESS_TIMEOUT` (10s) to bound the `claude` subprocess; the CLI's own stderr is surfaced verbatim in the step `detail` on failure.
-- No new crate dependencies; `repo-explorer-core` is untouched. The Node.js installer (`setup/index.mjs`) is out of scope and unchanged.
+- No new crate dependencies; `repo-explorer-core` is untouched. This install/uninstall feature does not touch the Node.js installer (`setup/index.mjs`) — but that file is not otherwise "unchanged": it independently provisions the private `codebase-memory-mcp` copy (see `## Self-update` above), so don't assume it's untouched by memory-binary work when changing `update.rs`.

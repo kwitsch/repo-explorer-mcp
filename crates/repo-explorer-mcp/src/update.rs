@@ -136,11 +136,18 @@ async fn provision_or_update_memory_binary(client: &reqwest::Client) -> Componen
         };
     }
 
-    let current = if path.exists() {
+    let path_exists = path.exists();
+    let current = if path_exists {
         read_installed_version_blocking(path.clone()).await
     } else {
         None
     };
+
+    // Only a genuinely absent file should trigger a fresh install. A file
+    // that exists but whose version couldn't be probed (a transient
+    // `--version` timeout or format mismatch) must be skipped like any other
+    // tracked dependency, never silently redownloaded/overwritten.
+    let install_if_missing = !path_exists;
 
     check_and_install(
         client,
@@ -152,7 +159,7 @@ async fn provision_or_update_memory_binary(client: &reqwest::Client) -> Componen
         },
         current,
         InstallTarget::Path(&path),
-        true,
+        install_if_missing,
     )
     .await
 }

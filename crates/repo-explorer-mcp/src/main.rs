@@ -115,16 +115,28 @@ async fn run(config: repo_explorer_core::config::Config) -> anyhow::Result<()> {
     // The directory the server is launched in = the project root to explore.
     let repo_root = std::env::current_dir().context("failed to determine current directory")?;
 
-    if let Ok(managed) = update::dedicated_memory_binary_path()
-        && managed_binary_missing(config.codebase_memory.command.as_deref(), &managed, |p| {
-            p.exists()
-        })
-    {
-        anyhow::bail!(
-            "dedicated codebase-memory-mcp binary not found at {}; \
-             run `repo-explorer-mcp --update` to provision it",
-            managed.display()
-        );
+    match update::dedicated_memory_binary_path() {
+        Ok(managed) => {
+            if managed_binary_missing(config.codebase_memory.command.as_deref(), &managed, |p| {
+                p.exists()
+            }) {
+                anyhow::bail!(
+                    "dedicated codebase-memory-mcp binary not found at {}; \
+                     run `repo-explorer-mcp --update` to provision it",
+                    managed.display()
+                );
+            }
+        }
+        Err(e) => {
+            // Can't compute the managed path (e.g. no resolvable data dir),
+            // so the pre-connect existence check above can't run. Log this
+            // instead of silently skipping it, so a subsequent low-level
+            // connect failure isn't a total mystery.
+            tracing::warn!(
+                "could not resolve the managed codebase-memory-mcp path ({e:#}); \
+                 skipping the pre-connect existence check"
+            );
+        }
     }
 
     let memory = MemoryClientBackend::connect(&config.codebase_memory)
@@ -189,7 +201,21 @@ fn managed_binary_missing(
     managed: &Path,
     exists: impl Fn(&Path) -> bool,
 ) -> bool {
-    command.is_some_and(|cmd| Path::new(cmd) == managed) && !exists(managed)
+    command.is_some_and(|cmd| paths_match_managed(Path::new(cmd), managed)) && !exists(managed)
+}
+
+/// Path equality for comparing a configured command against the managed
+/// binary path: case-insensitive on Windows (NTFS paths are
+/// case-insensitive, and `dirs::data_dir()`'s casing isn't guaranteed to
+/// match a hand-edited or copied-from-elsewhere config value byte-for-byte),
+/// exact elsewhere.
+fn paths_match_managed(cmd: &Path, managed: &Path) -> bool {
+    if cfg!(windows) {
+        cmd.to_string_lossy()
+            .eq_ignore_ascii_case(&managed.to_string_lossy())
+    } else {
+        cmd == managed
+    }
 }
 
 /// Fail-fast message when the mandatory `rtk` search binary is unresolved,
