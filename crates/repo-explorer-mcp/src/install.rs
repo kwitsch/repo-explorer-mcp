@@ -4,13 +4,15 @@
 //! registers this binary as a user-scoped MCP server (via the real `claude`
 //! CLI, never by hand-editing `~/.claude.json`) and writes an `explore`
 //! subagent to `<home>/.claude/agents/explore.md`; `--uninstall` reverses
-//! exactly those two changes, idempotently. Dispatched before config
+//! those two changes idempotently, but only deletes the agent file if its
+//! contents still match what install wrote. Dispatched before config
 //! resolution, so neither flag ever loads or creates `repo-explorer.toml`.
 //! stdout carries only the final JSON report; all other diagnostics go to
 //! stderr. Install checked before uninstall, so `--install` wins if both are
 //! passed.
 
 use anyhow::{Context, Result, anyhow};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -75,40 +77,45 @@ fit together. Do not modify files.
 }
 
 /// argv for `claude mcp add repo-explorer-mcp --scope user -- <exe>`. The `--`
-/// guard separates the stdio command from `claude`'s own flags.
-fn mcp_add_args(exe: &Path) -> Vec<String> {
+/// guard separates the stdio command from `claude`'s own flags. `OsString`
+/// (not `String`) so a non-UTF-8 executable path is passed through verbatim
+/// instead of being lossily mangled to `U+FFFD`.
+fn mcp_add_args(exe: &Path) -> Vec<OsString> {
     vec![
-        "mcp".to_string(),
-        "add".to_string(),
-        SERVER_NAME.to_string(),
-        "--scope".to_string(),
-        "user".to_string(),
-        "--".to_string(),
-        exe.display().to_string(),
+        OsString::from("mcp"),
+        OsString::from("add"),
+        OsString::from(SERVER_NAME),
+        OsString::from("--scope"),
+        OsString::from("user"),
+        OsString::from("--"),
+        exe.as_os_str().to_os_string(),
     ]
 }
 
 /// argv for `claude mcp remove repo-explorer-mcp --scope user`.
-fn mcp_remove_args() -> Vec<String> {
+fn mcp_remove_args() -> Vec<OsString> {
     vec![
-        "mcp".to_string(),
-        "remove".to_string(),
-        SERVER_NAME.to_string(),
-        "--scope".to_string(),
-        "user".to_string(),
+        OsString::from("mcp"),
+        OsString::from("remove"),
+        OsString::from(SERVER_NAME),
+        OsString::from("--scope"),
+        OsString::from("user"),
     ]
 }
 
 /// Invoke `claude` with `args`, bounded by [`crate::update::SUBPROCESS_TIMEOUT`]
 /// so a hung CLI cannot block the flag forever. Errors on spawn failure or
 /// timeout; otherwise yields the `Output` for the caller to interpret.
-fn run_claude(claude: &Path, args: &[String]) -> Result<std::process::Output> {
+fn run_claude(claude: &Path, args: &[OsString]) -> Result<std::process::Output> {
     let mut command = std::process::Command::new(claude);
     command.args(args);
     crate::update::run_with_timeout(command, crate::update::SUBPROCESS_TIMEOUT).ok_or_else(|| {
         anyhow!(
             "`claude {}` failed to run or did not exit within {:?}",
-            args.join(" "),
+            args.iter()
+                .map(|a| a.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" "),
             crate::update::SUBPROCESS_TIMEOUT
         )
     })
@@ -273,7 +280,8 @@ fn install_agent_file() -> StepReport {
 }
 
 /// `--uninstall`: reverse the two install steps. Tolerates an absent `claude`
-/// (the MCP step is skipped) and still deletes the agent file.
+/// (the MCP step is skipped) and only deletes the agent file if its contents
+/// still match what install wrote.
 pub fn run_uninstall() -> ExitCode {
     let claude = claude_binary();
     let steps = vec![
@@ -317,8 +325,11 @@ fn uninstall_mcp_server(claude: Option<&Path>) -> StepReport {
     )
 }
 
-/// Delete the explore agent file. Already-absent (`NotFound`) is `skipped`;
-/// any other IO error is `error`.
+/// Delete the explore agent file, but only if its contents still match what
+/// `install_agent_file` wrote. Already-absent (`NotFound`) is `skipped`, as is
+/// a file whose contents were replaced or hand-edited after install (so a
+/// user's own agent at this conventional path is never silently destroyed).
+/// Any other IO error is `error`.
 fn uninstall_agent_file() -> StepReport {
     let path = match explore_agent_path() {
         Ok(p) => p,
@@ -330,12 +341,33 @@ fn uninstall_agent_file() -> StepReport {
             };
         }
     };
+    uninstall_agent_file_at(&path)
+}
 
-    match std::fs::remove_file(&path) {
-        Ok(()) => StepReport {
+/// The path-parameterized core of [`uninstall_agent_file`], split out so
+/// tests can exercise the content-match guard against a temp file instead of
+/// the real `<home>/.claude/agents/explore.md`.
+fn uninstall_agent_file_at(path: &Path) -> StepReport {
+    match std::fs::read_to_string(path) {
+        Ok(contents) if contents == explore_agent_markdown() => match std::fs::remove_file(path) {
+            Ok(()) => StepReport {
+                name: "agent-file",
+                action: "removed",
+                detail: Some(path.display().to_string()),
+            },
+            Err(e) => StepReport {
+                name: "agent-file",
+                action: "error",
+                detail: Some(format!("failed to remove {}: {e}", path.display())),
+            },
+        },
+        Ok(_) => StepReport {
             name: "agent-file",
-            action: "removed",
-            detail: Some(path.display().to_string()),
+            action: "skipped",
+            detail: Some(format!(
+                "{} was modified after install; leaving it in place",
+                path.display()
+            )),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => StepReport {
             name: "agent-file",
@@ -345,7 +377,7 @@ fn uninstall_agent_file() -> StepReport {
         Err(e) => StepReport {
             name: "agent-file",
             action: "error",
-            detail: Some(format!("failed to remove {}: {e}", path.display())),
+            detail: Some(format!("failed to read {}: {e}", path.display())),
         },
     }
 }
@@ -356,6 +388,10 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn os_args(v: &[&str]) -> Vec<OsString> {
+        v.iter().map(OsString::from).collect()
     }
 
     #[test]
@@ -408,12 +444,49 @@ mod tests {
         assert!(md.starts_with("---\n"));
     }
 
+    /// A path under the OS temp dir unique to this test invocation, so
+    /// parallel test runs never collide.
+    fn unique_temp_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "repo-explorer-mcp-test-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    #[test]
+    fn uninstall_agent_file_at_removes_matching_content() {
+        let path = unique_temp_path("uninstall-match");
+        std::fs::write(&path, explore_agent_markdown()).unwrap();
+        let report = uninstall_agent_file_at(&path);
+        assert_eq!(report.action, "removed");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn uninstall_agent_file_at_skips_modified_content() {
+        let path = unique_temp_path("uninstall-modified");
+        std::fs::write(&path, "not what install wrote").unwrap();
+        let report = uninstall_agent_file_at(&path);
+        assert_eq!(report.action, "skipped");
+        // The user's own file at this path must survive.
+        assert!(path.exists());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn uninstall_agent_file_at_skips_already_absent() {
+        let path = unique_temp_path("uninstall-absent");
+        let report = uninstall_agent_file_at(&path);
+        assert_eq!(report.action, "skipped");
+    }
+
     #[test]
     fn mcp_add_args_exact_argv() {
         let exe = PathBuf::from("/opt/bin/repo-explorer-mcp");
         assert_eq!(
             mcp_add_args(&exe),
-            args(&[
+            os_args(&[
                 "mcp",
                 "add",
                 "repo-explorer-mcp",
@@ -426,10 +499,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn mcp_add_args_preserves_non_utf8_exe_path() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let exe = PathBuf::from(std::ffi::OsStr::from_bytes(b"/opt/bin/repo\xFFexplorer"));
+        let got = mcp_add_args(&exe);
+        assert_eq!(got.last().unwrap(), exe.as_os_str());
+    }
+
+    #[test]
     fn mcp_remove_args_exact_argv() {
         assert_eq!(
             mcp_remove_args(),
-            args(&["mcp", "remove", "repo-explorer-mcp", "--scope", "user"])
+            os_args(&["mcp", "remove", "repo-explorer-mcp", "--scope", "user"])
         );
     }
 }
