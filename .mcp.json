@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "repo-explorer": {
-      "command": "cargo",
-      "args": ["run", "--release", "--quiet", "-p", "repo-explorer-mcp", "--"],
-      "env": {}
-    }
-  }
-}

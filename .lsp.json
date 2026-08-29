@@ -6,5 +6,16 @@
       ".rs": "rust"
     },
     "startupTimeout": 60000
+  },
+  "typescript-language-server": {
+    "command": "typescript-language-server",
+    "args": ["--stdio"],
+    "extensionToLanguage": {
+      ".js": "javascript",
+      ".mjs": "javascript",
+      ".cjs": "javascript",
+      ".jsx": "javascript"
+    },
+    "startupTimeout": 60000
   }
 }
