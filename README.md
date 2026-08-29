@@ -14,8 +14,6 @@ binary, reports PATH status, and prints a ready-to-use `.mcp.json` snippet.
 
 ```bash
 npx github:kwitsch/repo-explorer-mcp
-# After the package is published to npm:
-# npx repo-explorer-mcp-setup
 ```
 
 Flags:
