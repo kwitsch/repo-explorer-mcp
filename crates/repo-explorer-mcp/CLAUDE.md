@@ -32,6 +32,7 @@ errors are consumed via `?`/`.context(...)`).
 - "Missing" means `ConfigError::is_not_found`, not a bare `Path::exists` probe, so an unreadable or malformed config reports its real error instead of "no config".
 - `--update` checks this binary and its runtime dependency binaries against their latest GitHub release, installs anything newer, and prints a structured JSON report to stdout; non-zero exit if any component errors.
 - Subcommand/flag detection runs over `args_without_config_value(argv)`, never raw `argv`: the value of a `--config <path>` pair must never be read as a subcommand (`--config setup` names a file, not the wizard).
+- `--install` registers this binary with Claude Code and is fully headless: it shells out to `claude mcp add repo-explorer-mcp --scope user -- <current_exe>` (idempotent remove-then-add, never hand-editing `~/.claude.json`) and writes an `explore` Haiku subagent to `<home>/.claude/agents/explore.md`. It fails fast with a non-zero exit and `claude_code_detected: false` when `claude` is not on PATH. `--uninstall` reverses exactly those two changes idempotently, tolerating an absent `claude` and an already-deleted agent file (both reported as `skipped`, not errors). Both print a per-step (`mcp-server`, `agent-file`) JSON report to stdout and exit non-zero only when a step errors, mirroring `--update`. Dispatched before config resolution, so neither loads or creates `repo-explorer.toml`; when both flags are passed, `--install` wins (checked first).
 
 ## Self-update (`src/update.rs`)
 
@@ -40,3 +41,11 @@ errors are consumed via `?`/`.context(...)`).
 - The `which`-resolved `rg` dependency, when its installed version can't be determined or it isn't on `PATH`, is skipped rather than blindly overwritten. The managed `rtk` and `codebase-memory-mcp` copies are instead installed when absent and updated when stale (`action` `installed`/`updated`/`up-to-date`).
 - This crate owns the `reqwest`/`semver`/`sha2`/`hex`/`flate2`/`tar`/`zip`/`self-replace` dependencies; core stays free of them.
 - It also uses `which`, already owned by `repo-explorer-search` — the only dependency this crate shares with another non-core crate rather than owning outright.
+
+## Install/uninstall (`src/install.rs`)
+
+- Sibling module to `setup.rs`/`update.rs`, dispatched from `main()` after the `--update` check and before `resolve_config_path`. Synchronous `run_install`/`run_uninstall` returning `ExitCode` (no async runtime — all work is `std::fs` writes and bounded blocking `claude` subprocess calls).
+- `wants_install`/`wants_uninstall` reuse `crate::has_flag` over `args_without_config_value` output, exactly like `update.rs`.
+- The MCP server name (`repo-explorer-mcp`, `--scope user`) and the agent's `tools: mcp__repo-explorer-mcp` line both derive from a single `SERVER_NAME` constant. The registered command is `std::env::current_exe()`.
+- Reuses `update.rs`'s `pub(crate)` `run_with_timeout` + `SUBPROCESS_TIMEOUT` (10s) to bound the `claude` subprocess; the CLI's own stderr is surfaced verbatim in the step `detail` on failure.
+- No new crate dependencies; `repo-explorer-core` is untouched. The Node.js installer (`setup/index.mjs`) is out of scope and unchanged.
