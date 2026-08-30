@@ -55,11 +55,16 @@ fn explore_agent_path() -> Result<PathBuf> {
 
 /// The full markdown+frontmatter document written to the agent file. The
 /// `tools:` line is derived from `SERVER_NAME`, so it always matches the
-/// registered server name.
+/// registered server name. `name: Explore` (capital E, matching Claude Code's
+/// built-in `agentType: "Explore"` exactly) is deliberate, not a convention
+/// violation: subagent override/shadowing is a literal, case-sensitive name
+/// match, so a lowercase `explore` would register as a separate, additional
+/// agent instead of replacing the built-in general-purpose one with this
+/// MCP-tool-backed version.
 fn explore_agent_markdown() -> String {
     format!(
         r#"---
-name: explore
+name: Explore
 description: Locate code and answer "where/how is X implemented" questions about the current repository by delegating to the repo-explorer-mcp explore_repository tool. Use for fast, read-only codebase exploration.
 tools: mcp__{SERVER_NAME}
 model: haiku
@@ -436,7 +441,7 @@ mod tests {
     #[test]
     fn explore_agent_markdown_has_required_frontmatter() {
         let md = explore_agent_markdown();
-        assert!(md.contains("name: explore"));
+        assert!(md.contains("name: Explore"));
         assert!(md.contains("model: haiku"));
         assert!(md.contains("tools: mcp__repo-explorer-mcp"));
         // Exactly one frontmatter fence delimiter pair (open + close).
