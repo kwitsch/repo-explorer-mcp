@@ -122,6 +122,10 @@ async fn run(config: repo_explorer_core::config::Config) -> anyhow::Result<()> {
         .await
         .context("failed to connect to codebase-memory-mcp")?;
     let search = CliSearchBackend::new(&config.search);
+    if !search.rtk_available() {
+        let managed = update::dedicated_rtk_binary_path().ok();
+        anyhow::bail!("{}", rtk_unresolved_message(managed.as_deref()));
+    }
     let router = repo_explorer_llm::build_router(&config.llm)
         .context("failed to build LLM provider router")?;
     let probe = GitStateProbe::new(config.search.timeout_seconds);
@@ -177,6 +181,19 @@ fn managed_binary_missing(
     exists: impl Fn(&Path) -> bool,
 ) -> bool {
     command.is_some_and(|cmd| Path::new(cmd) == managed) && !exists(managed)
+}
+
+/// Fail-fast message when the mandatory `rtk` search binary is unresolved,
+/// pointing at `--update` (and the managed install path when resolvable).
+fn rtk_unresolved_message(managed: Option<&Path>) -> String {
+    let managed = managed
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.local/bin/rtk".to_string());
+    format!(
+        "rtk is required for search but could not be resolved; \
+         run `repo-explorer-mcp --update` to install it to {managed}, \
+         or set `[search] rtk_path` to an existing rtk binary"
+    )
 }
 
 /// Resolve the config path. Precedence: `--config <path>` / `--config=<path>`
@@ -514,8 +531,8 @@ mod tests {
 
     #[test]
     fn managed_binary_missing_truth_table() {
-        let managed = PathBuf::from("/data/repo-explorer/bin/codebase-memory-mcp");
-        let managed_str = "/data/repo-explorer/bin/codebase-memory-mcp";
+        let managed = PathBuf::from("/home/user/.local/bin/codebase-memory-mcp");
+        let managed_str = "/home/user/.local/bin/codebase-memory-mcp";
         // Managed path configured, file absent -> refuse to serve.
         assert!(managed_binary_missing(Some(managed_str), &managed, |_| {
             false
@@ -532,6 +549,17 @@ mod tests {
         ));
         // No command (network endpoint branch) -> not our concern.
         assert!(!managed_binary_missing(None, &managed, |_| false));
+    }
+
+    #[test]
+    fn rtk_unresolved_message_points_at_update_and_managed_path() {
+        let msg = rtk_unresolved_message(Some(Path::new("/home/user/.local/bin/rtk")));
+        assert!(msg.contains("--update"));
+        assert!(msg.contains("/home/user/.local/bin/rtk"));
+        assert!(msg.contains("rtk_path"));
+        // Fallback when no managed path resolves.
+        let fallback = rtk_unresolved_message(None);
+        assert!(fallback.contains("~/.local/bin/rtk"));
     }
 
     #[test]
