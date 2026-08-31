@@ -1,51 +1,21 @@
-//! Pure binary-selection logic: pick which of `rtk`/`ripgrep` to run, resolving
-//! explicit config paths first and closure-injected PATH detection second. No
-//! subprocess is spawned here, so the fallback logic is unit-testable with no
-//! real binaries (mirrors `repo-explorer-memory::freshness`).
+//! Pure rtk-resolution logic: pick the `rtk` binary, resolving an explicit
+//! config path first and closure-injected PATH detection second. No subprocess
+//! is spawned here, so resolution is unit-testable with no real binary (mirrors
+//! `repo-explorer-memory::freshness`).
 
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Tool {
-    Rtk,
-    Ripgrep,
-}
-
-pub(crate) struct ResolvedBackend {
-    pub tool: Tool,
-    pub path: PathBuf,
-}
-
-/// Resolve a single tool: an explicit config path wins over PATH detection
+/// Resolve the rtk binary: an explicit config path wins over PATH detection
 /// (config doc says `None` -> auto-detect); a bad explicit path is trusted
-/// as-is and surfaces as a spawn failure at run time, not here.
-fn try_tool(
-    explicit: Option<&Path>,
-    tool: Tool,
-    find: impl Fn() -> Option<PathBuf>,
-) -> Option<ResolvedBackend> {
-    let path = match explicit {
-        Some(p) => p.to_path_buf(),
-        None => find()?,
-    };
-    Some(ResolvedBackend { tool, path })
-}
-
-/// Pick which binary to run. `prefer_rtk == true` tries rtk then rg; `false`
-/// tries rg then rtk. Returns `None` when neither tool resolves.
-pub(crate) fn resolve_backend(
+/// as-is and surfaces as a spawn failure at run time, not here. Returns `None`
+/// when rtk cannot be resolved at all.
+pub(crate) fn resolve_rtk(
     rtk_path: Option<&Path>,
-    ripgrep_path: Option<&Path>,
-    prefer_rtk: bool,
     find_rtk: impl Fn() -> Option<PathBuf>,
-    find_rg: impl Fn() -> Option<PathBuf>,
-) -> Option<ResolvedBackend> {
-    let try_rtk = || try_tool(rtk_path, Tool::Rtk, &find_rtk);
-    let try_rg = || try_tool(ripgrep_path, Tool::Ripgrep, &find_rg);
-    if prefer_rtk {
-        try_rtk().or_else(try_rg)
-    } else {
-        try_rg().or_else(try_rtk)
+) -> Option<PathBuf> {
+    match rtk_path {
+        Some(p) => Some(p.to_path_buf()),
+        None => find_rtk(),
     }
 }
 
@@ -57,51 +27,26 @@ mod tests {
     fn some_rtk() -> Option<PathBuf> {
         Some(PathBuf::from("/found/rtk"))
     }
-    fn some_rg() -> Option<PathBuf> {
-        Some(PathBuf::from("/found/rg"))
-    }
     fn none() -> Option<PathBuf> {
         None
     }
 
     #[test]
-    fn prefer_rtk_present_picks_rtk() {
-        let r = resolve_backend(None, None, true, some_rtk, some_rg).unwrap();
-        assert_eq!(r.tool, Tool::Rtk);
-        assert_eq!(r.path, PathBuf::from("/found/rtk"));
+    fn explicit_path_wins_over_finder() {
+        // The finder would return a different path, but the explicit config
+        // path wins and the finder is not consulted.
+        let resolved = resolve_rtk(Some(Path::new("/cfg/rtk")), some_rtk).unwrap();
+        assert_eq!(resolved, PathBuf::from("/cfg/rtk"));
     }
 
     #[test]
-    fn prefer_rtk_but_absent_falls_back_to_rg() {
-        let r = resolve_backend(None, None, true, none, some_rg).unwrap();
-        assert_eq!(r.tool, Tool::Ripgrep);
-        assert_eq!(r.path, PathBuf::from("/found/rg"));
+    fn finder_used_when_no_explicit_path() {
+        let resolved = resolve_rtk(None, some_rtk).unwrap();
+        assert_eq!(resolved, PathBuf::from("/found/rtk"));
     }
 
     #[test]
-    fn prefer_rg_picks_rg_first() {
-        let r = resolve_backend(None, None, false, some_rtk, some_rg).unwrap();
-        assert_eq!(r.tool, Tool::Ripgrep);
-    }
-
-    #[test]
-    fn prefer_rg_but_absent_falls_back_to_rtk() {
-        let r = resolve_backend(None, None, false, some_rtk, none).unwrap();
-        assert_eq!(r.tool, Tool::Rtk);
-    }
-
-    #[test]
-    fn explicit_rtk_path_overrides_finder() {
-        // finder returns a different path; the explicit config path wins and the
-        // finder is not consulted for rtk.
-        let explicit = PathBuf::from("/cfg/rtk");
-        let r = resolve_backend(Some(Path::new("/cfg/rtk")), None, true, none, some_rg).unwrap();
-        assert_eq!(r.tool, Tool::Rtk);
-        assert_eq!(r.path, explicit);
-    }
-
-    #[test]
-    fn neither_present_returns_none() {
-        assert!(resolve_backend(None, None, true, none, none).is_none());
+    fn none_when_unresolved() {
+        assert!(resolve_rtk(None, none).is_none());
     }
 }
