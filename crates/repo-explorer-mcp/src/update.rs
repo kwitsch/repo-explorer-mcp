@@ -1,9 +1,10 @@
 //! `--update` CLI mode.
 //!
-//! Instead of booting the MCP server, checks `repo-explorer-mcp` itself and
-//! its runtime dependency binaries (`rtk`, `rg`/ripgrep, `codebase-memory-mcp`)
-//! against their GitHub releases, and installs any newer version found.
-//! Never runs alongside the main exploration logic.
+//! Instead of booting the MCP server, checks `repo-explorer-mcp` itself, its
+//! `which`-resolved runtime dependency (`rg`/ripgrep), and its two managed
+//! install-if-absent copies (`rtk`, `codebase-memory-mcp`) against their GitHub
+//! releases, installing any newer version found. Never runs alongside the main
+//! exploration logic.
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -30,20 +31,41 @@ struct DependencyBinary {
     repo: &'static str,
 }
 
-const DEPENDENCY_BINARIES: &[DependencyBinary] = &[
-    DependencyBinary {
-        command: "rtk",
-        owner: "rtk-ai",
-        repo: "rtk",
-    },
-    DependencyBinary {
-        command: "rg",
-        owner: "BurntSushi",
-        repo: "ripgrep",
-    },
-];
+const DEPENDENCY_BINARIES: &[DependencyBinary] = &[DependencyBinary {
+    command: "rg",
+    owner: "BurntSushi",
+    repo: "ripgrep",
+}];
 
-/// File name of the private `codebase-memory-mcp` copy, with the platform's
+/// The shared per-user directory repo-explorer installs its managed binaries
+/// into: `~/.local/bin` on Linux (`dirs::executable_dir()`), and
+/// `%LOCALAPPDATA%\repo-explorer-mcp` on Windows
+/// (`dirs::data_local_dir().join("repo-explorer-mcp")`) — the same directory
+/// the npx installer's `installDir()` places the main binary in on each
+/// platform. Errors when no such directory is resolvable (e.g. no HOME /
+/// LOCALAPPDATA).
+fn managed_bin_dir() -> Result<PathBuf> {
+    if let Some(dir) = dirs::executable_dir() {
+        // Linux: $XDG_BIN_HOME or $HOME/.local/bin. (None on Windows/macOS.)
+        Ok(dir)
+    } else {
+        // Windows: %LOCALAPPDATA%\repo-explorer-mcp (matches installDir()).
+        let base = dirs::data_local_dir().ok_or_else(|| {
+            anyhow!(
+                "no local data directory available to place managed binaries (is LOCALAPPDATA set?)"
+            )
+        })?;
+        Ok(base.join("repo-explorer-mcp"))
+    }
+}
+
+/// Pure, testable path composer: the managed dir *is* the final directory, so
+/// the binary sits directly inside it.
+fn binary_path_in(bin_dir: &Path, file: &str) -> PathBuf {
+    bin_dir.join(file)
+}
+
+/// File name of the managed `codebase-memory-mcp` binary, with the platform's
 /// executable suffix on Windows.
 fn memory_binary_file_name() -> &'static str {
     if cfg!(windows) {
@@ -53,25 +75,28 @@ fn memory_binary_file_name() -> &'static str {
     }
 }
 
-/// Compose the private binary path under a given data dir. Pure and testable:
-/// takes the data dir explicitly so tests need no real directories.
-fn memory_binary_path_in(data_dir: &Path) -> PathBuf {
-    data_dir
-        .join("repo-explorer")
-        .join("bin")
-        .join(memory_binary_file_name())
+/// File name of the managed `rtk` binary, with the platform's executable suffix
+/// on Windows.
+fn rtk_binary_file_name() -> &'static str {
+    if cfg!(windows) { "rtk.exe" } else { "rtk" }
 }
 
-/// Absolute path of the private, repo-explorer-owned `codebase-memory-mcp`
-/// copy: `<data_dir>/repo-explorer/bin/codebase-memory-mcp[.exe]`. Errors when
-/// no data dir is resolvable (e.g. no HOME). Never consults PATH.
+/// Absolute path of the repo-explorer-managed `codebase-memory-mcp` binary in
+/// the shared managed bin dir (`~/.local/bin` on Linux,
+/// `%LOCALAPPDATA%\repo-explorer-mcp` on Windows). Errors when no managed dir is
+/// resolvable (e.g. no HOME). Never consults PATH.
 pub(crate) fn dedicated_memory_binary_path() -> Result<PathBuf> {
-    let data_dir = dirs::data_dir().ok_or_else(|| {
-        anyhow!(
-            "no data directory available to place the codebase-memory-mcp binary (is HOME set?)"
-        )
-    })?;
-    Ok(memory_binary_path_in(&data_dir))
+    Ok(binary_path_in(
+        &managed_bin_dir()?,
+        memory_binary_file_name(),
+    ))
+}
+
+/// Absolute path of the repo-explorer-managed `rtk` binary in the shared managed
+/// bin dir, alongside `codebase-memory-mcp`. Errors when no managed dir is
+/// resolvable. Never consults PATH.
+pub(crate) fn dedicated_rtk_binary_path() -> Result<PathBuf> {
+    Ok(binary_path_in(&managed_bin_dir()?, rtk_binary_file_name()))
 }
 
 /// Install-if-absent / update-if-stale the private `codebase-memory-mcp`
@@ -132,6 +157,64 @@ async fn provision_or_update_memory_binary(client: &reqwest::Client) -> Componen
     .await
 }
 
+/// Install-if-absent / update-if-stale the managed `rtk` copy at
+/// [`dedicated_rtk_binary_path`], via the shared [`check_and_install`] pipeline.
+/// Like the `codebase-memory-mcp` copy and unlike the `which`-resolved `rg`
+/// dependency, a *missing* binary is installed (not "skipped"):
+/// repo-explorer-mcp owns this copy and search is mandatory, so it never falls
+/// back to a PATH/global install — see `check_and_install`'s `install_if_missing`.
+async fn provision_or_update_rtk_binary(client: &reqwest::Client) -> ComponentReport {
+    let name = "rtk".to_string();
+
+    let path = match dedicated_rtk_binary_path() {
+        Ok(p) => p,
+        Err(e) => {
+            return ComponentReport {
+                name,
+                current_version: None,
+                latest_version: None,
+                action: "error",
+                detail: Some(e.to_string()),
+            };
+        }
+    };
+
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return ComponentReport {
+            name,
+            current_version: None,
+            latest_version: None,
+            action: "error",
+            detail: Some(format!(
+                "failed to create binary directory {}: {e}",
+                parent.display()
+            )),
+        };
+    }
+
+    let current = if path.exists() {
+        read_installed_version_blocking(path.clone()).await
+    } else {
+        None
+    };
+
+    check_and_install(
+        client,
+        name,
+        ReleaseSource {
+            owner: "rtk-ai",
+            repo: "rtk",
+            command: "rtk",
+        },
+        current,
+        InstallTarget::Path(&path),
+        true,
+    )
+    .await
+}
+
 /// True when `--update` is present among the raw CLI args.
 pub fn wants_update(args: &[String]) -> bool {
     crate::has_flag(args, &["--update"])
@@ -178,7 +261,7 @@ pub async fn run_update() -> ExitCode {
         }
     };
 
-    let mut handles = Vec::with_capacity(2 + DEPENDENCY_BINARIES.len());
+    let mut handles = Vec::with_capacity(3 + DEPENDENCY_BINARIES.len());
     let self_client = client.clone();
     handles.push((
         SELF_REPO,
@@ -191,6 +274,12 @@ pub async fn run_update() -> ExitCode {
             tokio::spawn(async move { update_dependency(&client, dep).await }),
         ));
     }
+
+    let rtk_client = client.clone();
+    handles.push((
+        "rtk",
+        tokio::spawn(async move { provision_or_update_rtk_binary(&rtk_client).await }),
+    ));
 
     let memory_client = client.clone();
     handles.push((
@@ -304,12 +393,12 @@ async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> 
 /// determined but a release lookup is still worth doing to report the latest
 /// version).
 ///
-/// `install_if_missing` controls what a `None` `current` means: for a PATH
-/// dependency (`rtk`, `rg`) it means "unmanaged installation, don't touch
-/// it" (`action: "skipped"`); for the private `codebase-memory-mcp` copy —
-/// which repo-explorer-mcp owns outright and never falls back to a
-/// PATH/global install — it means "not installed yet" and triggers a fresh
-/// install (`action: "installed"`) instead.
+/// `install_if_missing` controls what a `None` `current` means: for the
+/// `which`-resolved PATH dependency (`rg`) it means "unmanaged installation,
+/// don't touch it" (`action: "skipped"`); for the managed `rtk` and
+/// `codebase-memory-mcp` copies — which repo-explorer-mcp owns outright and
+/// never falls back to a PATH/global install — it means "not installed yet" and
+/// triggers a fresh install (`action: "installed"`) instead.
 async fn check_and_install(
     client: &reqwest::Client,
     name: String,
@@ -1066,36 +1155,57 @@ mod tests {
     }
 
     #[test]
-    fn memory_binary_path_composes_under_data_dir() {
-        let base = Path::new("/data");
-        let p = memory_binary_path_in(base);
-        let file = if cfg!(windows) {
+    fn binary_path_in_joins_file_onto_bin_dir() {
+        let dir = Path::new("/some/bin");
+        assert_eq!(
+            binary_path_in(dir, "codebase-memory-mcp"),
+            dir.join("codebase-memory-mcp")
+        );
+        assert_eq!(binary_path_in(dir, "rtk"), dir.join("rtk"));
+        let mem = if cfg!(windows) {
             "codebase-memory-mcp.exe"
         } else {
             "codebase-memory-mcp"
         };
-        assert_eq!(
-            p,
-            Path::new("/data")
-                .join("repo-explorer")
-                .join("bin")
-                .join(file)
-        );
-        assert_eq!(memory_binary_file_name(), file);
+        let rtk = if cfg!(windows) { "rtk.exe" } else { "rtk" };
+        assert_eq!(memory_binary_file_name(), mem);
+        assert_eq!(rtk_binary_file_name(), rtk);
     }
 
     #[test]
-    fn codebase_memory_removed_from_dependency_binaries() {
-        // Regression: the private copy is provisioned by
-        // `provision_or_update_memory_binary`, never via the which-based
-        // DEPENDENCY_BINARIES loop.
+    fn managed_binaries_removed_from_dependency_binaries() {
+        // Regression: rtk and codebase-memory-mcp are provisioned install-if-
+        // absent (`provision_or_update_*`), never via the which-based
+        // DEPENDENCY_BINARIES loop; only `rg` stays a PATH-resolved dependency.
         assert!(
             DEPENDENCY_BINARIES
                 .iter()
                 .all(|d| d.command != "codebase-memory-mcp"),
             "codebase-memory-mcp must not be a which-resolved dependency"
         );
-        assert!(DEPENDENCY_BINARIES.iter().any(|d| d.command == "rtk"));
+        assert!(
+            DEPENDENCY_BINARIES.iter().all(|d| d.command != "rtk"),
+            "rtk must not be a which-resolved dependency"
+        );
         assert!(DEPENDENCY_BINARIES.iter().any(|d| d.command == "rg"));
+    }
+
+    #[test]
+    fn managed_rtk_and_memory_share_a_parent_dir() {
+        let rtk = dedicated_rtk_binary_path().expect("rtk path resolves in the test env");
+        let mem = dedicated_memory_binary_path().expect("memory path resolves in the test env");
+        assert_eq!(
+            rtk.parent(),
+            mem.parent(),
+            "both managed binaries must live in the same shared bin dir"
+        );
+        assert_eq!(
+            rtk.file_name().unwrap(),
+            std::ffi::OsStr::new(rtk_binary_file_name())
+        );
+        assert_eq!(
+            mem.file_name().unwrap(),
+            std::ffi::OsStr::new(memory_binary_file_name())
+        );
     }
 }
