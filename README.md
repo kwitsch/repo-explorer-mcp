@@ -3,8 +3,10 @@
 A Rust MCP server that exposes the `explore_repository` tool over an rmcp stdio
 transport, shipped for Linux (`x86_64-unknown-linux-gnu`) and Windows
 (`x86_64-pc-windows-msvc`). It drives an internal LLM exploration loop over a
-privately-managed `codebase-memory-mcp` backend (a per-user copy provisioned by
-`repo-explorer-mcp --update`, never a global PATH install) and ripgrep/rtk text search.
+managed `codebase-memory-mcp` backend and mandatory `rtk` text search — both
+provisioned by `repo-explorer-mcp --update` into a shared per-user bin dir
+(`~/.local/bin` on Linux, `%LOCALAPPDATA%\repo-explorer-mcp` on Windows), never
+a global PATH install.
 
 ## Install (recommended: npx setup script)
 
@@ -27,13 +29,14 @@ The script installs into `~/.local/bin` (Linux) or
 `%LOCALAPPDATA%\repo-explorer-mcp` (Windows). It never edits your shell profile
 or system PATH — it only reports whether the install directory is on PATH.
 `ripgrep` is installed automatically via `apt`/`dnf`/`pacman` on Linux or
-`winget` on Windows; if none of those is available, the script warns and
-points at ripgrep's own install docs instead of installing it itself. `rtk` is
-report-only: if missing, the script tells you and points at its upstream install
-docs (`rtk` is optional; search falls back to plain ripgrep). `codebase-memory-mcp`
-is not taken from PATH: the installer invokes `repo-explorer-mcp --update` to
-install a private per-user copy at `<data dir>/repo-explorer/bin/codebase-memory-mcp`
-(best-effort; if that step fails, run `repo-explorer-mcp --update` later).
+`winget` on Windows; if none of those is available, the script warns and points
+at ripgrep's own install docs instead of installing it itself. ripgrep is
+required only as `rtk`'s own runtime dependency (`rtk rg …` shells out to it),
+not as a repo-explorer-managed binary. `rtk` and `codebase-memory-mcp` are not
+taken from PATH: the installer invokes `repo-explorer-mcp --update` to install
+both as managed per-user copies in the shared bin dir above (best-effort; if that
+step fails, run `repo-explorer-mcp --update` later). `rtk` is mandatory — the
+server refuses to start if it cannot be resolved, pointing you at `--update`.
 
 ## Install (manual fallback)
 
@@ -116,17 +119,18 @@ api_key_env = "OPENAI_API_KEY"
 models = ["gpt-4o"]
 
 # Exactly one of `command`+`args` (stdio) XOR `endpoint` (network).
-# `setup` writes the absolute path of the private codebase-memory-mcp copy
-# (provisioned by `repo-explorer-mcp --update`) into `command`; the path
-# below is illustrative and machine-specific.
+# `setup` writes the absolute path of the managed codebase-memory-mcp copy
+# (provisioned by `repo-explorer-mcp --update` into the shared bin dir) into
+# `command`; the path below is illustrative and machine-specific.
 [codebase_memory]
-command = "/home/you/.local/share/repo-explorer/bin/codebase-memory-mcp"
+command = "/home/you/.local/bin/codebase-memory-mcp"
 args = ["--stdio"]
 
 [search]
-prefer_rtk = false        # true prefers `rtk rg`; false uses plain ripgrep
 timeout_seconds = 45
-# rtk_path / ripgrep_path may be set explicitly; omitted => auto-detected on PATH.
+# rtk_path may be set explicitly; omitted => the absolute managed rtk path
+# `setup` writes, or PATH auto-detection via `which`. rtk is mandatory — there
+# is no ripgrep fallback.
 
 # Exploration pipeline knobs (all optional; shown with their defaults).
 [agent]
