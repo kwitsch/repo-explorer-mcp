@@ -11,7 +11,7 @@ use anyhow::Context;
 use repo_explorer_core::config::{
     self, CodebaseMemoryConfig, Config, KNOWN_PROVIDER_KINDS, LlmConfig, LoggingConfig,
     ProviderConfig, SearchConfig, default_api_key_env, default_cooldown_seconds,
-    default_staleness_seconds, env_var_is_set,
+    default_search_timeout_seconds, default_staleness_seconds, env_var_is_set,
 };
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -140,6 +140,18 @@ fn stdio_memory_config(binary_path: &Path) -> CodebaseMemoryConfig {
         args: vec!["--stdio".to_string()],
         endpoint: None,
         staleness_seconds: default_staleness_seconds(),
+    }
+}
+
+/// Build the `[search]` config from an already-resolved absolute managed rtk
+/// path. Pure/testable; the wizard resolves the path separately via
+/// `update::dedicated_rtk_binary_path` and warns when it doesn't yet exist. rtk
+/// is mandatory, so writing the absolute path keeps normal operation independent
+/// of `~/.local/bin` being on PATH — symmetric with the memory command.
+fn managed_search_config(rtk_path: &Path) -> SearchConfig {
+    SearchConfig {
+        rtk_path: Some(rtk_path.to_path_buf()),
+        timeout_seconds: default_search_timeout_seconds(),
     }
 }
 
@@ -339,8 +351,22 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
         eprintln!("  proxy URL must be a valid http:// or https:// URL with a host.");
     };
 
-    // search / agent / cache / logging left at defaults (fully defaulted in
-    // core); not prompted.
+    // Search: write the absolute managed rtk path so normal operation never
+    // depends on ~/.local/bin being on PATH — symmetric with the memory command
+    // above. rtk is mandatory; the server fails fast at startup if it is
+    // unresolved.
+    let rtk_path = crate::update::dedicated_rtk_binary_path()?;
+    if !rtk_path.exists() {
+        eprintln!(
+            "  note: the managed rtk binary is not installed yet at {}; \
+             run `repo-explorer-mcp --update` to provision it.",
+            rtk_path.display()
+        );
+    }
+    let search = managed_search_config(&rtk_path);
+
+    // agent / cache / logging left at defaults (fully defaulted in core); not
+    // prompted.
     let cfg = Config {
         llm: LlmConfig {
             providers,
@@ -348,7 +374,7 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
             https_proxy,
         },
         codebase_memory,
-        search: SearchConfig::default(),
+        search,
         agent: Default::default(),
         cache: Default::default(),
         logging: LoggingConfig::default(),
@@ -502,13 +528,24 @@ mod tests {
 
     #[test]
     fn stdio_memory_config_uses_absolute_path_and_stdio_args() {
-        let path = Path::new("/data/repo-explorer/bin/codebase-memory-mcp");
+        let path = Path::new("/home/user/.local/bin/codebase-memory-mcp");
         let cfg = stdio_memory_config(path);
         assert_eq!(
             cfg.command.as_deref(),
-            Some("/data/repo-explorer/bin/codebase-memory-mcp")
+            Some("/home/user/.local/bin/codebase-memory-mcp")
         );
         assert_eq!(cfg.args, vec!["--stdio".to_string()]);
         assert!(cfg.endpoint.is_none());
+    }
+
+    #[test]
+    fn managed_search_config_writes_absolute_rtk_path_and_default_timeout() {
+        let path = Path::new("/home/user/.local/bin/rtk");
+        let cfg = managed_search_config(path);
+        assert_eq!(
+            cfg.rtk_path.as_deref(),
+            Some(Path::new("/home/user/.local/bin/rtk"))
+        );
+        assert_eq!(cfg.timeout_seconds, default_search_timeout_seconds());
     }
 }
