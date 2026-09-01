@@ -36,7 +36,7 @@ This confirms the versioned build without loading any config.
 In a scratch repository, create a minimal `repo-explorer.toml` with a single
 provider (`models = [...]`, and its `api_key_env` variable set in the
 environment) and a reachable `codebase-memory-mcp` (stdio `command` or network
-`endpoint`). Ensure `rg` is on PATH; `rtk` is optional.
+`endpoint`). `rg` is provisioned into the shared bin dir by `repo-explorer-mcp --update` when no system `rg` is present, and `rtk` is mandatory (the server refuses to start without it).
 
 Validate it before launching:
 
