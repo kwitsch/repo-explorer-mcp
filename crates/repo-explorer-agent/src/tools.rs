@@ -4,6 +4,7 @@
 
 use repo_explorer_core::domain::{ExplorationFinding, ExplorationResult, FileLocation};
 use repo_explorer_core::llm::{Message, Tool, ToolCall};
+use repo_explorer_core::retrieval::normalize_location;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
@@ -88,7 +89,7 @@ fn build_catalog() -> Vec<Tool> {
     vec![
         tool(
             "search_code",
-            "PRIMARY/authoritative: semantic code search over the indexed memory graph. Prefer the memory tools first. Args: query (required), optional scope_hint, max_results.",
+            "PRIMARY/authoritative: literal/regex text search (grep-style, not natural language) over the indexed memory graph. Args: query (required, a literal string or regex pattern — not a natural-language question), optional scope_hint, max_results.",
             json!({
                 "type": "object",
                 "properties": {
@@ -130,15 +131,14 @@ fn build_catalog() -> Vec<Tool> {
         ),
         tool(
             "trace_path",
-            "PRIMARY: trace a dependency/reference path between two symbols in the memory graph. Args: from (required), to (required), optional max_depth.",
+            "PRIMARY: report a single function's callers and callees (both directions) in the memory graph — not a path between two symbols; the connected backend has no two-endpoint concept and takes no `to` argument. Args: from (required, the function name), optional max_depth.",
             json!({
                 "type": "object",
                 "properties": {
                     "from": {"type": "string"},
-                    "to": {"type": "string"},
                     "max_depth": {"type": "integer"}
                 },
-                "required": ["from", "to"],
+                "required": ["from"],
                 "additionalProperties": false
             }),
         ),
@@ -156,16 +156,13 @@ fn build_catalog() -> Vec<Tool> {
         ),
         tool(
             "get_code_snippet",
-            "PRIMARY: fetch a code snippet from memory, either by qualified_name or by file plus optional start_line/end_line. Provide qualified_name OR file (qualified_name wins if both are present).",
+            "PRIMARY: fetch a code snippet from memory by qualified_name. The connected backend requires qualified_name unconditionally — a file plus start_line/end_line alone is not supported and always fails; use read_file for a path/line-range read instead.",
             json!({
                 "type": "object",
                 "properties": {
-                    "qualified_name": {"type": "string"},
-                    "file": {"type": "string"},
-                    "start_line": {"type": "integer"},
-                    "end_line": {"type": "integer"}
+                    "qualified_name": {"type": "string"}
                 },
-                "required": [],
+                "required": ["qualified_name"],
                 "additionalProperties": false
             }),
         ),
@@ -271,7 +268,6 @@ pub(crate) struct QueryGraphArgs {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TracePathArgs {
     pub from: String,
-    pub to: String,
     #[serde(default)]
     pub max_depth: Option<u32>,
 }
@@ -286,14 +282,7 @@ pub(crate) struct GetArchitectureArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GetCodeSnippetArgs {
-    #[serde(default)]
-    pub qualified_name: Option<String>,
-    #[serde(default)]
-    pub file: Option<String>,
-    #[serde(default)]
-    pub start_line: Option<u32>,
-    #[serde(default)]
-    pub end_line: Option<u32>,
+    pub qualified_name: String,
 }
 
 /// Arguments of both `grep` (content pattern) and `find` (file-name glob) —
@@ -355,8 +344,11 @@ pub(crate) struct FinishLocation {
 /// Deserialize and hand-validate `finish` arguments into an `ExplorationResult`.
 /// `deny_unknown_fields` plus the required `summary`/`line_start`/`line_end`
 /// keys reject malformed payloads at parse time; the explicit non-empty-path
-/// check covers the one rule serde cannot express. Returns a human-readable
-/// reason string on rejection so the loop can feed it back to the model.
+/// check covers the one rule serde cannot express. Each location is run
+/// through the deterministic pipeline's `normalize_location`, so an inverted
+/// or zero-end range from the model comes out fixed like a retrieved
+/// candidate's would. Returns a human-readable reason string on rejection so
+/// the loop can feed it back to the model.
 pub(crate) fn parse_finish(arguments_json: &str) -> Result<ExplorationResult, String> {
     let args: FinishArgs = serde_json::from_str(arguments_json)
         .map_err(|e| format!("could not parse finish arguments: {e}"))?;
@@ -366,11 +358,11 @@ pub(crate) fn parse_finish(arguments_json: &str) -> Result<ExplorationResult, St
             return Err("finding location.path must be non-empty".to_string());
         }
         findings.push(ExplorationFinding {
-            location: FileLocation {
+            location: normalize_location(FileLocation {
                 path: PathBuf::from(f.location.path),
                 line_start: f.location.line_start,
                 line_end: f.location.line_end,
-            },
+            }),
             snippet: f.snippet,
             note: f.note,
         });
@@ -455,15 +447,10 @@ mod tests {
     }
 
     #[test]
-    fn get_code_snippet_args_parse_both_modes() {
+    fn get_code_snippet_args_parse_qualified_name() {
         let a: GetCodeSnippetArgs =
             serde_json::from_str(r#"{"qualified_name":"foo::bar"}"#).unwrap();
-        assert_eq!(a.qualified_name, Some("foo::bar".to_string()));
-        let b: GetCodeSnippetArgs =
-            serde_json::from_str(r#"{"file":"src/lib.rs","start_line":1,"end_line":9}"#).unwrap();
-        assert_eq!(b.file, Some("src/lib.rs".to_string()));
-        assert_eq!(b.start_line, Some(1));
-        assert_eq!(b.end_line, Some(9));
+        assert_eq!(a.qualified_name, "foo::bar");
     }
 
     #[test]
@@ -512,5 +499,21 @@ mod tests {
     fn parse_finish_rejects_missing_line_numbers() {
         let json = r#"{"findings":[{"location":{"path":"a.rs"}}],"summary":"s"}"#;
         assert!(parse_finish(json).is_err());
+    }
+
+    #[test]
+    fn parse_finish_normalizes_inverted_range() {
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":50,"line_end":10}}],"summary":"done"}"#;
+        let result = parse_finish(json).unwrap();
+        assert_eq!(result.findings[0].location.line_start, 10);
+        assert_eq!(result.findings[0].location.line_end, 50);
+    }
+
+    #[test]
+    fn parse_finish_widens_zero_end_to_start() {
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":7,"line_end":0}}],"summary":"done"}"#;
+        let result = parse_finish(json).unwrap();
+        assert_eq!(result.findings[0].location.line_start, 7);
+        assert_eq!(result.findings[0].location.line_end, 7);
     }
 }

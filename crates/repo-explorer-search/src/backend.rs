@@ -97,7 +97,7 @@ impl SearchBackend for CliSearchBackend {
 
         let stdout = run(&spec).await?;
 
-        let mut findings = parse_rtk(&stdout);
+        let mut findings = parse_rtk(&stdout)?;
         if let Some(max) = options.max_results {
             findings.truncate(max as usize);
         }

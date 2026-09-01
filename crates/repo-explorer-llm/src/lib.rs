@@ -295,7 +295,7 @@ fn to_genai_messages(
         .map(|tc| (tc.id.as_str(), tc.name.as_str()))
         .collect();
 
-    messages
+    let mapped = messages
         .iter()
         .map(|m| {
             let mapped = to_genai_message(provider, m, &call_id_to_fn_name)?;
@@ -308,7 +308,39 @@ fn to_genai_messages(
                 mapped
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, ProviderError>>()?;
+
+    Ok(merge_consecutive_tool_messages(mapped))
+}
+
+/// Merge runs of consecutive `ChatRole::Tool` messages into one, combining
+/// their content parts (each is a single `ToolResponse` — see
+/// `to_genai_message`). Unlike genai's Gemini adapter, which explicitly
+/// merges consecutive tool-response entries before building its request, the
+/// Anthropic adapter has no such step: `N` separate `Role::Tool` domain
+/// messages in a row (one per tool call in a batched turn — see
+/// `repo-explorer-agent`'s fallback loop and `verify` stage) would otherwise
+/// become `N` standalone `role:user` JSON messages with no assistant message
+/// between them, a shape Anthropic's Messages API rejects as malformed.
+/// Merging here, before any adapter sees the messages, keeps every adapter's
+/// request well-formed regardless of whether it merges on its own.
+fn merge_consecutive_tool_messages(
+    messages: Vec<genai::chat::ChatMessage>,
+) -> Vec<genai::chat::ChatMessage> {
+    use genai::chat::ChatRole;
+
+    let mut out: Vec<genai::chat::ChatMessage> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        if msg.role == ChatRole::Tool
+            && let Some(prev) = out.last_mut()
+            && prev.role == ChatRole::Tool
+        {
+            prev.content.extend(msg.content);
+        } else {
+            out.push(msg);
+        }
+    }
+    out
 }
 
 /// Map a single domain `Message` onto a genai `ChatMessage`. `call_id_to_fn_name`
@@ -356,7 +388,10 @@ fn to_genai_message(
             Ok(ChatMessage::assistant(MessageContent::from_parts(parts)))
         }
         Role::Tool => {
-            let call_id = message.tool_call_id.as_deref().unwrap_or("");
+            let call_id = message
+                .tool_call_id
+                .as_deref()
+                .expect("Role::Tool message always carries tool_call_id");
             let mut response = ToolResponse::new(call_id.to_string(), message.content.clone());
             if let Some(fn_name) = call_id_to_fn_name.get(call_id) {
                 response = response.with_fn_name(*fn_name);
@@ -422,11 +457,7 @@ fn from_genai_response(
     provider: &str,
     response: genai::chat::ChatResponse,
 ) -> Result<ProviderResponse, ProviderError> {
-    let has_tool_calls = response
-        .content
-        .iter()
-        .any(|p| matches!(p, genai::chat::ContentPart::ToolCall(_)));
-    if has_tool_calls {
+    if response.content.contains_tool_call() {
         let mapped = response
             .into_tool_calls()
             .into_iter()
@@ -664,6 +695,63 @@ mod tests {
         let responses = chat_messages[1].content.tool_responses();
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].fn_name.as_deref(), Some("read_file"));
+    }
+
+    #[test]
+    fn to_genai_messages_batches_consecutive_tool_results_into_one_message() {
+        // Mirrors the shape the fallback loop's batched-tool-call turn
+        // produces (agent.rs): one assistant message issuing 2+ tool calls,
+        // followed by one `Role::Tool` domain message per call. Anthropic
+        // requires every tool result following a multi-tool-call assistant
+        // turn to land in a single `role:user` message, so the two
+        // consecutive `Role::Tool` messages here must collapse into one
+        // genai `ChatMessage` instead of staying two.
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "toolu_01A".to_string(),
+                        name: "search_code".to_string(),
+                        arguments_json: "{}".to_string(),
+                        thought_signatures: None,
+                    },
+                    ToolCall {
+                        id: "toolu_01B".to_string(),
+                        name: "search_graph".to_string(),
+                        arguments_json: "{}".to_string(),
+                        thought_signatures: None,
+                    },
+                ],
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: "code results".to_string(),
+                tool_calls: vec![],
+                tool_call_id: Some("toolu_01A".to_string()),
+            },
+            Message {
+                role: Role::Tool,
+                content: "graph results".to_string(),
+                tool_calls: vec![],
+                tool_call_id: Some("toolu_01B".to_string()),
+            },
+        ];
+
+        let chat_messages =
+            to_genai_messages("anthropic", &messages, false).expect("mapping succeeds");
+
+        // Assistant turn + exactly one merged tool-result message, never two.
+        assert_eq!(chat_messages.len(), 2);
+        assert_eq!(chat_messages[1].role, genai::chat::ChatRole::Tool);
+        let responses = chat_messages[1].content.tool_responses();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0].call_id, "toolu_01A");
+        assert_eq!(responses[0].content, "code results");
+        assert_eq!(responses[1].call_id, "toolu_01B");
+        assert_eq!(responses[1].content, "graph results");
     }
 
     #[test]

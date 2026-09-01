@@ -10,12 +10,12 @@ use repo_explorer_core::llm::{
     CallOptions, Clock, LlmProvider, Message, ProviderResponse, ProviderRouter,
 };
 use repo_explorer_core::memory::MemoryBackend;
-use repo_explorer_core::retrieval::kind_label;
+use repo_explorer_core::retrieval::{is_unknown_location, kind_label};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::agent::{TokenBudget, push_nudge};
-use crate::dispatch::{parse_args, read_file};
+use crate::agent::{TokenBudget, force_finish_options, push_nudge};
+use crate::dispatch::{canonical_repo_root, parse_args, read_file_canonical};
 use crate::render::{RenderCaps, cap_file_lines, cap_snippet};
 use crate::skeleton::skeleton_for;
 use crate::tools::{ExpandArgs, resolve_finish, verify_catalog};
@@ -69,10 +69,7 @@ where
     for turn in 0..turns {
         let last = turn + 1 == turns || budget.exhausted();
         let options = if last {
-            CallOptions {
-                force_tool: Some("finish".to_string()),
-                max_tokens: None,
-            }
+            force_finish_options()
         } else {
             CallOptions::default()
         };
@@ -92,12 +89,15 @@ where
                         };
                         for call in calls.iter().filter(|c| c.name != "finish") {
                             let content = match call.name.as_str() {
-                                "expand" => expand_content(
-                                    repo_root,
-                                    candidates,
-                                    &call.arguments_json,
-                                    caps,
-                                ),
+                                "expand" => {
+                                    expand_content(
+                                        repo_root,
+                                        candidates,
+                                        &call.arguments_json,
+                                        caps,
+                                    )
+                                    .await
+                                }
                                 other => format!("unknown tool: {other}"),
                             };
                             responses.push(Message::tool(&call.id, content));
@@ -147,10 +147,10 @@ async fn candidates_block<M: MemoryBackend>(
     caps: &RenderCaps,
 ) -> String {
     let unique_paths: HashSet<&PathBuf> = candidates.iter().map(|c| &c.location.path).collect();
-    let skeletons: HashMap<PathBuf, String> =
+    let skeletons: HashMap<&PathBuf, String> =
         join_all(unique_paths.into_iter().map(|path| async move {
             let outline = skeleton_for(memory, repo_root, path).await?;
-            Some((path.clone(), outline))
+            Some((path, outline))
         }))
         .await
         .into_iter()
@@ -165,14 +165,23 @@ async fn candidates_block<M: MemoryBackend>(
             .as_deref()
             .map(|s| format!(", symbol `{s}`"))
             .unwrap_or_default();
-        out.push_str(&format!(
-            "[{}] {}:{}-{} ({}{symbol})\n",
-            idx + 1,
-            c.location.path.display(),
-            c.location.line_start,
-            c.location.line_end,
-            kind_label(c.kind),
-        ));
+        if is_unknown_location(&c.location) {
+            out.push_str(&format!(
+                "[{}] {} (location unknown, {}{symbol})\n",
+                idx + 1,
+                c.location.path.display(),
+                kind_label(c.kind),
+            ));
+        } else {
+            out.push_str(&format!(
+                "[{}] {}:{}-{} ({}{symbol})\n",
+                idx + 1,
+                c.location.path.display(),
+                c.location.line_start,
+                c.location.line_end,
+                kind_label(c.kind),
+            ));
+        }
         if let Some(outline) = skeletons.get(&c.location.path) {
             if shown_outline.insert(&c.location.path) {
                 out.push_str(outline);
@@ -190,8 +199,11 @@ async fn candidates_block<M: MemoryBackend>(
 }
 
 /// Bodies for the requested candidate ids, read deterministically from disk
-/// with context around each candidate's range.
-fn expand_content(
+/// with context around each candidate's range. Ids that don't resolve to a
+/// candidate become immediate errors; the rest are read concurrently (like
+/// every other fanout in this crate) against `repo_root` canonicalized once
+/// up front, then reassembled in the model's requested order.
+async fn expand_content(
     repo_root: &Path,
     candidates: &[Candidate],
     arguments_json: &str,
@@ -204,31 +216,64 @@ fn expand_content(
     if args.candidate_ids.is_empty() {
         return "invalid arguments: candidate_ids must be non-empty".to_string();
     }
-    let mut sections = Vec::new();
-    for id in args.candidate_ids {
-        let Some(candidate) = (id as usize).checked_sub(1).and_then(|i| candidates.get(i)) else {
-            sections.push(format!("[{id}] no such candidate"));
-            continue;
-        };
-        let path = candidate.location.path.to_string_lossy();
-        let start = candidate
-            .location
-            .line_start
-            .saturating_sub(EXPAND_CONTEXT_BEFORE)
-            .max(1);
-        let end = candidate
-            .location
-            .line_end
-            .saturating_add(EXPAND_CONTEXT_AFTER);
-        match read_file(repo_root, &path, Some(start), Some(end)) {
-            Ok(body) => sections.push(format!(
-                "[{id}] {path}:{start}-{end}\n{}",
-                cap_file_lines(body, caps.read_file_max_lines)
-            )),
-            Err(e) => sections.push(format!("[{id}] {e}")),
+
+    let mut sections: Vec<Option<String>> = vec![None; args.candidate_ids.len()];
+    let mut reads = Vec::new();
+    for (pos, id) in args.candidate_ids.into_iter().enumerate() {
+        match (id as usize).checked_sub(1).and_then(|i| candidates.get(i)) {
+            None => sections[pos] = Some(format!("[{id}] no such candidate")),
+            Some(candidate) if is_unknown_location(&candidate.location) => {
+                let path = candidate.location.path.to_string_lossy().into_owned();
+                sections[pos] = Some(format!(
+                    "[{id}] {path}: location unknown, no snippet available"
+                ));
+            }
+            Some(candidate) => {
+                let path = candidate.location.path.to_string_lossy().into_owned();
+                let start = candidate
+                    .location
+                    .line_start
+                    .saturating_sub(EXPAND_CONTEXT_BEFORE)
+                    .max(1);
+                let end = candidate
+                    .location
+                    .line_end
+                    .saturating_add(EXPAND_CONTEXT_AFTER);
+                reads.push((pos, id, path, start, end));
+            }
         }
     }
-    sections.join("\n\n")
+
+    if !reads.is_empty() {
+        let canonical_root = canonical_repo_root(repo_root).await;
+        let results = join_all(reads.iter().map(|(_, id, path, start, end)| {
+            let (id, start, end) = (*id, *start, *end);
+            let canonical_root = &canonical_root;
+            async move {
+                let result = match canonical_root {
+                    Ok(r) => read_file_canonical(repo_root, r, path, Some(start), Some(end)).await,
+                    Err(e) => Err(e.clone()),
+                };
+                match result {
+                    Ok(body) => format!(
+                        "[{id}] {path}:{start}-{end}\n{}",
+                        cap_file_lines(body, caps.read_file_max_lines)
+                    ),
+                    Err(e) => format!("[{id}] {e}"),
+                }
+            }
+        }))
+        .await;
+        for ((pos, ..), section) in reads.iter().zip(results) {
+            sections[*pos] = Some(section);
+        }
+    }
+
+    sections
+        .into_iter()
+        .map(|s| s.expect("every position filled by an error or a read"))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 #[cfg(test)]
@@ -267,31 +312,50 @@ mod tests {
         assert!(block.contains("fn sym() {}"));
     }
 
-    #[test]
-    fn expand_reports_unknown_ids_and_bad_args() {
+    #[tokio::test]
+    async fn expand_reports_unknown_ids_and_bad_args() {
         let caps = RenderCaps::default();
         let out = expand_content(
             Path::new("/repo"),
             &[candidate("a.rs", 1, 2)],
             r#"{"candidate_ids":[7]}"#,
             &caps,
-        );
+        )
+        .await;
         assert!(out.contains("[7] no such candidate"));
-        let out = expand_content(Path::new("/repo"), &[], r#"{"bogus":1}"#, &caps);
+        let out = expand_content(Path::new("/repo"), &[], r#"{"bogus":1}"#, &caps).await;
         assert!(out.contains("invalid arguments"));
-        let out = expand_content(Path::new("/repo"), &[], r#"{"candidate_ids":[]}"#, &caps);
+        let out = expand_content(Path::new("/repo"), &[], r#"{"candidate_ids":[]}"#, &caps).await;
         assert!(out.contains("must be non-empty"));
     }
 
-    #[test]
-    fn expand_id_zero_is_not_a_candidate() {
+    #[tokio::test]
+    async fn expand_reports_unknown_location_instead_of_fabricating_a_range() {
+        let caps = RenderCaps::default();
+        // (0, *) is core's "unknown location" sentinel — see
+        // `is_unknown_location` — reachable here via a SymbolFuzzy/SymbolExact
+        // candidate whose retrieval leg never resolved a line number.
+        let out = expand_content(
+            Path::new("/repo"),
+            &[candidate("a.rs", 0, 0)],
+            r#"{"candidate_ids":[1]}"#,
+            &caps,
+        )
+        .await;
+        assert!(out.contains("[1] a.rs: location unknown, no snippet available"));
+        assert!(!out.contains(":1-20"));
+    }
+
+    #[tokio::test]
+    async fn expand_id_zero_is_not_a_candidate() {
         let caps = RenderCaps::default();
         let out = expand_content(
             Path::new("/repo"),
             &[candidate("a.rs", 1, 2)],
             r#"{"candidate_ids":[0]}"#,
             &caps,
-        );
+        )
+        .await;
         assert!(out.contains("[0] no such candidate"));
     }
 }

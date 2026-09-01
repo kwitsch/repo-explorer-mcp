@@ -1655,6 +1655,7 @@ dependencies = [
 name = "repo-explorer-search"
 version = "0.2.0"
 dependencies = [
+ "hex",
  "repo-explorer-core",
  "sha2",
  "tokio",

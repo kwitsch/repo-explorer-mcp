@@ -14,15 +14,34 @@ use repo_explorer_core::memory::{
     GraphQuery, IndexStatus, MemoryBackend, MemoryError, SnippetTarget,
 };
 use serde_json::{Map, Value};
-use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 /// A `MemoryBackend` backed by a live `rmcp` client. Holds the staleness
 /// threshold from config so `ensure_fresh_index` needs no extra arguments.
+/// `client` is `None` only after `close()` (explicit or via `Drop`) has taken
+/// it; every other method requires it present.
 #[derive(Debug)]
 pub struct MemoryClientBackend {
-    client: MemoryClient,
+    client: Option<MemoryClient>,
     staleness: Duration,
+    /// Wall-clock time this process last successfully ran `index_repository`,
+    /// used as the `last_indexed_at` fed to `decide_freshness`. The real
+    /// `index_status` response carries no timestamp field at all (verified
+    /// against the live tool), so this in-process record is the only source
+    /// of that value — without it, `last_indexed_at` would always be `None`
+    /// and every `ensure_fresh_index` call would reindex regardless of the
+    /// configured staleness threshold.
+    last_reindexed_at: Mutex<Option<SystemTime>>,
+    /// Cache of the project name resolved from `repo_root`, keyed on the
+    /// `repo_root` it was resolved from. `repo_root` never changes across a
+    /// `MemoryClientBackend`'s lifetime (every query method is called with
+    /// the same value each time), so after the first resolution this lets
+    /// [`Self::cached_project_name`] skip `project_name`'s `spawn_blocking` +
+    /// `fs::canonicalize` round trip on every subsequent call — mirrors the
+    /// `last_reindexed_at` single-field-cache pattern above.
+    project_name_cache: Mutex<Option<(PathBuf, String)>>,
 }
 
 impl MemoryClientBackend {
@@ -30,14 +49,29 @@ impl MemoryClientBackend {
     pub async fn connect(config: &CodebaseMemoryConfig) -> Result<Self, MemoryError> {
         let client = MemoryClient::connect(config).await?;
         Ok(Self {
-            client,
+            client: Some(client),
             staleness: Duration::from_secs(config.staleness_seconds),
+            last_reindexed_at: Mutex::new(None),
+            project_name_cache: Mutex::new(None),
         })
     }
 
-    /// Best-effort graceful shutdown.
+    /// Best-effort graceful shutdown. Idempotent: a second call (or a
+    /// subsequent `Drop`) finds `client` already taken and does nothing.
     pub async fn close(&mut self) {
-        self.client.close().await;
+        if let Some(mut client) = self.client.take() {
+            client.close().await;
+        }
+    }
+
+    /// The connected client, for every call site that isn't `close()`
+    /// itself. Panics if called after `close()` has run — every other method
+    /// on this type is used-before-close by construction; a call afterward
+    /// is a caller bug, not a recoverable runtime condition.
+    fn client(&self) -> &MemoryClient {
+        self.client
+            .as_ref()
+            .expect("MemoryClientBackend used after close()")
     }
 
     /// Shared `client.call -> decode_result` sequence used by every tool call
@@ -49,40 +83,53 @@ impl MemoryClientBackend {
         tool: &'static str,
         args: Map<String, Value>,
     ) -> Result<Value, MemoryError> {
-        let result = self.client.call(tool, args).await?;
+        let result = self.client().call(tool, args).await?;
         decode_result(result)
     }
 
-    /// Probe `index_status` for the project, returning `(exists,
-    /// last_indexed_at)`; a tool error meaning "not indexed" is reported as
-    /// `exists = false` rather than an `Err`. The changed-file count is not
-    /// this call's to know, so the full `IndexProbe` is assembled by
-    /// `ensure_fresh_index` instead of being returned half-filled here.
-    async fn probe_status(&self, project: &str) -> Result<(bool, Option<SystemTime>), MemoryError> {
-        match self
-            .call_and_decode("index_status", base_args(project.to_string()))
+    /// Shared `call_and_decode` invocation for a project-scoped probe (the
+    /// tail `probe_status`/`probe_changes` share): both differ only in which
+    /// tool name they call against `{"project": ...}` — one place that
+    /// builds and sends that call, so a future change to how a probe call is
+    /// assembled (an added shared argument, a different project encoding)
+    /// only needs to be made here, not hand-kept in sync at each call site.
+    async fn probe(&self, tool: &'static str, project: &str) -> Result<Value, MemoryError> {
+        self.call_and_decode(tool, base_args(project.to_string()))
             .await
-        {
+    }
+
+    /// Probe `index_status` for the project, returning whether it exists; a
+    /// tool error meaning "not indexed" is reported as `exists = false`
+    /// rather than an `Err`. The changed-file count is not this call's to
+    /// know, so the full `IndexProbe` is assembled by `ensure_fresh_index`
+    /// instead of being returned half-filled here. The real response carries
+    /// no last-indexed timestamp of any kind, so this does not attempt to
+    /// parse one — `ensure_fresh_index` sources `last_indexed_at` from
+    /// `last_reindexed_at` instead.
+    async fn probe_status(&self, project: &str) -> Result<bool, MemoryError> {
+        match self.probe("index_status", project).await {
             Ok(json) => {
                 // An unrecognized/empty response must NOT be optimistically
                 // treated as "already indexed" — default to `false` so an
                 // unknown shape forces a (safe) reindex instead of skipping one.
-                let exists = first_field(&json, &["indexed", "exists"])
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let last_indexed_at = json
-                    .get("last_indexed_at")
-                    .and_then(Value::as_i64)
-                    .and_then(|secs| u64::try_from(secs).ok())
-                    .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
-                Ok((exists, last_indexed_at))
+                // The real tool reports a `status` string (e.g. "ready"), not a
+                // boolean `indexed`/`exists`; the latter are kept as a fallback
+                // in case another response shape ever uses them.
+                let exists = json
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.trim().is_empty())
+                    || first_field(&json, &["indexed", "exists"])
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                Ok(exists)
             }
             // Only a tool error that explicitly indicates the project is
             // unknown/not-yet-indexed is downgraded to "not indexed"; any other
             // tool failure (permission error, malformed input, internal fault)
             // is surfaced to the caller instead of being silently reinterpreted.
             Err(MemoryError::ToolFailed { message, .. }) if is_not_indexed_error(&message) => {
-                Ok((false, None))
+                Ok(false)
             }
             Err(e) => Err(e),
         }
@@ -90,10 +137,7 @@ impl MemoryClientBackend {
 
     /// Fill `changed_files` from `detect_changes` for an existing project.
     async fn probe_changes(&self, project: &str) -> Result<ChangeCount, MemoryError> {
-        match self
-            .call_and_decode("detect_changes", base_args(project.to_string()))
-            .await
-        {
+        match self.probe("detect_changes", project).await {
             Ok(json) => {
                 // Only a shape we actually understand yields a `Known` count.
                 // An absent field, an unexpected type, or a number that is not
@@ -102,17 +146,28 @@ impl MemoryClientBackend {
                 // would optimistically skip a needed reindex (same rule as
                 // `probe_status`: an unrecognized response must not be treated
                 // as "already indexed").
-                let changed = match first_field(&json, &["changed_files", "changed_count"]) {
-                    Some(Value::Array(a)) => ChangeCount::Known(a.len()),
-                    // Saturate rather than `as`-truncate: on a platform where
-                    // `usize` is narrower than `u64`, a huge count must clamp,
-                    // not wrap to a small, wrong value (matches the
-                    // `line_start`/`line_end` saturating casts in this module).
-                    Some(Value::Number(n)) => match n.as_u64() {
-                        Some(n) => ChangeCount::Known(n.min(usize::MAX as u64) as usize),
-                        None => ChangeCount::Unknown,
+                //
+                // The real tool answers with a plain-text block (a `changed_files:
+                // N` line followed by the changed paths), decoded as
+                // `Value::String` — `Value::get`/`first_field` never match a
+                // string, so that shape needs its own parse ahead of the
+                // structured-JSON fallback below.
+                let changed = match &json {
+                    Value::String(text) => parse_changed_count(text)
+                        .map(ChangeCount::Known)
+                        .unwrap_or(ChangeCount::Unknown),
+                    _ => match first_field(&json, &["changed_files", "changed_count"]) {
+                        Some(Value::Array(a)) => ChangeCount::Known(a.len()),
+                        // Saturate rather than `as`-truncate: on a platform where
+                        // `usize` is narrower than `u64`, a huge count must clamp,
+                        // not wrap to a small, wrong value (matches the
+                        // `line_start`/`line_end` saturating casts in this module).
+                        Some(Value::Number(n)) => match n.as_u64() {
+                            Some(n) => ChangeCount::Known(n.min(usize::MAX as u64) as usize),
+                            None => ChangeCount::Unknown,
+                        },
+                        _ => ChangeCount::Unknown,
                     },
-                    _ => ChangeCount::Unknown,
                 };
                 Ok(changed)
             }
@@ -136,17 +191,39 @@ impl MemoryClientBackend {
     /// duplicate a blocking filesystem syscall for no benefit.
     async fn run_index(&self, abs_repo_root: &Path) -> Result<IndexStatus, MemoryError> {
         let mut args = Map::new();
-        args.insert(
-            "path".to_string(),
-            Value::String(abs_repo_root.to_string_lossy().into_owned()),
-        );
-        match self.client.call("index_repository", args).await {
-            Ok(_) => Ok(IndexStatus::Reindexed),
+        insert_path(&mut args, "path", abs_repo_root);
+        match self.client().call("index_repository", args).await {
+            Ok(_) => {
+                // Record when *we* just rebuilt it — the only clock available,
+                // since the upstream tool never reports a build timestamp.
+                *self.last_reindexed_at.lock().unwrap() = Some(SystemTime::now());
+                Ok(IndexStatus::Reindexed)
+            }
             Err(MemoryError::ToolFailed { message, .. }) => {
                 Ok(IndexStatus::IndexingFailed { reason: message })
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// [`project_name`], but cached on `repo_root`: every query method calls
+    /// this with the same, never-changing `repo_root` for the lifetime of
+    /// this backend, so only the first call actually canonicalizes and
+    /// derives the name — later calls return the cached value straight off
+    /// the lock, with no `spawn_blocking` round trip.
+    async fn cached_project_name(&self, repo_root: &Path) -> Result<String, MemoryError> {
+        if let Some(name) = self
+            .project_name_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|(cached_root, name)| (cached_root == repo_root).then(|| name.clone()))
+        {
+            return Ok(name);
+        }
+        let name = project_name(repo_root).await?;
+        *self.project_name_cache.lock().unwrap() = Some((repo_root.to_path_buf(), name.clone()));
+        Ok(name)
     }
 
     /// Shared tail of every read-only memory-query method: resolve
@@ -161,13 +238,13 @@ impl MemoryClientBackend {
         tool: &'static str,
         repo_root: &Path,
         build_args: impl FnOnce(&mut Map<String, Value>),
-        map: impl FnOnce(&'static str, &Value) -> ExplorationResult,
+        map: impl FnOnce(&'static str, &Value, &Path) -> ExplorationResult,
     ) -> Result<ExplorationResult, MemoryError> {
-        let project = project_name(repo_root).await?;
+        let project = self.cached_project_name(repo_root).await?;
         let mut args = base_args(project);
         build_args(&mut args);
         let json = self.call_and_decode(tool, args).await?;
-        Ok(map(tool, &json))
+        Ok(map(tool, &json, repo_root))
     }
 
     /// [`call_memory_tool_with`] for the common case: a response holding an
@@ -180,6 +257,29 @@ impl MemoryClientBackend {
     ) -> Result<ExplorationResult, MemoryError> {
         self.call_memory_tool_with(tool, repo_root, build_args, findings_and_summary)
             .await
+    }
+}
+
+impl Drop for MemoryClientBackend {
+    /// The only path through which `close()`'s handshake actually runs in
+    /// the shipped binary: `main.rs` moves this by value into `AgentLoop`
+    /// (generic over `M: MemoryBackend`, a trait with no shutdown hook), so
+    /// nothing outside this module can ever get a `&mut MemoryClientBackend`
+    /// back to call `close()` on directly — but `Drop` still runs wherever
+    /// the value ends up, `Arc<AgentLoop<...>>` included. Spawns the close
+    /// handshake onto the ambient runtime rather than blocking here (`Drop`
+    /// cannot `.await`), which keeps this best-effort exactly as `close()`
+    /// already documents; with no ambient runtime (no `Handle::try_current`)
+    /// this is a silent no-op, same as never calling `close()` at all.
+    fn drop(&mut self) {
+        let Some(mut client) = self.client.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                client.close().await;
+            });
+        }
     }
 }
 
@@ -198,6 +298,15 @@ fn first_field<'a>(json: &'a Value, keys: &[&str]) -> Option<&'a Value> {
     keys.iter().find_map(|k| json.get(*k))
 }
 
+/// Parse `detect_changes`' plain-text response for its `changed_files: N`
+/// line (the count the tool reports up front, ahead of the indented list of
+/// changed paths); `None` when no such line is present.
+fn parse_changed_count(text: &str) -> Option<usize> {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("changed_files:"))
+        .and_then(|rest| rest.trim().parse::<usize>().ok())
+}
+
 /// Insert `key: v` into `args` when `v` is `Some` — the single place every
 /// optional-`u32`-to-JSON-number tool arg goes through, instead of a
 /// repeated `if let Some(x) = opt { args.insert(...) }` at each call site.
@@ -205,6 +314,36 @@ fn insert_opt_u32(args: &mut Map<String, Value>, key: &str, v: Option<u32>) {
     if let Some(v) = v {
         args.insert(key.to_string(), Value::Number(v.into()));
     }
+}
+
+/// Insert `key: v.clone()` into `args` when `v` is `Some` — the `Option<String>`
+/// counterpart to [`insert_opt_u32`], for the same "skip when absent" tool args.
+fn insert_opt_str(args: &mut Map<String, Value>, key: &str, v: &Option<String>) {
+    if let Some(v) = v {
+        args.insert(key.to_string(), Value::String(v.clone()));
+    }
+}
+
+/// Insert `key: path` into `args` as its lossy string form — the single place
+/// every `Path`-to-JSON-string tool arg goes through, instead of a repeated
+/// `Value::String(path.to_string_lossy().into_owned())` at each call site.
+fn insert_path(args: &mut Map<String, Value>, key: &str, path: &Path) {
+    args.insert(
+        key.to_string(),
+        Value::String(path.to_string_lossy().into_owned()),
+    );
+}
+
+/// Turn a bare directory path prefix (the shape `scope_hint` is documented
+/// and constructed as everywhere else in this codebase — e.g. `"crates/api"`)
+/// into the real glob the connected `search_code` tool's `file_pattern`
+/// requires. Unlike `search_graph`'s `file_pattern`, `search_code`'s does not
+/// do prefix matching on its own — a bare prefix silently matches zero files
+/// there — so this appends `/**` to scope the search to that directory.
+fn scope_glob(path: &Path) -> String {
+    let prefix = path.to_string_lossy();
+    let prefix = prefix.trim_end_matches(['/', '\\']);
+    format!("{prefix}/**")
 }
 
 /// Does a tool-failure message indicate "this project is not indexed yet"
@@ -220,9 +359,19 @@ fn is_not_indexed_error(message: &str) -> bool {
 
 /// Build a `FileLocation` from a JSON row's `file`/`path`/`file_path` plus
 /// `line_start`/`start_line` (and end variants), tolerating missing line
-/// fields (defaulting to 0).
-fn location_from(json: &Value) -> Option<FileLocation> {
+/// fields (defaulting to 0). Only `get_code_snippet`'s `file_path` is ever
+/// absolute (live-verified) -- every other tool already answers
+/// repo-relative -- so an absolute `file` is normalized against `repo_root`
+/// here, the one place every row becomes a `FileLocation`: this keeps every
+/// tool's output on the same repo-relative convention (so the same location
+/// reported by two different tools dedups instead of appearing twice) and
+/// never leaks the server host's absolute filesystem layout to the MCP
+/// caller. A `file` that isn't actually under `repo_root` (unexpected, but
+/// not fatal) is kept as-is rather than dropping the finding.
+fn location_from(json: &Value, repo_root: &Path) -> Option<FileLocation> {
     let file = first_field(json, &["file", "path", "file_path"]).and_then(Value::as_str)?;
+    let path = Path::new(file);
+    let path = path.strip_prefix(repo_root).unwrap_or(path);
     // Saturate rather than `as`-truncate: a line number beyond `u32::MAX` (or a
     // malformed huge value) must not silently wrap around to a small, wrong one.
     let line_start = first_field(json, &["line_start", "start_line"])
@@ -234,7 +383,7 @@ fn location_from(json: &Value) -> Option<FileLocation> {
         .map(saturate_u32)
         .unwrap_or(line_start);
     Some(FileLocation {
-        path: std::path::PathBuf::from(file),
+        path: path.to_path_buf(),
         line_start,
         line_end,
     })
@@ -246,8 +395,12 @@ fn location_from(json: &Value) -> Option<FileLocation> {
 /// `symbol_note` for the note. Shared by [`single_snippet`] and
 /// [`findings_and_summary`]'s row loop, which differ only in which keys the
 /// upstream tool uses for the snippet field.
-fn finding_from_row(row: &Value, snippet_keys: &[&str]) -> Option<ExplorationFinding> {
-    let location = location_from(row)?;
+fn finding_from_row(
+    row: &Value,
+    snippet_keys: &[&str],
+    repo_root: &Path,
+) -> Option<ExplorationFinding> {
+    let location = location_from(row, repo_root)?;
     let snippet = first_field(row, snippet_keys)
         .and_then(Value::as_str)
         .map(|s| s.to_string());
@@ -260,9 +413,9 @@ fn finding_from_row(row: &Value, snippet_keys: &[&str]) -> Option<ExplorationFin
 
 /// Decode a `get_code_snippet` response: 0 or 1 finding, reusing the same row
 /// shape as [`findings_and_summary`] if a location resolves.
-fn single_snippet(tool: &'static str, json: &Value) -> ExplorationResult {
+fn single_snippet(tool: &'static str, json: &Value, repo_root: &Path) -> ExplorationResult {
     let mut findings = Vec::new();
-    if let Some(f) = finding_from_row(json, &["snippet", "code", "source", "text"]) {
+    if let Some(f) = finding_from_row(json, &["snippet", "code", "source", "text"], repo_root) {
         findings.push(f);
     }
     let summary = if findings.is_empty() {
@@ -284,21 +437,21 @@ fn symbol_note(row: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Parse a single line-number cell (tolerating quotes and a `-` null
+/// placeholder, as `query_graph` emits for an absent property); unparseable
+/// input (including `-` itself) yields `None`.
+fn parse_line_cell(cell: &str) -> Option<u32> {
+    let cell = cell.trim().trim_matches('"');
+    cell.parse::<u64>().ok().map(saturate_u32)
+}
+
 /// Parse a `"start-end"` / `"start"` line-range cell (tolerating quotes) into
 /// a `(line_start, line_end)` pair; anything unparseable defaults to 0.
 fn parse_line_range(cell: &str) -> (u32, u32) {
     let cell = cell.trim().trim_matches('"');
     let mut parts = cell.splitn(2, '-');
-    let start = parts
-        .next()
-        .and_then(|p| p.parse::<u64>().ok())
-        .map(saturate_u32)
-        .unwrap_or(0);
-    let end = parts
-        .next()
-        .and_then(|p| p.parse::<u64>().ok())
-        .map(saturate_u32)
-        .unwrap_or(start);
+    let start = parts.next().and_then(parse_line_cell).unwrap_or(0);
+    let end = parts.next().and_then(parse_line_cell).unwrap_or(start);
     (start, end)
 }
 
@@ -364,8 +517,23 @@ struct TableCols {
     len: usize,
     file: Option<usize>,
     lines: Option<usize>,
+    line_start: Option<usize>,
+    line_end: Option<usize>,
     qn: Option<usize>,
     name: Option<usize>,
+}
+
+/// A column name's matchable identity: `search_code`/`get_architecture`/
+/// `search_graph` always use the fixed literals matched in
+/// [`parse_header_cols`] below (`file`, `lines`, `qn`, `name`), but
+/// `query_graph` columns are whatever the caller's Cypher-like `RETURN`
+/// clause names them -- typically a variable-qualified property reference
+/// (`RETURN n.name, n.file, n.line_start` renders the header
+/// `(cols: n.name n.file n.line_start)`). Stripping the `alias.`-prefix here
+/// lets `n.file` still match the bare `file` literal; a column with no `.`
+/// (every other tool's shape) is returned unchanged.
+fn col_name(c: &str) -> &str {
+    c.rsplit('.').next().unwrap_or(c)
 }
 
 /// Parse a header line's tail (after the section name's `:`) for a
@@ -374,12 +542,14 @@ struct TableCols {
 fn parse_header_cols(rest: &str) -> Option<TableCols> {
     let (_, tail) = rest.split_once("(cols:")?;
     let names: Vec<&str> = tail.trim_end_matches(')').split_whitespace().collect();
-    let pos = |name: &str| names.iter().position(|c| *c == name);
+    let pos = |name: &str| names.iter().position(|c| col_name(c) == name);
     Some(TableCols {
         len: names.len(),
-        file: pos("file"),
+        file: pos("file").or_else(|| pos("path")),
         lines: pos("lines"),
-        qn: pos("qn"),
+        line_start: pos("line_start").or_else(|| pos("start_line")),
+        line_end: pos("line_end").or_else(|| pos("end_line")),
+        qn: pos("qn").or_else(|| pos("qualified_name")),
         name: pos("name"),
     })
 }
@@ -396,11 +566,13 @@ fn parse_header_cols(rest: &str) -> Option<TableCols> {
 /// `search_code` sends a single `results:` section; `get_architecture`
 /// (which, unlike `search_graph`, never requests `format: "json"`) sends
 /// several — `node_labels:`, `edge_types:`, `packages:`, `entry_points:`,
-/// etc. Every unindented line is treated as a new section header and parsed
-/// for its `(cols: …)` list; only the indented rows under a header whose
-/// columns include `file` become findings, so a column-less section (a
-/// summary line) or a file-less one (e.g. `packages:`) is walked but simply
-/// contributes nothing.
+/// etc.; `query_graph` sends a `rows:` section whose columns are whatever
+/// the caller's Cypher-like `RETURN` clause named them (see
+/// [`parse_header_cols`]). Every unindented line is treated as a new section
+/// header and parsed for its `(cols: …)` list; only the indented rows under
+/// a header whose columns include a recognized `file` column become
+/// findings, so a column-less section (a summary line) or a file-less one
+/// (e.g. `packages:`) is walked but simply contributes nothing.
 fn text_table_findings(text: &str) -> Vec<ExplorationFinding> {
     let mut findings = Vec::new();
     let mut cols: Option<TableCols> = None;
@@ -412,23 +584,158 @@ fn text_table_findings(text: &str) -> Vec<ExplorationFinding> {
             continue;
         }
         let Some(t) = &cols else { continue };
+        // Known from the header, once per section — skip the row's
+        // allocation entirely for a column-less/file-less section instead of
+        // collecting cells just to discard them below.
+        let Some(file_col) = t.file else { continue };
         let cells: Vec<&str> = line.split_whitespace().collect();
         if cells.len() != t.len {
             continue;
         }
-        let Some(file) = t.file.and_then(|i| cells.get(i).copied()) else {
+        let Some(file) = cells.get(file_col).copied() else {
             continue;
         };
-        let (line_start, line_end) = t
-            .lines
-            .and_then(|i| cells.get(i).copied())
-            .map(parse_line_range)
-            .unwrap_or((0, 0));
+        // A combined `lines` (`"start-end"`) column, if the section has one
+        // (every fixed-shape tool); otherwise fall back to separate
+        // `line_start`/`line_end` columns, as an arbitrary `query_graph`
+        // `RETURN` clause is prone to naming them.
+        let (line_start, line_end) = match t.lines.and_then(|i| cells.get(i).copied()) {
+            Some(cell) => parse_line_range(cell),
+            None => {
+                let start = t
+                    .line_start
+                    .and_then(|i| cells.get(i).copied())
+                    .and_then(parse_line_cell)
+                    .unwrap_or(0);
+                let end = t
+                    .line_end
+                    .and_then(|i| cells.get(i).copied())
+                    .and_then(parse_line_cell)
+                    .unwrap_or(start);
+                (start, end)
+            }
+        };
         let note =
             t.qn.or(t.name)
                 .and_then(|i| cells.get(i).copied())
                 .map(str::to_string);
         findings.push(finding(file, line_start, line_end, note));
+    }
+    findings
+}
+
+/// Split a `trace_path` group-prefix line's qn (`<project>.<module path>`,
+/// plus an optional trailing `.<TypeName>` qualifier for a method) into that
+/// group's file: drop the leading project segment (live-verified against
+/// `search_graph`'s parallel `qn_prefix`/`file` pair for the same symbols --
+/// the group prefix always echoes the `project` argument the call was scoped
+/// to). `None` when no module segment is left to build a file from.
+///
+/// A segment sequence containing a literal `src`, `tests`, `benches`, or
+/// `examples` component follows Cargo's crate-dir/{dir}/file-stem convention:
+/// drop any trailing segment(s) that start with an uppercase ASCII letter (a
+/// Rust type name; every module-path segment -- crate dir, `src`, file stem
+/// -- is snake_case/kebab-case, so the first uppercase-led segment
+/// unambiguously starts the type qualifier instead of the file path), then
+/// append `.rs`, which mirrors the real file stem there (e.g.
+/// `crates.repo-explorer-mcp.src.main` -> `crates/repo-explorer-mcp/src/main.rs`,
+/// and, live-verified against this workspace's own
+/// `crates/repo-explorer-memory/tests/integration.rs`,
+/// `crates.repo-explorer-memory.tests.integration` ->
+/// `crates/repo-explorer-memory/tests/integration.rs`).
+///
+/// Outside that Rust src layout, an uppercase-led segment is never a type
+/// qualifier to strip -- that rule only holds once a `src`/`tests`/etc root
+/// is already established, so every remaining segment is kept (live-verified
+/// against this workspace's own `crates/repo-explorer-search/Cargo.toml`:
+/// group prefix `crates.repo-explorer-search.Cargo`, where the old
+/// uppercase-strip rule discarded `Cargo` and pointed at the bare crate
+/// directory instead). A non-Rust module the connected `codebase-memory-mcp`
+/// indexes otherwise collapses to just its containing directory with the
+/// actual file stem dropped entirely (live-verified: the JS entry point
+/// `setup/index.mjs` groups under prefix `<project>.setup`, with no `index`
+/// segment anywhere to recover) -- so two filenames this workspace's own
+/// tooling is guaranteed to surface are special-cased instead of guessed: a
+/// trailing `Cargo` segment is always that crate's `Cargo.toml` (a manifest
+/// never lives under `src`/`tests`/etc, so it can't already have been
+/// handled above), and the qn segment `mcp` alone is always the repo-root
+/// `.mcp.json` (live-verified: group prefix `<project>.mcp`) -- the qn
+/// format has no way to represent a dotfile's leading `.`, so the bare
+/// segment is otherwise indistinguishable from a same-named directory (the
+/// `setup` case above). Anything else falls back to the bare directory path
+/// instead of fabricating an extension.
+fn trace_path_group_file(qn_prefix: &str) -> Option<String> {
+    let mut segments = qn_prefix.split('.');
+    segments.next()?;
+    let segments: Vec<&str> = segments.collect();
+    if segments.is_empty() {
+        return None;
+    }
+    let is_rust_layout = ["src", "tests", "benches", "examples"]
+        .iter()
+        .any(|dir| segments.contains(dir));
+    if is_rust_layout {
+        let module_segments: Vec<&str> = segments
+            .iter()
+            .copied()
+            .take_while(|s| !s.starts_with(|c: char| c.is_ascii_uppercase()))
+            .collect();
+        return if module_segments.is_empty() {
+            None
+        } else {
+            Some(format!("{}.rs", module_segments.join("/")))
+        };
+    }
+    let path = segments.join("/");
+    if segments.last() == Some(&"Cargo") {
+        return Some(format!("{path}.toml"));
+    }
+    if path == "mcp" {
+        return Some(".mcp.json".to_string());
+    }
+    Some(path)
+}
+
+/// Parse the connected `trace_path` tool's plain-text response: a
+/// `callees:`/`callers:` header carrying `(rows: name hop; qn = group prefix
+/// + "." + name)` -- not the `(cols: ...)` marker every other text-table
+/// shape uses -- followed by one `<qn_prefix>:` group header per distinct
+/// caller/callee module (and, for a method, its enclosing type), each
+/// followed by its indented `name hop` rows. Unlike every other shape here,
+/// a row carries no `file` cell of its own -- the tool folds each symbol's
+/// location into the group prefix instead of a column, so `file` is derived
+/// from that prefix via [`trace_path_group_file`] and `note` is built
+/// exactly as the tool's own header documents (`qn_prefix + "." + name`).
+fn trace_path_findings(text: &str) -> Vec<ExplorationFinding> {
+    let mut findings = Vec::new();
+    // Whether we're inside a `(rows: ...)` section -- only then does an
+    // unindented, colon-terminated line mean a qn_prefix group header rather
+    // than unrelated metadata (`function:`, `direction:`, the `*_total:`
+    // counters), which must not be misread as one.
+    let mut in_rows_section = false;
+    let mut group: Option<(String, String)> = None;
+    for line in text.lines() {
+        if !line.starts_with(' ') {
+            group = None;
+            match line.split_once(':') {
+                Some((_, rest)) if rest.trim().is_empty() => {
+                    if in_rows_section {
+                        let prefix = line.trim_end_matches(':');
+                        group = trace_path_group_file(prefix).map(|f| (f, prefix.to_string()));
+                    }
+                }
+                Some((_, rest)) => in_rows_section = rest.contains("(rows:"),
+                None => in_rows_section = false,
+            }
+            continue;
+        }
+        let Some((file, qn_prefix)) = &group else {
+            continue;
+        };
+        let Some(name) = line.split_whitespace().next() else {
+            continue;
+        };
+        findings.push(finding(file, 0, 0, Some(format!("{qn_prefix}.{name}"))));
     }
     findings
 }
@@ -443,18 +750,62 @@ fn result_with_finding_count(
     ExplorationResult { findings, summary }
 }
 
+/// Decode a `{"status":"ambiguous","message":...,"suggestions":[{"qualified_name":...},...]}`
+/// success payload -- live-verified as `trace_path`'s response to a
+/// `function_name` that matches more than one symbol (e.g. `"connect"` or
+/// `"new"` in this workspace) -- into a summary carrying the tool's own
+/// message plus every suggested qualified name. Without this, the payload
+/// has none of "results"/"rows"/"hits" and no "cols" array, so
+/// `columnar_findings` returns `None` and the disambiguation prompt is
+/// silently discarded as an indistinguishable "0 locatable findings". `None`
+/// for every other shape.
+fn ambiguous_summary(json: &Value) -> Option<String> {
+    if json.get("status").and_then(Value::as_str) != Some("ambiguous") {
+        return None;
+    }
+    let message = json
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("ambiguous match");
+    let suggestions: Vec<&str> = json
+        .get("suggestions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.get("qualified_name").and_then(Value::as_str))
+        .collect();
+    Some(if suggestions.is_empty() {
+        message.to_string()
+    } else {
+        format!("{message} Candidates: {}", suggestions.join(", "))
+    })
+}
+
 /// Turn a tool response into findings plus a compact summary string. Handles
-/// the three shapes `codebase-memory-mcp` actually produces: an array of
+/// the five shapes `codebase-memory-mcp` actually produces: an array of
 /// object rows (`results`/`rows`/`hits`), the columnar `{cols, groups}` JSON,
-/// and the plain-text table (reaching here as `Value::String`).
-fn findings_and_summary(tool: &'static str, json: &Value) -> ExplorationResult {
+/// the plain-text table (reaching here as `Value::String`), `trace_path`'s own
+/// plain-text shape (grouped, columnless -- see [`trace_path_findings`]), and
+/// `trace_path`'s ambiguous-match success payload (see [`ambiguous_summary`]).
+fn findings_and_summary(tool: &'static str, json: &Value, repo_root: &Path) -> ExplorationResult {
     if let Value::String(text) = json {
-        return result_with_finding_count(tool, text_table_findings(text));
+        let findings = if tool == "trace_path" {
+            trace_path_findings(text)
+        } else {
+            text_table_findings(text)
+        };
+        return result_with_finding_count(tool, findings);
+    }
+    if let Some(message) = ambiguous_summary(json) {
+        return ExplorationResult {
+            findings: Vec::new(),
+            summary: format!("{tool}: {message}"),
+        };
     }
     let mut findings = Vec::new();
     if let Some(rows) = first_field(json, &["results", "rows", "hits"]).and_then(Value::as_array) {
         for row in rows {
-            if let Some(f) = finding_from_row(row, &["snippet", "text"]) {
+            if let Some(f) = finding_from_row(row, &["snippet", "text"], repo_root) {
                 findings.push(f);
             }
         }
@@ -476,12 +827,26 @@ impl MemoryBackend for MemoryClientBackend {
         // second time inside `run_index`.
         let abs = canonicalize_repo_root(repo_root).await;
         let project = project_name_from_abs(repo_root, &abs)?;
-        let (exists, last_indexed_at) = self.probe_status(&project).await?;
+        let exists = self.probe_status(&project).await?;
         // `detect_changes` is only meaningful for a project that exists.
         let changed_files = if exists {
             self.probe_changes(&project).await?
         } else {
             ChangeCount::Known(0)
+        };
+        // Seed the cache now, after `project`'s last borrow (keyed on the raw
+        // `repo_root`, same as `cached_project_name` compares against) so the
+        // retrieval calls that immediately follow this in `AgentLoop::run`
+        // skip the redundant canonicalize + project-name round trip on their
+        // first call -- moving `project` by value instead of cloning it, since
+        // nothing below needs it anymore.
+        *self.project_name_cache.lock().unwrap() = Some((repo_root.to_path_buf(), project));
+        // Only meaningful once this project has been indexed; irrelevant
+        // (and forced to `Reindex` regardless) when `exists` is false.
+        let last_indexed_at = if exists {
+            *self.last_reindexed_at.lock().unwrap()
+        } else {
+            None
         };
         let probe = IndexProbe {
             exists,
@@ -502,10 +867,7 @@ impl MemoryBackend for MemoryClientBackend {
         self.call_memory_tool("search_code", repo_root, |args| {
             args.insert("pattern".to_string(), Value::String(query.text.clone()));
             if let Some(scope) = &query.scope_hint {
-                args.insert(
-                    "file_pattern".to_string(),
-                    Value::String(scope.to_string_lossy().into_owned()),
-                );
+                args.insert("file_pattern".to_string(), Value::String(scope_glob(scope)));
             }
             insert_opt_u32(args, "limit", query.max_results);
         })
@@ -519,15 +881,9 @@ impl MemoryBackend for MemoryClientBackend {
     ) -> Result<ExplorationResult, MemoryError> {
         self.call_memory_tool("search_graph", repo_root, |args| {
             args.insert("format".to_string(), Value::String("json".to_string()));
-            if let Some(v) = &query.name_pattern {
-                args.insert("name_pattern".to_string(), Value::String(v.clone()));
-            }
-            if let Some(v) = &query.file_pattern {
-                args.insert("file_pattern".to_string(), Value::String(v.clone()));
-            }
-            if let Some(v) = &query.label {
-                args.insert("label".to_string(), Value::String(v.clone()));
-            }
+            insert_opt_str(args, "name_pattern", &query.name_pattern);
+            insert_opt_str(args, "file_pattern", &query.file_pattern);
+            insert_opt_str(args, "label", &query.label);
             insert_opt_u32(args, "limit", query.max_results);
         })
         .await
@@ -550,12 +906,21 @@ impl MemoryBackend for MemoryClientBackend {
         &self,
         repo_root: &Path,
         from: &str,
-        to: &str,
+        _to: &str,
         max_depth: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
+        // The connected `trace_path` tool has no two-endpoint path concept:
+        // it requires `function_name` and reports that single function's
+        // callers/callees, ignoring `from`/`to` entirely (live-verified:
+        // sending `{from, to}` alone fails with "function_name is required",
+        // and once `function_name` is supplied, varying `to` leaves the
+        // result unchanged). Map `from` onto `function_name` and request
+        // both directions -- the closest this shape gets to the caller's
+        // two-endpoint intent -- and drop `to`, which the tool has nowhere
+        // to put.
         self.call_memory_tool("trace_path", repo_root, |args| {
-            args.insert("from".to_string(), Value::String(from.to_string()));
-            args.insert("to".to_string(), Value::String(to.to_string()));
+            args.insert("function_name".to_string(), Value::String(from.to_string()));
+            args.insert("direction".to_string(), Value::String("both".to_string()));
             insert_opt_u32(args, "max_depth", max_depth);
         })
         .await
@@ -577,25 +942,28 @@ impl MemoryBackend for MemoryClientBackend {
         repo_root: &Path,
         target: &SnippetTarget,
     ) -> Result<ExplorationResult, MemoryError> {
+        // The connected `get_code_snippet` tool requires `qualified_name`
+        // unconditionally (live-verified: a call with only `file`/
+        // `start_line`/`end_line`, and separately a call with no arguments
+        // beyond `project` at all, both fail with "qualified_name is
+        // required") -- so a `FileRange` target, which carries no qualified
+        // name, can never succeed against it. Fail fast locally instead of
+        // spending a network round trip on a call guaranteed to come back as
+        // this same `ToolFailed`.
+        let name = match target {
+            SnippetTarget::QualifiedName(name) => name,
+            SnippetTarget::FileRange { .. } => {
+                return Err(MemoryError::ToolFailed {
+                    tool: "get_code_snippet",
+                    message: "qualified_name is required; file/start_line/end_line alone is not supported by the connected backend".to_string(),
+                });
+            }
+        };
         self.call_memory_tool_with(
             "get_code_snippet",
             repo_root,
-            |args| match target {
-                SnippetTarget::QualifiedName(name) => {
-                    args.insert("qualified_name".to_string(), Value::String(name.clone()));
-                }
-                SnippetTarget::FileRange {
-                    file,
-                    start_line,
-                    end_line,
-                } => {
-                    args.insert(
-                        "file".to_string(),
-                        Value::String(file.to_string_lossy().into_owned()),
-                    );
-                    insert_opt_u32(args, "start_line", *start_line);
-                    insert_opt_u32(args, "end_line", *end_line);
-                }
+            |args| {
+                args.insert("qualified_name".to_string(), Value::String(name.clone()));
             },
             single_snippet,
         )
@@ -622,7 +990,7 @@ mod tests {
             }],
             "has_more": false
         });
-        let res = findings_and_summary("search_graph", &payload);
+        let res = findings_and_summary("search_graph", &payload, Path::new("/repo"));
         assert_eq!(res.findings.len(), 1);
         let f = &res.findings[0];
         assert_eq!(
@@ -645,7 +1013,11 @@ repo.crates.a.src.b.MemoryClientBackend.probe_changes Method crates/a/src/b.rs 7
 repo.crates.a.src.b.MemoryClientBackend.ensure_fresh_index Method crates/a/src/b.rs 280-303 \"299\" 1 7\n  \
 repo.crates.a.src.f.decide_freshness Function crates/a/src/f.rs 40-60 \"40\" 1 0\n\
 dirs: 1  (cols: dir hits)\n  crates/ 28\ntotal_grep_matches: 44\n";
-        let res = findings_and_summary("search_code", &Value::String(text.to_string()));
+        let res = findings_and_summary(
+            "search_code",
+            &Value::String(text.to_string()),
+            Path::new("/repo"),
+        );
         assert_eq!(res.findings.len(), 3);
         assert_eq!(
             res.findings[2].location.path,
@@ -681,7 +1053,11 @@ packages: 1  (cols: name nodes fan_in fan_out)\n  repo-explorer-core 256 0 0\n\
 entry_points: 2  (cols: qn file)\n  \
 repo.crates.repo-explorer-mcp.src.main.main crates/repo-explorer-mcp/src/main.rs\n  \
 repo.crates.repo-explorer-core.src.lib.run crates/repo-explorer-core/src/lib.rs\n";
-        let res = findings_and_summary("get_architecture", &Value::String(text.to_string()));
+        let res = findings_and_summary(
+            "get_architecture",
+            &Value::String(text.to_string()),
+            Path::new("/repo"),
+        );
         assert_eq!(res.findings.len(), 2);
         assert_eq!(
             res.findings[0].location.path,
@@ -699,7 +1075,144 @@ repo.crates.repo-explorer-core.src.lib.run crates/repo-explorer-core/src/lib.rs\
         );
     }
 
+    /// Live-verified `trace_path` payload shape: no `(cols: ...)` marker and
+    /// no `file` cell per row -- each caller/callee's location rides on its
+    /// `<qn_prefix>:` group header instead, split back into a real file by
+    /// [`trace_path_group_file`].
+    #[test]
+    fn text_table_trace_path_payload_decodes() {
+        let text = "function: canonicalize_repo_root\n\
+direction: both\n\
+callees_total: 0\n\
+callees: 0  (rows: name hop; qn = group prefix + \".\" + name)\n\
+callers_total: 6\n\
+callers: 6  (rows: name hop; qn = group prefix + \".\" + name)\n\
+home-kwitsch-repos-repo-explorer-mcp.crates.repo-explorer-memory.src.backend.MemoryClientBackend:\n  \
+cached_project_name 2\n  \
+call_memory_tool_with 3\n  \
+ensure_fresh_index 1\n\
+home-kwitsch-repos-repo-explorer-mcp.crates.repo-explorer-memory.src.client:\n  \
+project_name 1\n  \
+project_name_from_directory 2\n  \
+project_name_root_path_errors 2\n";
+        let res = findings_and_summary(
+            "trace_path",
+            &Value::String(text.to_string()),
+            Path::new("/repo"),
+        );
+        assert_eq!(res.findings.len(), 6);
+        assert_eq!(
+            res.findings[0].location.path,
+            std::path::PathBuf::from("crates/repo-explorer-memory/src/backend.rs")
+        );
+        // No line info in this shape -- `(0, 0)` is the "unknown location" sentinel.
+        assert_eq!(
+            (
+                res.findings[0].location.line_start,
+                res.findings[0].location.line_end
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            res.findings[0].note.as_deref(),
+            Some(
+                "home-kwitsch-repos-repo-explorer-mcp.crates.repo-explorer-memory.src.backend.MemoryClientBackend.cached_project_name"
+            )
+        );
+        assert_eq!(
+            res.findings[3].location.path,
+            std::path::PathBuf::from("crates/repo-explorer-memory/src/client.rs")
+        );
+        assert_eq!(
+            res.findings[3].note.as_deref(),
+            Some(
+                "home-kwitsch-repos-repo-explorer-mcp.crates.repo-explorer-memory.src.client.project_name"
+            )
+        );
+        assert!(res.summary.contains("6 locatable finding"));
+    }
+
+    /// Live-verified `trace_path` group prefix for a non-Rust (JS) module --
+    /// no `src` segment, so [`trace_path_group_file`] must not append `.rs`
+    /// and fabricate a `setup.rs` file that doesn't exist; the real source is
+    /// `setup/index.mjs`, which the qn segments alone can't recover, so the
+    /// bare directory is the honest fallback.
+    #[test]
+    fn text_table_trace_path_non_rust_group_omits_rs_extension() {
+        let text = "function: parseArgs\n\
+direction: both\n\
+callees_total: 0\n\
+callees: 0  (rows: name hop; qn = group prefix + \".\" + name)\n\
+callers_total: 2\n\
+callers: 2  (rows: name hop; qn = group prefix + \".\" + name)\n\
+home-kwitsch-repos-repo-explorer-mcp.setup:\n  \
+index 2\n  \
+main 1\n";
+        let res = findings_and_summary(
+            "trace_path",
+            &Value::String(text.to_string()),
+            Path::new("/repo"),
+        );
+        assert_eq!(res.findings.len(), 2);
+        assert_eq!(
+            res.findings[0].location.path,
+            std::path::PathBuf::from("setup")
+        );
+        assert_eq!(
+            res.findings[0].note.as_deref(),
+            Some("home-kwitsch-repos-repo-explorer-mcp.setup.index")
+        );
+    }
+
+    /// Live-verified `query_graph` payload shape: `RETURN` column names are
+    /// whatever the caller's Cypher-like clause used (`n.name`, `n.file`,
+    /// `n.line_start`), not the fixed `file`/`lines`/`qn`/`name` literals
+    /// `search_code`/`get_architecture`/`search_graph` always use.
+    #[test]
+    fn text_table_query_graph_aliased_columns_decode() {
+        let text = "rows: 1  (cols: n.name n.file n.line_start)\n  \
+decide_freshness crates/repo-explorer-memory/src/freshness.rs -\n";
+        let res = findings_and_summary(
+            "query_graph",
+            &Value::String(text.to_string()),
+            Path::new("/repo"),
+        );
+        assert_eq!(res.findings.len(), 1);
+        let f = &res.findings[0];
+        assert_eq!(
+            f.location.path,
+            std::path::PathBuf::from("crates/repo-explorer-memory/src/freshness.rs")
+        );
+        // `n.line_start`'s value is the tool's `-` null placeholder.
+        assert_eq!((f.location.line_start, f.location.line_end), (0, 0));
+        assert_eq!(f.note.as_deref(), Some("decide_freshness"));
+    }
+
+    /// `query_graph` with separate `line_start`/`line_end` aliased columns
+    /// (rather than a single combined `lines` column).
+    #[test]
+    fn text_table_query_graph_separate_line_start_end_decode() {
+        let text = "rows: 1  (cols: n.qualified_name n.file n.line_start n.line_end)\n  \
+repo.crates.a.src.f.decide_freshness crates/a/src/f.rs 40 60\n";
+        let res = findings_and_summary(
+            "query_graph",
+            &Value::String(text.to_string()),
+            Path::new("/repo"),
+        );
+        assert_eq!(res.findings.len(), 1);
+        let f = &res.findings[0];
+        assert_eq!((f.location.line_start, f.location.line_end), (40, 60));
+        assert_eq!(
+            f.note.as_deref(),
+            Some("repo.crates.a.src.f.decide_freshness")
+        );
+    }
+
     /// Real `get_code_snippet` payload shape (file_path/start_line/source).
+    /// `file_path` is absolute (live-verified), unlike every other tool's
+    /// repo-relative paths -- must be normalized against `repo_root` so it
+    /// dedups with the same location reported by another tool, and never
+    /// leaks the server host's absolute filesystem layout.
     #[test]
     fn get_code_snippet_payload_decodes() {
         let payload = json!({
@@ -713,9 +1226,14 @@ repo.crates.repo-explorer-core.src.lib.run crates/repo-explorer-core/src/lib.rs\
             "callers": 1,
             "callees": 0
         });
-        let res = single_snippet("get_code_snippet", &payload);
+        let res = single_snippet("get_code_snippet", &payload, Path::new("/repo"));
         assert_eq!(res.findings.len(), 1);
         let f = &res.findings[0];
+        assert_eq!(
+            f.location.path,
+            std::path::PathBuf::from("crates/a/src/f.rs"),
+            "absolute file_path must be normalized to repo-relative"
+        );
         assert_eq!((f.location.line_start, f.location.line_end), (40, 60));
         assert_eq!(
             f.snippet.as_deref(),
@@ -727,6 +1245,38 @@ repo.crates.repo-explorer-core.src.lib.run crates/repo-explorer-core/src/lib.rs\
         );
     }
 
+    /// `SnippetTarget::FileRange` must fail immediately, with no attempt to
+    /// call through the (here, absent) client -- the connected
+    /// `get_code_snippet` tool requires `qualified_name` unconditionally, so
+    /// this target can never succeed against it. `client: None` makes this
+    /// verifiable: `self.client()` panics if the network-call path is
+    /// reached at all.
+    #[tokio::test]
+    async fn get_code_snippet_file_range_fails_fast_without_network_call() {
+        let backend = MemoryClientBackend {
+            client: None,
+            staleness: Duration::from_secs(1),
+            last_reindexed_at: Mutex::new(None),
+            project_name_cache: Mutex::new(None),
+        };
+        let target = SnippetTarget::FileRange {
+            file: std::path::PathBuf::from("src/a.rs"),
+            start_line: Some(1),
+            end_line: Some(2),
+        };
+        let err = backend
+            .get_code_snippet(Path::new("/repo"), &target)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            MemoryError::ToolFailed {
+                tool: "get_code_snippet",
+                ..
+            }
+        ));
+    }
+
     /// Object-row arrays (the previously supported shape) still decode.
     #[test]
     fn object_rows_still_decode() {
@@ -736,10 +1286,110 @@ repo.crates.repo-explorer-core.src.lib.run crates/repo-explorer-core/src/lib.rs\
                 {"no_file": true}
             ]
         });
-        let res = findings_and_summary("search_graph", &payload);
+        let res = findings_and_summary("search_graph", &payload, Path::new("/repo"));
         assert_eq!(res.findings.len(), 1);
         assert_eq!(res.findings[0].note.as_deref(), Some("foo"));
         assert!(res.summary.contains("2 row(s), 1 locatable finding(s)"));
+    }
+
+    /// Live-verified `trace_path` response to a non-unique `function_name`
+    /// (e.g. `"new"` in this workspace): a success payload, not a tool error,
+    /// that must surface its disambiguation message and suggestions instead
+    /// of being silently read as "0 locatable findings".
+    #[test]
+    fn trace_path_ambiguous_status_surfaces_message_and_suggestions() {
+        let payload = json!({
+            "status": "ambiguous",
+            "message": "13 matches for \"new\". Pick a qualified_name from suggestions below...",
+            "suggestions": [
+                {"qualified_name": "repo.crates.a.src.f.Foo.new"},
+                {"qualified_name": "repo.crates.b.src.g.Bar.new"}
+            ]
+        });
+        let res = findings_and_summary("trace_path", &payload, Path::new("/repo"));
+        assert!(res.findings.is_empty());
+        assert!(res.summary.contains("13 matches for \"new\""));
+        assert!(res.summary.contains("repo.crates.a.src.f.Foo.new"));
+        assert!(res.summary.contains("repo.crates.b.src.g.Bar.new"));
+    }
+
+    /// Live-verified `trace_path` group prefix for a Rust file outside
+    /// `src/` (this workspace's own `crates/repo-explorer-memory/tests/integration.rs`)
+    /// -- `trace_path_group_file` must append `.rs` here too, not just for
+    /// `src`, or it fabricates a path with no extension that doesn't exist.
+    #[test]
+    fn trace_path_group_file_appends_rs_for_tests_dir() {
+        assert_eq!(
+            trace_path_group_file(
+                "home-kwitsch-repos-repo-explorer-mcp.crates.repo-explorer-memory.tests.integration"
+            ),
+            Some("crates/repo-explorer-memory/tests/integration.rs".to_string())
+        );
+    }
+
+    /// Live-verified `trace_path` group prefix for a non-`src` `Cargo.toml`
+    /// dependency (this workspace's own `crates/repo-explorer-search/Cargo.toml`,
+    /// confirmed against `search_graph`'s parallel `qn_prefix`/`file` pair for
+    /// its `which` dependency) -- the trailing uppercase-led `Cargo` segment
+    /// must not be mistaken for a Rust type-name qualifier and stripped, or
+    /// it fabricates a path pointing at the bare crate directory with
+    /// `Cargo.toml` silently dropped.
+    #[test]
+    fn trace_path_group_file_resolves_cargo_toml() {
+        assert_eq!(
+            trace_path_group_file(
+                "home-kwitsch-repos-repo-explorer-mcp.crates.repo-explorer-search.Cargo"
+            ),
+            Some("crates/repo-explorer-search/Cargo.toml".to_string())
+        );
+    }
+
+    /// Live-verified `trace_path` group prefix for the repo-root `.mcp.json`
+    /// dotfile (confirmed against `search_graph`'s parallel `qn_prefix`/`file`
+    /// pair for its `env` field) -- the qn strips the leading `.` a
+    /// dotfile's basename starts with, so the bare segment `mcp` must not be
+    /// treated as a same-named directory (contrast the `setup` case above)
+    /// or it fabricates a path (`mcp`) that exists nowhere in the repo.
+    #[test]
+    fn trace_path_group_file_resolves_mcp_json_dotfile() {
+        assert_eq!(
+            trace_path_group_file("home-kwitsch-repos-repo-explorer-mcp.mcp"),
+            Some(".mcp.json".to_string())
+        );
+    }
+
+    /// Real `detect_changes` payload shape (plain-text block via `Value::String`).
+    #[test]
+    fn parse_changed_count_reads_real_detect_changes_text() {
+        let text = "base: main\nmerge_base: abc123\ndirection: inbound\nchanged_files: 2\n  \
+docs/project-plan/9-custom_model_training.md\n  \
+docs/project-plan/9b-open_weights_finetune.md\nseed_symbols: 0\n";
+        assert_eq!(parse_changed_count(text), Some(2));
+    }
+
+    #[test]
+    fn parse_changed_count_zero_and_missing() {
+        assert_eq!(parse_changed_count("changed_files: 0\n"), Some(0));
+        assert_eq!(
+            parse_changed_count("base: main\ndirection: inbound\n"),
+            None
+        );
+    }
+
+    /// `search_code`'s `file_pattern` needs real glob syntax, unlike the bare
+    /// prefix `scope_hint` is built from everywhere else — verifies the
+    /// conversion, trailing-slash-or-not alike.
+    #[test]
+    fn scope_glob_appends_recursive_glob_to_bare_prefix() {
+        assert_eq!(scope_glob(Path::new("crates")), "crates/**");
+        assert_eq!(
+            scope_glob(Path::new("crates/repo-explorer-memory")),
+            "crates/repo-explorer-memory/**"
+        );
+        assert_eq!(
+            scope_glob(Path::new("crates/repo-explorer-memory/")),
+            "crates/repo-explorer-memory/**"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
 use repo_explorer_agent::AgentLoop;
 use repo_explorer_core::domain::{ExplorationQuery, ExplorationResult};
 use repo_explorer_core::llm::SystemClock;
+use repo_explorer_core::retrieval::is_unknown_location;
 use repo_explorer_llm::GenaiProvider;
 use repo_explorer_memory::MemoryClientBackend;
 use repo_explorer_search::{CliSearchBackend, GitStateProbe};
@@ -42,8 +43,12 @@ struct ExploreRepositoryRequest {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct FileLocationDto {
     path: String,
-    line_start: u32,
-    line_end: u32,
+    /// Omitted (rather than a misleading `0`) when the underlying location is
+    /// core's "unknown" sentinel — see `is_unknown_location`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_start: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_end: Option<u32>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -67,21 +72,24 @@ impl From<ExplorationResult> for ExplorationResultDto {
             findings: result
                 .findings
                 .into_iter()
-                .map(|f| ExplorationFindingDto {
-                    location: FileLocationDto {
-                        // Reuses the existing buffer for valid UTF-8 paths; only
-                        // non-UTF-8 paths pay for the lossy allocation.
-                        path: f
-                            .location
-                            .path
-                            .into_os_string()
-                            .into_string()
-                            .unwrap_or_else(|s| s.to_string_lossy().into_owned()),
-                        line_start: f.location.line_start,
-                        line_end: f.location.line_end,
-                    },
-                    snippet: f.snippet,
-                    note: f.note,
+                .map(|f| {
+                    let known = !is_unknown_location(&f.location);
+                    ExplorationFindingDto {
+                        location: FileLocationDto {
+                            // Reuses the existing buffer for valid UTF-8 paths; only
+                            // non-UTF-8 paths pay for the lossy allocation.
+                            path: f
+                                .location
+                                .path
+                                .into_os_string()
+                                .into_string()
+                                .unwrap_or_else(|s| s.to_string_lossy().into_owned()),
+                            line_start: known.then_some(f.location.line_start),
+                            line_end: known.then_some(f.location.line_end),
+                        },
+                        snippet: f.snippet,
+                        note: f.note,
+                    }
                 })
                 .collect(),
             summary: result.summary,
@@ -111,7 +119,9 @@ impl RepoExplorerServer {
     #[tool(
         name = "explore_repository",
         description = "Explore the repository for the given request and return \
-                       matching file locations (with line numbers and optional \
+                       matching file locations (path always present; line \
+                       numbers included when resolvable, omitted entirely for \
+                       an unresolved/symbol-only match, plus optional \
                        snippet/context) plus a summary. Args: query (required), \
                        optional scope_hint (path prefix), optional max_results."
     )]
@@ -196,6 +206,38 @@ mod tests {
         // snippet/note omitted when None.
         assert!(findings[1].get("snippet").is_none());
         assert!(findings[1].get("note").is_none());
+    }
+
+    #[test]
+    fn omits_line_numbers_for_unknown_location() {
+        // Core's (0, 0) sentinel (e.g. a symbol row with no resolvable line)
+        // must never be serialized as a literal `line_start: 0` — that reads
+        // as real data instead of "unknown".
+        let result = ExplorationResult {
+            findings: vec![ExplorationFinding {
+                location: FileLocation {
+                    path: PathBuf::from("src/lib.rs"),
+                    line_start: 0,
+                    line_end: 0,
+                },
+                snippet: None,
+                note: Some("exact symbol match: `Foo`".to_string()),
+            }],
+            summary: "one finding".to_string(),
+        };
+
+        let dto = ExplorationResultDto::from(result);
+        let value = serde_json::to_value(&dto).expect("serialize dto");
+
+        let location = &value["findings"][0]["location"];
+        assert!(location.get("line_start").is_none());
+        assert!(location.get("line_end").is_none());
+        assert!(
+            location["path"]
+                .as_str()
+                .expect("path string")
+                .contains("lib.rs")
+        );
     }
 
     #[test]

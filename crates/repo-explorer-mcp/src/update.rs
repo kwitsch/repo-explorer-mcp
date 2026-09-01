@@ -324,23 +324,12 @@ fn build_http_client() -> Result<reqwest::Client> {
 }
 
 async fn update_self(client: &reqwest::Client) -> ComponentReport {
-    let name = SELF_REPO.to_string();
-    let current = match semver::Version::parse(env!("CARGO_PKG_VERSION")) {
-        Ok(v) => v,
-        Err(e) => {
-            return ComponentReport {
-                name,
-                current_version: None,
-                latest_version: None,
-                action: "error",
-                detail: Some(format!("own package version is not valid semver: {e}")),
-            };
-        }
-    };
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("CARGO_PKG_VERSION is validated as SemVer by cargo at build time");
 
     check_and_install(
         client,
-        name,
+        SELF_REPO.to_string(),
         ReleaseSource {
             owner: SELF_OWNER,
             repo: SELF_REPO,
@@ -452,11 +441,14 @@ async fn check_and_install(
         }
     };
 
+    let current_version = Some(current.to_string());
+    let latest_version = Some(latest.to_string());
+
     if latest <= current {
         return ComponentReport {
             name,
-            current_version: Some(current.to_string()),
-            latest_version: Some(latest.to_string()),
+            current_version,
+            latest_version,
             action: "up-to-date",
             detail: None,
         };
@@ -496,11 +488,14 @@ async fn install_release(
     command: &str,
     target: InstallTarget<'_>,
 ) -> ComponentReport {
+    let current_version = current.as_ref().map(|v| v.to_string());
+    let latest_version = Some(latest.to_string());
+
     let Some(asset) = pick_asset(&release.assets) else {
         return ComponentReport {
             name,
-            current_version: current.as_ref().map(|v| v.to_string()),
-            latest_version: Some(latest.to_string()),
+            current_version,
+            latest_version,
             action: "error",
             detail: Some(format!(
                 "no release asset matched this platform ({})",
@@ -512,8 +507,8 @@ async fn install_release(
     match install_from_asset(client, &release.assets, asset, command, target).await {
         Ok(note) => ComponentReport {
             name,
-            current_version: current.as_ref().map(|v| v.to_string()),
-            latest_version: Some(latest.to_string()),
+            current_version,
+            latest_version,
             action: if current.is_some() {
                 "updated"
             } else {
@@ -523,8 +518,8 @@ async fn install_release(
         },
         Err(e) => ComponentReport {
             name,
-            current_version: current.as_ref().map(|v| v.to_string()),
-            latest_version: Some(latest.to_string()),
+            current_version,
+            latest_version,
             action: "error",
             detail: Some(e.to_string()),
         },
@@ -565,7 +560,9 @@ async fn read_installed_version_blocking(path: std::path::PathBuf) -> Option<sem
 /// preferring a match on the first line — a tool's own version conventionally
 /// leads its `--version` banner, ahead of any bundled library versions it
 /// might also print — and falling back to the rest of the text otherwise.
-/// A bare `MAJOR.MINOR` is accepted too, treated as `MAJOR.MINOR.0`.
+/// A bare `MAJOR.MINOR` is accepted too, treated as `MAJOR.MINOR.0`, and a
+/// run of 4+ components (e.g. a VCS-revision-suffixed `1.2.3.4`) is read as
+/// its leading `MAJOR.MINOR.PATCH`.
 fn extract_semver(text: &str) -> Option<semver::Version> {
     let first_line = text.lines().next().unwrap_or("");
     scan_for_semver(first_line).or_else(|| scan_for_semver(text))
@@ -584,10 +581,17 @@ fn scan_for_semver(text: &str) -> Option<semver::Version> {
             if let Ok(v) = semver::Version::parse(candidate) {
                 return Some(v);
             }
-            if candidate.matches('.').count() == 1
+            let dot_count = candidate.matches('.').count();
+            if dot_count == 1
                 && let Ok(v) = semver::Version::parse(&format!("{candidate}.0"))
             {
                 return Some(v);
+            }
+            if dot_count >= 3 {
+                let leading = candidate.split('.').take(3).collect::<Vec<_>>().join(".");
+                if let Ok(v) = semver::Version::parse(&leading) {
+                    return Some(v);
+                }
             }
         } else {
             i += 1;
@@ -724,7 +728,10 @@ fn arch_keywords() -> Vec<&'static str> {
 fn pick_asset(assets: &[Asset]) -> Option<&Asset> {
     let os = current_os_keyword();
     let arch_keywords = arch_keywords();
-    let mut candidates: Vec<(&Asset, String)> = assets
+    // Only Windows has an MSVC-vs-GNU choice to break; on every other OS
+    // this must never penalize `-gnu` (e.g. Linux's gnu vs musl builds).
+    let windows = cfg!(target_os = "windows");
+    assets
         .iter()
         .filter_map(|a| {
             let name = a.name.to_lowercase();
@@ -734,9 +741,8 @@ fn pick_asset(assets: &[Asset]) -> Option<&Asset> {
                 && !name.contains("-ui-");
             matches.then_some((a, name))
         })
-        .collect();
-    candidates.sort_by_key(|(_, name)| (name.contains("portable"), name.contains("-gnu")));
-    candidates.into_iter().next().map(|(a, _)| a)
+        .min_by_key(|(_, name)| (name.contains("portable"), windows && name.contains("-gnu")))
+        .map(|(a, _)| a)
 }
 
 /// Find `<asset>.sha256`, the sidecar checksum naming convention this
@@ -850,11 +856,8 @@ fn extract_from_tar_gz(data: &[u8], command: &str) -> Result<Vec<u8>> {
     let mut archive = tar::Archive::new(decoder);
     for entry in archive.entries().context("failed to read tar.gz archive")? {
         let mut entry = entry.context("failed to read a tar.gz entry")?;
-        let path = entry
-            .path()
-            .context("failed to read a tar.gz entry path")?
-            .to_string_lossy()
-            .into_owned();
+        let path_buf = entry.path().context("failed to read a tar.gz entry path")?;
+        let path = path_buf.to_string_lossy();
         if matches_binary_name(&path, command) {
             let mut buf = Vec::new();
             entry
@@ -874,8 +877,8 @@ fn extract_from_zip(data: &[u8], command: &str) -> Result<Vec<u8>> {
         let mut file = archive
             .by_index(i)
             .context("failed to read a zip archive entry")?;
-        let name = file.name().to_string();
-        if matches_binary_name(&name, command) {
+        let name = file.name();
+        if matches_binary_name(name, command) {
             let mut buf = Vec::new();
             file.read_to_end(&mut buf)
                 .context("failed to read the binary out of the zip archive")?;
@@ -1012,6 +1015,16 @@ mod tests {
     }
 
     #[test]
+    fn extract_semver_reads_leading_triple_from_four_component_version() {
+        // Regression: a 4+ component version-like run (e.g. a VCS-revision
+        // suffix) must not be skipped in favor of a later, unrelated number.
+        assert_eq!(
+            extract_semver("tool 1.2.3.4 (rev 5.6.7)").unwrap(),
+            semver::Version::parse("1.2.3").unwrap()
+        );
+    }
+
+    #[test]
     fn parse_tag_version_strips_v_prefix() {
         assert_eq!(
             parse_tag_version("v1.2.3").unwrap(),
@@ -1073,16 +1086,16 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn pick_asset_prefers_msvc_over_gnu_on_a_tie() {
         // Regression: when a release publishes both toolchain variants for
-        // the same OS/arch (e.g. ripgrep's Windows gnu and msvc zips), the
-        // pick must be deterministic and favor msvc, not whichever happens
-        // to come first in GitHub's asset list. Built from the current
-        // host's own OS/arch keywords so the test matches on any runner.
-        let os = current_os_keyword();
+        // Windows (e.g. ripgrep's `-pc-windows-gnu` and `-pc-windows-msvc`
+        // zips), the pick must be deterministic and favor msvc, not whichever
+        // happens to come first in GitHub's asset list. Built from the
+        // current host's own arch keyword so the test matches on any runner.
         let arch = arch_keywords()[0];
-        let gnu = format!("tool-15.2.0-{arch}-{os}-gnu.zip");
-        let msvc = format!("tool-15.2.0-{arch}-{os}-msvc.zip");
+        let gnu = format!("tool-15.2.0-{arch}-windows-gnu.zip");
+        let msvc = format!("tool-15.2.0-{arch}-windows-msvc.zip");
 
         let assets = vec![asset(&gnu), asset(&msvc)];
         let picked = pick_asset(&assets).expect("an asset should match this platform");
@@ -1093,6 +1106,27 @@ mod tests {
         let picked_reversed =
             pick_asset(&assets_reversed).expect("an asset should match this platform");
         assert_eq!(picked_reversed.name, msvc);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn pick_asset_does_not_deprioritize_gnu_off_windows() {
+        // Regression: the MSVC-over-GNU tiebreak is Windows-only. Off
+        // Windows it must never penalize `-gnu` -- e.g. ripgrep's Linux
+        // release publishes both `-unknown-linux-gnu` and
+        // `-unknown-linux-musl` archives, and the old unscoped tiebreak
+        // silently installed musl every time regardless of list order.
+        let os = current_os_keyword();
+        let arch = arch_keywords()[0];
+        let gnu = format!("tool-15.2.0-{arch}-{os}-gnu.tar.gz");
+        let musl = format!("tool-15.2.0-{arch}-{os}-musl.tar.gz");
+
+        let assets = vec![asset(&gnu), asset(&musl)];
+        let picked = pick_asset(&assets).expect("an asset should match this platform");
+        assert_eq!(
+            picked.name, gnu,
+            "gnu must not be deprioritized off Windows"
+        );
     }
 
     #[test]

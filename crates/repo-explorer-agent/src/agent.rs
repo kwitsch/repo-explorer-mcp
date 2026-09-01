@@ -25,7 +25,7 @@ use repo_explorer_core::llm::{
     TokenUsage, ToolCall,
 };
 use repo_explorer_core::memory::{IndexStatus, MemoryBackend};
-use repo_explorer_core::retrieval::finding_from_candidate;
+use repo_explorer_core::retrieval::{finding_from_candidate, is_unknown_location};
 use repo_explorer_core::search::SearchBackend;
 use std::collections::HashSet;
 use std::path::Path;
@@ -33,7 +33,7 @@ use std::path::Path;
 use crate::cache::{QueryEntry, ResultCache};
 use crate::dispatch::dispatch_inner;
 use crate::pipeline;
-use crate::render::{RenderCaps, tidy_findings};
+use crate::render::{RenderCaps, dedupe_key, tidy_findings};
 use crate::tools::{finish_only_catalog, parse_finish, resolve_finish, tool_catalog};
 use crate::verify::{VerifyOutcome, verify};
 
@@ -186,7 +186,12 @@ where
         if outcome.confidence >= self.settings.early_exit_confidence
             && !outcome.candidates.is_empty()
         {
-            let result = self.result_from_candidates(outcome.candidates, query, outcome.confidence);
+            let result = self.result_from_candidates(
+                outcome.candidates,
+                query,
+                outcome.confidence,
+                index_note.as_deref(),
+            );
             return Ok(self.complete_run("early-exit", 0, &query_key, fingerprint, result));
         }
 
@@ -209,6 +214,7 @@ where
                 return Ok(self.finalize_and_complete(
                     "verify",
                     result,
+                    query.max_results,
                     &budget,
                     &query_key,
                     fingerprint,
@@ -223,18 +229,50 @@ where
                 repo_root,
                 query,
                 index_note.as_deref(),
-                &outcome.candidates,
+                outcome.candidates,
                 fingerprint.as_ref(),
                 &mut budget,
             )
             .await?;
-        Ok(self.finalize_and_complete("fallback", result, &budget, &query_key, fingerprint))
+        Ok(self.finalize_and_complete(
+            "fallback",
+            result,
+            query.max_results,
+            &budget,
+            &query_key,
+            fingerprint,
+        ))
+    }
+
+    /// The shared dedupe-then-truncate contract: dedupe first so a run of
+    /// colliding-sentinel findings can't push a legitimate distinct finding
+    /// out of the `max_results` cap. Used by both `finalize` (verify/fallback
+    /// results) and `result_from_candidates` (the early-exit path) so the two
+    /// can't silently diverge.
+    fn tidy_and_truncate(
+        &self,
+        findings: Vec<ExplorationFinding>,
+        max_results: Option<u32>,
+    ) -> Vec<ExplorationFinding> {
+        let mut findings = tidy_findings(findings, &self.caps);
+        if let Some(max) = max_results {
+            findings.truncate(max as usize);
+        }
+        findings
     }
 
     /// Normalize/dedupe/cap the final findings once, whatever stage produced
     /// them — preserving their order (rank order / the model's finish order).
-    fn finalize(&self, mut result: ExplorationResult) -> ExplorationResult {
-        result.findings = tidy_findings(result.findings, &self.caps);
+    /// `max_results` is enforced here (after dedupe) so it bounds every path
+    /// that doesn't early-exit: verify's finish, the fallback loop's finish,
+    /// its forced finish, and its no-finish synthesis all funnel through this
+    /// single choke point via `finalize_and_complete`.
+    fn finalize(
+        &self,
+        mut result: ExplorationResult,
+        max_results: Option<u32>,
+    ) -> ExplorationResult {
+        result.findings = self.tidy_and_truncate(result.findings, max_results);
         result
     }
 
@@ -260,11 +298,12 @@ where
         &self,
         stage: &'static str,
         result: ExplorationResult,
+        max_results: Option<u32>,
         budget: &TokenBudget,
         query_key: &str,
         fingerprint: Option<RepoFingerprint>,
     ) -> ExplorationResult {
-        let result = self.finalize(result);
+        let result = self.finalize(result, max_results);
         self.complete_run(stage, budget.spent(), query_key, fingerprint, result)
     }
 
@@ -331,30 +370,32 @@ where
         );
     }
 
-    /// Build the early-exit result straight from the ranked candidates.
+    /// Build the early-exit result straight from the ranked candidates, via
+    /// the same dedupe-then-truncate contract as `finalize()`. `index_note`
+    /// (e.g. a failed reindex) is appended to the summary — this is the only
+    /// stage that doesn't already thread it into an LLM prompt, so it must be
+    /// surfaced here or a confident answer from a stale index would carry no
+    /// warning at all.
     fn result_from_candidates(
         &self,
         candidates: Vec<Candidate>,
         query: &ExplorationQuery,
         confidence: u32,
+        index_note: Option<&str>,
     ) -> ExplorationResult {
-        let take = query
-            .max_results
-            .map(|m| m as usize)
-            .unwrap_or(candidates.len());
-        let findings = tidy_findings(
-            candidates
-                .into_iter()
-                .take(take)
-                .map(finding_from_candidate)
-                .collect(),
-            &self.caps,
+        let findings = self.tidy_and_truncate(
+            candidates.into_iter().map(finding_from_candidate).collect(),
+            query.max_results,
         );
-        let summary = format!(
+        let mut summary = format!(
             "Resolved deterministically by the retrieval pre-stage (confidence {confidence}/100, no LLM involved): {} location(s) matching \"{}\".",
             findings.len(),
             query.text
         );
+        if let Some(note) = index_note {
+            summary.push(' ');
+            summary.push_str(note);
+        }
         ExplorationResult { findings, summary }
     }
 
@@ -366,18 +407,18 @@ where
         repo_root: &Path,
         query: &ExplorationQuery,
         index_note: Option<&str>,
-        candidates: &[Candidate],
+        candidates: Vec<Candidate>,
         fingerprint: Option<&RepoFingerprint>,
         budget: &mut TokenBudget,
     ) -> Result<ExplorationResult, AgentLoopError> {
         let tools = tool_catalog();
         let mut messages: Vec<Message> = vec![
             Message::system(FALLBACK_SYSTEM_PROMPT),
-            Message::user(user_prompt(query, index_note, candidates)),
+            Message::user(user_prompt(query, index_note, &candidates)),
         ];
 
         let mut findings: Vec<ExplorationFinding> = Vec::new();
-        let mut seen: HashSet<FileLocation> = HashSet::new();
+        let mut seen: HashSet<(FileLocation, Option<String>)> = HashSet::new();
         let mut single_call_rejections = 0u32;
         let mut turn_limit_hit = true;
 
@@ -464,11 +505,7 @@ where
             return Ok(result);
         }
         for candidate in candidates {
-            accumulate(
-                &mut findings,
-                &mut seen,
-                finding_from_candidate(candidate.clone()),
-            );
+            accumulate(&mut findings, &mut seen, finding_from_candidate(candidate));
         }
         let cause = if turn_limit_hit {
             format!(
@@ -495,13 +532,9 @@ where
         messages.push(Message::user(
             "The exploration budget is exhausted. Call finish NOW with the best findings gathered so far.",
         ));
-        let options = CallOptions {
-            force_tool: Some("finish".to_string()),
-            max_tokens: None,
-        };
         match self
             .router
-            .complete_with_tools(messages, finish_only_catalog(), &options)
+            .complete_with_tools(messages, finish_only_catalog(), &force_finish_options())
             .await
         {
             Ok(completion) => {
@@ -557,16 +590,19 @@ where
     }
 }
 
-/// Push `f` unless a finding with the same `FileLocation` is already present
-/// (dedupe by location; first-seen snippet/note wins). `seen` mirrors the
-/// locations already in `findings`, so the check is O(1) rather than a linear
-/// scan per incoming finding.
+/// Push `f` unless a finding with the same dedupe key is already present
+/// (first-seen snippet/note wins). Keys on `render::dedupe_key` — location,
+/// disambiguated by note for the "unknown location" `(0, 0)` sentinel — so
+/// this can't diverge from `tidy_findings`'s later, note-aware dedup and
+/// collapse distinct same-file findings that only lack line info. `seen`
+/// mirrors the keys already in `findings`, so the check is O(1) rather than a
+/// linear scan per incoming finding.
 fn accumulate(
     findings: &mut Vec<ExplorationFinding>,
-    seen: &mut HashSet<FileLocation>,
+    seen: &mut HashSet<(FileLocation, Option<String>)>,
     f: ExplorationFinding,
 ) {
-    if seen.insert(f.location.clone()) {
+    if seen.insert(dedupe_key(&f)) {
         findings.push(f);
     }
 }
@@ -589,6 +625,15 @@ const SEED_CANDIDATES: usize = 8;
 pub(crate) fn push_nudge(messages: &mut Vec<Message>, assistant: Message, nudge: &str) {
     messages.push(assistant);
     messages.push(Message::user(nudge));
+}
+
+/// Call options that force the `finish` tool — the shape shared by this
+/// loop's `forced_finish` and the verification stage's last-turn call.
+pub(crate) fn force_finish_options() -> CallOptions {
+    CallOptions {
+        force_tool: Some("finish".to_string()),
+        max_tokens: None,
+    }
 }
 
 /// The 4-part preamble shared by the fallback loop's and the verification
@@ -624,12 +669,19 @@ fn user_prompt(
                 .as_deref()
                 .map(|sym| format!(" `{sym}`"))
                 .unwrap_or_default();
-            s.push_str(&format!(
-                "\n- {}:{}-{}{symbol}",
-                c.location.path.display(),
-                c.location.line_start,
-                c.location.line_end
-            ));
+            if is_unknown_location(&c.location) {
+                s.push_str(&format!(
+                    "\n- {} (location unknown){symbol}",
+                    c.location.path.display(),
+                ));
+            } else {
+                s.push_str(&format!(
+                    "\n- {}:{}-{}{symbol}",
+                    c.location.path.display(),
+                    c.location.line_start,
+                    c.location.line_end
+                ));
+            }
         }
     }
     s
@@ -639,6 +691,7 @@ fn user_prompt(
 mod tests {
     use super::*;
     use repo_explorer_core::config::AgentSettings;
+    use repo_explorer_core::domain::CandidateKind;
     use repo_explorer_core::fingerprint::RepoFingerprint;
     use repo_explorer_core::fingerprint::mock::MockRepoStateProbe;
     use repo_explorer_core::llm::mock::{FakeClock, MockLlmProvider};
@@ -702,6 +755,165 @@ mod tests {
         assert_eq!(got.summary, "done");
         assert_eq!(got.findings.len(), 1);
         assert_eq!(got.findings[0].location.line_start, 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_finish_is_capped_by_max_results() {
+        // Regression: `max_results` must bound the fallback loop's own
+        // `finish`, not just the deterministic early-exit path.
+        let two_findings = ToolCall {
+            id: "c1".to_string(),
+            name: "finish".to_string(),
+            arguments_json:
+                r#"{"findings":[{"location":{"path":"src/lib.rs","line_start":1,"line_end":2},"note":"one"},{"location":{"path":"src/other.rs","line_start":3,"line_end":4},"note":"two"}],"summary":"done"}"#
+                    .to_string(),
+            thought_signatures: None,
+        };
+        let provider = MockLlmProvider::new().with_responses(vec![tool_calls(vec![two_findings])]);
+        let agent = agent_with(provider);
+        let query = ExplorationQuery {
+            text: "where is main".to_string(),
+            scope_hint: None,
+            max_results: Some(1),
+        };
+        let got = agent.run(&PathBuf::from("/repo"), &query).await.unwrap();
+        assert_eq!(got.findings.len(), 1, "capped to max_results");
+        assert_eq!(got.findings[0].location.path, PathBuf::from("src/lib.rs"));
+    }
+
+    #[test]
+    fn early_exit_dedupes_before_truncating_to_max_results() {
+        // Regression: result_from_candidates must dedupe (collapsing true
+        // duplicates at the "unknown location" (0, 0) sentinel) before
+        // truncating to max_results, matching finalize()'s dedupe-then-
+        // truncate contract — otherwise a duplicate consumes a truncation
+        // slot a distinct 4th candidate should have had.
+        fn candidate(
+            path: &str,
+            line_start: u32,
+            line_end: u32,
+            symbol: &str,
+            kind: CandidateKind,
+            score: u32,
+        ) -> Candidate {
+            Candidate {
+                location: FileLocation {
+                    path: PathBuf::from(path),
+                    line_start,
+                    line_end,
+                },
+                symbol: Some(symbol.to_string()),
+                kind,
+                score,
+                snippet: None,
+            }
+        }
+        let candidates = vec![
+            candidate(
+                "a.rs",
+                10,
+                20,
+                "decide_freshness",
+                CandidateKind::SymbolExact,
+                900,
+            ),
+            candidate(
+                "b.rs",
+                0,
+                0,
+                "helper_thing",
+                CandidateKind::SymbolFuzzy,
+                430,
+            ),
+            candidate(
+                "b.rs",
+                0,
+                0,
+                "helper_thing",
+                CandidateKind::SymbolFuzzy,
+                430,
+            ),
+            candidate(
+                "another.rs",
+                5,
+                5,
+                "unrelated",
+                CandidateKind::ContentHit,
+                200,
+            ),
+        ];
+        let agent = agent_with(MockLlmProvider::new());
+        let query = ExplorationQuery {
+            text: "x".to_string(),
+            scope_hint: None,
+            max_results: Some(3),
+        };
+        let result = agent.result_from_candidates(candidates, &query, 100, None);
+        assert_eq!(
+            result.findings.len(),
+            3,
+            "the distinct 4th candidate must survive once the true duplicate is collapsed"
+        );
+        let paths: Vec<_> = result
+            .findings
+            .iter()
+            .map(|f| f.location.path.clone())
+            .collect();
+        assert!(
+            paths.contains(&PathBuf::from("another.rs")),
+            "pre-dedupe truncation must not drop the distinct 4th candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn early_exit_surfaces_stale_index_note_in_summary() {
+        // Regression: Stage 3's early exit must not silently drop Stage 1's
+        // index-freshness note — a confident answer served from a stale
+        // index (reindex failed, memory backend still answers from the
+        // previous index) must still say so.
+        let memory = MockMemoryBackend::new()
+            .with_ensure_fresh_index_result(Ok(IndexStatus::IndexingFailed {
+                reason: "boom".to_string(),
+            }))
+            .with_search_graph_result(Ok(ExplorationResult {
+                findings: vec![ExplorationFinding {
+                    location: FileLocation {
+                        path: PathBuf::from("crates/x/src/freshness.rs"),
+                        line_start: 12,
+                        line_end: 12,
+                    },
+                    snippet: None,
+                    note: Some("decide_freshness".to_string()),
+                }],
+                summary: "1 row".to_string(),
+            }));
+        let router = ProviderRouter::with_clock(
+            vec![(
+                "primary".to_string(),
+                vec![("m".to_string(), MockLlmProvider::new())],
+            )],
+            60,
+            FakeClock::new(),
+        );
+        let agent = AgentLoop::new(
+            memory,
+            MockSearchBackend::new(),
+            router,
+            MockRepoStateProbe::new(),
+            AgentSettings::default(),
+            CacheSettings::default(),
+        );
+        let query = ExplorationQuery {
+            text: "decide_freshness".to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let got = agent.run(&PathBuf::from("/repo"), &query).await.unwrap();
+        assert!(
+            got.summary.contains("memory index could not be refreshed"),
+            "early-exit summary must surface the index-freshness note: {}",
+            got.summary
+        );
     }
 
     #[tokio::test]
@@ -773,6 +985,42 @@ mod tests {
             .cache_for(Some(&fp))
             .and_then(|(cache, _)| cache.get_tool(&key));
         assert!(cached.is_none(), "a failed tool call must not be memoized");
+    }
+
+    #[test]
+    fn accumulate_keeps_distinct_unknown_location_findings_separate() {
+        // Regression: accumulate's dedup key must match render::dedupe_key's
+        // note-based disambiguation at the "unknown location" (0, 0)
+        // sentinel, or two genuinely distinct same-file findings that only
+        // lack line info collide and the second is silently dropped before
+        // finalize()'s later, note-aware dedup ever sees it.
+        let mut findings = Vec::new();
+        let mut seen = HashSet::new();
+        let foo = ExplorationFinding {
+            location: FileLocation {
+                path: PathBuf::from("a.rs"),
+                line_start: 0,
+                line_end: 0,
+            },
+            snippet: None,
+            note: Some("Foo".to_string()),
+        };
+        let bar = ExplorationFinding {
+            location: foo.location.clone(),
+            snippet: None,
+            note: Some("Bar".to_string()),
+        };
+        accumulate(&mut findings, &mut seen, foo.clone());
+        accumulate(&mut findings, &mut seen, bar);
+        assert_eq!(
+            findings.len(),
+            2,
+            "distinct notes at the unknown-location sentinel must not collide"
+        );
+
+        // True duplicates (same location AND note) must still collapse.
+        accumulate(&mut findings, &mut seen, foo);
+        assert_eq!(findings.len(), 2, "a true duplicate must still be dropped");
     }
 
     #[test]

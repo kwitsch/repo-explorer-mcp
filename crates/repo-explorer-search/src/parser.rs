@@ -3,9 +3,13 @@
 //! `parse_rtk` reads the fixed `rtk rg -H -n` line grammar (`path:line:content`
 //! for matches, `path-line-content` for context). It is tolerant of malformed
 //! individual rows (skip, not fatal) and saturates `u64`->`u32` line numbers
-//! (never a bare `as` cast).
+//! (never a bare `as` cast). The one row it does *not* tolerate is rtk's own
+//! truncation-footer line (see `is_truncation_marker`): that line is proof rtk
+//! silently dropped real matches for a file, so it is a decode error, not a
+//! skippable row.
 
 use repo_explorer_core::domain::{ExplorationFinding, FileLocation, saturate_u32};
+use repo_explorer_core::search::SearchError;
 use std::path::PathBuf;
 
 /// Find the leftmost *plausible* `<sep><digits><sep>` run for one separator
@@ -94,9 +98,9 @@ fn find_sep_run(bytes: &[u8], sep: u8, start: usize, end: usize) -> Option<(usiz
 /// `src/log.rs-69-status:42:ok`) sits after a path that already carries its
 /// own extension (`.rs`), while an extension-less file's trailing segment
 /// (`fix` in `issue-42-fix`) sits after a path prefix (`issue`) with none.
-/// So a bare-letters trailing token (`trailing_token_is_bare_word`) only
-/// flips the verdict to `:` when the path before the dash run also has no
-/// `.` anywhere.
+/// So a bare-letters trailing token (`token_is_bare_word`) only flips the
+/// verdict to `:` when the path before the dash run also has no `.`
+/// anywhere.
 fn trailing_token(bytes: &[u8], start: usize, end: usize) -> &[u8] {
     let span = &bytes[start..end];
     let token_start = span
@@ -106,15 +110,24 @@ fn trailing_token(bytes: &[u8], start: usize, end: usize) -> &[u8] {
     &span[token_start..]
 }
 
-fn trailing_token_has_extension(bytes: &[u8], start: usize, end: usize) -> bool {
-    let token = trailing_token(bytes, start, end);
+fn token_has_extension(token: &[u8]) -> bool {
     match token.iter().rposition(|&b| b == b'.') {
         Some(dot) => {
             let ext = &token[dot + 1..];
-            !ext.is_empty() && ext.iter().all(u8::is_ascii_alphabetic)
+            // Alphanumeric (not just alphabetic) so digit-bearing real
+            // extensions (`mp3`, `mp4`, `m4a`, `h5`, `json5`, `utf8`) count;
+            // still require at least one letter so a bare numeric suffix
+            // (ambiguous with a line number) isn't mistaken for one.
+            !ext.is_empty()
+                && ext.iter().all(u8::is_ascii_alphanumeric)
+                && ext.iter().any(u8::is_ascii_alphabetic)
         }
         None => false,
     }
+}
+
+fn trailing_token_has_extension(bytes: &[u8], start: usize, end: usize) -> bool {
+    token_has_extension(trailing_token(bytes, start, end))
 }
 
 /// True when the trailing token (see `trailing_token`) is a non-empty run of
@@ -126,36 +139,114 @@ fn trailing_token_has_extension(bytes: &[u8], start: usize, end: usize) -> bool 
 /// dash-delimited content -- so `split_grep_line` only acts on it once the
 /// path *before* the dash run also carries no extension of its own (see
 /// there for why).
-fn trailing_token_is_bare_word(bytes: &[u8], start: usize, end: usize) -> bool {
-    let token = trailing_token(bytes, start, end);
+fn token_is_bare_word(token: &[u8]) -> bool {
     !token.is_empty() && token.iter().all(u8::is_ascii_alphabetic)
 }
 
-/// Starting from the leftmost plausible `-N-` run, walk every later `-N-`
-/// run on the line and adopt one as the new candidate whenever the token
-/// immediately before it (back to the last whitespace, or to the prior run
-/// examined) ends in a plausible extension, marking a real file extension --
-/// the same disambiguation `split_grep_line` applies once between a dash run
-/// and a colon run, generalized to walk past every such run on a pure
-/// dash-delimited (no colon) line. The scan position advances past every run
-/// examined regardless of whether it was adopted, so a run whose preceding
-/// token has no extension (a coincidental in-path `-N-` segment) is skipped
-/// over rather than ending the walk -- needed for a path with two or more
-/// such segments before its extension, e.g.
-/// `component-1-item-2-view.tsx-45-body`, where neither the coincidental
-/// `-1-` nor `-2-` run has an extension-bearing token before it, but the
-/// real `-45-` separator further right (preceded by `view.tsx`) does; ending
-/// the walk at the first non-extension run would wrongly settle on `-1-`.
+/// Starting from the leftmost plausible `-N-` run, walk later `-N-` runs on
+/// the line and adopt the first one found whose token immediately before it
+/// (back to the last whitespace, or to the prior run examined) ends in a
+/// plausible extension, marking a real file extension -- the same
+/// disambiguation `split_grep_line` applies once between a dash run and a
+/// colon run, generalized to walk past every such run on a pure
+/// dash-delimited (no colon) line. A run whose preceding token has no
+/// extension (a coincidental in-path `-N-` segment) is skipped over rather
+/// than ending the walk -- needed for a path with two or more such segments
+/// before its extension, e.g. `component-1-item-2-view.tsx-45-body`, where
+/// neither the coincidental `-1-` nor `-2-` run has an extension-bearing
+/// token before it, but the real `-45-` separator further right (preceded by
+/// `view.tsx`) does; ending the walk at the first non-extension run would
+/// wrongly settle on `-1-`.
+///
+/// Once a run *is* adopted, though, that's the genuine path/line separator
+/// and the walk stops right there instead of continuing into the content
+/// that follows it: that content can itself contain a coincidental
+/// extension-shaped token immediately before a later `-N-` run (e.g. a
+/// mentioned filename like `see other.log-42-more`, or `readme.md-20-line`),
+/// which would otherwise be misadopted as a "more real" separator and
+/// corrupt the path/line/content split. The same reasoning applies to the
+/// leftmost run itself: if the token before *it* already looks like a real
+/// extension (e.g. `src/log.rs-69-...`, where `log.rs` precedes `-69-`), it
+/// is already the genuine separator and the walk never starts.
+///
+/// The walk is bounded to the first whitespace byte at or after the
+/// leftmost candidate run's own end -- not the line's first whitespace
+/// overall, since a real path can itself contain a space (e.g.
+/// `my issue-42-notes-7-done` for the extensionless file `my issue-42-notes`
+/// at line 7; bounding from byte 0 would stop at the space inside `my
+/// issue`, before the walk even starts, and wrongly return the coincidental
+/// `-42-` run untouched). Any `-N-` run at or after that bound is definitely
+/// inside free-text content, not a candidate separator at all -- e.g.
+/// `README-1-see item-2-here`: the coincidental `-2-` run sits inside
+/// `item-2-here`, which only appears after the space following `see`, so it
+/// is never even examined and the genuine `-1-` run is returned untouched.
+///
+/// If the walk exhausts every later in-bound run without any preceding
+/// token ever looking extension-shaped, the *last* run examined is
+/// returned rather than `first`: within the whitespace-bounded path region
+/// a later run is always at least as plausible as an earlier one (neither
+/// has positive extension evidence, so position is the only signal left,
+/// and the separator is what immediately precedes the content that
+/// follows it) -- e.g. `issue-42-fix-1-line one context`: both `-42-` and
+/// `-1-` sit before the line's first whitespace (inside "line one
+/// context"), so both are in-bound candidates, and `-1-` (examined last)
+/// is the genuine separator, not the coincidental `-42-` inside the file
+/// name.
+///
+/// The whitespace bound alone isn't enough, though: whitespace-free content
+/// (e.g. `see10.rs-99-x` in `notes-1-see10.rs-99-x`, the content for the
+/// extensionless file `notes` at line 1) can itself contain a `-N-` run
+/// whose preceding token happens to look extension-shaped (`see10.rs`), and
+/// with no whitespace to stop it the walk would misadopt that coincidental
+/// run instead of returning `first`. So the walk is *also* bounded to the
+/// first digit that doesn't open a `-N-` run (isn't immediately preceded by
+/// `-`, see `first_stray_digit`): every genuine candidate's digits are
+/// already required to start right after a `-` by `find_sep_run` itself, so
+/// a digit that doesn't is proof free-text content has started, and nothing
+/// at or beyond it -- however extension-shaped -- is a real candidate.
 fn resolve_dash_sep_run(bytes: &[u8], first: (usize, usize)) -> (usize, usize) {
+    if trailing_token_has_extension(bytes, 0, first.0) {
+        return first;
+    }
     let mut candidate = first;
     let mut cursor = first.1 + 1;
-    while let Some(next) = find_sep_run(bytes, b'-', cursor, bytes.len()) {
+    let ws_bound = bytes[cursor..]
+        .iter()
+        .position(u8::is_ascii_whitespace)
+        .map_or(bytes.len(), |p| cursor + p);
+    let bound = first_stray_digit(bytes, cursor, ws_bound).unwrap_or(ws_bound);
+    while let Some(next) = find_sep_run(bytes, b'-', cursor, bound) {
+        candidate = next;
         if trailing_token_has_extension(bytes, cursor, next.0) {
-            candidate = next;
+            return next;
         }
         cursor = next.1 + 1;
     }
     candidate
+}
+
+/// Position of the first digit in `bytes[start..end]` that does not open a
+/// legitimate `-N-` run, i.e. isn't immediately preceded by `-` (a digit
+/// mid-run, like the `5` in `-45-`, doesn't count as its own start). Such a
+/// digit can only come from free-text content -- a mentioned line number,
+/// timestamp, or version string -- never from a real separator candidate,
+/// since `find_sep_run` itself requires every candidate's digit span to
+/// begin right after a `-`.
+fn first_stray_digit(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+    let mut i = start;
+    while i < end {
+        if bytes[i].is_ascii_digit() {
+            if i == 0 || bytes[i - 1] != b'-' {
+                return Some(i);
+            }
+            while i < end && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    None
 }
 
 fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
@@ -167,10 +258,18 @@ fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
     let dash = find_sep_run(bytes, b'-', 0, dash_end);
     let (sep, i, j) = match (colon, dash) {
         (Some(c), Some(d))
-            if d.0 < c.0
-                && !trailing_token_has_extension(bytes, d.1 + 1, c.0)
-                && !(trailing_token_is_bare_word(bytes, d.1 + 1, c.0)
-                    && !bytes[..d.0].contains(&b'.')) =>
+            if d.0 < c.0 && {
+                // Computed once and reused by both checks below instead of
+                // each re-deriving the same trailing_token(bytes, d.1+1, c.0).
+                let token = trailing_token(bytes, d.1 + 1, c.0);
+                // Strip a leading `./` before checking for an extension dot: it's
+                // the tools' relative-prefix marker, not evidence of a real
+                // extension elsewhere in the path (see `split_grep_line_handles_*`
+                // extensionless-path tests with a `./` prefix).
+                let prefix = bytes[..d.0].strip_prefix(b"./").unwrap_or(&bytes[..d.0]);
+                !token_has_extension(token)
+                    && !(token_is_bare_word(token) && !prefix.contains(&b'.'))
+            } =>
         {
             let d = resolve_dash_sep_run(bytes, d);
             (b'-', d.0, d.1)
@@ -254,13 +353,47 @@ fn handle_context_line(
     }
 }
 
+/// True for either of rtk's own truncation-footer lines: the per-file footer,
+/// e.g. `  +35 more in many.txt [see remaining: tail -n +26
+/// ~/.local/share/rtk/tee/....log]`, emitted in place of a file's remaining
+/// match lines once its real match count exceeds rtk's undocumented,
+/// non-configurable per-file cap; and the whole-files-skipped footer, e.g.
+/// `+21 more files [see remaining: tail -n +1
+/// ~/.local/share/rtk/tee/..._grep_skipped.log]`, emitted once the number of
+/// matching files exceeds rtk's separate, also non-configurable total-files
+/// cap -- dropping entire files' worth of matches that never appear in stdout
+/// at all. Neither shape matches `split_grep_line`'s `path:line:content` /
+/// `path-line-content` grammar (no plausible `<sep><digits><sep>` run exists
+/// in either), so both must be recognized explicitly -- see `parse_rtk` for
+/// why silently falling through to its catch-all `None` arm, as for ordinary
+/// unparsable garbage, is wrong here specifically: unlike garbage, these
+/// lines are proof that real matches were dropped before `parse_rtk` ever saw
+/// them.
+fn is_truncation_marker(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix('+') else {
+        return false;
+    };
+    let digits_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    digits_end > 0
+        && (rest[digits_end..].starts_with(" more in ")
+            || rest[digits_end..].starts_with(" more files "))
+}
+
 /// Parse `rtk rg -H -n` output. Each match line becomes one finding. A context
 /// line before any group boundary (`--`) appends to the previous finding's
 /// snippet; a context line after a boundary -- including before the very
 /// first match, since the stream starts at a boundary -- is buffered and
 /// prepended to the next finding instead, since it leads that match rather
 /// than trailing the one before the boundary.
-pub(crate) fn parse_rtk(stdout: &str) -> Vec<ExplorationFinding> {
+///
+/// Errors with `SearchError::Decode` the moment a truncation-footer line (see
+/// `is_truncation_marker`) is seen: that line means rtk itself dropped real
+/// matches for a file, so the findings collected so far (from this file and
+/// any other) are known-incomplete and must not be reported as a complete,
+/// silent `Ok` result.
+pub(crate) fn parse_rtk(stdout: &str) -> Result<Vec<ExplorationFinding>, SearchError> {
     let mut findings: Vec<ExplorationFinding> = Vec::new();
     let mut pending_before: Vec<String> = Vec::new();
     // Starts true: any context before the first match in the whole stream is
@@ -274,6 +407,12 @@ pub(crate) fn parse_rtk(stdout: &str) -> Vec<ExplorationFinding> {
             at_boundary = true;
             continue;
         }
+        if is_truncation_marker(line) {
+            return Err(SearchError::Decode {
+                backend: "rtk",
+                message: format!("rtk truncated its own results and dropped matches: {line}"),
+            });
+        }
         match split_grep_line(line) {
             Some((path, num, content, true)) => {
                 push_finding(&mut findings, &mut pending_before, path, num, Some(content));
@@ -285,7 +424,7 @@ pub(crate) fn parse_rtk(stdout: &str) -> Vec<ExplorationFinding> {
             None => {}
         }
     }
-    findings
+    Ok(findings)
 }
 
 #[cfg(test)]
@@ -303,7 +442,7 @@ mod tests {
 
     #[test]
     fn parse_rtk_extracts_matches_and_appends_context() {
-        let findings = parse_rtk(&fixture("rtk_rg_output.txt"));
+        let findings = parse_rtk(&fixture("rtk_rg_output.txt")).unwrap();
         // Two match lines (70, 71); the leading context line (69), coming
         // before any "--" boundary, is prepended as findings[0]'s leading
         // context, and the trailing context line (72) appends to 71.
@@ -329,10 +468,89 @@ mod tests {
     #[test]
     fn parse_rtk_skips_group_separators_and_garbage() {
         let input = "--\nnotavalidline\nsrc/x.rs:5:hello\n";
-        let findings = parse_rtk(input);
+        let findings = parse_rtk(input).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].location.line_start, 5);
         assert_eq!(findings[0].snippet.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn parse_rtk_errors_on_truncation_footer() {
+        // Real rtk shape: a header, 25 real match rows (elided here), then a
+        // footer in place of the remaining rows once a file's match count
+        // exceeds rtk's internal per-file cap. The footer must not be
+        // silently dropped like ordinary garbage -- it is proof matches were
+        // lost, so it must surface as an error instead of a falsely-complete
+        // `Ok` result.
+        let input = "60 matches in 1 files:\nmany.txt:1:needle\n  +35 more in many.txt [see remaining: tail -n +26 ~/.local/share/rtk/tee/x.log]\n";
+        let err = parse_rtk(input).unwrap_err();
+        assert_eq!(
+            err,
+            SearchError::Decode {
+                backend: "rtk",
+                message: "rtk truncated its own results and dropped matches:   \
+                          +35 more in many.txt [see remaining: tail -n +26 ~/.local/share/rtk/tee/x.log]"
+                    .to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_rtk_errors_on_files_skipped_footer() {
+        // Real rtk shape: a header, real match rows across many files
+        // (elided here), then a second, distinct footer -- once the number
+        // of matching files exceeds rtk's separate total-files cap -- that
+        // drops entire files' worth of matches never shown in stdout at all.
+        // This must surface as an error just like the per-file footer above,
+        // not fall through to the catch-all `None` arm as ordinary garbage.
+        let input = "many.txt:1:needle\n+21 more files [see remaining: tail -n +1 ~/.local/share/rtk/tee/x_skipped.log]\n";
+        let err = parse_rtk(input).unwrap_err();
+        assert_eq!(
+            err,
+            SearchError::Decode {
+                backend: "rtk",
+                message: "rtk truncated its own results and dropped matches: +21 more files \
+                          [see remaining: tail -n +1 ~/.local/share/rtk/tee/x_skipped.log]"
+                    .to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn is_truncation_marker_matches_rtk_footer_shape() {
+        assert!(is_truncation_marker(
+            "  +35 more in many.txt [see remaining: tail -n +26 ~/x.log]"
+        ));
+        assert!(is_truncation_marker("+1 more in a.rs"));
+    }
+
+    #[test]
+    fn is_truncation_marker_matches_rtk_files_skipped_footer_shape() {
+        // rtk's separate, total-files cap footer -- distinct from the
+        // per-file `+N more in <file>` footer above -- drops entire files'
+        // worth of matches and must be recognized too.
+        assert!(is_truncation_marker(
+            "+21 more files [see remaining: tail -n +1 ~/.local/share/rtk/tee/x_skipped.log]"
+        ));
+        assert!(is_truncation_marker("+1 more files [see remaining: x]"));
+    }
+
+    #[test]
+    fn is_truncation_marker_rejects_non_footer_lines() {
+        // The summary header shares the digits-then-word shape but not the
+        // `+N more in ` prefix, and must stay a tolerated, skippable row.
+        assert!(!is_truncation_marker("60 matches in 1 files:"));
+        assert!(!is_truncation_marker("src/x.rs:5:hello"));
+        assert!(!is_truncation_marker(""));
+        assert!(!is_truncation_marker("notavalidline"));
+        // A `+`-prefixed content line whose digits aren't followed by the
+        // exact `" more in "` marker must not false-positive.
+        assert!(!is_truncation_marker("+35 more info"));
+        assert!(!is_truncation_marker("+more in x.rs"));
+        // Same for the `" more files "` marker: a merely similar word must
+        // not false-positive.
+        assert!(!is_truncation_marker("+21 more filesystems"));
+        assert!(!is_truncation_marker("+more files x"));
     }
 
     #[test]
@@ -365,6 +583,84 @@ mod tests {
     }
 
     #[test]
+    fn split_grep_line_handles_extensionless_file_in_context_line() {
+        // No colon anywhere (a context row) and the file itself has no
+        // extension, so no run's preceding token is ever extension-shaped.
+        // Both `-42-` (coincidental, inside the file name) and `-1-` (the
+        // genuine separator) sit before the line's first whitespace, so both
+        // are in-bound candidates; the genuine one is the one examined last,
+        // immediately before the real content (`line one context`) begins.
+        let result = split_grep_line("./issue-42-fix-1-line one context");
+        assert_eq!(
+            result,
+            Some(("./issue-42-fix", 1, "line one context", false))
+        );
+    }
+
+    #[test]
+    fn split_grep_line_handles_extensionless_file_with_coincidental_dash_run_in_content() {
+        // No colon anywhere and the file (`README`) has no extension. The
+        // coincidental `-2-` run sits inside `item-2-here`, which only
+        // appears after the space following `see` -- past the walk's
+        // whitespace bound -- so it is never even examined, and the
+        // genuine, leftmost `-1-` separator is returned untouched.
+        let result = split_grep_line("README-1-see item-2-here");
+        assert_eq!(result, Some(("README", 1, "see item-2-here", false)));
+
+        // Same shape, but the extensionless path itself also contains a
+        // (non-digit) dash (`run-tests`), and both `-3-` and the coincidental
+        // `-2-` inside `step-2-verify output` sit before the line's first
+        // whitespace (between "verify" and "output") -- so, unlike the
+        // README case above, the whitespace bound alone can't rule `-2-`
+        // out. With no extension evidence to prefer one over the other
+        // either, this specific shape is genuinely ambiguous from the bytes
+        // alone (`run-tests` at line 3 vs. `run-tests-3-step` at line 2 are
+        // both equally plausible extensionless file names) -- this pins
+        // down the walk's actual, deterministic choice (the run examined
+        // last within bounds) rather than asserting one reading is somehow
+        // provably correct.
+        let result = split_grep_line("run-tests-3-step-2-verify output");
+        assert_eq!(
+            result,
+            Some(("run-tests-3-step", 2, "verify output", false))
+        );
+    }
+
+    #[test]
+    fn split_grep_line_handles_extensionless_path_containing_whitespace() {
+        // No colon anywhere and the extensionless file's own name contains a
+        // space (`my issue-42-notes`). The whitespace bound must be measured
+        // from the leftmost candidate run's end onward, not from the start
+        // of the line -- bounding from byte 0 would land on the space inside
+        // `my issue`, before the walk even starts, and wrongly return the
+        // coincidental `-42-` run untouched instead of walking on to the
+        // genuine `-7-` separator.
+        let result = split_grep_line("my issue-42-notes-7-done");
+        assert_eq!(result, Some(("my issue-42-notes", 7, "done", false)));
+    }
+
+    #[test]
+    fn split_grep_line_handles_digit_bearing_extension_in_context_line() {
+        // `token_has_extension` must recognize real extensions containing
+        // digits (mp3, mp4, ...), not just alphabetic ones -- otherwise
+        // `song.mp3` isn't recognized as already having its genuine
+        // extension, and the walk keeps going past the real `-5-` separator
+        // to the coincidental `-20-` run inside the trailing content.
+        let result = split_grep_line("song.mp3-5-readme.md-20-line");
+        assert_eq!(result, Some(("song.mp3", 5, "readme.md-20-line", false)));
+    }
+
+    #[test]
+    fn split_grep_line_handles_digit_bearing_extension_in_match_line() {
+        // Same fix, but for a match line (colon-separated) where the
+        // coincidental dash-numbered segment precedes the digit-bearing
+        // extension: `clip-3-video.mp4` must be recognized as one filename,
+        // not split at the coincidental `-3-` run.
+        let result = split_grep_line("clip-3-video.mp4:10:content");
+        assert_eq!(result, Some(("clip-3-video.mp4", 10, "content", true)));
+    }
+
+    #[test]
     fn split_grep_line_handles_unpadded_dash_numbered_path() {
         // The `-42-` run inside the file name (unpadded, so not caught by the
         // zero-padding check) must not be mistaken for the real `:10:` match
@@ -381,6 +677,17 @@ mod tests {
         // `-42-` run must still lose to the real `:10:` match separator.
         let result = split_grep_line("issue-42-fix:10:the fix");
         assert_eq!(result, Some(("issue-42-fix", 10, "the fix", true)));
+    }
+
+    #[test]
+    fn split_grep_line_handles_unpadded_dash_numbered_extensionless_path_with_relative_prefix() {
+        // Same shape as above, but with the `./` relative prefix these tools
+        // always print (target is always `.`, see backend.rs). The leading
+        // `.` in `./` must not be mistaken for a real extension dot earlier
+        // in the path, or the `-42-` run wrongly wins over the real `:10:`
+        // match separator.
+        let result = split_grep_line("./issue-42-fix:10:the fix");
+        assert_eq!(result, Some(("./issue-42-fix", 10, "the fix", true)));
     }
 
     #[test]
@@ -476,5 +783,48 @@ mod tests {
             result,
             Some(("component-1-item-2-view.tsx", 45, "body", false))
         );
+    }
+
+    #[test]
+    fn split_grep_line_handles_extension_shaped_token_in_content_after_dash_separator() {
+        // The genuine `-10-` separator is directly preceded by an
+        // extension-bearing path (`foo.rs`), so it must be adopted
+        // immediately rather than walked past into the content, where the
+        // coincidental `-20-` run (preceded by the extension-shaped
+        // `readme.md`) must not be mistaken for a "more real" separator.
+        let result = split_grep_line("foo.rs-10-see readme.md-20-line");
+        assert_eq!(result, Some(("foo.rs", 10, "see readme.md-20-line", false)));
+
+        let result = split_grep_line("src/parser.rs-10-see utils.rs-20-also");
+        assert_eq!(
+            result,
+            Some(("src/parser.rs", 10, "see utils.rs-20-also", false))
+        );
+
+        let result = split_grep_line("src/log.rs-69-see other.log-42-more text");
+        assert_eq!(
+            result,
+            Some(("src/log.rs", 69, "see other.log-42-more text", false))
+        );
+    }
+
+    #[test]
+    fn split_grep_line_handles_extension_shaped_token_reached_via_stray_digit() {
+        // No whitespace anywhere, so the whitespace bound alone can't stop
+        // the walk before the coincidental `-99-` run, whose preceding token
+        // (`see10.rs`) happens to look extension-shaped. The `10` in that
+        // token isn't preceded by `-`, though, so it's a stray digit that
+        // marks the start of free-text content -- the walk must stop there
+        // and return the genuine, leftmost `-1-` separator for the
+        // extensionless file `notes`, not misadopt `-99-`.
+        let result = split_grep_line("notes-1-see10.rs-99-x");
+        assert_eq!(result, Some(("notes", 1, "see10.rs-99-x", false)));
+
+        // Same shape, but with a colon-bearing timestamp inside the content
+        // too, so the split_grep_line's mixed dash/colon guard picks the
+        // dash branch before resolve_dash_sep_run ever gets involved -- the
+        // stray-digit bound must still stop it at the genuine `-1-` run.
+        let result = split_grep_line("notes-1-see10:20:file.rs-99-x");
+        assert_eq!(result, Some(("notes", 1, "see10:20:file.rs-99-x", false)));
     }
 }

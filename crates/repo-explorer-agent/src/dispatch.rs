@@ -12,11 +12,19 @@ use repo_explorer_core::memory::{GraphQuery, MemoryBackend, SnippetTarget};
 use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use std::path::{Component, Path, PathBuf};
 
+use crate::pipeline::file_glob_for;
 use crate::render::{RenderCaps, cap_file_lines, render_findings, render_result};
 use crate::tools::{
     GetArchitectureArgs, GetCodeSnippetArgs, PatternArgs, QueryGraphArgs, ReadFileArgs,
     SearchCodeArgs, SearchGraphArgs, TracePathArgs,
 };
+
+/// `SearchBackend` has no dedicated filename-search capability; this pattern
+/// stands in for one by matching any non-empty line, so a search restricted
+/// via `file_glob`/`scope` degenerates into "does this file exist". Shared
+/// with `pipeline`'s file-lookup retrieval leg, which approximates the same
+/// capability the same way.
+pub(crate) const MATCH_ANY_NON_EMPTY_LINE: &str = ".";
 
 /// Dispatch a single non-`finish` tool call, returning the `Role::Tool` message
 /// to push and any findings to accumulate. Test-only: production dispatch goes
@@ -50,18 +58,29 @@ pub(crate) async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
     match call.name.as_str() {
         "search_code" => {
             let args: SearchCodeArgs = parse_args(&call.arguments_json)?;
+            let scope_hint = args
+                .scope_hint
+                .as_deref()
+                .map(|s| reject_escaping_path("scope_hint", s))
+                .transpose()?;
             let query = ExplorationQuery {
                 text: args.query,
-                scope_hint: args.scope_hint.map(PathBuf::from),
+                scope_hint,
                 max_results: args.max_results,
             };
             call_and_render("search_code", memory.search_code(repo_root, &query), caps).await
         }
         "search_graph" => {
             let args: SearchGraphArgs = parse_args(&call.arguments_json)?;
+            let file_pattern = args
+                .file_pattern
+                .as_deref()
+                .map(|s| reject_escaping_path("file_pattern", s))
+                .transpose()?
+                .map(|p| p.to_string_lossy().into_owned());
             let query = GraphQuery {
                 name_pattern: args.name_pattern,
-                file_pattern: args.file_pattern,
+                file_pattern,
                 label: args.label,
                 max_results: args.max_results,
             };
@@ -78,9 +97,11 @@ pub(crate) async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
         }
         "trace_path" => {
             let args: TracePathArgs = parse_args(&call.arguments_json)?;
+            // No `to` arg to pass on: the connected backend has no
+            // two-endpoint concept and ignores it (see MemoryBackend::trace_path).
             call_and_render(
                 "trace_path",
-                memory.trace_path(repo_root, &args.from, &args.to, args.max_depth),
+                memory.trace_path(repo_root, &args.from, "", args.max_depth),
                 caps,
             )
             .await
@@ -96,7 +117,7 @@ pub(crate) async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
         }
         "get_code_snippet" => {
             let args: GetCodeSnippetArgs = parse_args(&call.arguments_json)?;
-            let target = snippet_target(args)?;
+            let target = snippet_target(args);
             call_and_render(
                 "get_code_snippet",
                 memory.get_code_snippet(repo_root, &target),
@@ -109,9 +130,11 @@ pub(crate) async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
             // `find` has no dedicated backend capability: the real
             // `SearchBackend` only exposes a content search, so a filename
             // search is approximated by matching any non-empty line (pattern
-            // `.`) restricted to files matching `pattern` as a glob.
+            // `.`) restricted to files matching `pattern` as a glob — run
+            // through `file_glob_for` so a bare, extension-less pattern still
+            // matches a basename instead of only an exact filename.
             let (pattern, file_glob) = if name == "find" {
-                (".", Some(args.pattern))
+                (MATCH_ANY_NON_EMPTY_LINE, Some(file_glob_for(&args.pattern)))
             } else {
                 (args.pattern.as_str(), None)
             };
@@ -129,7 +152,7 @@ pub(crate) async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
         }
         "read_file" => {
             let args: ReadFileArgs = parse_args(&call.arguments_json)?;
-            let content = read_file(repo_root, &args.path, args.start_line, args.end_line)?;
+            let content = read_file(repo_root, &args.path, args.start_line, args.end_line).await?;
             Ok((
                 cap_file_lines(content, caps.read_file_max_lines),
                 Vec::new(),
@@ -156,37 +179,31 @@ pub(crate) fn parse_args<T: serde::de::DeserializeOwned>(json: &str) -> Result<T
     serde_json::from_str(json).map_err(|e| format!("invalid arguments: {e}"))
 }
 
-fn snippet_target(args: GetCodeSnippetArgs) -> Result<SnippetTarget, String> {
-    if let Some(name) = args.qualified_name {
-        Ok(SnippetTarget::QualifiedName(name))
-    } else if let Some(file) = args.file {
-        Ok(SnippetTarget::FileRange {
-            file: PathBuf::from(file),
-            start_line: args.start_line,
-            end_line: args.end_line,
-        })
-    } else {
-        Err("get_code_snippet requires either qualified_name or file".to_string())
-    }
+fn snippet_target(args: GetCodeSnippetArgs) -> SnippetTarget {
+    SnippetTarget::QualifiedName(args.qualified_name)
 }
 
-/// The one lexical "stays inside the repository" check: reject a
-/// model-supplied path that is absolute, walks out via a `..` component, or
-/// (on Windows) names a drive via a prefix component — `Component::Prefix`
-/// also catches a drive-relative path like `C:foo`, which is neither
-/// `is_absolute()` nor `has_root()` since it resolves against that drive's
-/// own current directory rather than `repo_root`.
+/// The one lexical "stays inside the repository" check: true if `path` is
+/// absolute, walks out via a `..` component, or (on Windows) names a drive
+/// via a prefix component — `Component::Prefix` also catches a drive-relative
+/// path like `C:foo`, which is neither `is_absolute()` nor `has_root()` since
+/// it resolves against that drive's own current directory rather than
+/// `repo_root`. Shared with `pipeline`'s top-level query `scope_hint` check so
+/// the two call sites can't drift apart on what counts as an escape.
+pub(crate) fn escapes_repo_root(path: &Path) -> bool {
+    path.has_root()
+        || path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+}
+
+/// [`escapes_repo_root`] plus error formatting for a model-supplied path.
 /// `label` names the offending input in the error (`scope`, `read_file path`).
 /// `read_file` additionally verifies the *resolved* path; a `SearchBackend`
 /// scope is only checked lexically because it need not exist yet.
 fn reject_escaping_path(label: &str, raw: &str) -> Result<PathBuf, String> {
     let rel = Path::new(raw);
-    if rel.is_absolute()
-        || rel.has_root()
-        || rel
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
-    {
+    if escapes_repo_root(rel) {
         return Err(format!("{label} `{raw}` escapes the repository root"));
     }
     Ok(rel.to_path_buf())
@@ -198,26 +215,68 @@ fn validate_scope(scope: Option<&str>) -> Result<Option<PathBuf>, String> {
     scope.map(|s| reject_escaping_path("scope", s)).transpose()
 }
 
-/// Also used directly by the verification stage's `expand` handler.
-pub(crate) fn read_file(
+/// Resolve `repo_root` to its canonical form, off the async runtime thread
+/// (`std::fs::canonicalize` runs via `spawn_blocking`, like the identical
+/// syscall in `repo-explorer-memory`'s `canonicalize_repo_root`) so a slow
+/// syscall never stalls the worker thread running other tool-call futures
+/// batched alongside it. Callers that read several files against the same
+/// root in a loop — e.g. verify's `expand_content`, which batches a whole
+/// `expand` call's candidate ids — should call this once and reuse the
+/// result via [`read_file_canonical`] instead of re-canonicalizing
+/// `repo_root` per file.
+pub(crate) async fn canonical_repo_root(repo_root: &Path) -> Result<PathBuf, String> {
+    let owned = repo_root.to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::canonicalize(&owned))
+        .await
+        .map_err(|e| format!("failed to resolve repo root: {e}"))?
+        .map_err(|e| format!("failed to resolve repo root: {e}"))
+}
+
+/// Single-file convenience over [`canonical_repo_root`] + [`read_file_canonical`];
+/// used by the `read_file` tool dispatch, which only ever reads one file per call.
+/// Runs the lexical escape check before resolving `repo_root` so a malformed
+/// `path` is rejected fast, without depending on `repo_root` existing on disk.
+pub(crate) async fn read_file(
     repo_root: &Path,
+    path: &str,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+) -> Result<String, String> {
+    reject_escaping_path("read_file path", path)?;
+    let canonical_root = canonical_repo_root(repo_root).await?;
+    read_file_canonical(repo_root, &canonical_root, path, start_line, end_line).await
+}
+
+/// [`read_file`] taking an already-canonicalized `repo_root`. Also used
+/// directly by the verification stage's `expand` handler, which resolves
+/// `repo_root` once per batch via [`canonical_repo_root`]. The resolve-and-read
+/// (`canonicalize` + `read_to_string`) both run inside one `spawn_blocking`
+/// so neither blocking syscall runs on the async runtime thread — see
+/// [`canonical_repo_root`].
+pub(crate) async fn read_file_canonical(
+    repo_root: &Path,
+    canonical_root: &Path,
     path: &str,
     start_line: Option<u32>,
     end_line: Option<u32>,
 ) -> Result<String, String> {
     let rel = reject_escaping_path("read_file path", path)?;
     let full = repo_root.join(rel);
-    let canonical_full =
-        std::fs::canonicalize(&full).map_err(|e| format!("read_file failed for `{path}`: {e}"))?;
-    let canonical_root = std::fs::canonicalize(repo_root)
-        .map_err(|e| format!("read_file failed for `{path}`: {e}"))?;
-    if !canonical_full.starts_with(&canonical_root) {
-        return Err(format!(
-            "read_file path `{path}` escapes the repository root"
-        ));
-    }
-    let contents = std::fs::read_to_string(&canonical_full)
-        .map_err(|e| format!("read_file failed for `{path}`: {e}"))?;
+    let canonical_root = canonical_root.to_path_buf();
+    let path_owned = path.to_string();
+    let contents = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let canonical_full = std::fs::canonicalize(&full)
+            .map_err(|e| format!("read_file failed for `{path_owned}`: {e}"))?;
+        if !canonical_full.starts_with(&canonical_root) {
+            return Err(format!(
+                "read_file path `{path_owned}` escapes the repository root"
+            ));
+        }
+        std::fs::read_to_string(&canonical_full)
+            .map_err(|e| format!("read_file failed for `{path_owned}`: {e}"))
+    })
+    .await
+    .map_err(|e| format!("read_file failed for `{path}`: internal error: {e}"))??;
     Ok(slice_lines(contents, start_line, end_line))
 }
 
@@ -353,37 +412,11 @@ mod tests {
                 scope,
                 ..
             } => {
-                assert_eq!(pattern, ".");
+                assert_eq!(pattern, MATCH_ANY_NON_EMPTY_LINE);
                 assert_eq!(options.file_glob.as_deref(), Some("*.rs"));
                 assert_eq!(scope, &None);
             }
         }
-    }
-
-    #[tokio::test]
-    async fn get_code_snippet_qualified_name_takes_precedence() {
-        let memory = MockMemoryBackend::new();
-        let root = PathBuf::from("/repo");
-        let c = call(
-            "c4",
-            "get_code_snippet",
-            r#"{"qualified_name":"a::b","file":"x.rs"}"#,
-        );
-        let _ = dispatch_call(
-            &memory,
-            &MockSearchBackend::new(),
-            &root,
-            &c,
-            &RenderCaps::default(),
-        )
-        .await;
-        assert_eq!(
-            memory.calls()[0],
-            MemCall::GetCodeSnippet {
-                repo_root: PathBuf::from("/repo"),
-                target: SnippetTarget::QualifiedName("a::b".to_string()),
-            }
-        );
     }
 
     #[tokio::test]
@@ -515,5 +548,41 @@ mod tests {
         )
         .await;
         assert!(message.content.contains("escapes the repository root"));
+    }
+
+    #[tokio::test]
+    async fn search_code_rejects_escaping_scope_hint() {
+        let memory = MockMemoryBackend::new();
+        let c = call(
+            "c11",
+            "search_code",
+            r#"{"query":"x","scope_hint":"../../../../etc"}"#,
+        );
+        let (message, _) = dispatch_call(
+            &memory,
+            &MockSearchBackend::new(),
+            &PathBuf::from("/repo"),
+            &c,
+            &RenderCaps::default(),
+        )
+        .await;
+        assert!(message.content.contains("escapes the repository root"));
+        assert!(memory.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_graph_rejects_escaping_file_pattern() {
+        let memory = MockMemoryBackend::new();
+        let c = call("c12", "search_graph", r#"{"file_pattern":"/etc"}"#);
+        let (message, _) = dispatch_call(
+            &memory,
+            &MockSearchBackend::new(),
+            &PathBuf::from("/repo"),
+            &c,
+            &RenderCaps::default(),
+        )
+        .await;
+        assert!(message.content.contains("escapes the repository root"));
+        assert!(memory.calls().is_empty());
     }
 }
