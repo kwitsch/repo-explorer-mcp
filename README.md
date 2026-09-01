@@ -5,8 +5,8 @@ transport, shipped for Linux (`x86_64-unknown-linux-gnu`) and Windows
 (`x86_64-pc-windows-msvc`). It drives an internal LLM exploration loop over a
 managed `codebase-memory-mcp` backend and mandatory `rtk` text search — both
 provisioned by `repo-explorer-mcp --update` into a shared per-user bin dir
-(`~/.local/bin` on Linux, `%LOCALAPPDATA%\repo-explorer-mcp` on Windows), never
-a global PATH install.
+(`$XDG_BIN_HOME` if set to an absolute path, else `~/.local/bin`, on Linux;
+`%LOCALAPPDATA%\repo-explorer-mcp` on Windows), never a global PATH install.
 
 ## Install (recommended: npx setup script)
 
@@ -25,18 +25,17 @@ Flags:
 - `--version <x.y.z>` — install a specific release (default: latest).
 - `-h`, `--help` — usage.
 
-The script installs into `~/.local/bin` (Linux) or
-`%LOCALAPPDATA%\repo-explorer-mcp` (Windows). It never edits your shell profile
-or system PATH — it only reports whether the install directory is on PATH.
-`ripgrep` is installed automatically via `apt`/`dnf`/`pacman` on Linux or
-`winget` on Windows; if none of those is available, the script warns and points
-at ripgrep's own install docs instead of installing it itself. ripgrep is
-required only as `rtk`'s own runtime dependency (`rtk rg …` shells out to it),
-not as a repo-explorer-managed binary. `rtk` and `codebase-memory-mcp` are not
-taken from PATH: the installer invokes `repo-explorer-mcp --update` to install
-both as managed per-user copies in the shared bin dir above (best-effort; if that
-step fails, run `repo-explorer-mcp --update` later). `rtk` is mandatory — the
-server refuses to start if it cannot be resolved, pointing you at `--update`.
+The script installs into `$XDG_BIN_HOME` (when set to an absolute path) or
+`~/.local/bin` (Linux), or `%LOCALAPPDATA%\repo-explorer-mcp` (Windows) — the
+same directory `repo-explorer-mcp --update` provisions the managed helpers
+into. It never edits your shell profile or system PATH — it only reports
+whether the install directory is on PATH. `ripgrep` is installed via
+`apt`/`dnf`/`pacman` on Linux or `winget` on Windows when available; when no
+package manager is found, `rg` is instead provisioned on demand (latest GitHub
+release) into the shared bin dir by `repo-explorer-mcp --update`. A system `rg`
+already on PATH is always preferred and left untouched — the managed copy is a
+fallback, created only when none is present.
+`rtk` and `codebase-memory-mcp` are not taken from PATH: the installer invokes `repo-explorer-mcp --update` to install both as managed per-user copies in the shared bin dir above (best-effort; if that step fails, run `repo-explorer-mcp --update` later). `rtk` is mandatory — the server refuses to start if it cannot be resolved, pointing you at `--update`.
 
 ## Install (manual fallback)
 
