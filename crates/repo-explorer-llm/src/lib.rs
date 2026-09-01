@@ -21,8 +21,9 @@ pub(crate) struct GenaiErrorFacts {
     pub message: String,
 }
 
-/// Substrings that indicate quota/billing exhaustion rather than transient rate
-/// limiting, checked (lowercased) when no structured code disambiguates.
+/// Substrings that indicate quota/billing exhaustion rather than transient
+/// rate limiting, checked (lowercased) against the flattened error message —
+/// `genai` exposes no structured error code to disambiguate on instead.
 fn message_indicates_quota(message: &str) -> bool {
     let m = message.to_lowercase();
     m.contains("insufficient_quota")

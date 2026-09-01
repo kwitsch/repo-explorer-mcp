@@ -14,7 +14,7 @@ use repo_explorer_core::memory::{
     GraphQuery, IndexStatus, MemoryBackend, MemoryError, SnippetTarget,
 };
 use serde_json::{Map, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -34,14 +34,19 @@ pub struct MemoryClientBackend {
     /// and every `ensure_fresh_index` call would reindex regardless of the
     /// configured staleness threshold.
     last_reindexed_at: Mutex<Option<SystemTime>>,
-    /// Cache of the project name resolved from `repo_root`. `repo_root` never
-    /// changes across a `MemoryClientBackend`'s lifetime (every query method
-    /// is called with the same value each time), so no key is needed: after
-    /// the first resolution this lets [`Self::cached_project_name`] skip
-    /// `project_name`'s `spawn_blocking` + `fs::canonicalize` round trip on
-    /// every subsequent call — mirrors the `last_reindexed_at`
-    /// single-field-cache pattern above.
-    project_name_cache: Mutex<Option<String>>,
+    /// Cache of the project name resolved from `repo_root`, keyed on the
+    /// `repo_root` it was resolved from. In practice `repo_root` never changes
+    /// across a `MemoryClientBackend`'s lifetime (every query method is called
+    /// with the same value each time), so after the first resolution this
+    /// lets [`Self::cached_project_name`] skip `project_name`'s
+    /// `spawn_blocking` + `fs::canonicalize` round trip on every subsequent
+    /// call — mirrors the `last_reindexed_at` single-field-cache pattern
+    /// above. The key guards that "in practice" is not a compile-time
+    /// guarantee: nothing stops a future caller from driving one instance with
+    /// two different `repo_root` values, and a keyless cache would then
+    /// silently serve the wrong project's cached name instead of
+    /// re-resolving.
+    project_name_cache: Mutex<Option<(PathBuf, String)>>,
 }
 
 impl MemoryClientBackend {
@@ -191,9 +196,10 @@ impl MemoryClientBackend {
     /// duplicate a blocking filesystem syscall for no benefit.
     async fn run_index(&self, abs_repo_root: &Path) -> Result<IndexStatus, MemoryError> {
         let mut args = Map::new();
-        args.insert(
-            "path".to_string(),
-            Value::String(abs_repo_root.to_string_lossy().into_owned()),
+        insert_str(
+            &mut args,
+            "path",
+            abs_repo_root.to_string_lossy().into_owned(),
         );
         match self.client().call("index_repository", args).await {
             Ok(_) => {
@@ -209,17 +215,23 @@ impl MemoryClientBackend {
         }
     }
 
-    /// [`project_name`], but cached: every query method calls this with the
-    /// same, never-changing `repo_root` for the lifetime of this backend, so
-    /// only the first call actually canonicalizes and derives the name —
-    /// later calls return the cached value straight off the lock, with no
-    /// `spawn_blocking` round trip.
+    /// [`project_name`], but cached on `repo_root`: every query method calls
+    /// this with the same, never-changing `repo_root` for the lifetime of
+    /// this backend, so only the first call actually canonicalizes and
+    /// derives the name — later calls return the cached value straight off
+    /// the lock, with no `spawn_blocking` round trip.
     async fn cached_project_name(&self, repo_root: &Path) -> Result<String, MemoryError> {
-        if let Some(name) = self.project_name_cache.lock().unwrap().clone() {
+        if let Some(name) = self
+            .project_name_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|(cached_root, name)| (cached_root == repo_root).then(|| name.clone()))
+        {
             return Ok(name);
         }
         let name = project_name(repo_root).await?;
-        *self.project_name_cache.lock().unwrap() = Some(name.clone());
+        *self.project_name_cache.lock().unwrap() = Some((repo_root.to_path_buf(), name.clone()));
         Ok(name)
     }
 
@@ -835,11 +847,13 @@ impl MemoryBackend for MemoryClientBackend {
         } else {
             ChangeCount::Known(0)
         };
-        // Seed the cache now so the retrieval calls that immediately follow
-        // this in `AgentLoop::run` skip the redundant canonicalize +
-        // project-name round trip on their first call -- moving `project` by
-        // value instead of cloning it, since nothing below needs it anymore.
-        *self.project_name_cache.lock().unwrap() = Some(project);
+        // Seed the cache now, after `project`'s last borrow (keyed on the raw
+        // `repo_root`, same as `cached_project_name` compares against) so the
+        // retrieval calls that immediately follow this in `AgentLoop::run`
+        // skip the redundant canonicalize + project-name round trip on their
+        // first call -- moving `project` by value instead of cloning it, since
+        // nothing below needs it anymore.
+        *self.project_name_cache.lock().unwrap() = Some((repo_root.to_path_buf(), project));
         // Only meaningful once this project has been indexed; irrelevant
         // (and forced to `Reindex` regardless) when `exists` is false.
         let last_indexed_at = if exists {
