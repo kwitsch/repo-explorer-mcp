@@ -30,6 +30,7 @@ impl GitStateProbe {
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: repo_root.to_path_buf(),
             timeout: self.timeout,
+            extra_path_dir: None,
         };
         run(&spec).await.ok()
     }

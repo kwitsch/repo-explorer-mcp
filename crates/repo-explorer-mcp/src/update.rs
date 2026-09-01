@@ -31,7 +31,7 @@ const SELF_REPO: &str = "repo-explorer-mcp";
 /// the npx installer's `installDir()` places the main binary in on each
 /// platform. Errors when no such directory is resolvable (e.g. no HOME /
 /// LOCALAPPDATA).
-fn managed_bin_dir() -> Result<PathBuf> {
+pub(crate) fn managed_bin_dir() -> Result<PathBuf> {
     if let Some(dir) = dirs::executable_dir() {
         // Linux: $XDG_BIN_HOME or $HOME/.local/bin. (None on Windows/macOS.)
         Ok(dir)
