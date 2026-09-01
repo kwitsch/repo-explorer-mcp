@@ -17,9 +17,6 @@ use repo_explorer_core::llm::{
 pub(crate) struct GenaiErrorFacts {
     /// HTTP status if `genai` exposed one.
     pub status: Option<u16>,
-    /// Provider-specific structured error code, if available (e.g. OpenAI
-    /// `insufficient_quota`, `rate_limit_exceeded`).
-    pub code: Option<String>,
     /// Human-readable, secret-free message.
     pub message: String,
 }
@@ -43,16 +40,6 @@ fn message_indicates_quota(message: &str) -> bool {
 pub(crate) fn classify_error_facts(provider: &str, facts: GenaiErrorFacts) -> ProviderError {
     let provider = provider.to_string();
     let message = facts.message;
-    let code = facts.code.as_deref().unwrap_or("");
-    let code_lower = code.to_lowercase();
-
-    // Structured code wins when present.
-    if code_lower.contains("quota") {
-        return ProviderError::QuotaExceeded { provider, message };
-    }
-    if code_lower.contains("rate_limit") {
-        return ProviderError::RateLimited { provider, message };
-    }
 
     match facts.status {
         // 429 is standard rate-limiting; 529 is Anthropic's overloaded_error, a
@@ -75,14 +62,13 @@ pub(crate) fn classify_error_facts(provider: &str, facts: GenaiErrorFacts) -> Pr
 ///
 /// `genai` 0.6.x surfaces an HTTP status on `Error::HttpError` and, indirectly,
 /// on the web-call variants whose `webc::Error::ResponseFailedStatus` carries
-/// one. It does not preserve a structured provider error *code*, so `code` stays
-/// `None` and classification relies on status plus substring matching. The
-/// flattened `message` is the SDK's `Display`, which contains provider error
-/// bodies but never our API key.
+/// one. It does not preserve a structured provider error *code*, so
+/// classification relies on status plus substring matching. The flattened
+/// `message` is the SDK's `Display`, which contains provider error bodies but
+/// never our API key.
 pub(crate) fn classify_genai_error(provider: &str, err: &genai::Error) -> ProviderError {
     let facts = GenaiErrorFacts {
         status: extract_status(err),
-        code: None,
         message: err.to_string(),
     };
     classify_error_facts(provider, facts)
@@ -565,17 +551,16 @@ mod tests {
         assert!(adapter_kind_for("not-a-real-kind").is_none());
     }
 
-    fn facts(status: Option<u16>, code: Option<&str>, message: &str) -> GenaiErrorFacts {
+    fn facts(status: Option<u16>, message: &str) -> GenaiErrorFacts {
         GenaiErrorFacts {
             status,
-            code: code.map(|c| c.to_string()),
             message: message.to_string(),
         }
     }
 
     #[test]
     fn http_429_classifies_as_rate_limited() {
-        let e = classify_error_facts("primary", facts(Some(429), None, "slow down"));
+        let e = classify_error_facts("primary", facts(Some(429), "slow down"));
         assert_eq!(
             e,
             ProviderError::RateLimited {
@@ -588,22 +573,21 @@ mod tests {
 
     #[test]
     fn openai_insufficient_quota_classifies_as_quota() {
-        let e = classify_error_facts(
-            "p",
-            facts(Some(429), Some("insufficient_quota"), "no credit"),
-        );
+        // `genai` preserves no structured error code, so this relies on the
+        // SDK's flattened message text containing the quota phrasing.
+        let e = classify_error_facts("p", facts(Some(429), "insufficient_quota: no credit"));
         assert_eq!(
             e,
             ProviderError::QuotaExceeded {
                 provider: "p".to_string(),
-                message: "no credit".to_string(),
+                message: "insufficient_quota: no credit".to_string(),
             }
         );
     }
 
     #[test]
     fn http_401_classifies_as_authentication_and_is_not_failover() {
-        let e = classify_error_facts("p", facts(Some(401), None, "bad key"));
+        let e = classify_error_facts("p", facts(Some(401), "bad key"));
         assert_eq!(
             e,
             ProviderError::Authentication {
@@ -616,7 +600,7 @@ mod tests {
 
     #[test]
     fn http_400_classifies_as_invalid_request() {
-        let e = classify_error_facts("p", facts(Some(400), None, "bad body"));
+        let e = classify_error_facts("p", facts(Some(400), "bad body"));
         assert_eq!(
             e,
             ProviderError::InvalidRequest {
@@ -628,7 +612,7 @@ mod tests {
 
     #[test]
     fn no_status_falls_back_to_transport() {
-        let e = classify_error_facts("p", facts(None, None, "connection reset"));
+        let e = classify_error_facts("p", facts(None, "connection reset"));
         assert_eq!(
             e,
             ProviderError::Transport {
@@ -641,7 +625,7 @@ mod tests {
     #[test]
     fn quota_via_substring_when_status_only_429() {
         // Anthropic billing/overloaded phrasing without a structured code.
-        let e = classify_error_facts("p", facts(Some(429), None, "credit balance is too low"));
+        let e = classify_error_facts("p", facts(Some(429), "credit balance is too low"));
         assert_eq!(
             e,
             ProviderError::QuotaExceeded {
@@ -783,7 +767,7 @@ mod tests {
     fn error_message_never_echoes_a_key() {
         // The classifier only ever copies the provided message; assert it does
         // not fabricate secrets and preserves the given text verbatim.
-        let e = classify_error_facts("p", facts(Some(500), None, "server error"));
+        let e = classify_error_facts("p", facts(Some(500), "server error"));
         assert_eq!(
             e,
             ProviderError::Transport {

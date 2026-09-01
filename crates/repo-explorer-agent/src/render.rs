@@ -155,10 +155,11 @@ fn finding_dto(f: &ExplorationFinding) -> FindingDto<'_> {
     }
 }
 
-/// Serialize `value`, falling back to `fallback` (a literal empty-JSON shape,
-/// e.g. `"{}"`/`"[]"`) on the practically-unreachable serialize failure.
-fn serialize_or_empty<T: Serialize>(value: &T, fallback: &str) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| fallback.to_string())
+/// Serialize `value`. These DTOs are string/number/Option fields only — no
+/// non-string map keys, nothing that can fail to serialize — so a failure
+/// here is a logic bug, not a runtime condition to recover from.
+fn serialize_or_empty<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).expect("DTO serialization cannot fail")
 }
 
 /// Render a memory-tool `ExplorationResult` compressed; returns the rendered
@@ -168,13 +169,10 @@ pub(crate) fn render_result(
     caps: &RenderCaps,
 ) -> (String, Vec<ExplorationFinding>) {
     let findings = compress_findings(res.findings, caps);
-    let content = serialize_or_empty(
-        &ResultDto {
-            findings: findings.iter().map(finding_dto).collect(),
-            summary: &res.summary,
-        },
-        "{}",
-    );
+    let content = serialize_or_empty(&ResultDto {
+        findings: findings.iter().map(finding_dto).collect(),
+        summary: &res.summary,
+    });
     (content, findings)
 }
 
@@ -185,7 +183,7 @@ pub(crate) fn render_findings(
 ) -> (String, Vec<ExplorationFinding>) {
     let findings = compress_findings(findings, caps);
     let dtos: Vec<FindingDto> = findings.iter().map(finding_dto).collect();
-    let content = serialize_or_empty(&dtos, "[]");
+    let content = serialize_or_empty(&dtos);
     (content, findings)
 }
 
