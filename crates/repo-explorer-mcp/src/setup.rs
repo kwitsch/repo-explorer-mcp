@@ -14,7 +14,7 @@ use repo_explorer_core::config::{
     default_search_timeout_seconds, default_staleness_seconds, env_var_is_set,
 };
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -329,15 +329,29 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
             staleness_seconds: default_staleness_seconds(),
         }
     } else {
-        let mem_path = crate::update::dedicated_memory_binary_path()?;
-        if !mem_path.exists() {
-            eprintln!(
-                "  note: the private codebase-memory-mcp binary is not installed yet at {}; \
-                 run `repo-explorer-mcp --update` to provision it.",
-                mem_path.display()
-            );
+        match crate::update::dedicated_memory_binary_path() {
+            Ok(mem_path) => {
+                if !mem_path.exists() {
+                    eprintln!(
+                        "  note: the private codebase-memory-mcp binary is not installed yet \
+                         at {}; run `repo-explorer-mcp --update` to provision it.",
+                        mem_path.display()
+                    );
+                }
+                stdio_memory_config(&mem_path)
+            }
+            Err(e) => {
+                // No resolvable data dir (e.g. HOME unset): fall back to a
+                // bare command resolved via PATH rather than propagating the
+                // error via `?`, which would discard every prior answer with
+                // no config written and no way to resume.
+                eprintln!(
+                    "  note: could not resolve the private codebase-memory-mcp path ({e:#}); \
+                     falling back to a bare `codebase-memory-mcp` command resolved via PATH."
+                );
+                stdio_memory_config(Path::new("codebase-memory-mcp"))
+            }
         }
-        stdio_memory_config(&mem_path)
     };
 
     // HTTPS proxy for model upstream requests (optional).
@@ -358,14 +372,28 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
     // depends on ~/.local/bin being on PATH — symmetric with the memory command
     // above. rtk is mandatory; the server fails fast at startup if it is
     // unresolved.
-    let rtk_path = crate::update::dedicated_rtk_binary_path()?;
-    if !rtk_path.exists() {
-        eprintln!(
-            "  note: the managed rtk binary is not installed yet at {}; \
-             run `repo-explorer-mcp --update` to provision it.",
-            rtk_path.display()
-        );
-    }
+    let rtk_path = match crate::update::dedicated_rtk_binary_path() {
+        Ok(p) => {
+            if !p.exists() {
+                eprintln!(
+                    "  note: the managed rtk binary is not installed yet at {}; \
+                     run `repo-explorer-mcp --update` to provision it.",
+                    p.display()
+                );
+            }
+            p
+        }
+        Err(e) => {
+            // Same reasoning as the codebase-memory branch above: don't
+            // propagate via `?`, which would discard every prior answer with
+            // no config written and no way to resume.
+            eprintln!(
+                "  note: could not resolve the managed rtk path ({e:#}); \
+                 falling back to a bare `rtk` command resolved via PATH."
+            );
+            PathBuf::from("rtk")
+        }
+    };
     let search = managed_search_config(&rtk_path);
 
     // agent / cache / logging left at defaults (fully defaulted in core); not
@@ -386,12 +414,12 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
     let toml_string =
         config::to_toml_string(&cfg).context("failed to serialize the generated config as TOML")?;
 
-    if let Some(parent) = config_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-    }
+    crate::ensure_parent_dir(config_path).with_context(|| {
+        format!(
+            "failed to create config directory {}",
+            config_path.parent().unwrap_or(config_path).display()
+        )
+    })?;
     std::fs::write(config_path, &toml_string)
         .with_context(|| format!("failed to write config to {}", config_path.display()))?;
 

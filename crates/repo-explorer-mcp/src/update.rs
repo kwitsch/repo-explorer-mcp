@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 /// Upper bound on how long a network request or a `--version` subprocess
 /// check may run before it's treated as failed, so a stalled connection or a
 /// hung/misbehaving binary can't make `--update` block forever.
-const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// GitHub owner/repo for `repo-explorer-mcp` itself.
@@ -121,9 +121,7 @@ async fn provision_or_update_memory_binary(client: &reqwest::Client) -> Componen
         }
     };
 
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
+    if let Err(e) = crate::ensure_parent_dir(&path) {
         return ComponentReport {
             name,
             current_version: None,
@@ -131,16 +129,23 @@ async fn provision_or_update_memory_binary(client: &reqwest::Client) -> Componen
             action: "error",
             detail: Some(format!(
                 "failed to create binary directory {}: {e}",
-                parent.display()
+                path.parent().unwrap_or(&path).display()
             )),
         };
     }
 
-    let current = if path.exists() {
+    let path_exists = path.exists();
+    let current = if path_exists {
         read_installed_version_blocking(path.clone()).await
     } else {
         None
     };
+
+    // Only a genuinely absent file should trigger a fresh install. A file
+    // that exists but whose version couldn't be probed (a transient
+    // `--version` timeout or format mismatch) must be skipped like any other
+    // tracked dependency, never silently redownloaded/overwritten.
+    let install_if_missing = !path_exists;
 
     check_and_install(
         client,
@@ -152,7 +157,7 @@ async fn provision_or_update_memory_binary(client: &reqwest::Client) -> Componen
         },
         current,
         InstallTarget::Path(&path),
-        true,
+        install_if_missing,
     )
     .await
 }
@@ -179,9 +184,7 @@ async fn provision_or_update_rtk_binary(client: &reqwest::Client) -> ComponentRe
         }
     };
 
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
+    if let Err(e) = crate::ensure_parent_dir(&path) {
         return ComponentReport {
             name,
             current_version: None,
@@ -189,16 +192,23 @@ async fn provision_or_update_rtk_binary(client: &reqwest::Client) -> ComponentRe
             action: "error",
             detail: Some(format!(
                 "failed to create binary directory {}: {e}",
-                parent.display()
+                path.parent().unwrap_or(&path).display()
             )),
         };
     }
 
-    let current = if path.exists() {
+    let path_exists = path.exists();
+    let current = if path_exists {
         read_installed_version_blocking(path.clone()).await
     } else {
         None
     };
+
+    // Only a genuinely absent file should trigger a fresh install — see the
+    // identical comment on `provision_or_update_memory_binary`. A file that
+    // exists but whose version couldn't be probed must be skipped like any
+    // other tracked dependency, never silently redownloaded/overwritten.
+    let install_if_missing = !path_exists;
 
     check_and_install(
         client,
@@ -210,7 +220,7 @@ async fn provision_or_update_rtk_binary(client: &reqwest::Client) -> ComponentRe
         },
         current,
         InstallTarget::Path(&path),
-        true,
+        install_if_missing,
     )
     .await
 }
@@ -605,7 +615,7 @@ fn scan_for_semver(text: &str) -> Option<semver::Version> {
 /// most a few lines) — output isn't drained until the process exits, so a
 /// process that blocks on a full stdout/stderr pipe before exiting would
 /// still hang until the timeout.
-fn run_with_timeout(
+pub(crate) fn run_with_timeout(
     mut command: std::process::Command,
     timeout: Duration,
 ) -> Option<std::process::Output> {

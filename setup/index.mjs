@@ -401,77 +401,77 @@ async function main() {
   const binName = binaryName(plat.osKind);
   const binPath = path.join(dir, binName);
 
-  // Idempotency check.
-  if (!opts.force && fs.existsSync(binPath)) {
-    const installed = probeVersion(binPath); // e.g. "repo-explorer-mcp 0.1.0"
-    const installedVer = parseInstalledVersion(installed);
-    if (
-      installedVer &&
-      installedVer.toLowerCase() === version.trim().toLowerCase()
-    ) {
-      console.log(
-        `\nrepo-explorer-mcp ${version} already installed at ${binPath} — already up to date.`,
-      );
-      // PATH status is reported on every run, including this one: the install
-      // dir can drop off PATH long after the binary was installed.
-      reportPathStatus(dir, plat.osKind);
-      const cmVer = provisionManagedTools(binPath);
-      rtkVer = reprobeRtk(dir, plat.osKind);
-      printSummary(binPath, version, { rgVer, rtkVer, cmVer });
-      return;
-    }
-  }
+  // Idempotency check. Skipped entirely under --force: the probe result
+  // would be unused (alreadyUpToDate is always false below), and probing
+  // would otherwise still exec whatever binary is currently at binPath even
+  // when --force was passed specifically to replace a broken one.
+  const installed =
+    !opts.force && fs.existsSync(binPath) ? probeVersion(binPath) : null; // e.g. "repo-explorer-mcp 0.1.0"
+  const installedVer = parseInstalledVersion(installed);
+  const alreadyUpToDate =
+    !opts.force &&
+    installedVer &&
+    installedVer.toLowerCase() === version.trim().toLowerCase();
 
-  // Download + verify + extract.
-  const archiveName = buildArchiveName({
-    binaryBaseName: BINARY_BASE,
-    version,
-    target: plat.target,
-    ext: plat.ext,
-  });
-  const { archiveUrl, sha256Url } = buildDownloadUrls({
-    owner: OWNER,
-    repo: REPO,
-    version,
-    archiveName,
-  });
-  console.log(`\nDownloading ${archiveUrl}`);
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "repo-explorer-mcp-"));
-  const archiveFile = path.join(tmp, archiveName);
-  try {
-    const [sumRes, buf] = await Promise.all([
-      fetch(sha256Url, fetchOptions()),
-      downloadTo(archiveUrl, archiveFile),
-    ]);
-    if (!sumRes.ok)
-      throw new Error(
-        `Checksum download failed: ${sha256Url} (HTTP ${sumRes.status}).`,
-      );
-    const expected = parseSha256Line(await sumRes.text());
-    const actual = sha256Hex(buf);
-    if (!hexEqual(actual, expected)) {
-      fs.rmSync(archiveFile, { force: true });
-      throw new Error(
-        `Checksum mismatch for ${archiveName}: download corrupted or tampered (expected ${expected}, got ${actual}).`,
-      );
-    }
-    console.log("Checksum verified.");
-    extractArchive(plat.osKind, archiveFile, tmp);
-    const extracted = path.join(tmp, binName);
+  if (alreadyUpToDate) {
+    console.log(
+      `\nrepo-explorer-mcp ${version} already installed at ${binPath} — already up to date.`,
+    );
+  } else {
+    // Download + verify + extract.
+    const archiveName = buildArchiveName({
+      binaryBaseName: BINARY_BASE,
+      version,
+      target: plat.target,
+      ext: plat.ext,
+    });
+    const { archiveUrl, sha256Url } = buildDownloadUrls({
+      owner: OWNER,
+      repo: REPO,
+      version,
+      archiveName,
+    });
+    console.log(`\nDownloading ${archiveUrl}`);
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "repo-explorer-mcp-"));
+    const archiveFile = path.join(tmp, archiveName);
     try {
-      fs.copyFileSync(extracted, binPath);
-    } catch (e) {
-      throw new Error(
-        `Failed to install the binary to ${binPath}: ${e.message}\n` +
-          "If repo-explorer-mcp is currently running, stop it and re-run this installer.",
-      );
+      const [sumRes, buf] = await Promise.all([
+        fetch(sha256Url, fetchOptions()),
+        downloadTo(archiveUrl, archiveFile),
+      ]);
+      if (!sumRes.ok)
+        throw new Error(
+          `Checksum download failed: ${sha256Url} (HTTP ${sumRes.status}).`,
+        );
+      const expected = parseSha256Line(await sumRes.text());
+      const actual = sha256Hex(buf);
+      if (!hexEqual(actual, expected)) {
+        fs.rmSync(archiveFile, { force: true });
+        throw new Error(
+          `Checksum mismatch for ${archiveName}: download corrupted or tampered (expected ${expected}, got ${actual}).`,
+        );
+      }
+      console.log("Checksum verified.");
+      extractArchive(plat.osKind, archiveFile, tmp);
+      const extracted = path.join(tmp, binName);
+      try {
+        fs.copyFileSync(extracted, binPath);
+      } catch (e) {
+        throw new Error(
+          `Failed to install the binary to ${binPath}: ${e.message}\n` +
+            "If repo-explorer-mcp is currently running, stop it and re-run this installer.",
+        );
+      }
+      if (plat.osKind !== "win32") fs.chmodSync(binPath, 0o755);
+      console.log(`Installed ${binName} -> ${binPath}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
     }
-    if (plat.osKind !== "win32") fs.chmodSync(binPath, 0o755);
-    console.log(`Installed ${binName} -> ${binPath}`);
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
   }
 
+  // PATH status is reported on every run, including the already-up-to-date
+  // path: the install dir can drop off PATH long after the binary was
+  // installed.
   reportPathStatus(dir, plat.osKind);
   const cmVer = provisionManagedTools(binPath);
   rtkVer = reprobeRtk(dir, plat.osKind);

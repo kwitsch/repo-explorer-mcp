@@ -4,6 +4,7 @@
 //! wires the exploration pipeline over rmcp stdio. stdout is reserved for the
 //! MCP protocol stream; every diagnostic goes to stderr.
 
+mod install;
 mod server;
 mod setup;
 mod update;
@@ -28,6 +29,8 @@ Usage:
   repo-explorer-mcp setup               Run the interactive first-run wizard
   repo-explorer-mcp config test         Validate the resolved config only
   repo-explorer-mcp --update            Check for and install updates
+  repo-explorer-mcp --install           Register with Claude Code (user MCP server + explore agent)
+  repo-explorer-mcp --uninstall         Reverse --install
   repo-explorer-mcp --version           Print the version
   repo-explorer-mcp --help              Print this help
 
@@ -52,7 +55,22 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if update::wants_update(&subcommand_args) {
+        if install::wants_install(&subcommand_args) || install::wants_uninstall(&subcommand_args) {
+            // --update is a full one-shot mode (check, install, exit) and
+            // can't meaningfully run in the same invocation as --install/
+            // --uninstall; say so instead of silently dropping the other flag.
+            eprintln!(
+                "repo-explorer-mcp: --update takes precedence over --install/--uninstall \
+                 in the same invocation; running --update only."
+            );
+        }
         return update::run_update().await;
+    }
+    if install::wants_install(&subcommand_args) {
+        return install::run_install();
+    }
+    if install::wants_uninstall(&subcommand_args) {
+        return install::run_uninstall();
     }
     let config_path = resolve_config_path(
         &argv,
@@ -106,16 +124,28 @@ async fn run(config: repo_explorer_core::config::Config) -> anyhow::Result<()> {
     // The directory the server is launched in = the project root to explore.
     let repo_root = std::env::current_dir().context("failed to determine current directory")?;
 
-    if let Ok(managed) = update::dedicated_memory_binary_path()
-        && managed_binary_missing(config.codebase_memory.command.as_deref(), &managed, |p| {
-            p.exists()
-        })
-    {
-        anyhow::bail!(
-            "dedicated codebase-memory-mcp binary not found at {}; \
-             run `repo-explorer-mcp --update` to provision it",
-            managed.display()
-        );
+    match update::dedicated_memory_binary_path() {
+        Ok(managed) => {
+            if managed_binary_missing(config.codebase_memory.command.as_deref(), &managed, |p| {
+                p.exists()
+            }) {
+                anyhow::bail!(
+                    "dedicated codebase-memory-mcp binary not found at {}; \
+                     run `repo-explorer-mcp --update` to provision it",
+                    managed.display()
+                );
+            }
+        }
+        Err(e) => {
+            // Can't compute the managed path (e.g. no resolvable data dir),
+            // so the pre-connect existence check above can't run. Log this
+            // instead of silently skipping it, so a subsequent low-level
+            // connect failure isn't a total mystery.
+            tracing::warn!(
+                "could not resolve the managed codebase-memory-mcp path ({e:#}); \
+                 skipping the pre-connect existence check"
+            );
+        }
     }
 
     let memory = MemoryClientBackend::connect(&config.codebase_memory)
@@ -123,7 +153,14 @@ async fn run(config: repo_explorer_core::config::Config) -> anyhow::Result<()> {
         .context("failed to connect to codebase-memory-mcp")?;
     let search = CliSearchBackend::new(&config.search);
     if !search.rtk_available() {
-        let managed = update::dedicated_rtk_binary_path().ok();
+        let managed = update::dedicated_rtk_binary_path()
+            .inspect_err(|e| {
+                // Same reasoning as the codebase-memory-mcp path above: log
+                // the real cause instead of silently falling back to the
+                // generic hardcoded path in `rtk_unresolved_message`.
+                tracing::warn!("could not resolve the managed rtk path ({e:#})");
+            })
+            .ok();
         anyhow::bail!("{}", rtk_unresolved_message(managed.as_deref()));
     }
     let router = repo_explorer_llm::build_router(&config.llm)
@@ -171,6 +208,19 @@ fn has_flag(args: &[String], flags: &[&str]) -> bool {
     args.iter().any(|a| flags.contains(&a.as_str()))
 }
 
+/// Create `path`'s parent directory tree if it doesn't already exist,
+/// tolerating a path with no parent component or an empty one (e.g. a bare
+/// relative filename) by treating that as nothing-to-create. Shared by
+/// `setup`/`update`/`install`'s "ensure the directory a file will be written
+/// into exists" step, so a future change to that logic only needs to be made
+/// once.
+fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => std::fs::create_dir_all(parent),
+        _ => Ok(()),
+    }
+}
+
 /// True only when `command` names the managed private binary path yet that
 /// path does not exist — the single case `run()` refuses to serve. A custom
 /// command (bare name or a hand-picked path) or a `None` command (network
@@ -180,7 +230,29 @@ fn managed_binary_missing(
     managed: &Path,
     exists: impl Fn(&Path) -> bool,
 ) -> bool {
-    command.is_some_and(|cmd| Path::new(cmd) == managed) && !exists(managed)
+    command.is_some_and(|cmd| paths_match_managed(Path::new(cmd), managed)) && !exists(managed)
+}
+
+/// Path equality for comparing a configured command against the managed
+/// binary path: case-insensitive on Windows (NTFS paths are
+/// case-insensitive, and `dirs::data_dir()`'s casing isn't guaranteed to
+/// match a hand-edited or copied-from-elsewhere config value byte-for-byte),
+/// exact elsewhere. Lowercasing and re-parsing as a `Path` (rather than
+/// comparing the lowercased strings directly) keeps `Path`'s own separator
+/// normalization on Windows, where `/` and `\` are equally valid and a
+/// hand-edited TOML value may use either — a raw string compare would treat
+/// two spellings of the identical path as different.
+fn paths_match_managed(cmd: &Path, managed: &Path) -> bool {
+    if cfg!(windows) {
+        // Lowercase first, then re-borrow as a `Path` for the comparison
+        // (rather than comparing the lowercased `String`s directly) so
+        // `Path`'s own separator normalization still applies.
+        let cmd_lower = cmd.to_string_lossy().to_ascii_lowercase();
+        let managed_lower = managed.to_string_lossy().to_ascii_lowercase();
+        Path::new(&cmd_lower) == Path::new(&managed_lower)
+    } else {
+        cmd == managed
+    }
 }
 
 /// Fail-fast message when the mandatory `rtk` search binary is unresolved,
@@ -436,6 +508,21 @@ mod tests {
     }
 
     #[test]
+    fn config_value_is_never_read_as_install_or_uninstall() {
+        // `--config install` names a config file, not the `--install` flag.
+        let stripped = args_without_config_value(&args(&["--config", "install"]));
+        assert!(!install::wants_install(&stripped));
+        // Same for a file named `uninstall`.
+        let stripped = args_without_config_value(&args(&["--config", "uninstall"]));
+        assert!(!install::wants_uninstall(&stripped));
+        // A real flag still survives the strip.
+        let stripped = args_without_config_value(&args(&["--config", "c.toml", "--install"]));
+        assert!(install::wants_install(&stripped));
+        let stripped = args_without_config_value(&args(&["--config", "c.toml", "--uninstall"]));
+        assert!(install::wants_uninstall(&stripped));
+    }
+
+    #[test]
     fn cli_arg_precedence_over_env() {
         let p = resolve_config_path(
             &args(&["--config", "cli.toml"]),
@@ -549,6 +636,25 @@ mod tests {
         ));
         // No command (network endpoint branch) -> not our concern.
         assert!(!managed_binary_missing(None, &managed, |_| false));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn paths_match_managed_is_case_insensitive_on_windows() {
+        let managed = PathBuf::from(r"C:\Users\user\AppData\Local\repo-explorer-mcp\rtk.exe");
+        let differently_cased = Path::new(r"C:\USERS\User\AppData\Local\Repo-Explorer-Mcp\RTK.EXE");
+        assert!(paths_match_managed(differently_cased, &managed));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn paths_match_managed_ignores_separator_style_on_windows() {
+        // A hand-edited TOML value may use forward slashes; the managed path
+        // is built via PathBuf::join and stringifies with backslashes. Both
+        // name the identical file and must match.
+        let managed = PathBuf::from(r"C:\Users\user\AppData\Local\repo-explorer-mcp\rtk.exe");
+        let forward_slashes = Path::new("C:/Users/user/AppData/Local/repo-explorer-mcp/rtk.exe");
+        assert!(paths_match_managed(forward_slashes, &managed));
     }
 
     #[test]
