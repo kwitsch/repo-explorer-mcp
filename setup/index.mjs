@@ -351,12 +351,21 @@ function reprobeRtk(dir, osKind) {
   return probeBinary("rtk", osKind);
 }
 
-// After `--update` runs, report rg's status for the summary. A managed rg
-// fallback lands next to the main binary in `dir`; if present, report it.
-// If no managed copy was provisioned (a system rg was preferred, or none
-// installed), keep whatever ensureRipgrep already reported (`prior`) so a
-// system rg's version or the winget "restart your terminal" note survives.
+// After `--update` runs, report rg's status for the summary. The Rust
+// updater always prefers a system rg over the managed fallback, so mirror
+// that precedence here: re-check PATH first. This matters because a managed
+// copy from an earlier run can be left on disk (the updater never deletes
+// it once a system rg takes over) — checking the managed file first would
+// wrongly report that stale leftover's version instead of the system rg
+// that's actually active. Only when no system rg is resolvable do we fall
+// back to the managed file next to the main binary in `dir` (a freshly
+// provisioned fallback), and finally to whatever ensureRipgrep already
+// reported (`prior`, e.g. the winget "restart your terminal" note).
 function reprobeRg(dir, osKind, prior) {
+  const onPath = probeBinary("rg", osKind);
+  if (onPath !== MISSING) {
+    return onPath;
+  }
   const file = path.join(dir, osKind === "win32" ? "rg.exe" : "rg");
   if (fs.existsSync(file)) {
     return probeVersion(file) ?? "provisioned";

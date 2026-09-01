@@ -52,6 +52,19 @@ fn binary_path_in(bin_dir: &Path, file: &str) -> PathBuf {
     bin_dir.join(file)
 }
 
+/// True when `a` and `b` refer to the same file. Prefers canonicalizing both
+/// paths first — resolving symlinks and, notably on Windows, normalizing
+/// case/drive-letter/`\\?\`-prefix differences between a `PATH`-resolved
+/// string and our own `dirs`-derived managed path — and falls back to a raw
+/// comparison when either side can't be canonicalized (e.g. the managed copy
+/// doesn't exist yet).
+fn same_binary_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
+}
+
 /// File name of the managed `codebase-memory-mcp` binary, with the platform's
 /// executable suffix on Windows.
 fn memory_binary_file_name() -> &'static str {
@@ -236,24 +249,46 @@ async fn provision_or_update_rtk_binary(client: &reqwest::Client) -> ComponentRe
 async fn provision_or_update_rg_binary(client: &reqwest::Client) -> ComponentReport {
     let name = "rg".to_string();
 
+    // Resolve a system `rg` before the managed bin dir: an unresolvable
+    // managed dir (e.g. no HOME/XDG_BIN_HOME) must not be reported as an
+    // error when a system `rg` is already on PATH and nothing needs to be
+    // installed.
+    let which_rg = which::which("rg").ok();
+
     let path = match dedicated_rg_binary_path() {
         Ok(p) => p,
         Err(e) => {
-            return ComponentReport {
-                name,
-                current_version: None,
-                latest_version: None,
-                action: "error",
-                detail: Some(e.to_string()),
+            return match &which_rg {
+                Some(found) => ComponentReport {
+                    name,
+                    current_version: None,
+                    latest_version: None,
+                    action: "skipped",
+                    detail: Some(format!(
+                        "a system `rg` is present at {} and is left untouched",
+                        found.display()
+                    )),
+                },
+                None => ComponentReport {
+                    name,
+                    current_version: None,
+                    latest_version: None,
+                    action: "error",
+                    detail: Some(e.to_string()),
+                },
             };
         }
     };
 
     // A `which`-resolved `rg` that is not our own managed copy is a
-    // system/distro install: leave it untouched. (`which` Err, or a resolve
-    // to the managed copy itself, both fall through to install/update.)
-    if let Ok(found) = which::which("rg")
-        && found != path
+    // system/distro install: leave it untouched. (`which` finding nothing,
+    // or resolving to the managed copy itself, both fall through to
+    // install/update.) Compared via `same_binary_path`, canonicalizing both
+    // sides when possible, since a `which`-resolved PATH string and our
+    // `dirs`-derived managed path can differ in case/drive-letter/`\\?\`-
+    // prefix form on Windows while naming the same file.
+    if let Some(found) = &which_rg
+        && !same_binary_path(found, &path)
     {
         return ComponentReport {
             name,
