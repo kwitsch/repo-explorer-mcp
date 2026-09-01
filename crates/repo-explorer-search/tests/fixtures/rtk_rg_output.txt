@@ -1,4 +1,4 @@
 crates/repo-explorer-core/src/config.rs-69-    pub timeout_seconds: u64,
-crates/repo-explorer-core/src/config.rs:70:    #[serde(default = "default_prefer_rtk")]
-crates/repo-explorer-core/src/config.rs:71:    pub prefer_rtk: bool,
+crates/repo-explorer-core/src/config.rs:70:    #[serde(default = "default_search_timeout_seconds")]
+crates/repo-explorer-core/src/config.rs:71:    pub max_depth: usize,
 crates/repo-explorer-core/src/config.rs-72-}

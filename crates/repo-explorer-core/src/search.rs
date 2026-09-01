@@ -32,7 +32,7 @@ pub struct SearchOptions {
 /// (which is not `Eq`).
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum SearchError {
-    /// No usable search binary was found (rtk and ripgrep both absent/unresolvable).
+    /// The `rtk` search binary could not be resolved.
     #[error("no search backend available: {0}")]
     BackendNotFound(String),
     /// The chosen backend failed to spawn or exited with a real error code.
