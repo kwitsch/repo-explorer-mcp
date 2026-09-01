@@ -280,7 +280,7 @@ async function ensureRipgrep(plat, opts) {
       return probeBinary("rg", plat.osKind);
     }
     console.warn(
-      `ripgrep is missing and no supported package manager (${LINUX_PKG_MANAGERS.map(([pm]) => pm).join("/")}) was found. ${RIPGREP_MANUAL_INSTALL_HINT}`,
+      `ripgrep is missing and no supported package manager (${LINUX_PKG_MANAGERS.map(([pm]) => pm).join("/")}) was found. It will be provisioned into the shared bin dir by \`repo-explorer-mcp --update\` (run below). To install it yourself instead: ${RIPGREP_MANUAL_INSTALL_HINT}`,
     );
     return MISSING;
   }
@@ -313,7 +313,7 @@ async function ensureRipgrep(plat, opts) {
     return probeBinary("rg", plat.osKind);
   }
   console.warn(
-    `ripgrep is missing and winget was not found. ${RIPGREP_MANUAL_INSTALL_HINT}`,
+    `ripgrep is missing and winget was not found. It will be provisioned into the shared bin dir by \`repo-explorer-mcp --update\` (run below). To install it yourself instead: ${RIPGREP_MANUAL_INSTALL_HINT}`,
   );
   return MISSING;
 }
@@ -325,7 +325,7 @@ async function ensureRipgrep(plat, opts) {
 // the binary install and provision later.
 function provisionManagedTools(binPath) {
   console.log(
-    "\nProvisioning managed tools (rtk, codebase-memory-mcp) into the shared bin dir via `repo-explorer-mcp --update`...",
+    "\nProvisioning managed tools (rtk, codebase-memory-mcp, rg) into the shared bin dir via `repo-explorer-mcp --update`...",
   );
   const r = spawnSync(binPath, ["--update"], {
     stdio: "inherit",
@@ -333,7 +333,7 @@ function provisionManagedTools(binPath) {
   });
   if (r.error || r.status !== 0) {
     console.warn(
-      "Failed to provision managed tools automatically; run `repo-explorer-mcp --update` (or `repo-explorer-mcp setup`) later to provision rtk and codebase-memory-mcp.",
+      "Failed to provision managed tools automatically; run `repo-explorer-mcp --update` (or `repo-explorer-mcp setup`) later to provision rtk, codebase-memory-mcp, and rg.",
     );
     return "provision failed (run --update later)";
   }
@@ -349,6 +349,19 @@ function reprobeRtk(dir, osKind) {
     return probeVersion(file) ?? "provisioned";
   }
   return probeBinary("rtk", osKind);
+}
+
+// After `--update` runs, report rg's status for the summary. A managed rg
+// fallback lands next to the main binary in `dir`; if present, report it.
+// If no managed copy was provisioned (a system rg was preferred, or none
+// installed), keep whatever ensureRipgrep already reported (`prior`) so a
+// system rg's version or the winget "restart your terminal" note survives.
+function reprobeRg(dir, osKind, prior) {
+  const file = path.join(dir, osKind === "win32" ? "rg.exe" : "rg");
+  if (fs.existsSync(file)) {
+    return probeVersion(file) ?? "provisioned";
+  }
+  return prior;
 }
 
 export function mcpSnippet(binPath) {
@@ -389,7 +402,7 @@ async function main() {
 
   // Dependency checks.
   console.log("\nDependency status:");
-  const rgVer = await ensureRipgrep(plat, opts);
+  let rgVer = await ensureRipgrep(plat, opts);
   console.log(`  ripgrep: ${rgVer}`);
   // rtk is provisioned into the shared bin dir by `repo-explorer-mcp --update`
   // (run below). Report its current status here; MISSING is expected on a first
@@ -484,6 +497,7 @@ async function main() {
   reportPathStatus(dir, plat.osKind);
   const cmVer = provisionManagedTools(binPath);
   rtkVer = reprobeRtk(dir, plat.osKind);
+  rgVer = reprobeRg(dir, plat.osKind, rgVer);
   printSummary(binPath, version, { rgVer, rtkVer, cmVer });
 }
 
