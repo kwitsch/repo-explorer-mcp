@@ -20,7 +20,7 @@ errors are consumed via `?`/`.context(...)`).
 - The XDG default is `$XDG_CONFIG_HOME/repo-explorer/repo-explorer.toml` on Linux, `%APPDATA%\repo-explorer\repo-explorer.toml` on Windows.
 - The two `exists` gates are load-bearing: the XDG default resolves on essentially every machine, so returning it unconditionally would make the `./repo-explorer.toml` fallback dead code and silently ignore an in-repo config.
 - This crate owns the `dirs` dependency used for XDG resolution; core and the other crates stay free of it.
-- `codebase-memory-mcp` and `rtk` are managed per-user copies in the shared bin dir (`~/.local/bin` on Linux via `dirs::executable_dir()`, `%LOCALAPPDATA%\repo-explorer-mcp` on Windows via `dirs::data_local_dir().join("repo-explorer-mcp")` — the same dir the npx installer uses for the main binary), provisioned/updated only by `--update` and launched by absolute path — never resolved via PATH/`which`. `setup` writes those absolute paths into `[codebase_memory] command` and `[search] rtk_path`; `run()` fails fast with a `--update` hint if either is missing and never downloads.
+- `codebase-memory-mcp` and `rtk` are managed per-user copies in the shared bin dir (`~/.local/bin` on Linux via `dirs::executable_dir()`, `%LOCALAPPDATA%\repo-explorer-mcp` on Windows via `dirs::data_local_dir().join("repo-explorer-mcp")` — the same dir the npx installer uses for the main binary), provisioned/updated only by `--update` and launched by absolute path — never resolved via PATH/`which`. `setup` writes those absolute paths into `[codebase_memory] command` and `[search] rtk_path`; `run()` fails fast with a `--update` hint if either is missing and never downloads. The Node installer's `installDir()` mirrors this same resolution (`$XDG_BIN_HOME` if absolute, else `$HOME/.local/bin`; `%LOCALAPPDATA%\repo-explorer-mcp` on Windows) so both place binaries in one shared dir.
 
 ## Subcommands
 
@@ -36,9 +36,9 @@ errors are consumed via `?`/`.context(...)`).
 
 ## Self-update (`src/update.rs`)
 
-- Tracked components: `repo-explorer-mcp` (`kwitsch/repo-explorer-mcp`) and `rg`/ripgrep (`BurntSushi/ripgrep`) — `rg` resolved on PATH via `which`, skip-if-absent — plus two managed install-if-absent / update-if-stale copies in the shared bin dir (`~/.local/bin` on Linux, `%LOCALAPPDATA%\repo-explorer-mcp` on Windows): `rtk` (`rtk-ai/rtk`) via `provision_or_update_rtk_binary` and `codebase-memory-mcp` (`DeusData/codebase-memory-mcp`) via `provision_or_update_memory_binary`.
+- Tracked components: `repo-explorer-mcp` (`kwitsch/repo-explorer-mcp`) plus three managed install-if-absent / update-if-stale copies in the shared bin dir (`$XDG_BIN_HOME` or `~/.local/bin` on Linux, `%LOCALAPPDATA%\repo-explorer-mcp` on Windows): `rtk` (`rtk-ai/rtk`) via `provision_or_update_rtk_binary`, `codebase-memory-mcp` (`DeusData/codebase-memory-mcp`) via `provision_or_update_memory_binary`, and `rg`/ripgrep (`BurntSushi/ripgrep`) via `provision_or_update_rg_binary`.
 - Runs instead of the MCP server loop, dispatched before config resolution and before the `setup` dispatch/auto-run.
-- The `which`-resolved `rg` dependency, when its installed version can't be determined or it isn't on `PATH`, is skipped rather than blindly overwritten. The managed `rtk` and `codebase-memory-mcp` copies are instead installed when absent and updated when stale (`action` `installed`/`updated`/`up-to-date`).
+- `rg` is managed only as a fallback: a system `rg` resolvable on PATH (any `which`-resolved `rg` other than the managed copy) is preferred and left untouched (`action: skipped`), never overwritten; the managed copy under `managed_bin_dir()` is provisioned only when no system `rg` is present, and updated when stale. `rtk` and `codebase-memory-mcp` are always managed (installed when absent, updated when stale — `installed`/`updated`/`up-to-date`).
 - This crate owns the `reqwest`/`semver`/`sha2`/`hex`/`flate2`/`tar`/`zip`/`self-replace` dependencies; core stays free of them.
 - It also uses `which`, already owned by `repo-explorer-search` — the only dependency this crate shares with another non-core crate rather than owning outright.
 

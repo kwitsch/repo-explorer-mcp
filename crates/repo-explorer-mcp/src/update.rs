@@ -1,10 +1,12 @@
 //! `--update` CLI mode.
 //!
-//! Instead of booting the MCP server, checks `repo-explorer-mcp` itself, its
-//! `which`-resolved runtime dependency (`rg`/ripgrep), and its two managed
-//! install-if-absent copies (`rtk`, `codebase-memory-mcp`) against their GitHub
-//! releases, installing any newer version found. Never runs alongside the main
-//! exploration logic.
+//! Instead of booting the MCP server, checks `repo-explorer-mcp` itself and
+//! its three managed install-if-absent / update-if-stale copies in the shared
+//! bin dir — `rtk`, `codebase-memory-mcp`, and `rg`/ripgrep — against their
+//! GitHub releases, installing any newer version found. `rg` is managed only
+//! as a fallback: a system `rg` already resolvable on PATH is preferred and
+//! left untouched, and the managed copy is provisioned only when none is
+//! present. Never runs alongside the main exploration logic.
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -22,21 +24,6 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const SELF_OWNER: &str = "kwitsch";
 const SELF_REPO: &str = "repo-explorer-mcp";
 
-/// A binary this project shells out to at runtime, checked/updated alongside
-/// itself. `command` is both the display name and the executable looked up
-/// via `which`.
-struct DependencyBinary {
-    command: &'static str,
-    owner: &'static str,
-    repo: &'static str,
-}
-
-const DEPENDENCY_BINARIES: &[DependencyBinary] = &[DependencyBinary {
-    command: "rg",
-    owner: "BurntSushi",
-    repo: "ripgrep",
-}];
-
 /// The shared per-user directory repo-explorer installs its managed binaries
 /// into: `~/.local/bin` on Linux (`dirs::executable_dir()`), and
 /// `%LOCALAPPDATA%\repo-explorer-mcp` on Windows
@@ -44,7 +31,7 @@ const DEPENDENCY_BINARIES: &[DependencyBinary] = &[DependencyBinary {
 /// the npx installer's `installDir()` places the main binary in on each
 /// platform. Errors when no such directory is resolvable (e.g. no HOME /
 /// LOCALAPPDATA).
-fn managed_bin_dir() -> Result<PathBuf> {
+pub(crate) fn managed_bin_dir() -> Result<PathBuf> {
     if let Some(dir) = dirs::executable_dir() {
         // Linux: $XDG_BIN_HOME or $HOME/.local/bin. (None on Windows/macOS.)
         Ok(dir)
@@ -63,6 +50,19 @@ fn managed_bin_dir() -> Result<PathBuf> {
 /// the binary sits directly inside it.
 fn binary_path_in(bin_dir: &Path, file: &str) -> PathBuf {
     bin_dir.join(file)
+}
+
+/// True when `a` and `b` refer to the same file. Prefers canonicalizing both
+/// paths first — resolving symlinks and, notably on Windows, normalizing
+/// case/drive-letter/`\\?\`-prefix differences between a `PATH`-resolved
+/// string and our own `dirs`-derived managed path — and falls back to a raw
+/// comparison when either side can't be canonicalized (e.g. the managed copy
+/// doesn't exist yet).
+fn same_binary_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
 }
 
 /// File name of the managed `codebase-memory-mcp` binary, with the platform's
@@ -99,6 +99,19 @@ pub(crate) fn dedicated_rtk_binary_path() -> Result<PathBuf> {
     Ok(binary_path_in(&managed_bin_dir()?, rtk_binary_file_name()))
 }
 
+/// File name of the managed `rg`/ripgrep binary, with the platform's
+/// executable suffix on Windows.
+fn rg_binary_file_name() -> &'static str {
+    if cfg!(windows) { "rg.exe" } else { "rg" }
+}
+
+/// Absolute path of the repo-explorer-managed `rg` fallback binary in the
+/// shared managed bin dir, alongside `rtk` and `codebase-memory-mcp`. Errors
+/// when no managed dir is resolvable. Never consults PATH.
+pub(crate) fn dedicated_rg_binary_path() -> Result<PathBuf> {
+    Ok(binary_path_in(&managed_bin_dir()?, rg_binary_file_name()))
+}
+
 /// Install-if-absent / update-if-stale the private `codebase-memory-mcp`
 /// copy at [`dedicated_memory_binary_path`], via the shared
 /// [`check_and_install`] pipeline. Unlike the `which`-resolved dependency
@@ -121,43 +134,15 @@ async fn provision_or_update_memory_binary(client: &reqwest::Client) -> Componen
         }
     };
 
-    if let Err(e) = crate::ensure_parent_dir(&path) {
-        return ComponentReport {
-            name,
-            current_version: None,
-            latest_version: None,
-            action: "error",
-            detail: Some(format!(
-                "failed to create binary directory {}: {e}",
-                path.parent().unwrap_or(&path).display()
-            )),
-        };
-    }
-
-    let path_exists = path.exists();
-    let current = if path_exists {
-        read_installed_version_blocking(path.clone()).await
-    } else {
-        None
-    };
-
-    // Only a genuinely absent file should trigger a fresh install. A file
-    // that exists but whose version couldn't be probed (a transient
-    // `--version` timeout or format mismatch) must be skipped like any other
-    // tracked dependency, never silently redownloaded/overwritten.
-    let install_if_missing = !path_exists;
-
-    check_and_install(
+    provision_managed_binary(
         client,
         name,
+        &path,
         ReleaseSource {
             owner: "DeusData",
             repo: "codebase-memory-mcp",
             command: "codebase-memory-mcp",
         },
-        current,
-        InstallTarget::Path(&path),
-        install_if_missing,
     )
     .await
 }
@@ -184,7 +169,120 @@ async fn provision_or_update_rtk_binary(client: &reqwest::Client) -> ComponentRe
         }
     };
 
-    if let Err(e) = crate::ensure_parent_dir(&path) {
+    provision_managed_binary(
+        client,
+        name,
+        &path,
+        ReleaseSource {
+            owner: "rtk-ai",
+            repo: "rtk",
+            command: "rtk",
+        },
+    )
+    .await
+}
+
+/// Install-if-absent / update-if-stale the managed `rg` fallback copy at
+/// [`dedicated_rg_binary_path`], via the shared [`check_and_install`]
+/// pipeline — but only when no *system* `rg` is already resolvable on PATH.
+/// A system `rg` (any `which`-resolved `rg` other than our own managed copy)
+/// is preferred and left untouched (`action: "skipped"`): it is never
+/// overwritten and no duplicate managed copy is provisioned. The install
+/// target is always the managed path, never the `which`-resolved path, so a
+/// system binary can never be written over even on a misclassification.
+async fn provision_or_update_rg_binary(client: &reqwest::Client) -> ComponentReport {
+    let name = "rg".to_string();
+
+    // Resolve a system `rg` before the managed bin dir: an unresolvable
+    // managed dir (e.g. no HOME/XDG_BIN_HOME) must not be reported as an
+    // error when a system `rg` is already on PATH and nothing needs to be
+    // installed.
+    let which_rg = which_rg_blocking().await;
+
+    let path = match dedicated_rg_binary_path() {
+        Ok(p) => p,
+        Err(e) => {
+            return match &which_rg {
+                Some(found) => skipped_for_system_rg(found),
+                None => ComponentReport {
+                    name,
+                    current_version: None,
+                    latest_version: None,
+                    action: "error",
+                    detail: Some(e.to_string()),
+                },
+            };
+        }
+    };
+
+    // A `which`-resolved `rg` that is not our own managed copy is a
+    // system/distro install: leave it untouched. (`which` finding nothing,
+    // or resolving to the managed copy itself, both fall through to
+    // install/update.) Compared via `same_binary_path`, canonicalizing both
+    // sides when possible, since a `which`-resolved PATH string and our
+    // `dirs`-derived managed path can differ in case/drive-letter/`\\?\`-
+    // prefix form on Windows while naming the same file.
+    if let Some(found) = &which_rg
+        && !same_binary_path(found, &path)
+    {
+        return skipped_for_system_rg(found);
+    }
+
+    provision_managed_binary(
+        client,
+        name,
+        &path,
+        ReleaseSource {
+            owner: "BurntSushi",
+            repo: "ripgrep",
+            command: "rg",
+        },
+    )
+    .await
+}
+
+/// [`ComponentReport`] for the "a system `rg` is present and is left
+/// untouched" outcome, shared by both places [`provision_or_update_rg_binary`]
+/// can reach that conclusion (an unresolvable managed dir with a system `rg`
+/// present, and a resolvable managed dir whose `which`-resolved `rg` isn't it).
+fn skipped_for_system_rg(found: &Path) -> ComponentReport {
+    ComponentReport {
+        name: "rg".to_string(),
+        current_version: None,
+        latest_version: None,
+        action: "skipped",
+        detail: Some(format!(
+            "a system `rg` is present at {} and is left untouched",
+            found.display()
+        )),
+    }
+}
+
+/// [`which::which`] off the async runtime's worker thread: like
+/// [`read_installed_version_blocking`], the synchronous stat calls it makes
+/// across every `PATH` entry could otherwise block a worker thread shared by
+/// the concurrently-spawned self/rtk/memory `--update` tasks.
+async fn which_rg_blocking() -> Option<PathBuf> {
+    tokio::task::spawn_blocking(|| which::which("rg").ok())
+        .await
+        .unwrap_or(None)
+}
+
+/// Shared install-if-absent / update-if-stale boilerplate for a managed
+/// binary at `path`: ensure its parent dir exists, probe its current version
+/// if it's already on disk, and route through [`check_and_install`]. Factors
+/// out the `ensure_parent_dir`-error / path-exists / current-version sequence
+/// that was duplicated across the rtk, codebase-memory-mcp, and rg
+/// provisioners. `path` resolution and its error handling stay with each
+/// caller, since rg's differs (a resolution failure isn't necessarily an
+/// error there — see [`provision_or_update_rg_binary`]).
+async fn provision_managed_binary(
+    client: &reqwest::Client,
+    name: String,
+    path: &Path,
+    source: ReleaseSource<'_>,
+) -> ComponentReport {
+    if let Err(e) = crate::ensure_parent_dir(path) {
         return ComponentReport {
             name,
             current_version: None,
@@ -192,34 +290,30 @@ async fn provision_or_update_rtk_binary(client: &reqwest::Client) -> ComponentRe
             action: "error",
             detail: Some(format!(
                 "failed to create binary directory {}: {e}",
-                path.parent().unwrap_or(&path).display()
+                path.parent().unwrap_or(path).display()
             )),
         };
     }
 
     let path_exists = path.exists();
     let current = if path_exists {
-        read_installed_version_blocking(path.clone()).await
+        read_installed_version_blocking(path.to_path_buf()).await
     } else {
         None
     };
 
-    // Only a genuinely absent file should trigger a fresh install — see the
-    // identical comment on `provision_or_update_memory_binary`. A file that
-    // exists but whose version couldn't be probed must be skipped like any
-    // other tracked dependency, never silently redownloaded/overwritten.
+    // Only a genuinely absent file should trigger a fresh install. A file
+    // that exists but whose version couldn't be probed (a transient
+    // `--version` timeout or format mismatch) must be skipped like any other
+    // tracked dependency, never silently redownloaded/overwritten.
     let install_if_missing = !path_exists;
 
     check_and_install(
         client,
         name,
-        ReleaseSource {
-            owner: "rtk-ai",
-            repo: "rtk",
-            command: "rtk",
-        },
+        source,
         current,
-        InstallTarget::Path(&path),
+        InstallTarget::Path(path),
         install_if_missing,
     )
     .await
@@ -271,19 +365,12 @@ pub async fn run_update() -> ExitCode {
         }
     };
 
-    let mut handles = Vec::with_capacity(3 + DEPENDENCY_BINARIES.len());
+    let mut handles = Vec::with_capacity(4);
     let self_client = client.clone();
     handles.push((
         SELF_REPO,
         tokio::spawn(async move { update_self(&self_client).await }),
     ));
-    for dep in DEPENDENCY_BINARIES {
-        let client = client.clone();
-        handles.push((
-            dep.command,
-            tokio::spawn(async move { update_dependency(&client, dep).await }),
-        ));
-    }
 
     let rtk_client = client.clone();
     handles.push((
@@ -295,6 +382,12 @@ pub async fn run_update() -> ExitCode {
     handles.push((
         "codebase-memory-mcp",
         tokio::spawn(async move { provision_or_update_memory_binary(&memory_client).await }),
+    ));
+
+    let rg_client = client.clone();
+    handles.push((
+        "rg",
+        tokio::spawn(async move { provision_or_update_rg_binary(&rg_client).await }),
     ));
 
     let mut components = Vec::with_capacity(handles.len());
@@ -352,52 +445,17 @@ async fn update_self(client: &reqwest::Client) -> ComponentReport {
     .await
 }
 
-async fn update_dependency(client: &reqwest::Client, dep: &DependencyBinary) -> ComponentReport {
-    let name = dep.command.to_string();
-
-    let path = match which::which(dep.command) {
-        Ok(p) => p,
-        Err(_) => {
-            return ComponentReport {
-                name,
-                current_version: None,
-                latest_version: None,
-                action: "skipped",
-                detail: Some("binary not found on PATH; install it first".to_string()),
-            };
-        }
-    };
-
-    let current = read_installed_version_blocking(path.clone()).await;
-
-    check_and_install(
-        client,
-        name,
-        ReleaseSource {
-            owner: dep.owner,
-            repo: dep.repo,
-            command: dep.command,
-        },
-        current,
-        InstallTarget::Path(&path),
-        false,
-    )
-    .await
-}
-
 /// Shared fetch-release -> parse-tag -> compare-versions -> pick-asset ->
-/// install -> [`ComponentReport`] sequence used by `update_self`,
-/// `update_dependency`, and `provision_or_update_memory_binary`, once each
-/// has arrived at its own `current` version (or `None`, if it couldn't be
-/// determined but a release lookup is still worth doing to report the latest
-/// version).
+/// install -> [`ComponentReport`] sequence used by `update_self` and the three
+/// managed provisioners (`provision_or_update_rtk_binary`,
+/// `provision_or_update_memory_binary`, `provision_or_update_rg_binary`), once
+/// each has arrived at its own `current` version (or `None`).
 ///
-/// `install_if_missing` controls what a `None` `current` means: for the
-/// `which`-resolved PATH dependency (`rg`) it means "unmanaged installation,
-/// don't touch it" (`action: "skipped"`); for the managed `rtk` and
-/// `codebase-memory-mcp` copies — which repo-explorer-mcp owns outright and
-/// never falls back to a PATH/global install — it means "not installed yet" and
-/// triggers a fresh install (`action: "installed"`) instead.
+/// `install_if_missing` controls what a `None` `current` means: `false` (a
+/// managed copy that exists but whose version couldn't be probed) means "don't
+/// overwrite it blindly" (`action: "skipped"`); `true` (a managed copy that is
+/// genuinely absent) means "not installed yet" and triggers a fresh install
+/// (`action: "installed"`).
 async fn check_and_install(
     client: &reqwest::Client,
     name: String,
@@ -1206,42 +1264,33 @@ mod tests {
             dir.join("codebase-memory-mcp")
         );
         assert_eq!(binary_path_in(dir, "rtk"), dir.join("rtk"));
+        assert_eq!(binary_path_in(dir, "rg"), dir.join("rg"));
         let mem = if cfg!(windows) {
             "codebase-memory-mcp.exe"
         } else {
             "codebase-memory-mcp"
         };
         let rtk = if cfg!(windows) { "rtk.exe" } else { "rtk" };
+        let rg = if cfg!(windows) { "rg.exe" } else { "rg" };
         assert_eq!(memory_binary_file_name(), mem);
         assert_eq!(rtk_binary_file_name(), rtk);
-    }
-
-    #[test]
-    fn managed_binaries_removed_from_dependency_binaries() {
-        // Regression: rtk and codebase-memory-mcp are provisioned install-if-
-        // absent (`provision_or_update_*`), never via the which-based
-        // DEPENDENCY_BINARIES loop; only `rg` stays a PATH-resolved dependency.
-        assert!(
-            DEPENDENCY_BINARIES
-                .iter()
-                .all(|d| d.command != "codebase-memory-mcp"),
-            "codebase-memory-mcp must not be a which-resolved dependency"
-        );
-        assert!(
-            DEPENDENCY_BINARIES.iter().all(|d| d.command != "rtk"),
-            "rtk must not be a which-resolved dependency"
-        );
-        assert!(DEPENDENCY_BINARIES.iter().any(|d| d.command == "rg"));
+        assert_eq!(rg_binary_file_name(), rg);
     }
 
     #[test]
     fn managed_rtk_and_memory_share_a_parent_dir() {
         let rtk = dedicated_rtk_binary_path().expect("rtk path resolves in the test env");
         let mem = dedicated_memory_binary_path().expect("memory path resolves in the test env");
+        let rg = dedicated_rg_binary_path().expect("rg path resolves in the test env");
         assert_eq!(
             rtk.parent(),
             mem.parent(),
             "both managed binaries must live in the same shared bin dir"
+        );
+        assert_eq!(
+            rg.parent(),
+            mem.parent(),
+            "the managed rg fallback must live in the same shared bin dir"
         );
         assert_eq!(
             rtk.file_name().unwrap(),
@@ -1250,6 +1299,10 @@ mod tests {
         assert_eq!(
             mem.file_name().unwrap(),
             std::ffi::OsStr::new(memory_binary_file_name())
+        );
+        assert_eq!(
+            rg.file_name().unwrap(),
+            std::ffi::OsStr::new(rg_binary_file_name())
         );
     }
 }

@@ -108,6 +108,15 @@ export function installDir(osKind, env, homedir) {
       );
     return path.join(local, "repo-explorer-mcp");
   }
+  // Mirror Rust dirs::executable_dir(): $XDG_BIN_HOME when it is an absolute
+  // path, else $HOME/.local/bin. Guard truthiness/type BEFORE path.isAbsolute
+  // — path.isAbsolute(undefined) throws TypeError, it does not return false.
+  if (
+    typeof env.XDG_BIN_HOME === "string" &&
+    path.isAbsolute(env.XDG_BIN_HOME)
+  ) {
+    return env.XDG_BIN_HOME;
+  }
   return path.join(homedir, ".local", "bin");
 }
 
@@ -271,7 +280,7 @@ async function ensureRipgrep(plat, opts) {
       return probeBinary("rg", plat.osKind);
     }
     console.warn(
-      `ripgrep is missing and no supported package manager (${LINUX_PKG_MANAGERS.map(([pm]) => pm).join("/")}) was found. ${RIPGREP_MANUAL_INSTALL_HINT}`,
+      `ripgrep is missing and no supported package manager (${LINUX_PKG_MANAGERS.map(([pm]) => pm).join("/")}) was found. It will be provisioned into the shared bin dir by \`repo-explorer-mcp --update\` (run below). To install it yourself instead: ${RIPGREP_MANUAL_INSTALL_HINT}`,
     );
     return MISSING;
   }
@@ -304,7 +313,7 @@ async function ensureRipgrep(plat, opts) {
     return probeBinary("rg", plat.osKind);
   }
   console.warn(
-    `ripgrep is missing and winget was not found. ${RIPGREP_MANUAL_INSTALL_HINT}`,
+    `ripgrep is missing and winget was not found. It will be provisioned into the shared bin dir by \`repo-explorer-mcp --update\` (run below). To install it yourself instead: ${RIPGREP_MANUAL_INSTALL_HINT}`,
   );
   return MISSING;
 }
@@ -316,7 +325,7 @@ async function ensureRipgrep(plat, opts) {
 // the binary install and provision later.
 function provisionManagedTools(binPath) {
   console.log(
-    "\nProvisioning managed tools (rtk, codebase-memory-mcp) into the shared bin dir via `repo-explorer-mcp --update`...",
+    "\nProvisioning managed tools (rtk, codebase-memory-mcp, rg) into the shared bin dir via `repo-explorer-mcp --update`...",
   );
   const r = spawnSync(binPath, ["--update"], {
     stdio: "inherit",
@@ -324,22 +333,49 @@ function provisionManagedTools(binPath) {
   });
   if (r.error || r.status !== 0) {
     console.warn(
-      "Failed to provision managed tools automatically; run `repo-explorer-mcp --update` (or `repo-explorer-mcp setup`) later to provision rtk and codebase-memory-mcp.",
+      "Failed to provision managed tools automatically; run `repo-explorer-mcp --update` (or `repo-explorer-mcp setup`) later to provision rtk, codebase-memory-mcp, and rg.",
     );
     return "provision failed (run --update later)";
   }
   return "provisioned via --update";
 }
 
+// Shared by reprobeRtk/reprobeRg: if the named managed binary exists next to
+// the main binary in `dir`, report its version (or "provisioned" if the
+// version probe itself came up empty); otherwise null, so callers can layer
+// their own fallback (the two differ in precedence, so that stays with them).
+function probeManagedFile(dir, osKind, fileName) {
+  const file = path.join(
+    dir,
+    osKind === "win32" ? `${fileName}.exe` : fileName,
+  );
+  if (!fs.existsSync(file)) return null;
+  return probeVersion(file) ?? "provisioned";
+}
+
 // After `--update` provisions rtk into the shared bin dir, report its status for
 // the summary. The dir may not be on PATH, so check the managed file directly
 // first (it lands next to the main binary in `dir`), then fall back to a PATH probe.
 function reprobeRtk(dir, osKind) {
-  const file = path.join(dir, osKind === "win32" ? "rtk.exe" : "rtk");
-  if (fs.existsSync(file)) {
-    return probeVersion(file) ?? "provisioned";
+  return probeManagedFile(dir, osKind, "rtk") ?? probeBinary("rtk", osKind);
+}
+
+// After `--update` runs, report rg's status for the summary. The Rust
+// updater always prefers a system rg over the managed fallback, so mirror
+// that precedence here: re-check PATH first. This matters because a managed
+// copy from an earlier run can be left on disk (the updater never deletes
+// it once a system rg takes over) — checking the managed file first would
+// wrongly report that stale leftover's version instead of the system rg
+// that's actually active. Only when no system rg is resolvable do we fall
+// back to the managed file next to the main binary in `dir` (a freshly
+// provisioned fallback), and finally to whatever ensureRipgrep already
+// reported (`prior`, e.g. the winget "restart your terminal" note).
+function reprobeRg(dir, osKind, prior) {
+  const onPath = probeBinary("rg", osKind);
+  if (onPath !== MISSING) {
+    return onPath;
   }
-  return probeBinary("rtk", osKind);
+  return probeManagedFile(dir, osKind, "rg") ?? prior;
 }
 
 export function mcpSnippet(binPath) {
@@ -380,7 +416,7 @@ async function main() {
 
   // Dependency checks.
   console.log("\nDependency status:");
-  const rgVer = await ensureRipgrep(plat, opts);
+  let rgVer = await ensureRipgrep(plat, opts);
   console.log(`  ripgrep: ${rgVer}`);
   // rtk is provisioned into the shared bin dir by `repo-explorer-mcp --update`
   // (run below). Report its current status here; MISSING is expected on a first
@@ -475,6 +511,7 @@ async function main() {
   reportPathStatus(dir, plat.osKind);
   const cmVer = provisionManagedTools(binPath);
   rtkVer = reprobeRtk(dir, plat.osKind);
+  rgVer = reprobeRg(dir, plat.osKind, rgVer);
   printSummary(binPath, version, { rgVer, rtkVer, cmVer });
 }
 

@@ -151,7 +151,18 @@ async fn run(config: repo_explorer_core::config::Config) -> anyhow::Result<()> {
     let memory = MemoryClientBackend::connect(&config.codebase_memory)
         .await
         .context("failed to connect to codebase-memory-mcp")?;
-    let search = CliSearchBackend::new(&config.search);
+    // Prepend the managed bin dir to rtk's own PATH (this child process only)
+    // so a repo-explorer-managed `rg` fallback outside the ambient PATH is
+    // still discoverable by rtk's `rg` shell-out.
+    let managed_bin_dir = update::managed_bin_dir()
+        .inspect_err(|e| {
+            tracing::warn!(
+                "could not resolve the managed bin dir ({e:#}); \
+                 rtk will search only the ambient PATH for rg"
+            );
+        })
+        .ok();
+    let search = CliSearchBackend::new(&config.search, managed_bin_dir);
     if !search.rtk_available() {
         let managed = update::dedicated_rtk_binary_path()
             .inspect_err(|e| {

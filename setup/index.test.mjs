@@ -138,8 +138,24 @@ test("binaryName is OS-specific", () => {
 });
 
 test("installDir is OS-specific", () => {
+  // XDG_BIN_HOME unset -> $HOME/.local/bin.
   assert.equal(
     installDir("linux", {}, "/home/u"),
+    ["", "home", "u", ".local", "bin"].join(sep),
+  );
+  // Absolute XDG_BIN_HOME -> returned verbatim (parity with Rust dirs::executable_dir()).
+  assert.equal(
+    installDir("linux", { XDG_BIN_HOME: "/custom/bin" }, "/home/u"),
+    "/custom/bin",
+  );
+  // Relative XDG_BIN_HOME is ignored -> falls back to $HOME/.local/bin.
+  assert.equal(
+    installDir("linux", { XDG_BIN_HOME: "relative/bin" }, "/home/u"),
+    ["", "home", "u", ".local", "bin"].join(sep),
+  );
+  // Empty XDG_BIN_HOME is ignored -> falls back to $HOME/.local/bin.
+  assert.equal(
+    installDir("linux", { XDG_BIN_HOME: "" }, "/home/u"),
     ["", "home", "u", ".local", "bin"].join(sep),
   );
 });

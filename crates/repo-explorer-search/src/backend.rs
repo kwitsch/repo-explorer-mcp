@@ -18,6 +18,7 @@ use std::time::Duration;
 pub struct CliSearchBackend {
     rtk: Option<PathBuf>,
     timeout_seconds: u64,
+    extra_path_dir: Option<PathBuf>,
 }
 
 impl CliSearchBackend {
@@ -25,10 +26,16 @@ impl CliSearchBackend {
     /// unresolved backend is constructible, and `search` fails fast via
     /// `BackendNotFound` while the serve-time gate in `main.rs` refuses to
     /// start (see `rtk_available`).
-    pub fn new(config: &SearchConfig) -> Self {
+    ///
+    /// `extra_path_dir`, when given, is prepended to the `PATH` `rtk` is
+    /// spawned with (this process only — never the user's shell/global PATH),
+    /// so a repo-explorer-managed `rg` fallback outside the ambient PATH is
+    /// still discoverable by rtk's own `rg` shell-out.
+    pub fn new(config: &SearchConfig, extra_path_dir: Option<PathBuf>) -> Self {
         Self {
             rtk: resolve_rtk(config.rtk_path.as_deref(), || which::which("rtk").ok()),
             timeout_seconds: config.timeout_seconds,
+            extra_path_dir,
         }
     }
 
@@ -93,6 +100,7 @@ impl SearchBackend for CliSearchBackend {
             args,
             cwd: repo_root.to_path_buf(),
             timeout: Duration::from_secs(self.timeout_seconds),
+            extra_path_dir: self.extra_path_dir.clone(),
         };
 
         let stdout = run(&spec).await?;
