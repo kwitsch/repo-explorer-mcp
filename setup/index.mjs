@@ -108,6 +108,15 @@ export function installDir(osKind, env, homedir) {
       );
     return path.join(local, "repo-explorer-mcp");
   }
+  // Mirror Rust dirs::executable_dir(): $XDG_BIN_HOME when it is an absolute
+  // path, else $HOME/.local/bin. Guard truthiness/type BEFORE path.isAbsolute
+  // — path.isAbsolute(undefined) throws TypeError, it does not return false.
+  if (
+    typeof env.XDG_BIN_HOME === "string" &&
+    path.isAbsolute(env.XDG_BIN_HOME)
+  ) {
+    return env.XDG_BIN_HOME;
+  }
   return path.join(homedir, ".local", "bin");
 }
 
