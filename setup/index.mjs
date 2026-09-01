@@ -401,8 +401,12 @@ async function main() {
   const binName = binaryName(plat.osKind);
   const binPath = path.join(dir, binName);
 
-  // Idempotency check.
-  const installed = fs.existsSync(binPath) ? probeVersion(binPath) : null; // e.g. "repo-explorer-mcp 0.1.0"
+  // Idempotency check. Skipped entirely under --force: the probe result
+  // would be unused (alreadyUpToDate is always false below), and probing
+  // would otherwise still exec whatever binary is currently at binPath even
+  // when --force was passed specifically to replace a broken one.
+  const installed =
+    !opts.force && fs.existsSync(binPath) ? probeVersion(binPath) : null; // e.g. "repo-explorer-mcp 0.1.0"
   const installedVer = parseInstalledVersion(installed);
   const alreadyUpToDate =
     !opts.force &&

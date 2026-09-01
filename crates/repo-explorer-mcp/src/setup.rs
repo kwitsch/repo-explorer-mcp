@@ -14,7 +14,7 @@ use repo_explorer_core::config::{
     default_search_timeout_seconds, default_staleness_seconds, env_var_is_set,
 };
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -372,14 +372,28 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
     // depends on ~/.local/bin being on PATH — symmetric with the memory command
     // above. rtk is mandatory; the server fails fast at startup if it is
     // unresolved.
-    let rtk_path = crate::update::dedicated_rtk_binary_path()?;
-    if !rtk_path.exists() {
-        eprintln!(
-            "  note: the managed rtk binary is not installed yet at {}; \
-             run `repo-explorer-mcp --update` to provision it.",
-            rtk_path.display()
-        );
-    }
+    let rtk_path = match crate::update::dedicated_rtk_binary_path() {
+        Ok(p) => {
+            if !p.exists() {
+                eprintln!(
+                    "  note: the managed rtk binary is not installed yet at {}; \
+                     run `repo-explorer-mcp --update` to provision it.",
+                    p.display()
+                );
+            }
+            p
+        }
+        Err(e) => {
+            // Same reasoning as the codebase-memory branch above: don't
+            // propagate via `?`, which would discard every prior answer with
+            // no config written and no way to resume.
+            eprintln!(
+                "  note: could not resolve the managed rtk path ({e:#}); \
+                 falling back to a bare `rtk` command resolved via PATH."
+            );
+            PathBuf::from("rtk")
+        }
+    };
     let search = managed_search_config(&rtk_path);
 
     // agent / cache / logging left at defaults (fully defaulted in core); not

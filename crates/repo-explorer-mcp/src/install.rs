@@ -2,8 +2,10 @@
 //!
 //! One-shot, non-interactive self-integration with Claude Code. `--install`
 //! registers this binary as a user-scoped MCP server (via the real `claude`
-//! CLI, never by hand-editing `~/.claude.json`) and writes an `explore`
-//! subagent to `<home>/.claude/agents/explore.md`; `--uninstall` reverses
+//! CLI, never by hand-editing `~/.claude.json`) and writes an `Explore`
+//! subagent (capitalized to deliberately shadow Claude Code's built-in
+//! `Explore` agent — see `explore_agent_markdown`) to
+//! `<home>/.claude/agents/explore.md`; `--uninstall` reverses
 //! those two changes idempotently, but only deletes the agent file if its
 //! contents still match what install wrote. Dispatched before config
 //! resolution, so neither flag ever loads or creates `repo-explorer.toml`.
@@ -108,20 +110,64 @@ fn mcp_remove_args() -> Vec<OsString> {
     ]
 }
 
+/// Build the not-yet-spawned `claude` command. On Windows, `which` (see
+/// `claude_binary`) can resolve `claude` to a `.cmd`/`.bat` shim — the shape
+/// an `npm install -g` Claude Code install leaves on PATH, with no `.exe` —
+/// and `Command::new(path).spawn()` cannot execute those directly:
+/// `CreateProcess` rejects a script file outright ("%1 is not a valid Win32
+/// application", OS error 193). Routing exactly that case through `cmd.exe
+/// /C` is the standard workaround; every other extension (notably `.exe`) is
+/// spawned directly, unchanged.
+#[cfg(windows)]
+fn claude_command(claude: &Path) -> std::process::Command {
+    let needs_cmd_shell = claude
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
+    if needs_cmd_shell {
+        let mut command = std::process::Command::new("cmd");
+        command.arg("/C").arg(claude);
+        command
+    } else {
+        std::process::Command::new(claude)
+    }
+}
+
+#[cfg(not(windows))]
+fn claude_command(claude: &Path) -> std::process::Command {
+    std::process::Command::new(claude)
+}
+
 /// Invoke `claude` with `args`, bounded by [`crate::update::SUBPROCESS_TIMEOUT`]
-/// so a hung CLI cannot block the flag forever. Errors on spawn failure or
+/// so a hung CLI cannot block the flag forever. stdin is explicitly `null`
+/// (never inherited) so `--install`/`--uninstall` stay headless even if the
+/// `claude` CLI ever probes or reads stdin. Errors on spawn failure or
 /// timeout; otherwise yields the `Output` for the caller to interpret.
 fn run_claude(claude: &Path, args: &[OsString]) -> Result<std::process::Output> {
-    let mut command = std::process::Command::new(claude);
+    run_claude_with_timeout(claude, args, crate::update::SUBPROCESS_TIMEOUT)
+}
+
+/// [`run_claude`], but with an explicit timeout instead of the default
+/// [`crate::update::SUBPROCESS_TIMEOUT`] — used for the best-effort
+/// remove-before-add step in [`install_mcp_server`], whose `Output` is
+/// discarded, so it shouldn't be allowed to eat the full budget a hung
+/// `claude` could otherwise stall the meaningful add/remove call with.
+fn run_claude_with_timeout(
+    claude: &Path,
+    args: &[OsString],
+    timeout: std::time::Duration,
+) -> Result<std::process::Output> {
+    let mut command = claude_command(claude);
     command.args(args);
-    crate::update::run_with_timeout(command, crate::update::SUBPROCESS_TIMEOUT).ok_or_else(|| {
+    command.stdin(std::process::Stdio::null());
+    crate::update::run_with_timeout(command, timeout).ok_or_else(|| {
         anyhow!(
             "`claude {}` failed to run or did not exit within {:?}",
             args.iter()
                 .map(|a| a.to_string_lossy())
                 .collect::<Vec<_>>()
                 .join(" "),
-            crate::update::SUBPROCESS_TIMEOUT
+            timeout
         )
     })
 }
@@ -155,11 +201,26 @@ fn claude_step_result(
             action: success_action,
             detail: success_detail,
         },
-        Ok(output) => StepReport {
-            name,
-            action: failure_action,
-            detail: Some(combined_output(&output)),
-        },
+        Ok(output) => {
+            let output_text = combined_output(&output);
+            let detail = if output_text.is_empty() {
+                // The CLI can exit non-zero with nothing on stdout or stderr
+                // (e.g. killed by a signal, or an exec failure some shells
+                // report only via the exit status) — fall back to the exit
+                // status itself so `detail` is never silently empty.
+                format!(
+                    "claude exited with {} and produced no output",
+                    output.status
+                )
+            } else {
+                output_text
+            };
+            StepReport {
+                name,
+                action: failure_action,
+                detail: Some(detail),
+            }
+        }
         Err(e) => StepReport {
             name,
             action: failure_action,
@@ -201,7 +262,25 @@ pub fn run_install() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let steps = vec![install_mcp_server(&claude), install_agent_file()];
+    let mcp_step = install_mcp_server(&claude);
+    // Only shadow the built-in `Explore` agent once the MCP server it points
+    // at is actually registered — writing the agent file after a failed
+    // `mcp_step` would silently replace a working built-in with one backed
+    // by a server that was never registered.
+    let agent_step = if mcp_step.action == "error" {
+        StepReport {
+            name: "agent-file",
+            action: "skipped",
+            detail: Some(
+                "mcp-server registration failed; not installing the explore agent so it \
+                 doesn't shadow the built-in Explore agent with an unregistered server"
+                    .to_string(),
+            ),
+        }
+    } else {
+        install_agent_file()
+    };
+    let steps = vec![mcp_step, agent_step];
 
     let had_error = steps.iter().any(|s| s.action == "error");
     let report = InstallReport {
@@ -234,8 +313,14 @@ fn install_mcp_server(claude: &Path) -> StepReport {
         };
 
     // Remove-then-add: a missing prior entry is fine, so its exit status is
-    // ignored.
-    let _ = run_claude(claude, &mcp_remove_args());
+    // ignored. A much shorter timeout than the meaningful add call below,
+    // since a hung `claude` here would otherwise cost up to the full
+    // SUBPROCESS_TIMEOUT for an outcome nobody reads.
+    let _ = run_claude_with_timeout(
+        claude,
+        &mcp_remove_args(),
+        std::time::Duration::from_secs(2),
+    );
 
     claude_step_result(
         run_claude(claude, &mcp_add_args(&exe)),
@@ -246,7 +331,7 @@ fn install_mcp_server(claude: &Path) -> StepReport {
     )
 }
 
-/// Write (or overwrite) the explore agent file, creating `agents/` if needed.
+/// Write the explore agent file, creating `agents/` if needed.
 fn install_agent_file() -> StepReport {
     let path = match explore_agent_path() {
         Ok(p) => p,
@@ -258,19 +343,44 @@ fn install_agent_file() -> StepReport {
             };
         }
     };
+    install_agent_file_at(&path)
+}
 
-    if let Err(e) = crate::ensure_parent_dir(&path) {
+/// The path-parameterized core of [`install_agent_file`], split out so tests
+/// can exercise it against a temp file instead of the real
+/// `<home>/.claude/agents/explore.md`. Only overwrites a pre-existing file
+/// when its contents already match what this function would write (a no-op
+/// rewrite) or the file is absent; a pre-existing file with *different*
+/// contents is left in place and reported `skipped`, mirroring
+/// [`uninstall_agent_file_at`]'s guard so a user's own file at this
+/// conventional path is never silently destroyed by `--install` either.
+fn install_agent_file_at(path: &Path) -> StepReport {
+    if let Ok(existing) = std::fs::read_to_string(path)
+        && existing != explore_agent_markdown()
+    {
+        return StepReport {
+            name: "agent-file",
+            action: "skipped",
+            detail: Some(format!(
+                "{} already exists with different content; leaving it in place \
+                 (run --uninstall then --install to replace it)",
+                path.display()
+            )),
+        };
+    }
+
+    if let Err(e) = crate::ensure_parent_dir(path) {
         return StepReport {
             name: "agent-file",
             action: "error",
             detail: Some(format!(
                 "failed to create agent directory {}: {e}",
-                path.parent().unwrap_or(&path).display()
+                path.parent().unwrap_or(path).display()
             )),
         };
     }
 
-    match std::fs::write(&path, explore_agent_markdown()) {
+    match std::fs::write(path, explore_agent_markdown()) {
         Ok(()) => StepReport {
             name: "agent-file",
             action: "installed",
@@ -457,6 +567,41 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ))
+    }
+
+    #[test]
+    fn install_agent_file_at_writes_when_absent() {
+        let path = unique_temp_path("install-absent");
+        let report = install_agent_file_at(&path);
+        assert_eq!(report.action, "installed");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            explore_agent_markdown()
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn install_agent_file_at_rewrites_matching_content() {
+        let path = unique_temp_path("install-match");
+        std::fs::write(&path, explore_agent_markdown()).unwrap();
+        let report = install_agent_file_at(&path);
+        assert_eq!(report.action, "installed");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn install_agent_file_at_skips_preexisting_different_content() {
+        let path = unique_temp_path("install-foreign");
+        std::fs::write(&path, "a user's own unrelated agent file").unwrap();
+        let report = install_agent_file_at(&path);
+        assert_eq!(report.action, "skipped");
+        // The user's own file must survive untouched.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a user's own unrelated agent file"
+        );
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
