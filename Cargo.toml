@@ -3,5 +3,5 @@ resolver = "2"
 members = ["crates/repo-explorer-core", "crates/repo-explorer-mcp", "crates/repo-explorer-memory", "crates/repo-explorer-llm", "crates/repo-explorer-search", "crates/repo-explorer-agent"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
