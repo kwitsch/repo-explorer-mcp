@@ -287,7 +287,7 @@ impl Drop for MemoryClientBackend {
 /// from — the one place the upstream `project` key name/encoding lives.
 fn base_args(project: String) -> Map<String, Value> {
     let mut args = Map::new();
-    args.insert("project".to_string(), Value::String(project));
+    insert_str(&mut args, "project", project);
     args
 }
 
@@ -332,6 +332,14 @@ fn insert_path(args: &mut Map<String, Value>, key: &str, path: &Path) {
         key.to_string(),
         Value::String(path.to_string_lossy().into_owned()),
     );
+}
+
+/// Insert `key: v.into()` into `args` — the required-field counterpart to
+/// [`insert_opt_str`]/[`insert_opt_u32`]/[`insert_path`] above, for a
+/// `String`-to-JSON-string tool arg that is always present rather than
+/// optional.
+fn insert_str(args: &mut Map<String, Value>, key: &str, v: impl Into<String>) {
+    args.insert(key.to_string(), Value::String(v.into()));
 }
 
 /// Turn a bare directory path prefix (the shape `scope_hint` is documented
@@ -595,25 +603,32 @@ fn text_table_findings(text: &str) -> Vec<ExplorationFinding> {
         let Some(file) = cells.get(file_col).copied() else {
             continue;
         };
-        // A combined `lines` (`"start-end"`) column, if the section has one
-        // (every fixed-shape tool); otherwise fall back to separate
-        // `line_start`/`line_end` columns, as an arbitrary `query_graph`
-        // `RETURN` clause is prone to naming them.
-        let (line_start, line_end) = match t.lines.and_then(|i| cells.get(i).copied()) {
-            Some(cell) => parse_line_range(cell),
-            None => {
-                let start = t
-                    .line_start
-                    .and_then(|i| cells.get(i).copied())
-                    .and_then(parse_line_cell)
-                    .unwrap_or(0);
-                let end = t
-                    .line_end
-                    .and_then(|i| cells.get(i).copied())
-                    .and_then(parse_line_cell)
-                    .unwrap_or(start);
-                (start, end)
-            }
+        // Separate `line_start`/`line_end` columns, when the section has
+        // either, take priority over a combined `lines` column: every
+        // fixed-shape tool (`search_code`/`get_architecture`/`search_graph`)
+        // only ever emits one or the other, but an arbitrary `query_graph`
+        // `RETURN` clause can name both in the same row (e.g. `n.lines`
+        // alongside `n.start_line`/`n.end_line`) — there, `lines` is just
+        // whatever unrelated graph-node property the caller happened to
+        // return, not a `"start-end"` range, so it must not shadow the real
+        // range sitting in the other columns of that same row.
+        let (line_start, line_end) = if t.line_start.is_some() || t.line_end.is_some() {
+            let start = t
+                .line_start
+                .and_then(|i| cells.get(i).copied())
+                .and_then(parse_line_cell)
+                .unwrap_or(0);
+            let end = t
+                .line_end
+                .and_then(|i| cells.get(i).copied())
+                .and_then(parse_line_cell)
+                .unwrap_or(start);
+            (start, end)
+        } else {
+            t.lines
+                .and_then(|i| cells.get(i).copied())
+                .map(parse_line_range)
+                .unwrap_or((0, 0))
         };
         let note =
             t.qn.or(t.name)
@@ -865,9 +880,9 @@ impl MemoryBackend for MemoryClientBackend {
         query: &ExplorationQuery,
     ) -> Result<ExplorationResult, MemoryError> {
         self.call_memory_tool("search_code", repo_root, |args| {
-            args.insert("pattern".to_string(), Value::String(query.text.clone()));
+            insert_str(args, "pattern", query.text.clone());
             if let Some(scope) = &query.scope_hint {
-                args.insert("file_pattern".to_string(), Value::String(scope_glob(scope)));
+                insert_str(args, "file_pattern", scope_glob(scope));
             }
             insert_opt_u32(args, "limit", query.max_results);
         })
@@ -880,7 +895,7 @@ impl MemoryBackend for MemoryClientBackend {
         query: &GraphQuery,
     ) -> Result<ExplorationResult, MemoryError> {
         self.call_memory_tool("search_graph", repo_root, |args| {
-            args.insert("format".to_string(), Value::String("json".to_string()));
+            insert_str(args, "format", "json");
             insert_opt_str(args, "name_pattern", &query.name_pattern);
             insert_opt_str(args, "file_pattern", &query.file_pattern);
             insert_opt_str(args, "label", &query.label);
@@ -896,7 +911,7 @@ impl MemoryBackend for MemoryClientBackend {
         max_results: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
         self.call_memory_tool("query_graph", repo_root, |args| {
-            args.insert("query".to_string(), Value::String(query.to_string()));
+            insert_str(args, "query", query);
             insert_opt_u32(args, "limit", max_results);
         })
         .await
@@ -919,8 +934,8 @@ impl MemoryBackend for MemoryClientBackend {
         // two-endpoint intent -- and drop `to`, which the tool has nowhere
         // to put.
         self.call_memory_tool("trace_path", repo_root, |args| {
-            args.insert("function_name".to_string(), Value::String(from.to_string()));
-            args.insert("direction".to_string(), Value::String("both".to_string()));
+            insert_str(args, "function_name", from);
+            insert_str(args, "direction", "both");
             insert_opt_u32(args, "max_depth", max_depth);
         })
         .await
@@ -963,7 +978,7 @@ impl MemoryBackend for MemoryClientBackend {
             "get_code_snippet",
             repo_root,
             |args| {
-                args.insert("qualified_name".to_string(), Value::String(name.clone()));
+                insert_str(args, "qualified_name", name.clone());
             },
             single_snippet,
         )
@@ -1206,6 +1221,29 @@ repo.crates.a.src.f.decide_freshness crates/a/src/f.rs 40 60\n";
             f.note.as_deref(),
             Some("repo.crates.a.src.f.decide_freshness")
         );
+    }
+
+    /// Live-verified `query_graph` payload shape where a row's `lines`
+    /// column and its `line_start`/`line_end` columns are both present --
+    /// `RETURN n.name, n.file, n.lines, n.start_line, n.end_line` against
+    /// `ensure_fresh_index` really answers `lines="1"` (an unrelated graph
+    /// property, not a range) alongside the correct `start_line="81"`/
+    /// `end_line="81"`. The separate columns must win: taking `lines` here
+    /// would fabricate `(1, 1)` and silently discard the real `(81, 81)`
+    /// range sitting in the same row.
+    #[test]
+    fn text_table_query_graph_lines_and_separate_columns_prefers_separate() {
+        let text = "rows: 1  (cols: n.name n.file n.lines n.start_line n.end_line)\n  \
+ensure_fresh_index crates/repo-explorer-core/src/memory.rs \"1\" \"81\" \"81\"\n";
+        let res = findings_and_summary(
+            "query_graph",
+            &Value::String(text.to_string()),
+            Path::new("/repo"),
+        );
+        assert_eq!(res.findings.len(), 1);
+        let f = &res.findings[0];
+        assert_eq!((f.location.line_start, f.location.line_end), (81, 81));
+        assert_eq!(f.note.as_deref(), Some("ensure_fresh_index"));
     }
 
     /// Real `get_code_snippet` payload shape (file_path/start_line/source).

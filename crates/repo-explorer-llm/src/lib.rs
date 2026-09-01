@@ -138,24 +138,10 @@ pub struct GenaiProvider {
 }
 
 impl GenaiProvider {
-    /// Build one provider from a single config entry. The API key is read (by
-    /// `genai`, at call time) from `provider.api_key_env`; this constructor only
-    /// confirms the var is present, and its value is NEVER placed into any error
-    /// message. `base_url`, when `Some`, overrides the adapter's endpoint. An
-    /// unrecognized `kind`, or a missing key var at call-time (distinct from
-    /// config-load validation), yields `ProviderError::Configuration`.
-    pub fn from_config(
-        provider: &ProviderConfig,
-        model: &str,
-        https_proxy: Option<&str>,
-    ) -> Result<Self, ProviderError> {
-        let shared = Self::build_shared(provider, https_proxy)?;
-        Ok(Self::bind_model(&shared, model))
-    }
-
     /// The one place a `GenaiProvider` is assembled from its parts, so
-    /// `from_config` and `build_router` (which reuses one client across an
-    /// entry's models) cannot drift as fields are added.
+    /// `build_router` (which reuses one client across an entry's models)
+    /// and its test-only single-provider callers cannot drift as fields are
+    /// added.
     fn bind_model(shared: &SharedProviderParts, model: &str) -> Self {
         Self {
             name: shared.name.clone(),
@@ -820,8 +806,8 @@ mod tests {
             models: vec!["gpt-4o-mini".to_string()],
             base_url: None,
         };
-        let provider =
-            GenaiProvider::from_config(&cfg, &cfg.models[0], None).expect("build provider");
+        let shared = GenaiProvider::build_shared(&cfg, None).expect("build shared parts");
+        let provider = GenaiProvider::bind_model(&shared, &cfg.models[0]);
         let msgs = vec![Message {
             role: Role::User,
             content: "Say hello.".to_string(),

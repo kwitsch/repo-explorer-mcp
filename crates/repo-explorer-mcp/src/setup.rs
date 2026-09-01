@@ -169,11 +169,16 @@ fn read_line() -> anyhow::Result<Option<String>> {
     Ok(Some(line))
 }
 
+/// Print `{text}: ` on stderr, flush, and read one line. `None` on EOF.
+fn prompt_line(text: &str) -> anyhow::Result<Option<String>> {
+    eprint!("{text}: ");
+    let _ = std::io::stderr().flush();
+    read_line()
+}
+
 /// Prompt (showing `default`) on stderr; empty input or EOF returns `default`.
 fn prompt_default(prompt: &str, default: &str) -> anyhow::Result<String> {
-    eprint!("{prompt} [{default}]: ");
-    let _ = std::io::stderr().flush();
-    match read_line()? {
+    match prompt_line(&format!("{prompt} [{default}]"))? {
         Some(s) => {
             let trimmed = s.trim();
             if trimmed.is_empty() {
@@ -188,9 +193,7 @@ fn prompt_default(prompt: &str, default: &str) -> anyhow::Result<String> {
 
 /// Prompt on stderr and return the raw trimmed line (may be empty). EOF bails.
 fn prompt_raw(prompt: &str) -> anyhow::Result<String> {
-    eprint!("{prompt}: ");
-    let _ = std::io::stderr().flush();
-    match read_line()? {
+    match prompt_line(prompt)? {
         Some(s) => Ok(s.trim().to_string()),
         None => anyhow::bail!("unexpected end of input"),
     }
