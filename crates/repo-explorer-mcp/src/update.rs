@@ -134,43 +134,15 @@ async fn provision_or_update_memory_binary(client: &reqwest::Client) -> Componen
         }
     };
 
-    if let Err(e) = crate::ensure_parent_dir(&path) {
-        return ComponentReport {
-            name,
-            current_version: None,
-            latest_version: None,
-            action: "error",
-            detail: Some(format!(
-                "failed to create binary directory {}: {e}",
-                path.parent().unwrap_or(&path).display()
-            )),
-        };
-    }
-
-    let path_exists = path.exists();
-    let current = if path_exists {
-        read_installed_version_blocking(path.clone()).await
-    } else {
-        None
-    };
-
-    // Only a genuinely absent file should trigger a fresh install. A file
-    // that exists but whose version couldn't be probed (a transient
-    // `--version` timeout or format mismatch) must be skipped like any other
-    // tracked dependency, never silently redownloaded/overwritten.
-    let install_if_missing = !path_exists;
-
-    check_and_install(
+    provision_managed_binary(
         client,
         name,
+        &path,
         ReleaseSource {
             owner: "DeusData",
             repo: "codebase-memory-mcp",
             command: "codebase-memory-mcp",
         },
-        current,
-        InstallTarget::Path(&path),
-        install_if_missing,
     )
     .await
 }
@@ -197,43 +169,15 @@ async fn provision_or_update_rtk_binary(client: &reqwest::Client) -> ComponentRe
         }
     };
 
-    if let Err(e) = crate::ensure_parent_dir(&path) {
-        return ComponentReport {
-            name,
-            current_version: None,
-            latest_version: None,
-            action: "error",
-            detail: Some(format!(
-                "failed to create binary directory {}: {e}",
-                path.parent().unwrap_or(&path).display()
-            )),
-        };
-    }
-
-    let path_exists = path.exists();
-    let current = if path_exists {
-        read_installed_version_blocking(path.clone()).await
-    } else {
-        None
-    };
-
-    // Only a genuinely absent file should trigger a fresh install — see the
-    // identical comment on `provision_or_update_memory_binary`. A file that
-    // exists but whose version couldn't be probed must be skipped like any
-    // other tracked dependency, never silently redownloaded/overwritten.
-    let install_if_missing = !path_exists;
-
-    check_and_install(
+    provision_managed_binary(
         client,
         name,
+        &path,
         ReleaseSource {
             owner: "rtk-ai",
             repo: "rtk",
             command: "rtk",
         },
-        current,
-        InstallTarget::Path(&path),
-        install_if_missing,
     )
     .await
 }
@@ -253,22 +197,13 @@ async fn provision_or_update_rg_binary(client: &reqwest::Client) -> ComponentRep
     // managed dir (e.g. no HOME/XDG_BIN_HOME) must not be reported as an
     // error when a system `rg` is already on PATH and nothing needs to be
     // installed.
-    let which_rg = which::which("rg").ok();
+    let which_rg = which_rg_blocking().await;
 
     let path = match dedicated_rg_binary_path() {
         Ok(p) => p,
         Err(e) => {
             return match &which_rg {
-                Some(found) => ComponentReport {
-                    name,
-                    current_version: None,
-                    latest_version: None,
-                    action: "skipped",
-                    detail: Some(format!(
-                        "a system `rg` is present at {} and is left untouched",
-                        found.display()
-                    )),
-                },
+                Some(found) => skipped_for_system_rg(found),
                 None => ComponentReport {
                     name,
                     current_version: None,
@@ -290,19 +225,64 @@ async fn provision_or_update_rg_binary(client: &reqwest::Client) -> ComponentRep
     if let Some(found) = &which_rg
         && !same_binary_path(found, &path)
     {
-        return ComponentReport {
-            name,
-            current_version: None,
-            latest_version: None,
-            action: "skipped",
-            detail: Some(format!(
-                "a system `rg` is present at {} and is left untouched",
-                found.display()
-            )),
-        };
+        return skipped_for_system_rg(found);
     }
 
-    if let Err(e) = crate::ensure_parent_dir(&path) {
+    provision_managed_binary(
+        client,
+        name,
+        &path,
+        ReleaseSource {
+            owner: "BurntSushi",
+            repo: "ripgrep",
+            command: "rg",
+        },
+    )
+    .await
+}
+
+/// [`ComponentReport`] for the "a system `rg` is present and is left
+/// untouched" outcome, shared by both places [`provision_or_update_rg_binary`]
+/// can reach that conclusion (an unresolvable managed dir with a system `rg`
+/// present, and a resolvable managed dir whose `which`-resolved `rg` isn't it).
+fn skipped_for_system_rg(found: &Path) -> ComponentReport {
+    ComponentReport {
+        name: "rg".to_string(),
+        current_version: None,
+        latest_version: None,
+        action: "skipped",
+        detail: Some(format!(
+            "a system `rg` is present at {} and is left untouched",
+            found.display()
+        )),
+    }
+}
+
+/// [`which::which`] off the async runtime's worker thread: like
+/// [`read_installed_version_blocking`], the synchronous stat calls it makes
+/// across every `PATH` entry could otherwise block a worker thread shared by
+/// the concurrently-spawned self/rtk/memory `--update` tasks.
+async fn which_rg_blocking() -> Option<PathBuf> {
+    tokio::task::spawn_blocking(|| which::which("rg").ok())
+        .await
+        .unwrap_or(None)
+}
+
+/// Shared install-if-absent / update-if-stale boilerplate for a managed
+/// binary at `path`: ensure its parent dir exists, probe its current version
+/// if it's already on disk, and route through [`check_and_install`]. Factors
+/// out the `ensure_parent_dir`-error / path-exists / current-version sequence
+/// that was duplicated across the rtk, codebase-memory-mcp, and rg
+/// provisioners. `path` resolution and its error handling stay with each
+/// caller, since rg's differs (a resolution failure isn't necessarily an
+/// error there — see [`provision_or_update_rg_binary`]).
+async fn provision_managed_binary(
+    client: &reqwest::Client,
+    name: String,
+    path: &Path,
+    source: ReleaseSource<'_>,
+) -> ComponentReport {
+    if let Err(e) = crate::ensure_parent_dir(path) {
         return ComponentReport {
             name,
             current_version: None,
@@ -310,32 +290,30 @@ async fn provision_or_update_rg_binary(client: &reqwest::Client) -> ComponentRep
             action: "error",
             detail: Some(format!(
                 "failed to create binary directory {}: {e}",
-                path.parent().unwrap_or(&path).display()
+                path.parent().unwrap_or(path).display()
             )),
         };
     }
 
     let path_exists = path.exists();
     let current = if path_exists {
-        read_installed_version_blocking(path.clone()).await
+        read_installed_version_blocking(path.to_path_buf()).await
     } else {
         None
     };
 
-    // A genuinely absent managed copy is installed; an existing-but-unprobeable
-    // one is skipped by check_and_install rather than blindly overwritten.
+    // Only a genuinely absent file should trigger a fresh install. A file
+    // that exists but whose version couldn't be probed (a transient
+    // `--version` timeout or format mismatch) must be skipped like any other
+    // tracked dependency, never silently redownloaded/overwritten.
     let install_if_missing = !path_exists;
 
     check_and_install(
         client,
         name,
-        ReleaseSource {
-            owner: "BurntSushi",
-            repo: "ripgrep",
-            command: "rg",
-        },
+        source,
         current,
-        InstallTarget::Path(&path),
+        InstallTarget::Path(path),
         install_if_missing,
     )
     .await

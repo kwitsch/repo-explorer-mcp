@@ -340,15 +340,24 @@ function provisionManagedTools(binPath) {
   return "provisioned via --update";
 }
 
+// Shared by reprobeRtk/reprobeRg: if the named managed binary exists next to
+// the main binary in `dir`, report its version (or "provisioned" if the
+// version probe itself came up empty); otherwise null, so callers can layer
+// their own fallback (the two differ in precedence, so that stays with them).
+function probeManagedFile(dir, osKind, fileName) {
+  const file = path.join(
+    dir,
+    osKind === "win32" ? `${fileName}.exe` : fileName,
+  );
+  if (!fs.existsSync(file)) return null;
+  return probeVersion(file) ?? "provisioned";
+}
+
 // After `--update` provisions rtk into the shared bin dir, report its status for
 // the summary. The dir may not be on PATH, so check the managed file directly
 // first (it lands next to the main binary in `dir`), then fall back to a PATH probe.
 function reprobeRtk(dir, osKind) {
-  const file = path.join(dir, osKind === "win32" ? "rtk.exe" : "rtk");
-  if (fs.existsSync(file)) {
-    return probeVersion(file) ?? "provisioned";
-  }
-  return probeBinary("rtk", osKind);
+  return probeManagedFile(dir, osKind, "rtk") ?? probeBinary("rtk", osKind);
 }
 
 // After `--update` runs, report rg's status for the summary. The Rust
@@ -366,11 +375,7 @@ function reprobeRg(dir, osKind, prior) {
   if (onPath !== MISSING) {
     return onPath;
   }
-  const file = path.join(dir, osKind === "win32" ? "rg.exe" : "rg");
-  if (fs.existsSync(file)) {
-    return probeVersion(file) ?? "provisioned";
-  }
-  return prior;
+  return probeManagedFile(dir, osKind, "rg") ?? prior;
 }
 
 export function mcpSnippet(binPath) {
