@@ -19,6 +19,8 @@ use crate::dispatch::{MATCH_ANY_NON_EMPTY_LINE, escapes_repo_root};
 
 /// How many identifier tokens get their own symbol-lookup leg.
 const SYMBOL_LOOKUP_TOKENS: usize = 4;
+/// How many literal/identifier tokens get their own memory-search leg.
+const SEMANTIC_LOOKUP_TOKENS: usize = 4;
 /// How many path tokens get their own file-name leg.
 const FILE_LOOKUP_TOKENS: usize = 3;
 /// Raw results requested per leg (ranking truncates to top-k afterwards).
@@ -80,31 +82,46 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
         },
     ));
 
-    let semantic_leg = memoized(
-        leg_cache,
-        move || {
-            let mut key = leg_key("semantic", &query.text, scope);
-            encode_field_into(&mut key, &opt_to_string(query.max_results));
-            key
-        },
-        async move {
-            // Reuses `query.text`/`max_results` but swaps in the already-
-            // filtered `scope`, not `query.scope_hint` — an escaping hint
-            // must not reach `search_code`'s RPC any more than it reaches
-            // `search.search` in the other three legs.
-            let sanitized_query = ExplorationQuery {
-                text: query.text.clone(),
-                scope_hint: scope.map(Path::to_path_buf),
-                max_results: query.max_results,
-            };
-            soft_leg(
-                "semantic",
-                query.text.as_str(),
-                memory.search_code(repo_root, &sanitized_query),
-                |res| candidates_of_kind(res.findings, CandidateKind::SemanticHit),
-            )
-            .await
-        },
+    // The connected backend's `search_code` is a literal-substring search, not
+    // semantic search (confirmed live): the raw free-text `query.text` almost
+    // never appears verbatim in source, so it must never be forwarded as-is.
+    // Fan out one call per derived literal/identifier token instead — the
+    // same tokens the grep legs search for, but against the memory backend's
+    // own index (a distinct corpus from the CLI search backend).
+    let semantic_legs = join_all(
+        patterns
+            .literals
+            .iter()
+            .chain(patterns.identifiers.iter())
+            .take(SEMANTIC_LOOKUP_TOKENS)
+            .map(|token| {
+                memoized(
+                    leg_cache,
+                    move || {
+                        let mut key = leg_key("semantic", token, scope);
+                        encode_field_into(&mut key, &opt_to_string(query.max_results));
+                        key
+                    },
+                    async move {
+                        // Swaps in the already-filtered `scope`, not
+                        // `query.scope_hint` — an escaping hint must not
+                        // reach `search_code`'s RPC any more than it reaches
+                        // `search.search` in the other three legs.
+                        let sanitized_query = ExplorationQuery {
+                            text: token.clone(),
+                            scope_hint: scope.map(Path::to_path_buf),
+                            max_results: query.max_results,
+                        };
+                        soft_leg(
+                            "semantic",
+                            token.as_str(),
+                            memory.search_code(repo_root, &sanitized_query),
+                            |res| candidates_of_kind(res.findings, CandidateKind::SemanticHit),
+                        )
+                        .await
+                    },
+                )
+            }),
     );
 
     let grep_legs = join_all(patterns.grep_patterns.iter().map(|pattern| {
@@ -155,11 +172,11 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
     );
 
     let (symbols, semantic, greps, files) =
-        futures_util::future::join4(symbol_legs, semantic_leg, grep_legs, file_legs).await;
+        futures_util::future::join4(symbol_legs, semantic_legs, grep_legs, file_legs).await;
 
     let mut raw: Vec<Candidate> = Vec::new();
     raw.extend(symbols.into_iter().flatten());
-    raw.extend(semantic);
+    raw.extend(semantic.into_iter().flatten());
     raw.extend(greps.into_iter().flatten());
     raw.extend(files.into_iter().flatten());
 
@@ -598,6 +615,48 @@ mod tests {
             );
         }
         assert_escaping_scope_hint_dropped_from_memory(&memory);
+    }
+
+    /// Regression: the semantic leg's `search_code` calls must carry one of
+    /// `derive_patterns`' own literal/identifier tokens, never the raw
+    /// multi-word query text verbatim -- the connected backend's
+    /// `search_code` is a literal-substring search, so the raw sentence
+    /// itself almost never appears in source and the leg would silently
+    /// surface nothing for real free-text queries.
+    #[tokio::test]
+    async fn semantic_leg_searches_derived_tokens_not_the_raw_sentence() {
+        let search = MockSearchBackend::new().with_search_result(Ok(vec![]));
+        let memory = MockMemoryBackend::new();
+        let query = ExplorationQuery {
+            text: "hello world foo_bar".to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let _ = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
+        let calls = memory.calls();
+        let search_code_texts: Vec<_> = calls
+            .iter()
+            .filter_map(|c| match c {
+                repo_explorer_core::memory::mock::Call::SearchCode { query, .. } => {
+                    Some(query.text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !search_code_texts.is_empty(),
+            "semantic leg never called search_code"
+        );
+        for text in &search_code_texts {
+            assert_ne!(
+                *text, "hello world foo_bar",
+                "semantic leg must not forward the raw sentence verbatim"
+            );
+        }
+        assert!(
+            search_code_texts.contains(&"foo_bar"),
+            "expected a per-token search_code call, got {search_code_texts:?}"
+        );
     }
 
     /// Regression for the semantic leg forwarding the raw, unsanitized
