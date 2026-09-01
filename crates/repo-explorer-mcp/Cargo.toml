@@ -4,11 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-repo-explorer-core   = { version = "0.3.0", path = "../repo-explorer-core" }
-repo-explorer-memory = { version = "0.3.0", path = "../repo-explorer-memory" }
-repo-explorer-search = { version = "0.3.0", path = "../repo-explorer-search" }
-repo-explorer-llm    = { version = "0.3.0", path = "../repo-explorer-llm" }
-repo-explorer-agent  = { version = "0.3.0", path = "../repo-explorer-agent" }
+repo-explorer-core   = { version = "0.3.1", path = "../repo-explorer-core" }
+repo-explorer-memory = { version = "0.3.1", path = "../repo-explorer-memory" }
+repo-explorer-search = { version = "0.3.1", path = "../repo-explorer-search" }
+repo-explorer-llm    = { version = "0.3.1", path = "../repo-explorer-llm" }
+repo-explorer-agent  = { version = "0.3.1", path = "../repo-explorer-agent" }
 rmcp = { version = "3.1.4", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
 anyhow = "1"
