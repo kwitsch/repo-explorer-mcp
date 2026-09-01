@@ -35,12 +35,17 @@ pub struct MemoryClientBackend {
     /// configured staleness threshold.
     last_reindexed_at: Mutex<Option<SystemTime>>,
     /// Cache of the project name resolved from `repo_root`, keyed on the
-    /// `repo_root` it was resolved from. `repo_root` never changes across a
-    /// `MemoryClientBackend`'s lifetime (every query method is called with
-    /// the same value each time), so after the first resolution this lets
-    /// [`Self::cached_project_name`] skip `project_name`'s `spawn_blocking` +
-    /// `fs::canonicalize` round trip on every subsequent call — mirrors the
-    /// `last_reindexed_at` single-field-cache pattern above.
+    /// `repo_root` it was resolved from. In practice `repo_root` never changes
+    /// across a `MemoryClientBackend`'s lifetime (every query method is called
+    /// with the same value each time), so after the first resolution this
+    /// lets [`Self::cached_project_name`] skip `project_name`'s
+    /// `spawn_blocking` + `fs::canonicalize` round trip on every subsequent
+    /// call — mirrors the `last_reindexed_at` single-field-cache pattern
+    /// above. The key guards that "in practice" is not a compile-time
+    /// guarantee: nothing stops a future caller from driving one instance with
+    /// two different `repo_root` values, and a keyless cache would then
+    /// silently serve the wrong project's cached name instead of
+    /// re-resolving.
     project_name_cache: Mutex<Option<(PathBuf, String)>>,
 }
 
@@ -191,7 +196,11 @@ impl MemoryClientBackend {
     /// duplicate a blocking filesystem syscall for no benefit.
     async fn run_index(&self, abs_repo_root: &Path) -> Result<IndexStatus, MemoryError> {
         let mut args = Map::new();
-        insert_path(&mut args, "path", abs_repo_root);
+        insert_str(
+            &mut args,
+            "path",
+            abs_repo_root.to_string_lossy().into_owned(),
+        );
         match self.client().call("index_repository", args).await {
             Ok(_) => {
                 // Record when *we* just rebuilt it — the only clock available,
@@ -324,20 +333,9 @@ fn insert_opt_str(args: &mut Map<String, Value>, key: &str, v: &Option<String>) 
     }
 }
 
-/// Insert `key: path` into `args` as its lossy string form — the single place
-/// every `Path`-to-JSON-string tool arg goes through, instead of a repeated
-/// `Value::String(path.to_string_lossy().into_owned())` at each call site.
-fn insert_path(args: &mut Map<String, Value>, key: &str, path: &Path) {
-    args.insert(
-        key.to_string(),
-        Value::String(path.to_string_lossy().into_owned()),
-    );
-}
-
 /// Insert `key: v.into()` into `args` — the required-field counterpart to
-/// [`insert_opt_str`]/[`insert_opt_u32`]/[`insert_path`] above, for a
-/// `String`-to-JSON-string tool arg that is always present rather than
-/// optional.
+/// [`insert_opt_str`]/[`insert_opt_u32`] above, for a `String`-to-JSON-string
+/// tool arg that is always present rather than optional.
 fn insert_str(args: &mut Map<String, Value>, key: &str, v: impl Into<String>) {
     args.insert(key.to_string(), Value::String(v.into()));
 }

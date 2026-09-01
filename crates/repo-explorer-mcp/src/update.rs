@@ -46,12 +46,6 @@ pub(crate) fn managed_bin_dir() -> Result<PathBuf> {
     }
 }
 
-/// Pure, testable path composer: the managed dir *is* the final directory, so
-/// the binary sits directly inside it.
-fn binary_path_in(bin_dir: &Path, file: &str) -> PathBuf {
-    bin_dir.join(file)
-}
-
 /// True when `a` and `b` refer to the same file. Prefers canonicalizing both
 /// paths first — resolving symlinks and, notably on Windows, normalizing
 /// case/drive-letter/`\\?\`-prefix differences between a `PATH`-resolved
@@ -86,17 +80,14 @@ fn rtk_binary_file_name() -> &'static str {
 /// `%LOCALAPPDATA%\repo-explorer-mcp` on Windows). Errors when no managed dir is
 /// resolvable (e.g. no HOME). Never consults PATH.
 pub(crate) fn dedicated_memory_binary_path() -> Result<PathBuf> {
-    Ok(binary_path_in(
-        &managed_bin_dir()?,
-        memory_binary_file_name(),
-    ))
+    Ok(managed_bin_dir()?.join(memory_binary_file_name()))
 }
 
 /// Absolute path of the repo-explorer-managed `rtk` binary in the shared managed
 /// bin dir, alongside `codebase-memory-mcp`. Errors when no managed dir is
 /// resolvable. Never consults PATH.
 pub(crate) fn dedicated_rtk_binary_path() -> Result<PathBuf> {
-    Ok(binary_path_in(&managed_bin_dir()?, rtk_binary_file_name()))
+    Ok(managed_bin_dir()?.join(rtk_binary_file_name()))
 }
 
 /// File name of the managed `rg`/ripgrep binary, with the platform's
@@ -109,7 +100,7 @@ fn rg_binary_file_name() -> &'static str {
 /// shared managed bin dir, alongside `rtk` and `codebase-memory-mcp`. Errors
 /// when no managed dir is resolvable. Never consults PATH.
 pub(crate) fn dedicated_rg_binary_path() -> Result<PathBuf> {
-    Ok(binary_path_in(&managed_bin_dir()?, rg_binary_file_name()))
+    Ok(managed_bin_dir()?.join(rg_binary_file_name()))
 }
 
 /// Install-if-absent / update-if-stale the private `codebase-memory-mcp`
@@ -1257,14 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn binary_path_in_joins_file_onto_bin_dir() {
-        let dir = Path::new("/some/bin");
-        assert_eq!(
-            binary_path_in(dir, "codebase-memory-mcp"),
-            dir.join("codebase-memory-mcp")
-        );
-        assert_eq!(binary_path_in(dir, "rtk"), dir.join("rtk"));
-        assert_eq!(binary_path_in(dir, "rg"), dir.join("rg"));
+    fn managed_binary_file_names_have_platform_suffix() {
         let mem = if cfg!(windows) {
             "codebase-memory-mcp.exe"
         } else {
