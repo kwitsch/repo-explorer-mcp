@@ -126,31 +126,24 @@ pub struct CodebaseMemoryConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SearchConfig {
-    /// Explicit path to the `rtk` binary; `None` → auto-detect in Stage 3.
+    /// Explicit path to the `rtk` binary; `None` → auto-detect on PATH via `which`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtk_path: Option<PathBuf>,
-    /// Explicit path to the `ripgrep` binary; `None` → auto-detect in Stage 3.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ripgrep_path: Option<PathBuf>,
     /// Per-search subprocess timeout. `0` means "no timeout" — the explicit
     /// opt-out, not a stand-in for the default.
     #[serde(default = "default_search_timeout_seconds")]
     pub timeout_seconds: u64,
-    #[serde(default = "default_prefer_rtk")]
-    pub prefer_rtk: bool,
 }
 
 /// Hand-written (not derived) so that `SearchConfig::default()` and the serde
 /// field defaults are the *same* values: a derived `Default` would yield
-/// `timeout_seconds: 0` / `prefer_rtk: false`, silently disagreeing with what
-/// loading an empty `[search]` section produces.
+/// `timeout_seconds: 0`, silently disagreeing with what loading an empty
+/// `[search]` section produces.
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             rtk_path: None,
-            ripgrep_path: None,
             timeout_seconds: default_search_timeout_seconds(),
-            prefer_rtk: default_prefer_rtk(),
         }
     }
 }
@@ -253,12 +246,11 @@ pub fn default_staleness_seconds() -> u64 {
     3600
 }
 
-fn default_search_timeout_seconds() -> u64 {
+/// Default `search.timeout_seconds` (also the serde default for that field).
+/// Public so the setup wizard can write it into `[search]` alongside the
+/// resolved `rtk_path` instead of duplicating the literal.
+pub fn default_search_timeout_seconds() -> u64 {
     30
-}
-
-fn default_prefer_rtk() -> bool {
-    true
 }
 
 fn default_max_fallback_iterations() -> u32 {
@@ -634,7 +626,6 @@ mod tests {
 
         // Explicit values from the fixture.
         assert_eq!(config.search.timeout_seconds, 45);
-        assert!(!config.search.prefer_rtk);
         assert_eq!(config.logging.level, LogLevel::Debug);
 
         // Defaults for values omitted in the fixture.
@@ -957,8 +948,7 @@ mod tests {
     #[test]
     fn search_config_default_matches_serde_defaults() {
         // A derived `Default` would silently disagree with the serde field
-        // defaults, and the setup wizard writes `SearchConfig::default()` —
-        // producing configs with no search timeout and rtk preference off.
+        // defaults, producing configs with no search timeout.
         let from_default = SearchConfig::default();
         let from_empty_section: SearchConfig =
             toml::from_str("").expect("an empty [search] section must parse");
@@ -966,12 +956,10 @@ mod tests {
             from_default.timeout_seconds,
             from_empty_section.timeout_seconds
         );
-        assert_eq!(from_default.prefer_rtk, from_empty_section.prefer_rtk);
         assert_eq!(
             from_default.timeout_seconds,
             default_search_timeout_seconds()
         );
-        assert!(from_default.prefer_rtk);
     }
 
     #[test]

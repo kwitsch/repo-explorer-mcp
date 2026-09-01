@@ -1,42 +1,45 @@
-//! `CliSearchBackend`: resolves the search binary once at construction, then
+//! `CliSearchBackend`: resolves the `rtk` binary once at construction, then
 //! wires resolver -> process -> parser on each `search` call. rtk is invoked as
-//! `rtk rg -H -n ...` (raw rg passthrough, one fixed line grammar); rg as
-//! `rg --json -H ...`. `-H` guarantees filenames so the parser grammar is fixed.
+//! `rtk rg -H -n ...` (raw rg passthrough, one fixed line grammar); `-H`
+//! guarantees filenames so the parser grammar is fixed. rtk is mandatory: an
+//! unresolved backend is still constructible (`new` is infallible) and `search`
+//! returns `BackendNotFound`, while the serve-time gate in `main.rs` (see
+//! `rtk_available`) refuses to start.
 
-use crate::parser::{parse_rg_json, parse_rtk};
+use crate::parser::parse_rtk;
 use crate::process::{SpawnSpec, run};
-use crate::resolver::{ResolvedBackend, Tool, resolve_backend};
+use crate::resolver::resolve_rtk;
 use repo_explorer_core::config::SearchConfig;
 use repo_explorer_core::domain::ExplorationFinding;
 use repo_explorer_core::search::{SearchBackend, SearchError, SearchOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub struct CliSearchBackend {
-    backend: Option<ResolvedBackend>,
+    rtk: Option<PathBuf>,
     timeout_seconds: u64,
 }
 
 impl CliSearchBackend {
-    /// Resolve the search binary from config + PATH once. A backend that
-    /// resolves to nothing is still constructible; `search` returns
-    /// `BackendNotFound` when invoked.
+    /// Resolve the `rtk` binary from config + PATH once. Still infallible: an
+    /// unresolved backend is constructible, and `search` fails fast via
+    /// `BackendNotFound` while the serve-time gate in `main.rs` refuses to
+    /// start (see `rtk_available`).
     pub fn new(config: &SearchConfig) -> Self {
-        let backend = resolve_backend(
-            config.rtk_path.as_deref(),
-            config.ripgrep_path.as_deref(),
-            config.prefer_rtk,
-            || which::which("rtk").ok(),
-            || which::which("rg").ok(),
-        );
         Self {
-            backend,
+            rtk: resolve_rtk(config.rtk_path.as_deref(), || which::which("rtk").ok()),
             timeout_seconds: config.timeout_seconds,
         }
     }
+
+    /// True when the `rtk` binary resolved. Consumed by the serve-time
+    /// fail-fast in `main.rs`, since rtk is a hard requirement of search.
+    pub fn rtk_available(&self) -> bool {
+        self.rtk.is_some()
+    }
 }
 
-/// Append the flags common to both tools' native rg surface.
+/// Append the flags common to rtk's native rg surface.
 fn push_flags(args: &mut Vec<String>, options: &SearchOptions) {
     if options.case_sensitive {
         args.push("-s".to_string());
@@ -66,21 +69,17 @@ impl SearchBackend for CliSearchBackend {
                 "empty search pattern".to_string(),
             ));
         }
-        let resolved = self.backend.as_ref().ok_or_else(|| {
-            SearchError::BackendNotFound("neither rtk nor ripgrep could be resolved".to_string())
-        })?;
+        let program = self
+            .rtk
+            .as_ref()
+            .ok_or_else(|| SearchError::BackendNotFound("rtk could not be resolved".to_string()))?;
 
         let target = scope
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| ".".to_string());
 
-        // Only the leading flags and the reported backend name differ per tool;
-        // everything after them is identical, so it is built exactly once.
-        let (backend_name, leading) = match resolved.tool {
-            Tool::Rtk => ("rtk", ["rg", "-H", "-n"].as_slice()),
-            Tool::Ripgrep => ("ripgrep", ["--json", "-H"].as_slice()),
-        };
-        let mut args: Vec<String> = leading.iter().map(|s| s.to_string()).collect();
+        // rtk's raw rg passthrough: `rtk rg -H -n <flags> -- <pattern> <target>`.
+        let mut args: Vec<String> = ["rg", "-H", "-n"].iter().map(|s| s.to_string()).collect();
         push_flags(&mut args, options);
         // `--` ends option parsing so a pattern/target starting with `-` (e.g.
         // `-\d+` or a leading-dash file name) is never misread as a flag.
@@ -89,8 +88,8 @@ impl SearchBackend for CliSearchBackend {
         args.push(target);
 
         let spec = SpawnSpec {
-            backend: backend_name,
-            program: resolved.path.clone(),
+            backend: "rtk",
+            program: program.clone(),
             args,
             cwd: repo_root.to_path_buf(),
             timeout: Duration::from_secs(self.timeout_seconds),
@@ -98,10 +97,7 @@ impl SearchBackend for CliSearchBackend {
 
         let stdout = run(&spec).await?;
 
-        let mut findings = match resolved.tool {
-            Tool::Rtk => parse_rtk(&stdout)?,
-            Tool::Ripgrep => parse_rg_json(&stdout)?,
-        };
+        let mut findings = parse_rtk(&stdout)?;
         if let Some(max) = options.max_results {
             findings.truncate(max as usize);
         }

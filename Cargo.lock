@@ -1657,7 +1657,6 @@ version = "0.2.0"
 dependencies = [
  "hex",
  "repo-explorer-core",
- "serde_json",
  "sha2",
  "tokio",
  "which",

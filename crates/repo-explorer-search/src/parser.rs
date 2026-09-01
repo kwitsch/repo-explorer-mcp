@@ -1,16 +1,15 @@
-//! Two tolerant parsers turning raw tool output into `ExplorationFinding`s.
+//! A tolerant parser turning raw `rtk rg -H -n` output into `ExplorationFinding`s.
 //!
 //! `parse_rtk` reads the fixed `rtk rg -H -n` line grammar (`path:line:content`
-//! for matches, `path-line-content` for context); `parse_rg_json` reads
-//! `rg --json` JSON-lines. Both are tolerant of malformed individual rows (skip,
-//! not fatal) and saturate `u64`->`u32` line numbers (never a bare `as` cast).
-//! The one row `parse_rtk` does *not* tolerate is rtk's own truncation-footer
-//! line (see `is_truncation_marker`): that line is proof rtk silently dropped
-//! real matches for a file, so it is a decode error, not a skippable row.
+//! for matches, `path-line-content` for context). It is tolerant of malformed
+//! individual rows (skip, not fatal) and saturates `u64`->`u32` line numbers
+//! (never a bare `as` cast). The one row it does *not* tolerate is rtk's own
+//! truncation-footer line (see `is_truncation_marker`): that line is proof rtk
+//! silently dropped real matches for a file, so it is a decode error, not a
+//! skippable row.
 
 use repo_explorer_core::domain::{ExplorationFinding, FileLocation, saturate_u32};
 use repo_explorer_core::search::SearchError;
-use serde_json::Value;
 use std::path::PathBuf;
 
 /// Find the leftmost *plausible* `<sep><digits><sep>` run for one separator
@@ -289,8 +288,8 @@ fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
 }
 
 /// Build one finding for a match line, prepending any buffered before-context
-/// collected since the last group boundary (and clearing the buffer). Shared
-/// by `parse_rtk` and `parse_rg_json`.
+/// collected since the last group boundary (and clearing the buffer). Used by
+/// `parse_rtk`.
 fn push_finding(
     findings: &mut Vec<ExplorationFinding>,
     pending_before: &mut Vec<String>,
@@ -340,7 +339,7 @@ fn append_context(findings: &mut [ExplorationFinding], text: &str) {
 /// Route one context line's text to the right place depending on where it
 /// falls relative to a group boundary: text seen since a boundary leads the
 /// next, not yet created, finding and is buffered; otherwise it trails the
-/// previous finding. Shared by `parse_rtk` and `parse_rg_json`.
+/// previous finding. Used by `parse_rtk`.
 fn handle_context_line(
     findings: &mut [ExplorationFinding],
     pending_before: &mut Vec<String>,
@@ -389,17 +388,16 @@ fn is_truncation_marker(line: &str) -> bool {
 /// prepended to the next finding instead, since it leads that match rather
 /// than trailing the one before the boundary.
 ///
-/// Errors with `SearchError::Decode` -- mirroring `parse_rg_json`'s reaction
-/// to a line that violates rg's JSON grammar -- the moment a truncation-
-/// footer line (see `is_truncation_marker`) is seen: that line means rtk
-/// itself dropped real matches for a file, so the findings collected so far
-/// (from this file and any other) are known-incomplete and must not be
-/// reported as a complete, silent `Ok` result.
+/// Errors with `SearchError::Decode` the moment a truncation-footer line (see
+/// `is_truncation_marker`) is seen: that line means rtk itself dropped real
+/// matches for a file, so the findings collected so far (from this file and
+/// any other) are known-incomplete and must not be reported as a complete,
+/// silent `Ok` result.
 pub(crate) fn parse_rtk(stdout: &str) -> Result<Vec<ExplorationFinding>, SearchError> {
     let mut findings: Vec<ExplorationFinding> = Vec::new();
     let mut pending_before: Vec<String> = Vec::new();
-    // Starts true, mirroring parse_rg_json: any context before the first
-    // match in the whole stream is leading, not trailing a prior finding.
+    // Starts true: any context before the first match in the whole stream is
+    // leading, not trailing a prior finding.
     let mut at_boundary = true;
     for line in stdout.lines() {
         if line.is_empty() {
@@ -424,123 +422,6 @@ pub(crate) fn parse_rtk(stdout: &str) -> Result<Vec<ExplorationFinding>, SearchE
                 handle_context_line(&mut findings, &mut pending_before, at_boundary, content);
             }
             None => {}
-        }
-    }
-    Ok(findings)
-}
-
-/// Parse `rg --json` JSON-lines output. Each non-empty line must be valid JSON
-/// (a non-JSON line means the whole stream shape is wrong -> `Decode`); a
-/// well-formed line missing expected fields (including a `bytes`-only binary
-/// row) is skipped. Only `"match"` produces a finding; `"context"` appends to
-/// the previous finding's snippet while contiguous with the last line seen in
-/// this file (so it trails that match), or is buffered and prepended to the
-/// next finding instead once a gap is seen (so it leads the next match) --
-/// unlike rtk's explicit `--` separator, `rg --json` has no marker between
-/// match groups within one file, so line-number contiguity is the only signal
-/// available to tell trailing context from leading context. That leading/
-/// trailing mode is tracked as persistent state (`at_boundary`, mirroring
-/// rtk's boundary flag) rather than recomputed from each row's immediate
-/// predecessor alone: once a gap flips it into leading mode it stays there
-/// across any further *contiguous* context rows, so a whole multi-line
-/// leading-context run (`context_lines >= 2`) buffers correctly instead of
-/// only its first row; a match row resets it back to trailing mode. All other
-/// event types are ignored.
-fn row_line_text(data: &Value) -> Option<&str> {
-    data.get("lines")
-        .and_then(|l| l.get("text"))
-        .and_then(Value::as_str)
-        // rg's `lines.text` carries the line's original terminator; strip a
-        // trailing LF and then, for CRLF-terminated source files, the CR left
-        // behind so it doesn't end up baked into the returned snippet.
-        .map(|s| s.strip_suffix('\n').unwrap_or(s))
-        .map(|s| s.strip_suffix('\r').unwrap_or(s))
-}
-
-fn row_line_number(data: &Value) -> Option<u32> {
-    data.get("line_number")
-        .and_then(Value::as_u64)
-        .map(saturate_u32)
-}
-
-pub(crate) fn parse_rg_json(stdout: &str) -> Result<Vec<ExplorationFinding>, SearchError> {
-    let mut findings: Vec<ExplorationFinding> = Vec::new();
-    let mut pending_before: Vec<String> = Vec::new();
-    // Line number of the last match/context row seen in the current file;
-    // `None` right after `begin` (no rows seen yet) or once `saturate_u32`
-    // pins a `line_number` at `u32::MAX` (no successor can be contiguous).
-    let mut last_line_number: Option<u32> = None;
-    // Persistent leading/trailing-context mode, like rtk's boundary flag:
-    // starts (and resets on `begin`) true since any context before the first
-    // match is leading; a match row sets it false; a context row can only
-    // set it back to true on a line-number gap, and it then stays true
-    // through subsequent contiguous context rows until the next match.
-    let mut at_boundary = true;
-    for line in stdout.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value: Value = serde_json::from_str(line).map_err(|e| SearchError::Decode {
-            backend: "ripgrep",
-            message: format!("invalid JSON line: {e}"),
-        })?;
-        let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
-        let Some(data) = value.get("data") else {
-            continue;
-        };
-        match kind {
-            "begin" => {
-                // drop any leading-context buffered for a dropped match in the
-                // previous file, so it can't leak into this file's first finding
-                pending_before.clear();
-                last_line_number = None;
-                at_boundary = true;
-            }
-            "match" => {
-                // bytes-only / binary row: drop gracefully
-                let Some(path) = data
-                    .get("path")
-                    .and_then(|p| p.get("text"))
-                    .and_then(Value::as_str)
-                else {
-                    continue;
-                };
-                // missing line_number: rg is always run with `-H` line numbering
-                // on, so a real match row always has one -- drop it like the
-                // missing-path case above rather than fabricate line 0
-                let Some(line_number) = row_line_number(data) else {
-                    continue;
-                };
-                let snippet = row_line_text(data);
-                push_finding(
-                    &mut findings,
-                    &mut pending_before,
-                    path,
-                    line_number,
-                    snippet,
-                );
-                last_line_number = Some(line_number);
-                at_boundary = false;
-            }
-            "context" => {
-                // Compute the gap and advance `last_line_number` from this row's
-                // `line_number` even when `lines` is undecodable (`bytes`, no
-                // `text`): otherwise an unrelated undecodable row between two
-                // decodable ones would leave `last_line_number` stale, making the
-                // next contiguous row look like it has a gap and get misrouted as
-                // leading context for a later, unrelated match.
-                let line_number = row_line_number(data);
-                let gap = match (last_line_number, line_number) {
-                    (Some(prev), Some(n)) => prev.checked_add(1) != Some(n),
-                    _ => true,
-                };
-                at_boundary |= gap;
-                if let Some(text) = row_line_text(data) {
-                    handle_context_line(&mut findings, &mut pending_before, at_boundary, text);
-                }
-                last_line_number = line_number.or(last_line_number);
-            }
-            _ => {} // end / summary / unknown: ignored, not a decode error
         }
     }
     Ok(findings)
@@ -574,11 +455,13 @@ mod tests {
         assert_eq!(findings[0].location.line_end, 70);
         assert_eq!(
             findings[0].snippet.as_deref(),
-            Some("    pub timeout_seconds: u64,\n    #[serde(default = \"default_prefer_rtk\")]")
+            Some(
+                "    pub timeout_seconds: u64,\n    #[serde(default = \"default_search_timeout_seconds\")]"
+            )
         );
         assert_eq!(findings[1].location.line_start, 71);
         let s1 = findings[1].snippet.as_deref().unwrap();
-        assert!(s1.contains("pub prefer_rtk: bool,"));
+        assert!(s1.contains("pub max_depth: usize,"));
         assert!(s1.contains('}')); // trailing context appended
     }
 
@@ -943,160 +826,5 @@ mod tests {
         // stray-digit bound must still stop it at the genuine `-1-` run.
         let result = split_grep_line("notes-1-see10:20:file.rs-99-x");
         assert_eq!(result, Some(("notes", 1, "see10:20:file.rs-99-x", false)));
-    }
-
-    #[test]
-    fn parse_rg_json_routes_context_between_two_match_groups_in_one_file() {
-        // Two matches (3, 9) far enough apart that their context windows
-        // (radius 1) don't overlap: context(4) trails match A, context(8)
-        // leads match B -- there is no `begin`/boundary marker between them,
-        // so this must be inferred from line-number contiguity alone.
-        let input = concat!(
-            "{\"type\":\"begin\",\"data\":{\"path\":{\"text\":\"f.rs\"}}}\n",
-            "{\"type\":\"context\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
-            "\"lines\":{\"text\":\"line2\\n\"},\"line_number\":2}}\n",
-            "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
-            "\"lines\":{\"text\":\"MATCH_A\\n\"},\"line_number\":3}}\n",
-            "{\"type\":\"context\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
-            "\"lines\":{\"text\":\"line4\\n\"},\"line_number\":4}}\n",
-            "{\"type\":\"context\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
-            "\"lines\":{\"text\":\"line8\\n\"},\"line_number\":8}}\n",
-            "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
-            "\"lines\":{\"text\":\"MATCH_B\\n\"},\"line_number\":9}}\n",
-            "{\"type\":\"context\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
-            "\"lines\":{\"text\":\"line10\\n\"},\"line_number\":10}}\n",
-            "{\"type\":\"end\",\"data\":{\"path\":{\"text\":\"f.rs\"}}}\n",
-        );
-        let findings = parse_rg_json(input).unwrap();
-        assert_eq!(findings.len(), 2);
-        assert_eq!(
-            findings[0].snippet.as_deref(),
-            Some("line2\nMATCH_A\nline4")
-        );
-        assert_eq!(
-            findings[1].snippet.as_deref(),
-            Some("line8\nMATCH_B\nline10")
-        );
-    }
-
-    #[test]
-    fn parse_rg_json_buffers_multi_line_leading_context() {
-        // context_lines >= 2: a match at line 7 preceded by two leading
-        // context rows (5, 6) with no prior match in the file. Both rows must
-        // land in the *upcoming* finding's snippet, not be dropped or glued
-        // onto an unrelated already-emitted finding.
-        let input = concat!(
-            "{\"type\":\"begin\",\"data\":{\"path\":{\"text\":\"f.rs\"}}}\n",
-            "{\"type\":\"context\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
-            "\"lines\":{\"text\":\"line5\\n\"},\"line_number\":5}}\n",
-            "{\"type\":\"context\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
-            "\"lines\":{\"text\":\"line6\\n\"},\"line_number\":6}}\n",
-            "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
-            "\"lines\":{\"text\":\"MATCH\\n\"},\"line_number\":7}}\n",
-            "{\"type\":\"end\",\"data\":{\"path\":{\"text\":\"f.rs\"}}}\n",
-        );
-        let findings = parse_rg_json(input).unwrap();
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].location.line_start, 7);
-        assert_eq!(findings[0].snippet.as_deref(), Some("line5\nline6\nMATCH"));
-    }
-
-    #[test]
-    fn row_line_text_strips_crlf_line_ending() {
-        let data: Value =
-            serde_json::from_str(r#"{"lines":{"text":"    let x = 1;\r\n"},"line_number":1}"#)
-                .unwrap();
-        assert_eq!(row_line_text(&data), Some("    let x = 1;"));
-    }
-
-    #[test]
-    fn parse_rg_json_extracts_matches_ignores_non_match_events() {
-        let findings = parse_rg_json(&fixture("rg_output.jsonl")).unwrap();
-        // begin/end/summary are ignored; only the two match rows produce findings.
-        assert_eq!(findings.len(), 2);
-        assert_eq!(
-            findings[0].location.path,
-            PathBuf::from("crates/repo-explorer-core/src/config.rs")
-        );
-        assert_eq!(findings[0].location.line_start, 70);
-        assert_eq!(findings[0].location.line_end, 70);
-        assert_eq!(
-            findings[0].snippet.as_deref(),
-            Some("    #[serde(default = \"default_prefer_rtk\")]")
-        );
-        assert_eq!(findings[1].location.line_start, 71);
-    }
-
-    #[test]
-    fn parse_rg_json_drops_binary_bytes_only_row() {
-        // A match row whose path/lines carry `bytes` (base64) instead of `text`
-        // must be dropped gracefully, not panic on `.as_str()`.
-        let input = concat!(
-            "{\"type\":\"match\",\"data\":{\"path\":{\"bytes\":\"AAAA\"},",
-            "\"lines\":{\"bytes\":\"BBBB\"},\"line_number\":3}}\n"
-        );
-        let findings = parse_rg_json(input).unwrap();
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn parse_rg_json_undecodable_context_row_keeps_line_bookkeeping() {
-        // An undecodable (`bytes`-only) context row between two decodable ones
-        // must still update `last_line_number`/`at_boundary` from its own
-        // `line_number` even though it contributes no text itself: otherwise
-        // the next contiguous context row would see a spurious gap and get
-        // misrouted as leading context for a later, unrelated match instead of
-        // trailing context for the match it actually follows.
-        let input = concat!(
-            "{\"type\":\"begin\",\"data\":{\"path\":{\"text\":\"f.rs\"}}}\n",
-            "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
-            "\"lines\":{\"text\":\"MATCH_A\\n\"},\"line_number\":3}}\n",
-            "{\"type\":\"context\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
-            "\"lines\":{\"bytes\":\"AAAA\"},\"line_number\":4}}\n",
-            "{\"type\":\"context\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
-            "\"lines\":{\"text\":\"line5\\n\"},\"line_number\":5}}\n",
-            "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"f.rs\"},",
-            "\"lines\":{\"text\":\"MATCH_B\\n\"},\"line_number\":20}}\n",
-            "{\"type\":\"end\",\"data\":{\"path\":{\"text\":\"f.rs\"}}}\n",
-        );
-        let findings = parse_rg_json(input).unwrap();
-        assert_eq!(findings.len(), 2);
-        assert_eq!(findings[0].snippet.as_deref(), Some("MATCH_A\nline5"));
-        assert_eq!(findings[1].snippet.as_deref(), Some("MATCH_B"));
-    }
-
-    #[test]
-    fn parse_rg_json_drops_match_row_missing_line_number() {
-        // A match row without `line_number` must be dropped like the missing-path
-        // case, not fabricate a bogus `line 0` finding.
-        let input = concat!(
-            "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"a.rs\"},",
-            "\"lines\":{\"text\":\"x\\n\"}}}\n"
-        );
-        let findings = parse_rg_json(input).unwrap();
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn parse_rg_json_non_json_line_is_decode_error() {
-        let err = parse_rg_json("not json at all\n").unwrap_err();
-        assert!(matches!(
-            err,
-            repo_explorer_core::search::SearchError::Decode {
-                backend: "ripgrep",
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn parse_rg_json_saturates_huge_line_number() {
-        let big = u64::MAX;
-        let input = format!(
-            "{{\"type\":\"match\",\"data\":{{\"path\":{{\"text\":\"a.rs\"}},\
-             \"lines\":{{\"text\":\"x\\n\"}},\"line_number\":{big}}}}}\n"
-        );
-        let findings = parse_rg_json(&input).unwrap();
-        assert_eq!(findings[0].location.line_start, u32::MAX);
     }
 }

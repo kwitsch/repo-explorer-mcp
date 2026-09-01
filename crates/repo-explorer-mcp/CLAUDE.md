@@ -12,16 +12,15 @@ errors are consumed via `?`/`.context(...)`).
 - Serialization lives in core (`config::to_toml_string`); the binary adds no `toml` dependency.
 - The wizard writes to the _resolved_ config path (the XDG default unless `--config`/`REPO_EXPLORER_CONFIG` overrides it).
 - It self-verifies the written file via `repo_explorer_core::config::load`.
-- The `[search]`, `[agent]`, `[cache]`, and `[logging]` sections are left at their (fully defaulted) core values — not prompted. `main.rs::run` plumbs `config.agent`/`config.cache` into `AgentLoop::new` together with a `GitStateProbe` built from `config.search.timeout_seconds`.
+- The `[search]` section receives `rtk_path` — the resolved absolute path of the managed `rtk` binary in the shared bin dir (not interactively prompted); `[agent]`, `[cache]`, and `[logging]` are left at their (fully defaulted) core values. `main.rs::run` plumbs `config.agent`/`config.cache` into `AgentLoop::new` together with a `GitStateProbe` built from `config.search.timeout_seconds`.
 
 ## Config path resolution
 
-- `.mcp.json` registers `repo-explorer-mcp`, launched via `cargo run --release --quiet`.
 - Precedence: `--config <path>` CLI arg -> `REPO_EXPLORER_CONFIG` env var -> XDG default **if it exists** -> `./repo-explorer.toml` **if it exists** -> the XDG default again, as the wizard's write target.
 - The XDG default is `$XDG_CONFIG_HOME/repo-explorer/repo-explorer.toml` on Linux, `%APPDATA%\repo-explorer\repo-explorer.toml` on Windows.
-- The two `exists` gates are load-bearing: the XDG default resolves on essentially every machine, so returning it unconditionally would make the `./repo-explorer.toml` fallback dead code and silently ignore an in-repo config — including `.mcp.json`'s own no-`--config` launch.
+- The two `exists` gates are load-bearing: the XDG default resolves on essentially every machine, so returning it unconditionally would make the `./repo-explorer.toml` fallback dead code and silently ignore an in-repo config.
 - This crate owns the `dirs` dependency used for XDG resolution; core and the other crates stay free of it.
-- A reachable `codebase-memory-mcp` is required at run time.
+- `codebase-memory-mcp` and `rtk` are managed per-user copies in the shared bin dir (`~/.local/bin` on Linux via `dirs::executable_dir()`, `%LOCALAPPDATA%\repo-explorer-mcp` on Windows via `dirs::data_local_dir().join("repo-explorer-mcp")` — the same dir the npx installer uses for the main binary), provisioned/updated only by `--update` and launched by absolute path — never resolved via PATH/`which`. `setup` writes those absolute paths into `[codebase_memory] command` and `[search] rtk_path`; `run()` fails fast with a `--update` hint if either is missing and never downloads.
 
 ## Subcommands
 
@@ -36,8 +35,8 @@ errors are consumed via `?`/`.context(...)`).
 
 ## Self-update (`src/update.rs`)
 
-- Tracked components: `repo-explorer-mcp` (`kwitsch/repo-explorer-mcp`), `rtk` (`rtk-ai/rtk`), `rg`/ripgrep (`BurntSushi/ripgrep`), `codebase-memory-mcp` (`DeusData/codebase-memory-mcp`).
+- Tracked components: `repo-explorer-mcp` (`kwitsch/repo-explorer-mcp`) and `rg`/ripgrep (`BurntSushi/ripgrep`) — `rg` resolved on PATH via `which`, skip-if-absent — plus two managed install-if-absent / update-if-stale copies in the shared bin dir (`~/.local/bin` on Linux, `%LOCALAPPDATA%\repo-explorer-mcp` on Windows): `rtk` (`rtk-ai/rtk`) via `provision_or_update_rtk_binary` and `codebase-memory-mcp` (`DeusData/codebase-memory-mcp`) via `provision_or_update_memory_binary`.
 - Runs instead of the MCP server loop, dispatched before config resolution and before the `setup` dispatch/auto-run.
-- A dependency binary whose installed version can't be determined, or that isn't on `PATH`, is skipped rather than blindly overwritten.
+- The `which`-resolved `rg` dependency, when its installed version can't be determined or it isn't on `PATH`, is skipped rather than blindly overwritten. The managed `rtk` and `codebase-memory-mcp` copies are instead installed when absent and updated when stale (`action` `installed`/`updated`/`up-to-date`).
 - This crate owns the `reqwest`/`semver`/`sha2`/`hex`/`flate2`/`tar`/`zip`/`self-replace` dependencies; core stays free of them.
 - It also uses `which`, already owned by `repo-explorer-search` — the only dependency this crate shares with another non-core crate rather than owning outright.

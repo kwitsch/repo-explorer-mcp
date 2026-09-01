@@ -1,5 +1,0 @@
-{"type":"begin","data":{"path":{"text":"crates/repo-explorer-core/src/config.rs"}}}
-{"type":"match","data":{"path":{"text":"crates/repo-explorer-core/src/config.rs"},"lines":{"text":"    #[serde(default = \"default_prefer_rtk\")]\n"},"line_number":70,"absolute_offset":2392,"submatches":[{"match":{"text":"prefer_rtk"},"start":31,"end":41}]}}
-{"type":"match","data":{"path":{"text":"crates/repo-explorer-core/src/config.rs"},"lines":{"text":"    pub prefer_rtk: bool,\n"},"line_number":71,"absolute_offset":2437,"submatches":[{"match":{"text":"prefer_rtk"},"start":8,"end":18}]}}
-{"type":"end","data":{"path":{"text":"crates/repo-explorer-core/src/config.rs"}}}
-{"type":"summary","data":{"stats":{"matched_lines":2,"matches":2}}}

@@ -142,7 +142,7 @@ function probeVersion(bin, args = ["--version"], timeout = 1500) {
 }
 
 // One "is it there, and what does it say" probe, shared by the auto-installed
-// dependency (ripgrep) and the report-only ones.
+// dependency (ripgrep) and the managed-tool status checks.
 function probeBinary(name, osKind) {
   if (!onPathTool(name, osKind)) return MISSING;
   // Short, single-attempt probe: these binaries aren't guaranteed to be
@@ -309,13 +309,37 @@ async function ensureRipgrep(plat, opts) {
   return MISSING;
 }
 
-function reportOnlyDep(name, plat, pointer) {
-  const found = probeBinary(name, plat.osKind);
-  if (found !== MISSING) return found;
-  console.warn(
-    `${name} is missing. This installer does not auto-install it. ${pointer}`,
+// Provision the managed helper binaries (rtk and codebase-memory-mcp) into the
+// shared per-user bin dir by invoking the freshly installed repo-explorer-mcp's
+// `--update`. Best-effort: a spawn failure or non-zero exit warns and returns a
+// note instead of failing the install, so an offline machine can still complete
+// the binary install and provision later.
+function provisionManagedTools(binPath) {
+  console.log(
+    "\nProvisioning managed tools (rtk, codebase-memory-mcp) into the shared bin dir via `repo-explorer-mcp --update`...",
   );
-  return MISSING;
+  const r = spawnSync(binPath, ["--update"], {
+    stdio: "inherit",
+    timeout: 120_000,
+  });
+  if (r.error || r.status !== 0) {
+    console.warn(
+      "Failed to provision managed tools automatically; run `repo-explorer-mcp --update` (or `repo-explorer-mcp setup`) later to provision rtk and codebase-memory-mcp.",
+    );
+    return "provision failed (run --update later)";
+  }
+  return "provisioned via --update";
+}
+
+// After `--update` provisions rtk into the shared bin dir, report its status for
+// the summary. The dir may not be on PATH, so check the managed file directly
+// first (it lands next to the main binary in `dir`), then fall back to a PATH probe.
+function reprobeRtk(dir, osKind) {
+  const file = path.join(dir, osKind === "win32" ? "rtk.exe" : "rtk");
+  if (fs.existsSync(file)) {
+    return probeVersion(file) ?? "provisioned";
+  }
+  return probeBinary("rtk", osKind);
 }
 
 export function mcpSnippet(binPath) {
@@ -358,18 +382,17 @@ async function main() {
   console.log("\nDependency status:");
   const rgVer = await ensureRipgrep(plat, opts);
   console.log(`  ripgrep: ${rgVer}`);
-  const rtkVer = reportOnlyDep(
-    "rtk",
-    plat,
-    "Install rtk from its upstream distribution; it is optional (search falls back to plain ripgrep).",
-  );
-  console.log(`  rtk: ${rtkVer}`);
-  const cmVer = reportOnlyDep(
-    "codebase-memory-mcp",
-    plat,
-    "Install codebase-memory-mcp from its upstream distribution; it is required at runtime.",
-  );
-  console.log(`  codebase-memory-mcp: ${cmVer}`);
+  // rtk is provisioned into the shared bin dir by `repo-explorer-mcp --update`
+  // (run below). Report its current status here; MISSING is expected on a first
+  // install and resolved by the --update step.
+  let rtkVer = probeBinary("rtk", plat.osKind);
+  if (rtkVer === MISSING) {
+    console.log(
+      "  rtk: missing (will be provisioned by `repo-explorer-mcp --update`)",
+    );
+  } else {
+    console.log(`  rtk: ${rtkVer}`);
+  }
 
   // Resolve version + install dir.
   const version = await resolveVersion(opts.version);
@@ -377,8 +400,6 @@ async function main() {
   fs.mkdirSync(dir, { recursive: true });
   const binName = binaryName(plat.osKind);
   const binPath = path.join(dir, binName);
-
-  const deps = { rgVer, rtkVer, cmVer };
 
   // Idempotency check.
   if (!opts.force && fs.existsSync(binPath)) {
@@ -394,7 +415,9 @@ async function main() {
       // PATH status is reported on every run, including this one: the install
       // dir can drop off PATH long after the binary was installed.
       reportPathStatus(dir, plat.osKind);
-      printSummary(binPath, version, deps);
+      const cmVer = provisionManagedTools(binPath);
+      rtkVer = reprobeRtk(dir, plat.osKind);
+      printSummary(binPath, version, { rgVer, rtkVer, cmVer });
       return;
     }
   }
@@ -450,7 +473,9 @@ async function main() {
   }
 
   reportPathStatus(dir, plat.osKind);
-  printSummary(binPath, version, deps);
+  const cmVer = provisionManagedTools(binPath);
+  rtkVer = reprobeRtk(dir, plat.osKind);
+  printSummary(binPath, version, { rgVer, rtkVer, cmVer });
 }
 
 // PATH reporting (detect, never modify).
