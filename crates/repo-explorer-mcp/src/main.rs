@@ -124,11 +124,21 @@ async fn run(config: repo_explorer_core::config::Config) -> anyhow::Result<()> {
     // The directory the server is launched in = the project root to explore.
     let repo_root = std::env::current_dir().context("failed to determine current directory")?;
 
+    let mut memory_config = config.codebase_memory.clone();
+    if memory_config.command.is_some()
+        && let Some(running) = wait_for_running_memory_binary().await
+    {
+        tracing::info!(
+            "reusing the already-running codebase-memory-mcp at {} (its daemon only accepts \
+             clients launched from that exact path)",
+            running.display()
+        );
+        memory_config.command = Some(running.to_string_lossy().into_owned());
+    }
+
     match update::dedicated_memory_binary_path() {
         Ok(managed) => {
-            if managed_binary_missing(config.codebase_memory.command.as_deref(), &managed, |p| {
-                p.exists()
-            }) {
+            if managed_binary_missing(memory_config.command.as_deref(), &managed, |p| p.exists()) {
                 anyhow::bail!(
                     "dedicated codebase-memory-mcp binary not found at {}; \
                      run `repo-explorer-mcp --update` to provision it",
@@ -148,9 +158,13 @@ async fn run(config: repo_explorer_core::config::Config) -> anyhow::Result<()> {
         }
     }
 
-    let memory = MemoryClientBackend::connect(&config.codebase_memory)
-        .await
-        .context("failed to connect to codebase-memory-mcp")?;
+    let memory = MemoryClientBackend::connect(&memory_config).await.context(
+        "failed to connect to codebase-memory-mcp (if its stderr reports a \"conflicting CBM \
+         process\" or that the daemon \"could not accept this client\", another \
+         codebase-memory-mcp install, e.g. a Claude Code plugin's, claimed the per-user \
+         daemon after this server looked for one; restart this server so it reuses that \
+         install)",
+    )?;
     // Prepend the managed bin dir to rtk's own PATH (this child process only)
     // so a repo-explorer-managed `rg` fallback outside the ambient PATH is
     // still discoverable by rtk's `rg` shell-out.
@@ -236,6 +250,75 @@ fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
 /// path does not exist — the single case `run()` refuses to serve. A custom
 /// command (bare name or a hand-picked path) or a `None` command (network
 /// endpoint branch) returns false and falls through to connect unchanged.
+/// `codebase-memory-mcp` runs a single per-user daemon that only accepts
+/// clients launched from the *exact same executable path string*: a
+/// byte-identical copy, a symlink, or a hardlink under another path hangs
+/// until a 30s accept timeout, and a different build is rejected outright.
+/// So when another integration (e.g. the Claude Code plugin) already runs
+/// one, the only binary this server can spawn is theirs. Waits a short grace
+/// period so a plugin whose CBM starts concurrently with this server still
+/// wins the daemon instead of being locked out by ours.
+async fn wait_for_running_memory_binary() -> Option<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    // ponytail: fixed 5s cold-start grace, paid by every stdio start with no
+    // other CBM around; make it configurable if that shows up as latency.
+    for _ in 0..25 {
+        if let Some(path) = running_memory_binary() {
+            return Some(path);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    None
+}
+
+/// Executable path of an already-running `codebase-memory-mcp` owned by this
+/// user, preferring the daemon process itself (the path clients must match).
+#[cfg(target_os = "linux")]
+fn running_memory_binary() -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata("/proc/self").ok()?.uid();
+    let mut client = None;
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        if entry.metadata().is_ok_and(|m| m.uid() != uid) {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        match memory_binary_from_cmdline(&cmdline, |p| p.exists()) {
+            Some((path, true)) => return Some(path),
+            Some((path, false)) => client.get_or_insert(path),
+            None => continue,
+        };
+    }
+    client
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_memory_binary() -> Option<PathBuf> {
+    None
+}
+
+/// Parse a NUL-separated `/proc/<pid>/cmdline`; `Some((argv0, is_daemon))`
+/// when argv0 is an existing absolute `codebase-memory-mcp` path.
+#[cfg(target_os = "linux")]
+fn memory_binary_from_cmdline(
+    cmdline: &[u8],
+    exists: impl Fn(&Path) -> bool,
+) -> Option<(PathBuf, bool)> {
+    let mut argv = cmdline.split(|b| *b == 0);
+    let path = Path::new(std::str::from_utf8(argv.next()?).ok()?);
+    let matches = path.is_absolute()
+        && path.file_name().is_some_and(|n| n == "codebase-memory-mcp")
+        && exists(path);
+    matches.then(|| {
+        let daemon = argv.any(|a| a == b"--cbm-daemon-internal");
+        (path.to_path_buf(), daemon)
+    })
+}
+
 fn managed_binary_missing(
     command: Option<&str>,
     managed: &Path,
@@ -625,6 +708,32 @@ mod tests {
             "test".to_string(),
             "config".to_string()
         ]));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn memory_binary_from_cmdline_matches_only_existing_absolute_cbm_paths() {
+        let daemon = b"/opt/cbm/codebase-memory-mcp\0--cbm-daemon-internal\0";
+        assert_eq!(
+            memory_binary_from_cmdline(daemon, |_| true),
+            Some((PathBuf::from("/opt/cbm/codebase-memory-mcp"), true))
+        );
+        let client = b"/opt/cbm/codebase-memory-mcp\0--stdio\0";
+        assert_eq!(
+            memory_binary_from_cmdline(client, |_| true),
+            Some((PathBuf::from("/opt/cbm/codebase-memory-mcp"), false))
+        );
+        // Bare name (argv0 via PATH), other binaries, vanished binaries, empty.
+        assert_eq!(
+            memory_binary_from_cmdline(b"codebase-memory-mcp\0", |_| true),
+            None
+        );
+        assert_eq!(
+            memory_binary_from_cmdline(b"/usr/bin/codebase-memory-mcp-ui\0", |_| true),
+            None
+        );
+        assert_eq!(memory_binary_from_cmdline(daemon, |_| false), None);
+        assert_eq!(memory_binary_from_cmdline(b"", |_| true), None);
     }
 
     #[test]
