@@ -43,15 +43,16 @@ pub(crate) fn classify_error_facts(provider: &str, facts: GenaiErrorFacts) -> Pr
     let message = facts.message;
 
     match facts.status {
-        // 429 is standard rate-limiting; 529 is Anthropic's overloaded_error, a
-        // transient-overload signal that should failover the same way; no
-        // status at all is a connection/transport failure. All three report
+        // 429 is standard rate-limiting; 529 is Anthropic's overloaded_error
+        // and 503 UNAVAILABLE is Gemini's "experiencing high demand" — both
+        // transient-overload signals that should failover the same way; no
+        // status at all is a connection/transport failure. All of them report
         // QuotaExceeded instead when the message clearly names a quota/billing
         // condition.
-        Some(429) | Some(529) | None if message_indicates_quota(&message) => {
+        Some(429) | Some(503) | Some(529) | None if message_indicates_quota(&message) => {
             ProviderError::QuotaExceeded { provider, message }
         }
-        Some(429) | Some(529) => ProviderError::RateLimited { provider, message },
+        Some(429) | Some(503) | Some(529) => ProviderError::RateLimited { provider, message },
         Some(401) | Some(403) => ProviderError::Authentication { provider, message },
         Some(400) | Some(404) | Some(422) => ProviderError::InvalidRequest { provider, message },
         // Other 5xx, any other status, and no status at all: transport-level.
@@ -119,6 +120,7 @@ pub struct GenaiProvider {
     name: String,
     model: String,
     client: genai::Client,
+    adapter_kind: genai::adapter::AdapterKind,
     /// Mark system messages with a provider-side prompt-cache hint. Only the
     /// Anthropic adapter supports the content-level `cache_control` marker.
     cache_system_prompt: bool,
@@ -134,6 +136,7 @@ impl GenaiProvider {
             name: shared.name.clone(),
             model: model.to_string(),
             client: shared.client.clone(),
+            adapter_kind: shared.adapter_kind,
             cache_system_prompt: shared.adapter_kind == genai::adapter::AdapterKind::Anthropic,
         }
     }
@@ -409,12 +412,19 @@ fn to_genai_tool_call(
 
 /// Map domain `Tool`s onto genai tool definitions. The JSON-schema text is
 /// parsed here at the crate boundary; a parse failure is an `InvalidRequest`.
-fn to_genai_tools(provider: &str, tools: &[Tool]) -> Result<Vec<genai::chat::Tool>, ProviderError> {
+fn to_genai_tools(
+    provider: &str,
+    adapter_kind: genai::adapter::AdapterKind,
+    tools: &[Tool],
+) -> Result<Vec<genai::chat::Tool>, ProviderError> {
     let mut out = Vec::with_capacity(tools.len());
     for t in tools {
-        let schema = parse_json_or_invalid_request(provider, &t.parameters_schema_json, |e| {
+        let mut schema = parse_json_or_invalid_request(provider, &t.parameters_schema_json, |e| {
             format!("tool `{}` has invalid parameter schema: {e}", t.name)
         })?;
+        if adapter_kind == genai::adapter::AdapterKind::Gemini {
+            strip_additional_properties(&mut schema);
+        }
         out.push(
             genai::chat::Tool::new(t.name.clone())
                 .with_description(t.description.clone())
@@ -422,6 +432,24 @@ fn to_genai_tools(provider: &str, tools: &[Tool]) -> Result<Vec<genai::chat::Too
         );
     }
     Ok(out)
+}
+
+/// Gemini's `functionDeclarations[].parameters` is an OpenAPI-subset `Schema`
+/// proto with no `additionalProperties` field: the API rejects the whole
+/// request with HTTP 400 `Unknown name "additionalProperties"` when it appears
+/// anywhere in the tree, and genai 0.6 forwards it verbatim. Every catalog
+/// schema in `repo-explorer-agent` sets it (the dispatcher is
+/// `deny_unknown_fields`), so it's dropped here for Gemini only — the other
+/// adapters accept it and benefit from the hint.
+fn strip_additional_properties(schema: &mut serde_json::Value) {
+    match schema {
+        serde_json::Value::Object(map) => {
+            map.remove("additionalProperties");
+            map.values_mut().for_each(strip_additional_properties);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_additional_properties),
+        _ => {}
+    }
 }
 
 /// Map a genai chat response to a `ProviderResponse`: tool calls take priority,
@@ -501,7 +529,7 @@ impl LlmProvider for GenaiProvider {
         options: &CallOptions,
     ) -> Result<Completion, ProviderError> {
         let chat_messages = to_genai_messages(&self.name, messages, self.cache_system_prompt)?;
-        let genai_tools = to_genai_tools(&self.name, tools)?;
+        let genai_tools = to_genai_tools(&self.name, self.adapter_kind, tools)?;
         let (request, chat_options) = build_chat_request(chat_messages, genai_tools, options);
 
         match self
@@ -550,6 +578,48 @@ mod tests {
             );
         }
         assert!(adapter_kind_for("not-a-real-kind").is_none());
+    }
+
+    #[test]
+    fn to_genai_tools_strips_additional_properties_for_gemini_only() {
+        use genai::adapter::AdapterKind;
+        // Regression: Gemini answered 400 "Unknown name additionalProperties"
+        // to every tool-bearing request, since its function-declaration
+        // schema proto has no such field and genai forwards it verbatim.
+        let tool = Tool {
+            name: "grep".to_string(),
+            description: String::new(),
+            parameters_schema_json: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "opts": {
+                        "type": "object",
+                        "properties": {"x": {"type": "integer"}},
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            })
+            .to_string(),
+        };
+
+        let gemini = to_genai_tools("p", AdapterKind::Gemini, std::slice::from_ref(&tool)).unwrap();
+        let schema = gemini[0].schema.as_ref().unwrap();
+        assert!(schema.get("additionalProperties").is_none());
+        assert!(
+            schema["properties"]["opts"]
+                .get("additionalProperties")
+                .is_none()
+        );
+        assert_eq!(schema["required"], serde_json::json!(["pattern"]));
+
+        let anthropic =
+            to_genai_tools("p", AdapterKind::Anthropic, std::slice::from_ref(&tool)).unwrap();
+        let schema = anthropic[0].schema.as_ref().unwrap();
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["opts"]["additionalProperties"], false);
     }
 
     fn facts(status: Option<u16>, message: &str) -> GenaiErrorFacts {
@@ -609,6 +679,15 @@ mod tests {
                 message: "bad body".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn http_503_classifies_as_rate_limited_so_the_next_model_is_tried() {
+        // Regression: Gemini's 503 UNAVAILABLE "experiencing high demand" was a
+        // Transport error, which the router surfaces immediately — the other
+        // configured models were never tried.
+        let e = classify_error_facts("p", facts(Some(503), "high demand"));
+        assert!(e.is_failover_trigger(), "{e:?}");
     }
 
     #[test]
