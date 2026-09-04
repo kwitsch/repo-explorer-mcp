@@ -303,6 +303,9 @@ fn running_memory_binary() -> Option<PathBuf> {
 
 /// Parse a NUL-separated `/proc/<pid>/cmdline`; `Some((argv0, is_daemon))`
 /// when argv0 is an existing absolute `codebase-memory-mcp` path.
+/// Only the Linux `/proc` scan calls it, but it stays compiled (and unit
+/// tested) on every platform.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn memory_binary_from_cmdline(
     cmdline: &[u8],
     exists: impl Fn(&Path) -> bool,
