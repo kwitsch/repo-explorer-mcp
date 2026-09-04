@@ -90,6 +90,12 @@ fn detect_providers(get: impl Fn(&str) -> Option<String>) -> Vec<DetectedProvide
 /// provide only one-time trial credit or opt-in allowances, i.e. no stable
 /// free-tier model list, so their slices are empty.
 ///
+/// The Gemini entries are Google's rolling `-latest` aliases rather than
+/// pinned versions: pinned Flash IDs get retired for new API keys within a
+/// few model generations (`gemini-2.5-flash` started answering 404 "no longer
+/// available to new users" in 2026-09), which left every fresh `setup`
+/// config unable to complete a single LLM call.
+///
 /// CAVEATS:
 ///  - Hand-maintained: there is NO compile-time or automated check against
 ///    live provider APIs, so this table can drift/stale over time.
@@ -100,7 +106,7 @@ fn detect_providers(get: impl Fn(&str) -> Option<String>) -> Vec<DetectedProvide
 ///    legal, so there is no validation of the IDs here.
 fn free_tier_models(kind: &str) -> &'static [&'static str] {
     match kind {
-        "gemini" | "google" => &["gemini-2.5-flash", "gemini-2.5-flash-lite"],
+        "gemini" | "google" => &["gemini-flash-latest", "gemini-flash-lite-latest"],
         // Every other kind (anthropic, openai, and anything unrecognized) has
         // no standing free tier, so one arm covers them all.
         _ => &[],
