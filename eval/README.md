@@ -88,6 +88,17 @@ built out here — see the plan's §11 phase table.
   rather than a literal quote). (2) `negative_ok` was computed per-row but never printed, and
   the `file_hit@3` table included negative queries where a 0 is the _correct_ outcome — added a
   dedicated negative-queries section and excluded `N` from the file-hit table.
+- `score.py` F-17: the `snippet_found_at` "near"-alignment window only searched a
+  ±4-line band around `line_start` and exempted only whole-file spans, so a real,
+  in-range representative-line snippet cited from a large non-whole-file span
+  (e.g. a 16–40-line body) sitting more than ~4 lines past `line_start` was flagged
+  `misaligned_snippet`. Widened the window to the full claimed `[line_start, line_end]`
+  span with a ±4-line pad (commit `4ca0a18`); rescoring `results/20260905T220843`
+  drops the flagged-hallucination count from **32** (25 misaligned + 7 fabricated) to
+  **11** (4 misaligned + 7 fabricated). The residual 4 misaligned are three separate
+  pre-existing defects (duplicate-match `find_chunk`, single-character chunks, content
+  genuinely >4 lines off) tracked as F-17 follow-ups, not this fix — the §7.5
+  `hallucinated = 0` gate still fails.
 
 ## Decisions in force for this pilot (accepted 2026-09-05)
 
