@@ -157,6 +157,12 @@ pub enum ProviderError {
     RateLimited { provider: String, message: String },
     #[error("provider `{provider}` quota exceeded: {message}")]
     QuotaExceeded { provider: String, message: String },
+    /// The requested model id doesn't exist or was retired (HTTP 404 on the
+    /// completion endpoint) — unlike `InvalidRequest`, this is specific to
+    /// the one model slot, not the request shape, so it's a failover
+    /// trigger: the next configured model may well still be valid.
+    #[error("provider `{provider}` model unavailable: {message}")]
+    ModelUnavailable { provider: String, message: String },
     #[error("provider `{provider}` authentication failed: {message}")]
     Authentication { provider: String, message: String },
     #[error("provider `{provider}` request invalid: {message}")]
@@ -175,7 +181,10 @@ pub enum ProviderError {
 impl ProviderError {
     /// Exactly the limit situations that trigger router failover.
     pub fn is_failover_trigger(&self) -> bool {
-        matches!(self, Self::RateLimited { .. } | Self::QuotaExceeded { .. })
+        matches!(
+            self,
+            Self::RateLimited { .. } | Self::QuotaExceeded { .. } | Self::ModelUnavailable { .. }
+        )
     }
 
     /// Provider name this error is attributed to.
@@ -183,6 +192,7 @@ impl ProviderError {
         match self {
             Self::RateLimited { provider, .. }
             | Self::QuotaExceeded { provider, .. }
+            | Self::ModelUnavailable { provider, .. }
             | Self::Authentication { provider, .. }
             | Self::InvalidRequest { provider, .. }
             | Self::Transport { provider, .. }
@@ -550,6 +560,13 @@ mod tests {
         };
         assert_eq!(qe.to_string(), "provider `p2` quota exceeded: no credit");
 
+        let mu = ProviderError::ModelUnavailable {
+            provider: "p8".to_string(),
+            message: "not found".to_string(),
+        };
+        assert_eq!(mu.to_string(), "provider `p8` model unavailable: not found");
+        assert_eq!(mu.provider(), "p8");
+
         let auth = ProviderError::Authentication {
             provider: "p3".to_string(),
             message: "bad key".to_string(),
@@ -593,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn only_rate_and_quota_are_failover_triggers() {
+    fn only_rate_quota_and_model_unavailable_are_failover_triggers() {
         let p = "x".to_string();
         assert!(
             ProviderError::RateLimited {
@@ -604,6 +621,13 @@ mod tests {
         );
         assert!(
             ProviderError::QuotaExceeded {
+                provider: p.clone(),
+                message: String::new()
+            }
+            .is_failover_trigger()
+        );
+        assert!(
+            ProviderError::ModelUnavailable {
                 provider: p.clone(),
                 message: String::new()
             }
@@ -814,6 +838,31 @@ mod tests {
             .await;
         assert_eq!(third, Ok(text("p1 recovered")));
         assert_eq!(p1.calls().len(), 2, "p1 retried after cooldown elapsed");
+    }
+
+    #[tokio::test]
+    async fn model_unavailable_falls_over_to_next_model_not_fail_fast() {
+        // Regression: a retired model id (HTTP 404) used to classify as
+        // InvalidRequest, a fail-fast error — the router returned it
+        // straight to the caller instead of trying `b`.
+        let a = MockLlmProvider::new().with_fallback(Err(ProviderError::ModelUnavailable {
+            provider: "primary".to_string(),
+            message: "model not found".to_string(),
+        }));
+        let b = MockLlmProvider::new().with_fallback(Ok(text("from b")));
+        let router = ProviderRouter::new(
+            vec![(
+                "primary".to_string(),
+                vec![("a".to_string(), a.clone()), ("b".to_string(), b.clone())],
+            )],
+            60,
+        );
+        let got = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
+        assert_eq!(got, Ok(text("from b")));
+        assert_eq!(a.calls().len(), 1);
+        assert_eq!(b.calls().len(), 1);
     }
 
     #[tokio::test]
