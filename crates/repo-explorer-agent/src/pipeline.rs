@@ -9,7 +9,7 @@ use repo_explorer_core::domain::{
 };
 use repo_explorer_core::fingerprint::RepoFingerprint;
 use repo_explorer_core::memory::{GraphQuery, MemoryBackend};
-use repo_explorer_core::retrieval::{confidence, derive_patterns, merge_and_rank};
+use repo_explorer_core::retrieval::{confidence, derive_patterns, is_symbol_token, merge_and_rank};
 use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use std::collections::HashSet;
 use std::path::Path;
@@ -32,6 +32,10 @@ pub(crate) struct RetrievalOutcome {
     pub candidates: Vec<Candidate>,
     /// 0-100; see `repo_explorer_core::retrieval::confidence`.
     pub confidence: u32,
+    /// True when the query text contains at least one symbol-shaped token
+    /// (see `repo_explorer_core::retrieval::is_symbol_token`). Gates the Stage 3
+    /// early-exit route: a query that names no symbol can never early-exit (F-16).
+    pub has_symbol_token: bool,
 }
 
 /// Memoization handle for the fanout legs: only active when both a cache and
@@ -189,9 +193,11 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
 
     let candidates = merge_and_rank(raw, &patterns, top_k);
     let confidence = confidence(&candidates);
+    let has_symbol_token = patterns.identifiers.iter().any(|t| is_symbol_token(t));
     RetrievalOutcome {
         candidates,
         confidence,
+        has_symbol_token,
     }
 }
 
@@ -424,6 +430,42 @@ mod tests {
         let out = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
         assert_eq!(out.candidates[0].kind, CandidateKind::SymbolExact);
         assert!(out.confidence >= 90, "got {}", out.confidence);
+    }
+
+    #[tokio::test]
+    async fn retrieve_sets_has_symbol_token_true_for_snake_case() {
+        let memory = MockMemoryBackend::new();
+        let search = MockSearchBackend::new().with_search_result(Ok(vec![]));
+        let query = ExplorationQuery {
+            text: "decide_freshness".to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let out = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
+        assert!(
+            out.has_symbol_token,
+            "a snake_case query names a symbol and must set has_symbol_token"
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieve_sets_has_symbol_token_false_for_symbol_free_query() {
+        // The F-16 self-P2-01 repro: every token is a path segment or a long
+        // prose word (crates/repo/explorer/agent/verify/constant) — none is
+        // snake_case / camelCase / digit-bearing, so has_symbol_token is false.
+        let memory = MockMemoryBackend::new();
+        let search = MockSearchBackend::new().with_search_result(Ok(vec![]));
+        let query = ExplorationQuery {
+            text: "crates/repo-explorer-agent/src/verify.rs:35 what does this constant do"
+                .to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let out = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
+        assert!(
+            !out.has_symbol_token,
+            "a query with only prose/path tokens must not set has_symbol_token"
+        );
     }
 
     #[tokio::test]
