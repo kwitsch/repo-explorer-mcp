@@ -4,9 +4,8 @@
 //! for matches, `path-line-content` for context). It is tolerant of malformed
 //! individual rows (skip, not fatal) and saturates `u64`->`u32` line numbers
 //! (never a bare `as` cast). It never returns an error: any row it cannot
-//! interpret — including the rtk truncation-footer shapes plain `rg` never
-//! emits (see `is_truncation_marker`) — is skipped, never fatal, so a single
-//! odd line can never discard the findings already collected.
+//! interpret is skipped, never fatal, so a single odd line can never discard
+//! the findings already collected.
 
 use repo_explorer_core::domain::{ExplorationFinding, FileLocation, saturate_u32};
 use std::path::PathBuf;
@@ -352,33 +351,6 @@ fn handle_context_line(
     }
 }
 
-/// True for either of rtk's own truncation-footer lines: the per-file footer,
-/// e.g. `  +35 more in many.txt [see remaining: tail -n +26
-/// ~/.local/share/rtk/tee/....log]`, emitted in place of a file's remaining
-/// match lines once its real match count exceeds rtk's undocumented,
-/// non-configurable per-file cap; and the whole-files-skipped footer, e.g.
-/// `+21 more files [see remaining: tail -n +1
-/// ~/.local/share/rtk/tee/..._grep_skipped.log]`, emitted once the number of
-/// matching files exceeds rtk's separate, also non-configurable total-files
-/// cap -- dropping entire files' worth of matches that never appear in stdout
-/// at all. Neither shape matches `split_grep_line`'s `path:line:content` /
-/// `path-line-content` grammar (no plausible `<sep><digits><sep>` run exists
-/// in either). Plain `rg` never emits these lines; the check is kept as inert
-/// insurance so that if some wrapper ever reintroduces truncation-shaped
-/// output, `parse_rg` skips that one line rather than misparsing it — see
-/// `parse_rg`.
-fn is_truncation_marker(line: &str) -> bool {
-    let Some(rest) = line.trim_start().strip_prefix('+') else {
-        return false;
-    };
-    let digits_end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    digits_end > 0
-        && (rest[digits_end..].starts_with(" more in ")
-            || rest[digits_end..].starts_with(" more files "))
-}
-
 /// Parse `rg -H -n` output. Each match line becomes one finding. A context
 /// line before any group boundary (`--`) appends to the previous finding's
 /// snippet; a context line after a boundary -- including before the very
@@ -386,11 +358,10 @@ fn is_truncation_marker(line: &str) -> bool {
 /// prepended to the next finding instead, since it leads that match rather
 /// than trailing the one before the boundary.
 ///
-/// Infallible: every row it cannot interpret is skipped rather than fatal,
-/// including a truncation-footer line (see `is_truncation_marker`) that plain
-/// `rg` never emits. A parser that cannot return `Err` can never trigger the
-/// caller's whole-leg discard, which is the structural root fix for the
-/// pre-migration 100%-loss bug.
+/// Infallible: every row it cannot interpret is skipped rather than fatal. A
+/// parser that cannot return `Err` can never trigger the caller's whole-leg
+/// discard, which is the structural root fix for the pre-migration 100%-loss
+/// bug.
 pub(crate) fn parse_rg(stdout: &str) -> Vec<ExplorationFinding> {
     let mut findings: Vec<ExplorationFinding> = Vec::new();
     let mut pending_before: Vec<String> = Vec::new();
@@ -403,14 +374,6 @@ pub(crate) fn parse_rg(stdout: &str) -> Vec<ExplorationFinding> {
         }
         if line == "--" {
             at_boundary = true;
-            continue;
-        }
-        if is_truncation_marker(line) {
-            // Plain `rg` never emits rtk's truncation footer. Kept as inert
-            // insurance: if a wrapper ever reintroduces truncation-shaped
-            // output, skip that one line rather than aborting the whole parse
-            // and losing every finding collected so far (the pre-migration
-            // 100%-loss bug).
             continue;
         }
         match split_grep_line(line) {
@@ -476,8 +439,9 @@ mod tests {
 
     #[test]
     fn parse_rg_skips_files_skipped_footer_keeping_prior_matches() {
-        // The second rtk footer shape (whole-files-skipped) is likewise
-        // skipped, not fatal; the prior real match survives.
+        // A footer-shaped line matches no `split_grep_line` grammar, so it
+        // falls into the generic skip arm, not fatal; the prior real match
+        // survives.
         let input = "many.txt:1:needle\n+21 more files [see remaining: tail -n +1 ~/.local/share/rtk/tee/x_skipped.log]\n";
         let findings = parse_rg(input);
         assert_eq!(findings.len(), 1);
@@ -488,52 +452,16 @@ mod tests {
     #[test]
     fn parse_rg_skips_truncation_footer_keeping_prior_matches() {
         // Regression test for the pre-migration 100%-loss bug: a real match
-        // line followed by an rtk-shaped truncation footer. The footer is
-        // skipped like any other unparsable row, and the real match survives
-        // instead of the whole parse aborting to an empty result.
+        // line followed by an rtk-shaped truncation footer. The footer
+        // matches no grammar and is skipped like any other unparsable row,
+        // and the real match survives instead of the whole parse aborting to
+        // an empty result.
         let input = "60 matches in 1 files:\nmany.txt:1:needle\n  +35 more in many.txt [see remaining: tail -n +26 ~/.local/share/rtk/tee/x.log]\n";
         let findings = parse_rg(input);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].location.path, PathBuf::from("many.txt"));
         assert_eq!(findings[0].location.line_start, 1);
         assert_eq!(findings[0].snippet.as_deref(), Some("needle"));
-    }
-
-    #[test]
-    fn is_truncation_marker_matches_rtk_footer_shape() {
-        assert!(is_truncation_marker(
-            "  +35 more in many.txt [see remaining: tail -n +26 ~/x.log]"
-        ));
-        assert!(is_truncation_marker("+1 more in a.rs"));
-    }
-
-    #[test]
-    fn is_truncation_marker_matches_rtk_files_skipped_footer_shape() {
-        // rtk's separate, total-files cap footer -- distinct from the
-        // per-file `+N more in <file>` footer above -- drops entire files'
-        // worth of matches and must be recognized too.
-        assert!(is_truncation_marker(
-            "+21 more files [see remaining: tail -n +1 ~/.local/share/rtk/tee/x_skipped.log]"
-        ));
-        assert!(is_truncation_marker("+1 more files [see remaining: x]"));
-    }
-
-    #[test]
-    fn is_truncation_marker_rejects_non_footer_lines() {
-        // The summary header shares the digits-then-word shape but not the
-        // `+N more in ` prefix, and must stay a tolerated, skippable row.
-        assert!(!is_truncation_marker("60 matches in 1 files:"));
-        assert!(!is_truncation_marker("src/x.rs:5:hello"));
-        assert!(!is_truncation_marker(""));
-        assert!(!is_truncation_marker("notavalidline"));
-        // A `+`-prefixed content line whose digits aren't followed by the
-        // exact `" more in "` marker must not false-positive.
-        assert!(!is_truncation_marker("+35 more info"));
-        assert!(!is_truncation_marker("+more in x.rs"));
-        // Same for the `" more files "` marker: a merely similar word must
-        // not false-positive.
-        assert!(!is_truncation_marker("+21 more filesystems"));
-        assert!(!is_truncation_marker("+more files x"));
     }
 
     #[test]

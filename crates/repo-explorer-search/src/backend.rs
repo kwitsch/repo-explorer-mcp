@@ -27,10 +27,23 @@ impl CliSearchBackend {
     /// disk. Still infallible: an unresolved backend is constructible; `search`
     /// fails fast via `BackendNotFound` and the serve-time gate in `main.rs`
     /// (see `rg_available`) refuses to start.
-    pub fn new(config: &SearchConfig, managed_rg_path: Option<PathBuf>) -> Self {
+    ///
+    /// Async: only when no explicit path is configured does resolution fall
+    /// through to `which::which`, whose PATH-wide stat calls run via
+    /// `spawn_blocking` rather than directly on a tokio worker thread (an
+    /// unusually long/slow-to-stat PATH must not stall it) — mirroring
+    /// `update.rs`'s `which_rg_blocking`.
+    pub async fn new(config: &SearchConfig, managed_rg_path: Option<PathBuf>) -> Self {
+        let system_rg = if config.rg_path.is_some() {
+            None
+        } else {
+            tokio::task::spawn_blocking(|| which::which("rg").ok())
+                .await
+                .unwrap_or(None)
+        };
         let rg = resolve_rg(config.rg_path.as_deref(), || {
-            which::which("rg")
-                .ok()
+            system_rg
+                .clone()
                 .or_else(|| managed_rg_path.clone().filter(|p| p.exists()))
         });
         Self {

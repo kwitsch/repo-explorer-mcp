@@ -108,6 +108,20 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // `SearchConfig` renamed `rtk_path` to `rg_path` in 0.5.5; `Config` has no
+    // `deny_unknown_fields`, so a config carrying the old key loads silently
+    // with the setting dropped. Warn from the raw text (a cheap re-read of an
+    // already-small file) since the parsed `Config` has no trace of it.
+    if let Ok(raw) = std::fs::read_to_string(&config_path)
+        && raw.contains("rtk_path")
+    {
+        eprintln!(
+            "repo-explorer-mcp: config at {} still sets [search] rtk_path; that key was \
+             renamed to rg_path in 0.5.5 and is now silently ignored — remove it or rename it \
+             to rg_path.",
+            config_path.display()
+        );
+    }
     match run(config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -177,7 +191,7 @@ async fn run(config: repo_explorer_core::config::Config) -> anyhow::Result<()> {
             );
         })
         .ok();
-    let search = CliSearchBackend::new(&config.search, managed_rg_path.clone());
+    let search = CliSearchBackend::new(&config.search, managed_rg_path.clone()).await;
     if !search.rg_available() {
         anyhow::bail!("{}", rg_unresolved_message(managed_rg_path.as_deref()));
     }

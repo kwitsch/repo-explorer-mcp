@@ -22,7 +22,7 @@ async fn searches_bundled_repo_for_literal() {
         eprintln!("skipping: `rg` is not available on PATH");
         return;
     }
-    let backend = CliSearchBackend::new(&SearchConfig::default(), None);
+    let backend = CliSearchBackend::new(&SearchConfig::default(), None).await;
     let root = sample_repo();
     let findings = backend
         .search(&root, "needle", None, &SearchOptions::default())
@@ -49,7 +49,7 @@ async fn searches_bundled_repo_for_literal() {
 
 #[tokio::test]
 async fn empty_pattern_is_invalid_input() {
-    let backend = CliSearchBackend::new(&SearchConfig::default(), None);
+    let backend = CliSearchBackend::new(&SearchConfig::default(), None).await;
     let root = sample_repo();
     let err = backend
         .search(&root, "", None, &SearchOptions::default())
