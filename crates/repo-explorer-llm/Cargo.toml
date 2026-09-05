@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-repo-explorer-core = { version = "0.5.3", path = "../repo-explorer-core" }
+repo-explorer-core = { version = "0.5.4", path = "../repo-explorer-core" }
 genai = "0.6"
 serde_json = "1"
 tracing = "0.1"
