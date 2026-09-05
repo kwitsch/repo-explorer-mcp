@@ -28,8 +28,6 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-import yaml
-
 EVAL_DIR = Path(__file__).resolve().parent
 REPO_ROOT = EVAL_DIR.parent
 
@@ -54,6 +52,8 @@ def wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float, fl
 
 
 def load_queries(repo_id: str) -> dict[str, dict]:
+    import yaml
+
     path = EVAL_DIR / "queries" / f"{repo_id}.yaml"
     with open(path) as f:
         items = yaml.safe_load(f) or []
@@ -137,11 +137,18 @@ def file_len(repo_path: Path, rel: str) -> int | None:
 def snippet_found_at(
     repo_path: Path, rel: str, line_start: int | None, line_end: int | None, snippet: str
 ) -> str:
-    """Returns 'ok' (matches at/near the claimed range, or the range is a whole-file span so
-    "near" is moot), 'misaligned' (found elsewhere in the file), or 'not_found' (fabricated) —
-    the §7.1 hallucinated classification, minus the 'fabricated path'/'range outside file' cases
-    checked separately. Matches per-chunk (see snippet_chunks) so a genuine multi-line quote
-    isn't flagged fabricated just because no single physical line equals the whole snippet."""
+    """Returns 'ok' (matches at/near the claimed range, or the range is a whole-file span, or the
+    location itself is unknown, so "near" is moot), 'misaligned' (found elsewhere in the file), or
+    'not_found' (fabricated) — the §7.1 hallucinated classification, minus the 'fabricated
+    path'/'range outside file' cases checked separately. Matches per-chunk (see snippet_chunks) so
+    a genuine multi-line quote isn't flagged fabricated just because no single physical line equals
+    the whole snippet. When both bounds are known, the "near" window spans the full claimed
+    [line_start, line_end] range with a ±4-line pad (not just a band around line_start), so a
+    representative line cited from anywhere inside a large non-whole-file span is accepted as
+    in-range. When line_end is unknown, the window stays the narrower legacy line_start-4..
+    line_start+3 band (no forward pad) rather than silently widening by one line. When line_start
+    itself is unknown (location genuinely unknown), no misalignment check applies at all — only
+    fabrication (not_found) is possible."""
     p = repo_path / rel
     if not p.exists() or not p.is_file():
         return "not_found"
@@ -156,18 +163,21 @@ def snippet_found_at(
     # A whole-file (or near-whole-file) span has no meaningful "near line_start" — a module-level
     # semantic match legitimately cites a representative line from anywhere in the file.
     whole_file = line_start is not None and line_end is not None and (line_end - line_start) >= len(lines) - 2
-    near = set()
+    near_range = None
     if line_start and not whole_file:
-        near = set(range(max(0, line_start - 4), min(len(lines), line_start + 3)))
+        upper = line_end + 4 if line_end is not None else line_start + 3
+        near_range = (max(0, line_start - 4), min(len(lines), upper))
     # Every chunk must exist somewhere in the file (a chunk that's missing is fabricated
     # content, even if the rest of the snippet is real); "misaligned" only if all chunks exist
-    # but at least one falls outside the claimed range.
+    # but at least one falls outside the claimed range. A finding with no known line_start has no
+    # range to fall outside of, so it can only ever be "ok" or "not_found" here.
     any_far = False
     for chunk in chunks:
         idx = find_chunk(file_lines, chunk)
         if idx is None:
             return "not_found"
-        if not (whole_file or idx in near):
+        in_near = near_range is not None and near_range[0] <= idx < near_range[1]
+        if not (whole_file or line_start is None or in_near):
             any_far = True
     return "misaligned" if any_far else "ok"
 

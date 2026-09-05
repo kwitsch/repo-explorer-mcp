@@ -88,6 +88,13 @@ built out here — see the plan's §11 phase table.
   rather than a literal quote). (2) `negative_ok` was computed per-row but never printed, and
   the `file_hit@3` table included negative queries where a 0 is the _correct_ outcome — added a
   dedicated negative-queries section and excluded `N` from the file-hit table.
+- `score.py`'s `snippet_found_at` "near"-alignment window ignored `line_end` — filed
+  as **F-17** in the plan (widened to the full claimed span, commit `4ca0a18`;
+  rescoring `results/20260905T220843` drops hallucinations from **32** to **11**,
+  though an escalated-review follow-up further tightened the function afterwards
+  and that count needs reconfirming; see the F-17 row in
+  `docs/eval/real-world-test-plan.md` for the full breakdown and residual
+  follow-ups).
 
 ## Decisions in force for this pilot (accepted 2026-09-05)
 
