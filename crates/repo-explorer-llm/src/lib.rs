@@ -54,7 +54,13 @@ pub(crate) fn classify_error_facts(provider: &str, facts: GenaiErrorFacts) -> Pr
         }
         Some(429) | Some(503) | Some(529) => ProviderError::RateLimited { provider, message },
         Some(401) | Some(403) => ProviderError::Authentication { provider, message },
-        Some(400) | Some(404) | Some(422) => ProviderError::InvalidRequest { provider, message },
+        // A model-scoped completion endpoint returning 404 always means "this
+        // model id doesn't exist / was retired" (never a malformed-body
+        // issue — that's 400), across OpenAI, Anthropic and Gemini alike. So
+        // unlike 400/422, it's specific to the one model slot: failover to
+        // the next configured model instead of failing the whole request.
+        Some(404) => ProviderError::ModelUnavailable { provider, message },
+        Some(400) | Some(422) => ProviderError::InvalidRequest { provider, message },
         // Other 5xx, any other status, and no status at all: transport-level.
         Some(_) | None => ProviderError::Transport { provider, message },
     }
@@ -532,6 +538,7 @@ fn outcome_label(err: &ProviderError) -> &'static str {
     match err {
         ProviderError::RateLimited { .. } => "rate_limited",
         ProviderError::QuotaExceeded { .. } => "quota",
+        ProviderError::ModelUnavailable { .. } => "model_unavailable",
         ProviderError::Authentication { .. } => "auth",
         ProviderError::InvalidRequest { .. } => "invalid",
         ProviderError::Transport { .. }
@@ -757,6 +764,24 @@ mod tests {
         // Transport error, which the router surfaces immediately — the other
         // configured models were never tried.
         let e = classify_error_facts("p", facts(Some(503), "high demand"));
+        assert!(e.is_failover_trigger(), "{e:?}");
+    }
+
+    #[test]
+    fn http_404_classifies_as_model_unavailable_so_the_next_model_is_tried() {
+        // Regression: a retired/renamed model id (e.g. Gemini's
+        // "gemini-2.5-flash is no longer available to new users") answered
+        // every request with 404, which used to classify as InvalidRequest —
+        // the router fails fast on that, so every model configured after the
+        // dead one in the chain was never tried.
+        let e = classify_error_facts("p", facts(Some(404), "model not found"));
+        assert_eq!(
+            e,
+            ProviderError::ModelUnavailable {
+                provider: "p".to_string(),
+                message: "model not found".to_string(),
+            }
+        );
         assert!(e.is_failover_trigger(), "{e:?}");
     }
 
