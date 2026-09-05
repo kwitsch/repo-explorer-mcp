@@ -187,14 +187,13 @@ def match_expected(response_findings: list[dict], expect: dict) -> dict:
     ranked by first-finding position; equivalent-group membership and primary_mode (all/any)
     are honored."""
     primary = expect.get("primary", []) or []
-    equivalent_groups = expect.get("equivalent", []) or []
+    equivalent = expect.get("equivalent", []) or []
     primary_mode = expect.get("primary_mode", "all")
-    is_negative = not primary and not equivalent_groups
+    is_negative = not primary and not equivalent
 
     target_files = {p["path"] for p in primary}
-    for group in equivalent_groups:
-        for member in group:
-            target_files.add(member["path"])
+    for member in equivalent:
+        target_files.add(member["path"])
 
     ranked_files = []
     seen_files = set()
@@ -218,10 +217,9 @@ def match_expected(response_findings: list[dict], expect: dict) -> dict:
     # range_hit: any finding whose range overlaps a target span, within the 3x/40-line cap.
     range_hit = False
     all_spans = [(p["path"], p.get("span")) for p in primary if p.get("span")]
-    for group in equivalent_groups:
-        for m in group:
-            if m.get("span"):
-                all_spans.append((m["path"], m["span"]))
+    for m in equivalent:
+        if m.get("span"):
+            all_spans.append((m["path"], m["span"]))
     for f in response_findings:
         rel = normalize_finding_path(f.get("location", {}).get("path", ""))
         ls, le = f.get("location", {}).get("line_start"), f.get("location", {}).get("line_end")
@@ -236,11 +234,8 @@ def match_expected(response_findings: list[dict], expect: dict) -> dict:
     # twin_confusion / dedupe_defect
     distractor_files = {d["path"] for d in (expect.get("distractor") or [])}
     twin_confusion = bool(distractor_files & seen_files)
-    dedupe_defect = False
-    for group in equivalent_groups:
-        members_seen = sum(1 for m in group if m["path"] in seen_files)
-        if members_seen >= 2:
-            dedupe_defect = True
+    members_seen = sum(1 for m in equivalent if m["path"] in seen_files)
+    dedupe_defect = members_seen >= 2
 
     negative_ok = None
     if is_negative:
@@ -272,9 +267,8 @@ def compute_cand_recall(candidates_ranked: list[dict] | None, expect: dict) -> d
         return {"cand_recall_at_topk": None, "cand_rank": None}
     primary = expect.get("primary", []) or []
     target_files = {p["path"] for p in primary}
-    for group in expect.get("equivalent", []) or []:
-        for member in group:
-            target_files.add(member["path"])
+    for member in expect.get("equivalent", []) or []:
+        target_files.add(member["path"])
     if not target_files:
         return {"cand_recall_at_topk": None, "cand_rank": None}  # negative query: nothing to find
     best_rank = None
@@ -481,7 +475,7 @@ def print_report(result: dict) -> None:
         for pc in provider_rows:
             by_outcome[pc.get("outcome")] += 1
         for outcome, n in sorted(by_outcome.items(), key=lambda kv: -kv[1]):
-            print(f"  outcome={outcome:14s} {n}")
+            print(f"  outcome={outcome or '<none>':14s} {n}")
         models_served = sorted({pc["model_served"] for pc in provider_rows if pc.get("model_served")})
         print(f"  models served this run: {models_served}")
         if pinned_model:
