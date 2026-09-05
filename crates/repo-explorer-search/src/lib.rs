@@ -1,4 +1,4 @@
-//! CLI-driven text search backend (rtk / ripgrep) implementing
+//! CLI-driven text search backend (ripgrep) implementing
 //! `repo_explorer_core::search::SearchBackend`, plus the git-backed
 //! `RepoStateProbe` (`GitStateProbe`) — both subprocess-driven, which is this
 //! crate's dependency domain.

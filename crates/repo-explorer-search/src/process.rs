@@ -14,11 +14,6 @@ pub(crate) struct SpawnSpec {
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub timeout: Duration,
-    /// A directory to prepend to this child's inherited `PATH` (process-scoped
-    /// only — never mutates the user's shell/global PATH). Used so `rtk`'s own
-    /// `rg` shell-out can find a repo-explorer-managed `rg` fallback that
-    /// isn't on the ambient PATH.
-    pub extra_path_dir: Option<PathBuf>,
 }
 
 /// True when `stdout` is exactly one line and that line is `rg --json`'s
@@ -54,15 +49,6 @@ pub(crate) async fn run(spec: &SpawnSpec) -> Result<String, SearchError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-
-    if let Some(dir) = &spec.extra_path_dir {
-        let inherited = std::env::var_os("PATH").unwrap_or_default();
-        let mut dirs: Vec<PathBuf> = vec![dir.clone()];
-        dirs.extend(std::env::split_paths(&inherited));
-        if let Ok(joined) = std::env::join_paths(dirs) {
-            cmd.env("PATH", joined);
-        }
-    }
 
     let child = cmd.spawn().map_err(|e| SearchError::BackendFailed {
         backend: spec.backend,
