@@ -63,6 +63,26 @@ fn query(text: &str) -> ExplorationQuery {
     }
 }
 
+/// Temp repo whose `src/` holds the files the finish-payload tests reference,
+/// each 40 lines long, so `finish` path validation accepts the model's
+/// findings and clamps nothing, via the crate's shared
+/// `test_support::temp_repo_with` fixture. Caller removes the dir.
+fn temp_repo(test: &str) -> PathBuf {
+    let body = (1..=40)
+        .map(|i| format!("l{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    repo_explorer_agent::test_support::temp_repo_with(
+        "agent_integ",
+        test,
+        &[
+            ("src/main.rs", body.as_str()),
+            ("src/fresh_a.rs", body.as_str()),
+            ("src/fresh_b.rs", body.as_str()),
+        ],
+    )
+}
+
 fn router(
     providers: Vec<(String, Vec<(String, MockLlmProvider)>)>,
 ) -> ProviderRouter<MockLlmProvider, FakeClock> {
@@ -118,10 +138,8 @@ async fn fake_provider_dispatch_and_assembly() {
         fallback_only(),
         CacheSettings::default(),
     );
-    let result = agent
-        .run(&PathBuf::from("/repo"), &query("where is main"))
-        .await
-        .unwrap();
+    let dir = temp_repo("dispatch");
+    let result = agent.run(&dir, &query("where is main")).await.unwrap();
 
     // Returned result equals the finish payload.
     assert_eq!(result.summary, "found main");
@@ -142,12 +160,12 @@ async fn fake_provider_dispatch_and_assembly() {
     let mem_calls = mem_probe.calls();
     assert!(mem_calls.iter().any(|c| matches!(
         c,
-        MemCall::EnsureFreshIndex { repo_root } if repo_root == &PathBuf::from("/repo")
+        MemCall::EnsureFreshIndex { repo_root } if repo_root == &dir
     )));
     assert!(mem_calls.iter().any(|c| matches!(
         c,
         MemCall::SearchCode { repo_root, query }
-            if repo_root == &PathBuf::from("/repo")
+            if repo_root == &dir
                 && query.text == "main"
                 && query.max_results == Some(5)
     )));
@@ -158,7 +176,7 @@ async fn fake_provider_dispatch_and_assembly() {
     assert!(search_calls.iter().any(|c| matches!(
         c,
         SearchCall::Search { repo_root, pattern, scope, .. }
-            if repo_root == &PathBuf::from("/repo")
+            if repo_root == &dir
                 && pattern == "fn main"
                 && scope == &Some(PathBuf::from("src"))
     )));
@@ -181,6 +199,7 @@ async fn fake_provider_dispatch_and_assembly() {
             .iter()
             .any(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("c2"))
     );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
@@ -326,10 +345,8 @@ async fn medium_confidence_verifies_in_one_turn() {
         AgentSettings::default(),
         CacheSettings::default(),
     );
-    let result = agent
-        .run(&PathBuf::from("/repo"), &query("decide_freshness"))
-        .await
-        .unwrap();
+    let dir = temp_repo("medium");
+    let result = agent.run(&dir, &query("decide_freshness")).await.unwrap();
 
     assert_eq!(result.summary, "verified");
     let calls = provider_probe.calls();
@@ -344,6 +361,7 @@ async fn medium_confidence_verifies_in_one_turn() {
             .iter()
             .any(|m| m.role == Role::User && m.content.contains("Candidates:"))
     );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
@@ -365,13 +383,15 @@ async fn verify_finish_is_capped_by_max_results() {
     );
     let mut q = query("decide_freshness");
     q.max_results = Some(1);
-    let result = agent.run(&PathBuf::from("/repo"), &q).await.unwrap();
+    let dir = temp_repo("verify_capped");
+    let result = agent.run(&dir, &q).await.unwrap();
 
     assert_eq!(result.findings.len(), 1, "capped to max_results");
     assert_eq!(
         result.findings[0].location.path,
         PathBuf::from("src/fresh_a.rs")
     );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]

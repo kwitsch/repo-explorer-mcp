@@ -1583,6 +1583,7 @@ name = "repo-explorer-agent"
 version = "0.5.5"
 dependencies = [
  "futures-util",
+ "repo-explorer-agent",
  "repo-explorer-core",
  "serde",
  "serde_json",

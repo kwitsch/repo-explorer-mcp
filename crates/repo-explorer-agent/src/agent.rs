@@ -34,7 +34,7 @@ use crate::cache::{QueryEntry, ResultCache};
 use crate::dispatch::dispatch_inner;
 use crate::pipeline;
 use crate::render::{RenderCaps, dedupe_key, tidy_findings};
-use crate::tools::{finish_only_catalog, parse_finish, resolve_finish, tool_catalog};
+use crate::tools::{finish_only_catalog, parse_finish_lenient, resolve_finish, tool_catalog};
 use crate::verify::{VerifyOutcome, verify};
 
 /// The only hard-failure mode: the provider router could not produce a response
@@ -536,10 +536,11 @@ where
                             // those borrows are done instead of cloned up front. On the
                             // common immediate-finish path we return before any of that
                             // is needed, skipping the allocation entirely.
-                            let mut turn_messages: Vec<Message> = match resolve_finish(&calls) {
-                                Ok(result) => return Ok((result, false)),
-                                Err(rejections) => rejections,
-                            };
+                            let mut turn_messages: Vec<Message> =
+                                match resolve_finish(&calls, repo_root).await {
+                                    Ok(result) => return Ok((result, false)),
+                                    Err(rejections) => rejections,
+                                };
                             let non_finish: Vec<&ToolCall> =
                                 calls.iter().filter(|c| c.name != "finish").collect();
                             if calls.len() == 1
@@ -613,7 +614,7 @@ where
 
         // Budget exhausted without finish: one forced final answer, then a
         // deterministic synthesis from everything gathered so far.
-        if let Some(result) = self.forced_finish(&mut messages, budget).await {
+        if let Some(result) = self.forced_finish(&mut messages, budget, repo_root).await {
             return Ok((result, true));
         }
         for candidate in candidates {
@@ -643,6 +644,7 @@ where
         &self,
         messages: &mut Vec<Message>,
         budget: &mut TokenBudget,
+        repo_root: &Path,
     ) -> Option<ExplorationResult> {
         messages.push(Message::user(
             "The exploration budget is exhausted. Call finish NOW with the best findings gathered so far.",
@@ -656,10 +658,18 @@ where
                 budget.add(completion.usage);
                 if let ProviderResponse::ToolCalls(calls) = completion.response {
                     for call in &calls {
-                        if call.name == "finish"
-                            && let Ok(result) = parse_finish(&call.arguments_json)
-                        {
-                            return Some(result);
+                        if call.name != "finish" {
+                            continue;
+                        }
+                        // Lenient: a one-shot call has no retry path to feed a
+                        // rejection back to the model, so keep whatever findings
+                        // validate instead of discarding all of them over one bad
+                        // path (see F-05 escalation on parse_finish's strictness).
+                        match parse_finish_lenient(&call.arguments_json, repo_root).await {
+                            Ok(result) => return Some(result),
+                            Err(reason) => {
+                                tracing::debug!(reason = %reason, "forced finish call failed to parse")
+                            }
                         }
                     }
                 }
@@ -871,6 +881,17 @@ mod tests {
         }
     }
 
+    /// Temp repo containing the finding paths the fallback `finish` tests
+    /// reference, so path validation accepts them, via the crate's shared
+    /// `test_support::temp_repo_with` fixture. Caller removes the dir.
+    fn temp_repo(test: &str) -> PathBuf {
+        crate::test_support::temp_repo_with(
+            "agent_run",
+            test,
+            &[("src/lib.rs", "a\nb\nc\n"), ("src/other.rs", "d\ne\nf\n")],
+        )
+    }
+
     fn tool_calls(
         calls: Vec<ToolCall>,
     ) -> Result<Completion, repo_explorer_core::llm::ProviderError> {
@@ -910,10 +931,12 @@ mod tests {
             scope_hint: None,
             max_results: None,
         };
-        let got = agent.run(&PathBuf::from("/repo"), &query).await.unwrap();
+        let dir = temp_repo("immediate_finish");
+        let got = agent.run(&dir, &query).await.unwrap();
         assert_eq!(got.summary, "done");
         assert_eq!(got.findings.len(), 1);
         assert_eq!(got.findings[0].location.line_start, 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -935,9 +958,11 @@ mod tests {
             scope_hint: None,
             max_results: Some(1),
         };
-        let got = agent.run(&PathBuf::from("/repo"), &query).await.unwrap();
+        let dir = temp_repo("fallback_capped");
+        let got = agent.run(&dir, &query).await.unwrap();
         assert_eq!(got.findings.len(), 1, "capped to max_results");
         assert_eq!(got.findings[0].location.path, PathBuf::from("src/lib.rs"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

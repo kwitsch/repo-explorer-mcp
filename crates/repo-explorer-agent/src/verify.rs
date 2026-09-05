@@ -83,7 +83,7 @@ where
                     ProviderResponse::ToolCalls(calls) if !calls.is_empty() => {
                         // Check for a successful finish before cloning anything: the
                         // common case (finish on the first turn) returns right here.
-                        let mut responses = match resolve_finish(&calls) {
+                        let mut responses = match resolve_finish(&calls, repo_root).await {
                             Ok(result) => {
                                 let action = if last { "forced_finish" } else { "finish" };
                                 tracing::debug!(turn, action, "verify action");

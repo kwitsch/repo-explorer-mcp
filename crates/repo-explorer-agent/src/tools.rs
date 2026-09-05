@@ -2,12 +2,13 @@
 //! `finish` validation. `repo_root` is never a tool parameter — the dispatcher
 //! supplies it from loop state.
 
+use crate::dispatch::{canonical_repo_root, read_file_canonical};
 use repo_explorer_core::domain::{ExplorationFinding, ExplorationResult, FileLocation};
 use repo_explorer_core::llm::{Message, Tool, ToolCall};
 use repo_explorer_core::retrieval::normalize_location;
 use serde::Deserialize;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 /// Appended to every `tool_catalog()` tool other than `finish`: the fallback
@@ -341,31 +342,113 @@ pub(crate) struct FinishLocation {
     pub line_end: u32,
 }
 
+/// Validate one finding's location against the filesystem under `repo_root`:
+/// non-empty path, `normalize_location`, then existence/escape/inside-repo
+/// check by reusing `read_file_canonical`. A `line_end` past the file's real
+/// length is clamped to the line count (never below `line_start`), the same
+/// defect class as F-13. Returns a human-readable reason string on rejection.
+async fn validate_finding(
+    f: FinishFinding,
+    repo_root: &Path,
+    canonical_root: &Path,
+) -> Result<ExplorationFinding, String> {
+    if f.location.path.trim().is_empty() {
+        return Err("finding location.path must be non-empty".to_string());
+    }
+    let location = normalize_location(FileLocation {
+        path: PathBuf::from(&f.location.path),
+        line_start: f.location.line_start,
+        line_end: f.location.line_end,
+    });
+    let path_str = location.path.to_string_lossy();
+    // Existence + escape + inside-repo check, reusing the read_file safe-read.
+    // ponytail: reads the whole file just to count lines; swap for a
+    // stat-only helper if finish-time I/O ever profiles hot.
+    let content = read_file_canonical(repo_root, canonical_root, &path_str, None, None)
+        .await
+        .map_err(|_| {
+            format!("finding location.path `{path_str}` does not exist in the repository")
+        })?;
+    // Clamp a line_end past EOF to the file length, never below line_start.
+    let line_count = content.lines().count() as u32;
+    let line_end = location.line_end.min(line_count.max(location.line_start));
+    Ok(ExplorationFinding {
+        location: FileLocation {
+            line_end,
+            ..location
+        },
+        snippet: f.snippet,
+        note: f.note,
+    })
+}
+
 /// Deserialize and hand-validate `finish` arguments into an `ExplorationResult`.
 /// `deny_unknown_fields` plus the required `summary`/`line_start`/`line_end`
-/// keys reject malformed payloads at parse time; the explicit non-empty-path
-/// check covers the one rule serde cannot express. Each location is run
-/// through the deterministic pipeline's `normalize_location`, so an inverted
-/// or zero-end range from the model comes out fixed like a retrieved
-/// candidate's would. Returns a human-readable reason string on rejection so
-/// the loop can feed it back to the model.
-pub(crate) fn parse_finish(arguments_json: &str) -> Result<ExplorationResult, String> {
+/// keys reject malformed payloads at parse time; every finding is validated by
+/// [`validate_finding`], and the first rejection fails the whole call — the
+/// loop feeds the reason back to the model as a retry rejection message via
+/// [`resolve_finish`]. See [`parse_finish_lenient`] for the one-shot forced-finish
+/// path, which has no retry loop to feed a rejection back to.
+pub(crate) async fn parse_finish(
+    arguments_json: &str,
+    repo_root: &Path,
+) -> Result<ExplorationResult, String> {
     let args: FinishArgs = serde_json::from_str(arguments_json)
         .map_err(|e| format!("could not parse finish arguments: {e}"))?;
+    // Resolve the canonical repo root once, and only when there is at least
+    // one path to validate (see canonical_repo_root's reuse guidance).
+    let canonical_root = if args.findings.is_empty() {
+        None
+    } else {
+        Some(canonical_repo_root(repo_root).await?)
+    };
     let mut findings = Vec::with_capacity(args.findings.len());
     for f in args.findings {
-        if f.location.path.trim().is_empty() {
-            return Err("finding location.path must be non-empty".to_string());
+        let canonical_root = canonical_root
+            .as_ref()
+            .expect("canonical_root is Some when findings are non-empty");
+        findings.push(validate_finding(f, repo_root, canonical_root).await?);
+    }
+    Ok(ExplorationResult {
+        findings,
+        summary: args.summary,
+    })
+}
+
+/// Lenient counterpart to [`parse_finish`] for `forced_finish`, whose one-shot
+/// call has no retry path to feed a rejection back to the model: rather than
+/// discarding the whole payload over a single bad finding, this keeps every
+/// finding that validates and silently drops only the invalid ones. An empty
+/// `findings` array is still a legitimate "nothing found" completion; only a
+/// non-empty array left with zero survivors is an error, matching
+/// [`parse_finish`]'s all-or-nothing behavior for that case. Still propagates
+/// a JSON parse error, since there is nothing salvageable then.
+pub(crate) async fn parse_finish_lenient(
+    arguments_json: &str,
+    repo_root: &Path,
+) -> Result<ExplorationResult, String> {
+    let args: FinishArgs = serde_json::from_str(arguments_json)
+        .map_err(|e| format!("could not parse finish arguments: {e}"))?;
+    let had_findings = !args.findings.is_empty();
+    let canonical_root = if args.findings.is_empty() {
+        None
+    } else {
+        Some(canonical_repo_root(repo_root).await?)
+    };
+    let mut findings = Vec::with_capacity(args.findings.len());
+    for f in args.findings {
+        let canonical_root = canonical_root
+            .as_ref()
+            .expect("canonical_root is Some when findings are non-empty");
+        match validate_finding(f, repo_root, canonical_root).await {
+            Ok(finding) => findings.push(finding),
+            Err(reason) => {
+                tracing::debug!(reason = %reason, "forced finish dropped an invalid finding")
+            }
         }
-        findings.push(ExplorationFinding {
-            location: normalize_location(FileLocation {
-                path: PathBuf::from(f.location.path),
-                line_start: f.location.line_start,
-                line_end: f.location.line_end,
-            }),
-            snippet: f.snippet,
-            note: f.note,
-        });
+    }
+    if had_findings && findings.is_empty() {
+        return Err("no finding in the finish call had a valid path".to_string());
     }
     Ok(ExplorationResult {
         findings,
@@ -379,10 +462,13 @@ pub(crate) fn parse_finish(arguments_json: &str) -> Result<ExplorationResult, St
 /// caller can feed it back to the model and let it retry. Shared by the
 /// fallback loop and the verification stage, which otherwise duplicated this
 /// exact resolution logic.
-pub(crate) fn resolve_finish(calls: &[ToolCall]) -> Result<ExplorationResult, Vec<Message>> {
+pub(crate) async fn resolve_finish(
+    calls: &[ToolCall],
+    repo_root: &Path,
+) -> Result<ExplorationResult, Vec<Message>> {
     let mut rejections = Vec::new();
     for c in calls.iter().filter(|c| c.name == "finish") {
-        match parse_finish(&c.arguments_json) {
+        match parse_finish(&c.arguments_json, repo_root).await {
             Ok(result) => return Ok(result),
             Err(reason) => rejections.push(Message::tool(
                 &c.id,
@@ -396,6 +482,17 @@ pub(crate) fn resolve_finish(calls: &[ToolCall]) -> Result<ExplorationResult, Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Temp repo containing `src/main.rs` with `n_lines` numbered lines, via
+    /// the crate's shared `test_support::temp_repo_with` fixture. Caller
+    /// removes the dir at the end.
+    fn temp_repo_main(test: &str, n_lines: usize) -> std::path::PathBuf {
+        let body = (1..=n_lines)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        crate::test_support::temp_repo_with("agent_tools_finish", test, &[("src/main.rs", &body)])
+    }
 
     const NAMES: [&str; 10] = [
         "search_code",
@@ -459,10 +556,11 @@ mod tests {
         assert!(r.is_err());
     }
 
-    #[test]
-    fn parse_finish_round_trips() {
+    #[tokio::test]
+    async fn parse_finish_round_trips() {
+        let dir = temp_repo_main("round_trips", 5);
         let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":1,"line_end":3},"note":"here"}],"summary":"done"}"#;
-        let result = parse_finish(json).unwrap();
+        let result = parse_finish(json, &dir).await.unwrap();
         assert_eq!(result.summary, "done");
         assert_eq!(result.findings.len(), 1);
         assert_eq!(
@@ -474,46 +572,154 @@ mod tests {
             }
         );
         assert_eq!(result.findings[0].note, Some("here".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn parse_finish_allows_empty_findings() {
-        let result = parse_finish(r#"{"summary":"nothing found"}"#).unwrap();
+    #[tokio::test]
+    async fn parse_finish_allows_empty_findings() {
+        let result = parse_finish(r#"{"summary":"nothing found"}"#, &std::env::temp_dir())
+            .await
+            .unwrap();
         assert!(result.findings.is_empty());
         assert_eq!(result.summary, "nothing found");
     }
 
-    #[test]
-    fn parse_finish_rejects_missing_summary() {
-        assert!(parse_finish(r#"{"findings":[]}"#).is_err());
+    #[tokio::test]
+    async fn parse_finish_rejects_missing_summary() {
+        assert!(
+            parse_finish(r#"{"findings":[]}"#, &std::env::temp_dir())
+                .await
+                .is_err()
+        );
     }
 
-    #[test]
-    fn parse_finish_rejects_empty_path() {
+    #[tokio::test]
+    async fn parse_finish_rejects_empty_path() {
         let json =
             r#"{"findings":[{"location":{"path":"","line_start":1,"line_end":2}}],"summary":"s"}"#;
-        assert!(parse_finish(json).is_err());
+        assert!(parse_finish(json, &std::env::temp_dir()).await.is_err());
     }
 
-    #[test]
-    fn parse_finish_rejects_missing_line_numbers() {
+    #[tokio::test]
+    async fn parse_finish_rejects_missing_line_numbers() {
         let json = r#"{"findings":[{"location":{"path":"a.rs"}}],"summary":"s"}"#;
-        assert!(parse_finish(json).is_err());
+        assert!(parse_finish(json, &std::env::temp_dir()).await.is_err());
     }
 
-    #[test]
-    fn parse_finish_normalizes_inverted_range() {
+    #[tokio::test]
+    async fn parse_finish_normalizes_inverted_range() {
+        let dir = temp_repo_main("inverted", 60);
         let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":50,"line_end":10}}],"summary":"done"}"#;
-        let result = parse_finish(json).unwrap();
+        let result = parse_finish(json, &dir).await.unwrap();
         assert_eq!(result.findings[0].location.line_start, 10);
         assert_eq!(result.findings[0].location.line_end, 50);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn parse_finish_widens_zero_end_to_start() {
+    #[tokio::test]
+    async fn parse_finish_widens_zero_end_to_start() {
+        let dir = temp_repo_main("zero_end", 10);
         let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":7,"line_end":0}}],"summary":"done"}"#;
-        let result = parse_finish(json).unwrap();
+        let result = parse_finish(json, &dir).await.unwrap();
         assert_eq!(result.findings[0].location.line_start, 7);
         assert_eq!(result.findings[0].location.line_end, 7);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn parse_finish_accepts_existing_path() {
+        let dir = temp_repo_main("accepts", 5);
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":2,"line_end":4}}],"summary":"ok"}"#;
+        let result = parse_finish(json, &dir).await.unwrap();
+        assert_eq!(
+            result.findings[0].location,
+            repo_explorer_core::domain::FileLocation {
+                path: std::path::PathBuf::from("src/main.rs"),
+                line_start: 2,
+                line_end: 4,
+            }
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn parse_finish_rejects_nonexistent_path() {
+        let dir = temp_repo_main("nonexistent", 5);
+        let json = r#"{"findings":[{"location":{"path":"src/gone.rs","line_start":1,"line_end":2}}],"summary":"s"}"#;
+        let err = parse_finish(json, &dir).await.unwrap_err();
+        assert!(err.contains("does not exist"), "reason was: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn parse_finish_clamps_line_end_past_eof() {
+        let dir = temp_repo_main("clamp", 3);
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":2,"line_end":99}}],"summary":"s"}"#;
+        let result = parse_finish(json, &dir).await.unwrap();
+        assert_eq!(result.findings[0].location.line_start, 2);
+        assert_eq!(result.findings[0].location.line_end, 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn resolve_finish_rejects_nonexistent_path() {
+        let dir = temp_repo_main("resolve_nonexistent", 5);
+        let json = r#"{"findings":[{"location":{"path":"src/gone.rs","line_start":1,"line_end":2}}],"summary":"s"}"#;
+        let call = ToolCall {
+            id: "call-1".to_string(),
+            name: "finish".to_string(),
+            arguments_json: json.to_string(),
+            thought_signatures: None,
+        };
+        let rejections = resolve_finish(&[call], &dir).await.unwrap_err();
+        assert_eq!(rejections.len(), 1);
+        let msg = &rejections[0];
+        assert_eq!(msg.role, repo_explorer_core::llm::Role::Tool);
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call-1"));
+        assert!(
+            msg.content.contains("finish rejected"),
+            "content: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("does not exist"),
+            "content: {}",
+            msg.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn parse_finish_lenient_drops_invalid_findings_keeps_valid() {
+        let dir = temp_repo_main("lenient_partial", 5);
+        let json = r#"{"findings":[
+            {"location":{"path":"src/main.rs","line_start":1,"line_end":2}},
+            {"location":{"path":"src/gone.rs","line_start":1,"line_end":2}}
+        ],"summary":"partial"}"#;
+        let result = parse_finish_lenient(json, &dir).await.unwrap();
+        assert_eq!(result.summary, "partial");
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(
+            result.findings[0].location.path,
+            std::path::PathBuf::from("src/main.rs")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn parse_finish_lenient_rejects_when_all_findings_invalid() {
+        let dir = temp_repo_main("lenient_all_invalid", 5);
+        let json = r#"{"findings":[{"location":{"path":"src/gone.rs","line_start":1,"line_end":2}}],"summary":"s"}"#;
+        assert!(parse_finish_lenient(json, &dir).await.is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn parse_finish_lenient_allows_empty_findings() {
+        let result = parse_finish_lenient(r#"{"summary":"nothing found"}"#, &std::env::temp_dir())
+            .await
+            .unwrap();
+        assert!(result.findings.is_empty());
+        assert_eq!(result.summary, "nothing found");
     }
 }

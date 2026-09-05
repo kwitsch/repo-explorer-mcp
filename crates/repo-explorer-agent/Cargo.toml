@@ -12,6 +12,12 @@ thiserror = "2"
 tracing = "0.1"
 tokio = { version = "1", features = ["rt"] }
 
+[features]
+# Gates the in-crate `temp_repo_with` fixture (test_support) for
+# tests/integration.rs, a separate test binary.
+test-support = []
+
 [dev-dependencies]
 repo-explorer-core = { version = "0.5.5", path = "../repo-explorer-core", features = ["test-support"] }
+repo-explorer-agent = { path = ".", features = ["test-support"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
