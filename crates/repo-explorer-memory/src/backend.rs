@@ -461,6 +461,19 @@ fn parse_line_range(cell: &str) -> (u32, u32) {
     (start, end)
 }
 
+/// `codebase-memory-mcp`'s whole-file `Module` node reports `line_end` one
+/// past the file's actual last line (live-verified against this repo:
+/// `config.rs` is 980 lines, `search_graph` reports `"1-981"`; ordinary
+/// symbol spans from the same call are exact). Every other node label is
+/// left untouched.
+fn correct_module_end(label: Option<&str>, start: u32, end: u32) -> u32 {
+    if label == Some("Module") && end > start {
+        end - 1
+    } else {
+        end
+    }
+}
+
 /// Build the `ExplorationFinding` shape both table-row parsers
 /// (`columnar_findings`, `text_table_findings`) return: no snippet (neither
 /// tool shape carries one) plus whatever symbol/name `note` was resolved.
@@ -485,6 +498,7 @@ fn columnar_findings(json: &Value) -> Option<Vec<ExplorationFinding>> {
     let col = |name: &str| cols.iter().position(|c| c.as_str() == Some(name));
     let name_col = col("name");
     let lines_col = col("lines");
+    let label_col = col("label");
     let groups = json.get("groups")?.as_array()?;
     let mut findings = Vec::new();
     for group in groups {
@@ -503,6 +517,7 @@ fn columnar_findings(json: &Value) -> Option<Vec<ExplorationFinding>> {
             };
             let cell = |i: Option<usize>| i.and_then(|i| cells.get(i)).and_then(Value::as_str);
             let (line_start, line_end) = cell(lines_col).map(parse_line_range).unwrap_or((0, 0));
+            let line_end = correct_module_end(cell(label_col), line_start, line_end);
             let note = cell(name_col).map(|name| {
                 if qn_prefix.is_empty() {
                     name.to_string()
@@ -527,6 +542,7 @@ struct TableCols {
     line_end: Option<usize>,
     qn: Option<usize>,
     name: Option<usize>,
+    label: Option<usize>,
 }
 
 /// A column name's matchable identity: `search_code`/`get_architecture`/
@@ -557,6 +573,7 @@ fn parse_header_cols(rest: &str) -> Option<TableCols> {
         line_end: pos("line_end").or_else(|| pos("end_line")),
         qn: pos("qn").or_else(|| pos("qualified_name")),
         name: pos("name"),
+        label: pos("label"),
     })
 }
 
@@ -628,6 +645,8 @@ fn text_table_findings(text: &str) -> Vec<ExplorationFinding> {
                 .map(parse_line_range)
                 .unwrap_or((0, 0))
         };
+        let label = t.label.and_then(|i| cells.get(i).copied());
+        let line_end = correct_module_end(label, line_start, line_end);
         let note =
             t.qn.or(t.name)
                 .and_then(|i| cells.get(i).copied())
@@ -1467,5 +1486,42 @@ docs/project-plan/9b-open_weights_finetune.md\nseed_symbols: 0\n";
         assert_eq!(parse_line_range("7"), (7, 7));
         assert_eq!(parse_line_range("garbage"), (0, 0));
         assert_eq!(parse_line_range("5-x"), (5, 5));
+    }
+
+    #[test]
+    fn correct_module_end_fixes_only_module_rows() {
+        // Live-verified quirk: a Module node's reported end is one past the
+        // file's real last line.
+        assert_eq!(correct_module_end(Some("Module"), 1, 981), 980);
+        // Every other label's span is already exact — left untouched.
+        assert_eq!(correct_module_end(Some("Function"), 40, 60), 60);
+        assert_eq!(correct_module_end(None, 40, 60), 60);
+        // A degenerate single-line Module row must not go negative/below start.
+        assert_eq!(correct_module_end(Some("Module"), 1, 1), 1);
+    }
+
+    /// A whole-file `Module` row's `line_end` (search_graph JSON shape) is
+    /// corrected from CBM's off-by-one before it reaches a finding.
+    #[test]
+    fn columnar_module_row_end_is_corrected() {
+        let payload = json!({
+            "total": 1,
+            "count": 1,
+            "cols": ["name", "label", "lines", "in", "out"],
+            "groups": [{
+                "qn_prefix": "repo.crates.a.src",
+                "file": "crates/a/src/config.rs",
+                "rows": [["config", "Module", "1-981", 0, 18]]
+            }],
+            "has_more": false
+        });
+        let res = findings_and_summary("search_graph", &payload, Path::new("/repo"));
+        assert_eq!(
+            (
+                res.findings[0].location.line_start,
+                res.findings[0].location.line_end
+            ),
+            (1, 980)
+        );
     }
 }
