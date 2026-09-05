@@ -100,6 +100,54 @@ pub fn escape_regex(literal: &str) -> String {
     out
 }
 
+/// Produce the opposite-convention spelling of a snake_case or camelCase
+/// identifier so a case/convention-mismatch query still reaches the real
+/// symbol (F-15): `resolveRedirects` -> `resolve_redirects`, `derive_patterns`
+/// -> `derivePatterns`, `StalenessWindow` -> `staleness_window`. Returns `None`
+/// for a token with no case/underscore signal (a plain lowercase word, an
+/// all-caps token, or a bare number) or when the transform reproduces the input.
+///
+/// Hand-rolled to keep core dependency-lean (same rationale as `escape_regex`).
+/// ponytail: acronym runs collapse (`HTTPServer` -> `httpserver`); acceptable
+/// ceiling, upgrade to acronym-aware splitting only if evals show it matters.
+fn case_fold_variant(token: &str) -> Option<String> {
+    let variant = if token.contains('_') {
+        // snake_case -> camelCase
+        let mut out = String::with_capacity(token.len());
+        let mut upper_next = false;
+        for c in token.chars() {
+            if c == '_' {
+                upper_next = !out.is_empty(); // leading '_' produces no cap
+                continue;
+            }
+            if upper_next {
+                out.push(c.to_ascii_uppercase());
+                upper_next = false;
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    } else if token.chars().any(|c| c.is_ascii_lowercase())
+        && token.chars().any(|c| c.is_ascii_uppercase())
+    {
+        // camelCase / PascalCase -> snake_case
+        let mut out = String::with_capacity(token.len() + 4);
+        let mut prev_lower = false;
+        for c in token.chars() {
+            if c.is_ascii_uppercase() && prev_lower {
+                out.push('_');
+            }
+            prev_lower = c.is_ascii_lowercase();
+            out.push(c.to_ascii_lowercase());
+        }
+        out
+    } else {
+        return None;
+    };
+    (variant != token && !variant.is_empty()).then_some(variant)
+}
+
 fn push_unique(list: &mut Vec<String>, value: String) {
     if !value.is_empty() && !list.contains(&value) {
         list.push(value);
@@ -204,6 +252,21 @@ pub fn derive_patterns(query: &str) -> QueryPatterns {
         }
     }
 
+    // F-15: a case/convention-mismatch query must not be silently
+    // zero-candidate. Append each identifier's opposite-convention spelling
+    // AFTER all originals so the front-loaded symbol/semantic/grep windows keep
+    // prioritizing the genuinely-distinct query terms; push_unique collapses a
+    // variant that coincides with an already-collected token. Collect into a
+    // temporary Vec first to avoid borrowing patterns.identifiers while pushing.
+    let variants: Vec<String> = patterns
+        .identifiers
+        .iter()
+        .filter_map(|token| case_fold_variant(token))
+        .collect();
+    for variant in variants {
+        push_unique(&mut patterns.identifiers, variant);
+    }
+
     for token in patterns.literals.iter().chain(patterns.identifiers.iter()) {
         if patterns.grep_patterns.len() >= MAX_GREP_PATTERNS {
             break;
@@ -233,6 +296,15 @@ fn kind_base_score(kind: CandidateKind) -> u32 {
     }
 }
 
+/// Fold a token to a convention-insensitive coverage key: lowercase and drop
+/// `_`, so `resolveRedirects`, `resolve_redirects`, and `resolveredirects` all
+/// compare equal for coverage counting.
+fn canonical_coverage_key(s: &str) -> String {
+    let mut out = s.to_ascii_lowercase();
+    out.retain(|c| c != '_');
+    out
+}
+
 /// Number of distinct query identifiers/literals (pre-lowercased by the
 /// caller) appearing in the candidate's symbol, path, or snippet.
 fn coverage(candidate: &Candidate, lowered_patterns: &[String]) -> u32 {
@@ -243,6 +315,7 @@ fn coverage(candidate: &Candidate, lowered_patterns: &[String]) -> u32 {
         candidate.snippet.as_deref().unwrap_or("")
     );
     haystack.make_ascii_lowercase();
+    haystack.retain(|c| c != '_');
     lowered_patterns
         .iter()
         .filter(|token| haystack.contains(token.as_str()))
@@ -309,12 +382,14 @@ fn merge_into(a: &mut Candidate, b: Candidate) {
 /// Merge overlapping candidates per file, score, rank, and truncate to
 /// `top_k`. Deterministic: stable ordering by (score desc, path, line_start).
 pub fn merge_and_rank(raw: Vec<Candidate>, patterns: &QueryPatterns, top_k: u32) -> Vec<Candidate> {
-    // Lowercase pattern tokens once, deduped post-lowercasing so a term
-    // repeated under different casing (or as both identifier and literal)
-    // isn't double-counted by coverage()'s distinct-match contract.
+    // Canonicalize pattern tokens once (lowercased and underscore-folded),
+    // deduped post-canonicalization so a term repeated under different casing
+    // or convention (or as both identifier and literal, or as an original and
+    // its case-fold variant) isn't double-counted by coverage()'s
+    // distinct-match contract.
     let mut lowered_patterns: Vec<String> = Vec::new();
     for token in patterns.identifiers.iter().chain(patterns.literals.iter()) {
-        push_unique(&mut lowered_patterns, token.to_ascii_lowercase());
+        push_unique(&mut lowered_patterns, canonical_coverage_key(token));
     }
 
     let mut normalized: Vec<Candidate> = raw
@@ -451,7 +526,14 @@ mod tests {
         let p = derive_patterns("how does decide_freshness handle StalenessWindow timeouts");
         assert_eq!(
             p.identifiers,
-            vec!["decide_freshness", "handle", "StalenessWindow", "timeouts"]
+            vec![
+                "decide_freshness",
+                "handle",
+                "StalenessWindow",
+                "timeouts",
+                "decideFreshness",
+                "staleness_window"
+            ]
         );
     }
 
@@ -467,7 +549,7 @@ mod tests {
     fn unbalanced_quote_degrades_to_plain_text() {
         let p = derive_patterns("what is \"decide_freshness");
         assert!(p.literals.is_empty());
-        assert_eq!(p.identifiers, vec!["decide_freshness"]);
+        assert_eq!(p.identifiers, vec!["decide_freshness", "decideFreshness"]);
     }
 
     #[test]
@@ -542,7 +624,55 @@ mod tests {
     fn grep_fanout_is_capped_and_deduped() {
         let p = derive_patterns("alpha_a beta_b gamma_c delta_d epsilon_e zeta_f eta_g alpha_a");
         assert_eq!(p.grep_patterns.len(), MAX_GREP_PATTERNS);
-        assert_eq!(p.identifiers.len(), 7);
+        assert_eq!(p.identifiers.len(), 14);
+    }
+
+    #[test]
+    fn camel_query_derives_snake_variant() {
+        let p = derive_patterns("resolveRedirects");
+        assert!(
+            p.identifiers.contains(&"resolve_redirects".to_string()),
+            "got {:?}",
+            p.identifiers
+        );
+        assert!(
+            p.identifiers.contains(&"resolveRedirects".to_string()),
+            "got {:?}",
+            p.identifiers
+        );
+    }
+
+    #[test]
+    fn snake_query_derives_camel_variant() {
+        let p = derive_patterns("derive_patterns");
+        assert!(
+            p.identifiers.contains(&"derivePatterns".to_string()),
+            "got {:?}",
+            p.identifiers
+        );
+        // camel input yields the snake variant (self-I3-02 evidence shape).
+        let p = derive_patterns("derivePatterns");
+        assert!(
+            p.identifiers.contains(&"derive_patterns".to_string()),
+            "got {:?}",
+            p.identifiers
+        );
+    }
+
+    #[test]
+    fn case_variant_reaches_grep_patterns() {
+        let p = derive_patterns("resolveRedirects");
+        assert!(
+            p.grep_patterns.contains(&"resolve_redirects".to_string()),
+            "got {:?}",
+            p.grep_patterns
+        );
+    }
+
+    #[test]
+    fn no_signal_token_produces_no_variant() {
+        let p = derive_patterns("timeouts");
+        assert_eq!(p.identifiers, vec!["timeouts"]);
     }
 
     // --- merge_and_rank boundaries ---
@@ -721,6 +851,25 @@ mod tests {
         assert_eq!(
             ranked[0].score,
             kind_base_score(CandidateKind::ContentHit) + 120
+        );
+    }
+
+    #[test]
+    fn coverage_folds_variant_pair_to_one() {
+        // The camel query gains its snake variant (Task 1), so identifiers
+        // hold an original+variant pair. A candidate whose snippet carries
+        // BOTH spellings must count as one distinct concept for coverage,
+        // not two — canonical (lowercase + underscore-folded) keys collapse
+        // them.
+        let p = derive_patterns("resolveRedirects");
+        assert!(p.identifiers.contains(&"resolve_redirects".to_string()));
+        let mut c = candidate("a.rs", 1, 1, CandidateKind::ContentHit);
+        c.snippet = Some("call resolveRedirects then resolve_redirects".to_string());
+        let ranked = merge_and_rank(vec![c], &p, 10);
+        // one distinct concept -> boost of 30, not 60.
+        assert_eq!(
+            ranked[0].score,
+            kind_base_score(CandidateKind::ContentHit) + 30
         );
     }
 
