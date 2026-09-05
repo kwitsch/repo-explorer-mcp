@@ -215,27 +215,36 @@ where
 
         let mut budget = TokenBudget::new(self.settings.token_budget);
 
-        // Stage 3: early exit — the pre-stage already answered.
+        // Stage 3: early exit — the pre-stage already answered. Guarded by
+        // has_symbol_token: a query that names no symbol-shaped token can never
+        // early-exit, even at high confidence — a coincidental path/prose match
+        // is not proof the query named a real code symbol (F-16).
         if outcome.confidence >= self.settings.early_exit_confidence
             && !outcome.candidates.is_empty()
         {
-            let result = self.result_from_candidates(
-                outcome.candidates,
-                query,
-                outcome.confidence,
-                index_note.as_deref(),
+            if outcome.has_symbol_token {
+                let result = self.result_from_candidates(
+                    outcome.candidates,
+                    query,
+                    outcome.confidence,
+                    index_note.as_deref(),
+                );
+                return Ok(self.complete_run(
+                    "early-exit",
+                    0,
+                    0,
+                    false,
+                    index_status,
+                    git_probe_ms,
+                    &query_key,
+                    fingerprint,
+                    result,
+                ));
+            }
+            tracing::info!(
+                confidence = outcome.confidence,
+                "early-exit vetoed: query has no symbol-shaped token"
             );
-            return Ok(self.complete_run(
-                "early-exit",
-                0,
-                0,
-                false,
-                index_status,
-                git_probe_ms,
-                &query_key,
-                fingerprint,
-                result,
-            ));
         }
 
         // Stage 4: LLM verification over the candidates.
@@ -1098,6 +1107,64 @@ mod tests {
             "early-exit summary must surface the index-freshness note: {}",
             got.summary
         );
+    }
+
+    #[tokio::test]
+    async fn symbol_free_query_is_vetoed_from_early_exit() {
+        // Regression: F-16 — a query that names no symbol-shaped token
+        // (snake_case / camelCase / digit-bearing) must never take the
+        // deterministic early-exit route, even when a coincidental candidate
+        // clears the confidence threshold. The self-P2-01 repro string tokenizes
+        // to only path segments / long prose words (crates, repo, explorer,
+        // agent, verify, constant) — zero symbol tokens — so has_symbol_token is
+        // false and the Stage 3 gate is vetoed. A lone SymbolExact candidate here
+        // scores >= 90, so the guard (not the confidence check) is the blocker.
+        let memory = MockMemoryBackend::new().with_search_graph_result(Ok(ExplorationResult {
+            findings: vec![ExplorationFinding {
+                location: FileLocation {
+                    path: PathBuf::from("crates/repo-explorer-agent/src/verify.rs"),
+                    line_start: 35,
+                    line_end: 35,
+                },
+                snippet: None,
+                // Last segment "crates" == the query's first symbol-lookup token,
+                // so the symbol leg classifies this as SymbolExact -> confidence
+                // clears early_exit_confidence (90). Only the guard blocks it.
+                note: Some("crates".to_string()),
+            }],
+            summary: "1 row".to_string(),
+        }));
+        // Prime the LLM to finish so the vetoed run completes via verify; the
+        // finish payload points at src/lib.rs, which temp_repo creates.
+        let provider = MockLlmProvider::new().with_responses(vec![tool_calls(vec![finish_call()])]);
+        let router = ProviderRouter::with_clock(
+            vec![("primary".to_string(), vec![("m".to_string(), provider)])],
+            60,
+            FakeClock::new(),
+        );
+        let agent = AgentLoop::new(
+            memory,
+            MockSearchBackend::new(),
+            router,
+            MockRepoStateProbe::new(),
+            AgentSettings::default(),
+            CacheSettings::default(),
+        );
+        let query = ExplorationQuery {
+            text: "crates/repo-explorer-agent/src/verify.rs:35 what does this constant do"
+                .to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let dir = temp_repo("symbol_free_no_early_exit");
+        let got = agent.run(&dir, &query).await.unwrap();
+        assert!(
+            !got.summary
+                .contains("Resolved deterministically by the retrieval pre-stage"),
+            "symbol-free query must not early-exit: {}",
+            got.summary
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
