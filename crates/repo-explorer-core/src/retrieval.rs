@@ -39,21 +39,22 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// True for tokens worth treating as identifiers: snake_case, camelCase,
-/// digit-bearing, or any sufficiently long non-stopword word.
-fn is_identifier_like(token: &str) -> bool {
+/// True for tokens that look like a real code symbol: snake_case, camelCase, or
+/// digit-bearing. Excludes plain long prose words and bare path segments — the
+/// permissive `len() >= 4` fallback that `is_identifier_like` adds on top of
+/// this is deliberately NOT part of the "symbol" test, because that fallback is
+/// exactly why the early-exit gate misfires on symbol-free queries (F-16).
+/// Pure, I/O-free, no dependencies.
+pub fn is_symbol_token(token: &str) -> bool {
     if token.len() < 3 {
         return false;
     }
-    // Stopword check must precede the shape checks below: a capitalized
-    // stopword (e.g. "How") still has_lower && has_upper and would otherwise
-    // short-circuit past the filter.
+    // A capitalized stopword (e.g. "How") still has_lower && has_upper and would
+    // otherwise pass the shape test below, so reject stopwords first.
     if STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(token)) {
         return false;
     }
-    // Pure numerals (e.g. a stripped line number) carry no lexical identity;
-    // exclude them before the digit check below would otherwise wave them
-    // through as identifiers.
+    // Pure numerals (e.g. a stripped line number) carry no lexical identity.
     if token.chars().all(|c| c.is_ascii_digit()) {
         return false;
     }
@@ -61,10 +62,30 @@ fn is_identifier_like(token: &str) -> bool {
     let has_digit = token.chars().any(|c| c.is_ascii_digit());
     let has_lower = token.chars().any(|c| c.is_ascii_lowercase());
     let has_upper = token.chars().any(|c| c.is_ascii_uppercase());
-    if has_underscore || has_digit || (has_lower && has_upper) {
-        return true;
+    has_underscore || has_digit || (has_lower && has_upper)
+}
+
+/// True for tokens worth treating as identifiers: snake_case, camelCase,
+/// digit-bearing, or any sufficiently long non-stopword word.
+fn is_identifier_like(token: &str) -> bool {
+    if token.len() < 3 {
+        return false;
     }
-    token.len() >= 4
+    // Stopword check must precede the shape checks: a capitalized stopword
+    // (e.g. "How") still has_lower && has_upper and would otherwise short-
+    // circuit past the filter.
+    if STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(token)) {
+        return false;
+    }
+    // Pure numerals (e.g. a stripped line number) carry no lexical identity;
+    // exclude them before the digit check inside is_symbol_token would
+    // otherwise wave them through.
+    if token.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    // Symbol-shaped tokens always qualify; otherwise fall back to the permissive
+    // "any long word" rule, kept for the grep/symbol fanout's broad recall.
+    is_symbol_token(token) || token.len() >= 4
 }
 
 /// Strip up to two trailing `:<digits>` groups (a `:line` or `:line:col`
@@ -453,6 +474,24 @@ mod tests {
             p.identifiers,
             vec!["decide_freshness", "handle", "StalenessWindow", "timeouts"]
         );
+    }
+
+    #[test]
+    fn is_symbol_token_matches_only_symbol_shaped_tokens() {
+        // snake_case / camelCase / digit-bearing all read as real symbols.
+        for t in ["prepare_url", "ShellCompDirective", "JsonReader", "sha256"] {
+            assert!(is_symbol_token(t), "{t} should be a symbol token");
+        }
+        // Long lowercase prose words and bare path segments are NOT symbols:
+        // they only clear is_identifier_like via its permissive len>=4 fallback,
+        // which the guard deliberately excludes (this is the F-16 fix).
+        for t in ["crates", "agent", "verify", "constant", "engines", "view"] {
+            assert!(!is_symbol_token(t), "{t} must not be a symbol token");
+        }
+        // Stopwords, pure numerals, and sub-3-char tokens are rejected up front.
+        assert!(!is_symbol_token("what"), "stopword");
+        assert!(!is_symbol_token("35"), "pure numeral");
+        assert!(!is_symbol_token("rs"), "sub-3-char");
     }
 
     #[test]
