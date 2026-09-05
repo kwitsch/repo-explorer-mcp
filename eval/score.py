@@ -141,7 +141,10 @@ def snippet_found_at(
     "near" is moot), 'misaligned' (found elsewhere in the file), or 'not_found' (fabricated) —
     the §7.1 hallucinated classification, minus the 'fabricated path'/'range outside file' cases
     checked separately. Matches per-chunk (see snippet_chunks) so a genuine multi-line quote
-    isn't flagged fabricated just because no single physical line equals the whole snippet."""
+    isn't flagged fabricated just because no single physical line equals the whole snippet.
+    The "near" window spans the full claimed [line_start, line_end] range with a ±4-line pad
+    (not just a band around line_start), so a representative line cited from anywhere inside a
+    large non-whole-file span is accepted as in-range."""
     p = repo_path / rel
     if not p.exists() or not p.is_file():
         return "not_found"
@@ -158,7 +161,8 @@ def snippet_found_at(
     whole_file = line_start is not None and line_end is not None and (line_end - line_start) >= len(lines) - 2
     near = set()
     if line_start and not whole_file:
-        near = set(range(max(0, line_start - 4), min(len(lines), line_start + 3)))
+        end = line_end if line_end is not None else line_start
+        near = set(range(max(0, line_start - 4), min(len(lines), end + 4)))
     # Every chunk must exist somewhere in the file (a chunk that's missing is fabricated
     # content, even if the rest of the snippet is real); "misaligned" only if all chunks exist
     # but at least one falls outside the claimed range.
