@@ -35,8 +35,8 @@ built out here — see the plan's §11 phase table.
     `parse_line_range`, which parses whatever `"start-end"` string codebase-memory-mcp's
     `search_code` sends verbatim with no clamp against the file's real length — likely an
     inclusive/exclusive line-range convention mismatch with the upstream CBM tool, not a bug
-    introduced by the observability patch. Not yet filed as a plan candidate defect (would be
-    F-13); repo-explorer-mcp's own code was not changed to fix it (out of scope for this edit).
+    introduced by the observability patch. Filed as **F-13**, and since fixed in `07b6602`
+    (`correct_module_end` decrements a `Module` row's `line_end` by 1).
   - Also observed live: the pinned `~/repos/eval-corpus/self` clone was not yet indexed by
     codebase-memory-mcp on its first call (`retrieval leg failed leg="symbol"`/`"semantic"`,
     "project not found or not indexed"), confirming F-08 (every new server process reindexes on
@@ -66,6 +66,28 @@ built out here — see the plan's §11 phase table.
   scaffolded for later phases (4, 3) but not yet exercised.
 - `baseline.py` (Layer B), `gen_synthetic.py`, `claude_loop.sh`, `judge_prompt.md` — **not yet
   built**; out of pilot scope (Phase 2+).
+- **Phase 1 run for real** (`results/20260905T145436`, installed v0.5.4, full production
+  6-model Gemini chain, PR #30's 404-failover live): 254/303 provider calls `ok`, 39 `quota`,
+  10 `rate_limited`, 0 hard failures — first pass with quota no longer dominating the result.
+  `cand_recall@top_k = 0.38` (95% CI [0.26, 0.51]); negative queries (`N`) score
+  `negative_ok = 1.00` (a scoring bug had this misreported as `file_hit@3 = 0.00`, a false
+  "complete miss" — `score.py` never printed `negative_ok` and lumped `N` into the file-hit
+  table where 0 is actually the correct outcome; both are now fixed, see below).
+  `index_status` is `IndexingFailed` on all 60 calls that reported one — filed as **F-14** in
+  the plan (`index_repository` fails against the installed codebase-memory-mcp with reason
+  `"repo_path is required"`; likely contributor to the low `cand_recall`).
+- `score.py` hallucination scoring had two more bugs, found and fixed against this run
+  (commit `0eec259` + a follow-up): (1) `snippet_found_at` flattened multi-line snippets and
+  compared them against single physical source lines, so a correctly-quoted multi-line snippet
+  (struct/function bodies) could never match and was flagged `fabricated_snippet`; whole-file
+  `Module` hits were also flagged `misaligned_snippet` since the "near `line_start`" check
+  assumed a narrow span. Now matches per-chunk (splitting on `"..."`/`"…[truncated]"` omission
+  markers) against contiguous file-line runs, and exempts whole-file spans from the alignment
+  check — dropped the flagged-hallucination count from ~50 to 34 on the same data (still not
+  confirmed zero; a manual spot-check found at least one of the 34 to be a real LLM digest
+  rather than a literal quote). (2) `negative_ok` was computed per-row but never printed, and
+  the `file_hit@3` table included negative queries where a 0 is the _correct_ outcome — added a
+  dedicated negative-queries section and excluded `N` from the file-hit table.
 
 ## Decisions in force for this pilot (accepted 2026-09-05)
 

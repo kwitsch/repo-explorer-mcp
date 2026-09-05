@@ -441,13 +441,25 @@ def print_report(result: dict) -> None:
             f"{q['n_ok']}/{q['n_passes']} {q['classification']:20s} stages={q['stages_seen']}{flag}"
         )
 
-    print("\n=== Per-category file_hit@3 (pooled across passes, not pass@1) ===")
+    print("\n=== Per-category file_hit@3 (pooled across passes, not pass@1; excludes negative queries) ===")
     by_cat = defaultdict(list)
     for r in rows:
+        if r["is_negative"]:
+            continue  # scored via negative_ok below — file_hit@3=0 is the correct outcome here
         by_cat[r["cat"]].append(r["file_hit_3"])
     for cat, vals in sorted(by_cat.items()):
         p, lo, hi = wilson_ci(sum(vals), len(vals))
         print(f"  {cat:8s} n={len(vals):3d}  file_hit@3={p:.2f}  95% CI [{lo:.2f}, {hi:.2f}]")
+
+    print("\n=== Negative queries (negative_ok: 1.0=correctly empty, 0.5=off-topic hedge, 0.0=confident wrong) ===")
+    neg_rows = [r for r in rows if r["is_negative"]]
+    if neg_rows:
+        avg = sum(r["negative_ok"] for r in neg_rows) / len(neg_rows)
+        print(f"  n={len(neg_rows):3d}  mean negative_ok={avg:.2f}")
+        for r in neg_rows:
+            print(f"  {r['repo']}/{r['query_id']} pass{r['pass']}: negative_ok={r['negative_ok']}")
+    else:
+        print("  none")
 
     print("\n=== Hallucinations (P0/P1 — must be zero) ===")
     any_halluc = False
