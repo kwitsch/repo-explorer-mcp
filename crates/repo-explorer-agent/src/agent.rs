@@ -34,7 +34,7 @@ use crate::cache::{QueryEntry, ResultCache};
 use crate::dispatch::dispatch_inner;
 use crate::pipeline;
 use crate::render::{RenderCaps, dedupe_key, tidy_findings};
-use crate::tools::{finish_only_catalog, parse_finish, resolve_finish, tool_catalog};
+use crate::tools::{finish_only_catalog, parse_finish_lenient, resolve_finish, tool_catalog};
 use crate::verify::{VerifyOutcome, verify};
 
 /// The only hard-failure mode: the provider router could not produce a response
@@ -658,10 +658,18 @@ where
                 budget.add(completion.usage);
                 if let ProviderResponse::ToolCalls(calls) = completion.response {
                     for call in &calls {
-                        if call.name == "finish"
-                            && let Ok(result) = parse_finish(&call.arguments_json, repo_root).await
-                        {
-                            return Some(result);
+                        if call.name != "finish" {
+                            continue;
+                        }
+                        // Lenient: a one-shot call has no retry path to feed a
+                        // rejection back to the model, so keep whatever findings
+                        // validate instead of discarding all of them over one bad
+                        // path (see F-05 escalation on parse_finish's strictness).
+                        match parse_finish_lenient(&call.arguments_json, repo_root).await {
+                            Ok(result) => return Some(result),
+                            Err(reason) => {
+                                tracing::debug!(reason = %reason, "forced finish call failed to parse")
+                            }
                         }
                     }
                 }
