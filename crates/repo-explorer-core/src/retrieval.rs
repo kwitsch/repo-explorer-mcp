@@ -296,6 +296,15 @@ fn kind_base_score(kind: CandidateKind) -> u32 {
     }
 }
 
+/// Fold a token to a convention-insensitive coverage key: lowercase and drop
+/// `_`, so `resolveRedirects`, `resolve_redirects`, and `resolveredirects` all
+/// compare equal for coverage counting.
+fn canonical_coverage_key(s: &str) -> String {
+    let mut out = s.to_ascii_lowercase();
+    out.retain(|c| c != '_');
+    out
+}
+
 /// Number of distinct query identifiers/literals (pre-lowercased by the
 /// caller) appearing in the candidate's symbol, path, or snippet.
 fn coverage(candidate: &Candidate, lowered_patterns: &[String]) -> u32 {
@@ -306,6 +315,7 @@ fn coverage(candidate: &Candidate, lowered_patterns: &[String]) -> u32 {
         candidate.snippet.as_deref().unwrap_or("")
     );
     haystack.make_ascii_lowercase();
+    haystack.retain(|c| c != '_');
     lowered_patterns
         .iter()
         .filter(|token| haystack.contains(token.as_str()))
@@ -372,12 +382,14 @@ fn merge_into(a: &mut Candidate, b: Candidate) {
 /// Merge overlapping candidates per file, score, rank, and truncate to
 /// `top_k`. Deterministic: stable ordering by (score desc, path, line_start).
 pub fn merge_and_rank(raw: Vec<Candidate>, patterns: &QueryPatterns, top_k: u32) -> Vec<Candidate> {
-    // Lowercase pattern tokens once, deduped post-lowercasing so a term
-    // repeated under different casing (or as both identifier and literal)
-    // isn't double-counted by coverage()'s distinct-match contract.
+    // Canonicalize pattern tokens once (lowercased and underscore-folded),
+    // deduped post-canonicalization so a term repeated under different casing
+    // or convention (or as both identifier and literal, or as an original and
+    // its case-fold variant) isn't double-counted by coverage()'s
+    // distinct-match contract.
     let mut lowered_patterns: Vec<String> = Vec::new();
     for token in patterns.identifiers.iter().chain(patterns.literals.iter()) {
-        push_unique(&mut lowered_patterns, token.to_ascii_lowercase());
+        push_unique(&mut lowered_patterns, canonical_coverage_key(token));
     }
 
     let mut normalized: Vec<Candidate> = raw
@@ -839,6 +851,25 @@ mod tests {
         assert_eq!(
             ranked[0].score,
             kind_base_score(CandidateKind::ContentHit) + 120
+        );
+    }
+
+    #[test]
+    fn coverage_folds_variant_pair_to_one() {
+        // The camel query gains its snake variant (Task 1), so identifiers
+        // hold an original+variant pair. A candidate whose snippet carries
+        // BOTH spellings must count as one distinct concept for coverage,
+        // not two — canonical (lowercase + underscore-folded) keys collapse
+        // them.
+        let p = derive_patterns("resolveRedirects");
+        assert!(p.identifiers.contains(&"resolve_redirects".to_string()));
+        let mut c = candidate("a.rs", 1, 1, CandidateKind::ContentHit);
+        c.snippet = Some("call resolveRedirects then resolve_redirects".to_string());
+        let ranked = merge_and_rank(vec![c], &p, 10);
+        // one distinct concept -> boost of 30, not 60.
+        assert_eq!(
+            ranked[0].score,
+            kind_base_score(CandidateKind::ContentHit) + 30
         );
     }
 
