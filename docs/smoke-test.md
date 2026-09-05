@@ -36,7 +36,7 @@ This confirms the versioned build without loading any config.
 In a scratch repository, create a minimal `repo-explorer.toml` with a single
 provider (`models = [...]`, and its `api_key_env` variable set in the
 environment) and a reachable `codebase-memory-mcp` (stdio `command` or network
-`endpoint`). `rg` is provisioned into the shared bin dir by `repo-explorer-mcp --update` when no system `rg` is present, and `rtk` is mandatory (the server refuses to start without it).
+`endpoint`). Search uses `rg`: a system `rg` on PATH is preferred, and a managed `rg` copy is provisioned into the shared bin dir by `repo-explorer-mcp --update` only when no system `rg` is present. The server fails fast if no `rg` can be resolved.
 
 Validate it before launching:
 
