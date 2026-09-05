@@ -1,6 +1,6 @@
 //! Integration test for `CliSearchBackend` against a bundled fixture repo.
 //!
-//! Not `#[ignore]`d: it runs wherever `rtk` is present (a common CI tool) and
+//! Not `#[ignore]`d: it runs wherever `rg` is present (a common CI tool) and
 //! skips cleanly (early return, no panic) when it is not. It needs no network
 //! and no live server.
 
@@ -18,11 +18,11 @@ fn sample_repo() -> std::path::PathBuf {
 
 #[tokio::test]
 async fn searches_bundled_repo_for_literal() {
-    if which::which("rtk").is_err() {
-        eprintln!("skipping: `rtk` is not available on PATH");
+    if which::which("rg").is_err() {
+        eprintln!("skipping: `rg` is not available on PATH");
         return;
     }
-    let backend = CliSearchBackend::new(&SearchConfig::default(), None);
+    let backend = CliSearchBackend::new(&SearchConfig::default(), None).await;
     let root = sample_repo();
     let findings = backend
         .search(&root, "needle", None, &SearchOptions::default())
@@ -49,7 +49,7 @@ async fn searches_bundled_repo_for_literal() {
 
 #[tokio::test]
 async fn empty_pattern_is_invalid_input() {
-    let backend = CliSearchBackend::new(&SearchConfig::default(), None);
+    let backend = CliSearchBackend::new(&SearchConfig::default(), None).await;
     let root = sample_repo();
     let err = backend
         .search(&root, "", None, &SearchOptions::default())

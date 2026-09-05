@@ -126,9 +126,10 @@ pub struct CodebaseMemoryConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SearchConfig {
-    /// Explicit path to the `rtk` binary; `None` → auto-detect on PATH via `which`.
+    /// Explicit path to the `rg` binary; `None` → auto-detect (system PATH via
+    /// `which`, then the managed fallback).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rtk_path: Option<PathBuf>,
+    pub rg_path: Option<PathBuf>,
     /// Per-search subprocess timeout. `0` means "no timeout" — the explicit
     /// opt-out, not a stand-in for the default.
     #[serde(default = "default_search_timeout_seconds")]
@@ -142,7 +143,7 @@ pub struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            rtk_path: None,
+            rg_path: None,
             timeout_seconds: default_search_timeout_seconds(),
         }
     }
@@ -247,8 +248,8 @@ pub fn default_staleness_seconds() -> u64 {
 }
 
 /// Default `search.timeout_seconds` (also the serde default for that field).
-/// Public so the setup wizard can write it into `[search]` alongside the
-/// resolved `rtk_path` instead of duplicating the literal.
+/// Public so callers building a `Config` programmatically (e.g. the setup
+/// wizard) can reuse the same value instead of duplicating the literal.
 pub fn default_search_timeout_seconds() -> u64 {
     30
 }
@@ -637,7 +638,7 @@ mod tests {
             config.codebase_memory.command.as_deref(),
             Some("codebase-memory-mcp")
         );
-        assert_eq!(config.search.rtk_path, None);
+        assert_eq!(config.search.rg_path, None);
 
         unsafe {
             std::env::remove_var(var);

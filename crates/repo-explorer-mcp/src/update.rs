@@ -1,8 +1,8 @@
 //! `--update` CLI mode.
 //!
 //! Instead of booting the MCP server, checks `repo-explorer-mcp` itself and
-//! its three managed install-if-absent / update-if-stale copies in the shared
-//! bin dir — `rtk`, `codebase-memory-mcp`, and `rg`/ripgrep — against their
+//! its two managed install-if-absent / update-if-stale copies in the shared
+//! bin dir — `codebase-memory-mcp` and `rg`/ripgrep — against their
 //! GitHub releases, installing any newer version found. `rg` is managed only
 //! as a fallback: a system `rg` already resolvable on PATH is preferred and
 //! left untouched, and the managed copy is provisioned only when none is
@@ -69,25 +69,12 @@ fn memory_binary_file_name() -> &'static str {
     }
 }
 
-/// File name of the managed `rtk` binary, with the platform's executable suffix
-/// on Windows.
-fn rtk_binary_file_name() -> &'static str {
-    if cfg!(windows) { "rtk.exe" } else { "rtk" }
-}
-
 /// Absolute path of the repo-explorer-managed `codebase-memory-mcp` binary in
 /// the shared managed bin dir (`~/.local/bin` on Linux,
 /// `%LOCALAPPDATA%\repo-explorer-mcp` on Windows). Errors when no managed dir is
 /// resolvable (e.g. no HOME). Never consults PATH.
 pub(crate) fn dedicated_memory_binary_path() -> Result<PathBuf> {
     Ok(managed_bin_dir()?.join(memory_binary_file_name()))
-}
-
-/// Absolute path of the repo-explorer-managed `rtk` binary in the shared managed
-/// bin dir, alongside `codebase-memory-mcp`. Errors when no managed dir is
-/// resolvable. Never consults PATH.
-pub(crate) fn dedicated_rtk_binary_path() -> Result<PathBuf> {
-    Ok(managed_bin_dir()?.join(rtk_binary_file_name()))
 }
 
 /// File name of the managed `rg`/ripgrep binary, with the platform's
@@ -97,7 +84,7 @@ fn rg_binary_file_name() -> &'static str {
 }
 
 /// Absolute path of the repo-explorer-managed `rg` fallback binary in the
-/// shared managed bin dir, alongside `rtk` and `codebase-memory-mcp`. Errors
+/// shared managed bin dir, alongside `codebase-memory-mcp`. Errors
 /// when no managed dir is resolvable. Never consults PATH.
 pub(crate) fn dedicated_rg_binary_path() -> Result<PathBuf> {
     Ok(managed_bin_dir()?.join(rg_binary_file_name()))
@@ -133,41 +120,6 @@ async fn provision_or_update_memory_binary(client: &reqwest::Client) -> Componen
             owner: "DeusData",
             repo: "codebase-memory-mcp",
             command: "codebase-memory-mcp",
-        },
-    )
-    .await
-}
-
-/// Install-if-absent / update-if-stale the managed `rtk` copy at
-/// [`dedicated_rtk_binary_path`], via the shared [`check_and_install`] pipeline.
-/// Like the `codebase-memory-mcp` copy and unlike the `which`-resolved `rg`
-/// dependency, a *missing* binary is installed (not "skipped"):
-/// repo-explorer-mcp owns this copy and search is mandatory, so it never falls
-/// back to a PATH/global install — see `check_and_install`'s `install_if_missing`.
-async fn provision_or_update_rtk_binary(client: &reqwest::Client) -> ComponentReport {
-    let name = "rtk".to_string();
-
-    let path = match dedicated_rtk_binary_path() {
-        Ok(p) => p,
-        Err(e) => {
-            return ComponentReport {
-                name,
-                current_version: None,
-                latest_version: None,
-                action: "error",
-                detail: Some(e.to_string()),
-            };
-        }
-    };
-
-    provision_managed_binary(
-        client,
-        name,
-        &path,
-        ReleaseSource {
-            owner: "rtk-ai",
-            repo: "rtk",
-            command: "rtk",
         },
     )
     .await
@@ -252,7 +204,7 @@ fn skipped_for_system_rg(found: &Path) -> ComponentReport {
 /// [`which::which`] off the async runtime's worker thread: like
 /// [`read_installed_version_blocking`], the synchronous stat calls it makes
 /// across every `PATH` entry could otherwise block a worker thread shared by
-/// the concurrently-spawned self/rtk/memory `--update` tasks.
+/// the concurrently-spawned self/memory `--update` tasks.
 async fn which_rg_blocking() -> Option<PathBuf> {
     tokio::task::spawn_blocking(|| which::which("rg").ok())
         .await
@@ -263,7 +215,7 @@ async fn which_rg_blocking() -> Option<PathBuf> {
 /// binary at `path`: ensure its parent dir exists, probe its current version
 /// if it's already on disk, and route through [`check_and_install`]. Factors
 /// out the `ensure_parent_dir`-error / path-exists / current-version sequence
-/// that was duplicated across the rtk, codebase-memory-mcp, and rg
+/// that was duplicated across the codebase-memory-mcp and rg
 /// provisioners. `path` resolution and its error handling stay with each
 /// caller, since rg's differs (a resolution failure isn't necessarily an
 /// error there — see [`provision_or_update_rg_binary`]).
@@ -356,17 +308,11 @@ pub async fn run_update() -> ExitCode {
         }
     };
 
-    let mut handles = Vec::with_capacity(4);
+    let mut handles = Vec::with_capacity(3);
     let self_client = client.clone();
     handles.push((
         SELF_REPO,
         tokio::spawn(async move { update_self(&self_client).await }),
-    ));
-
-    let rtk_client = client.clone();
-    handles.push((
-        "rtk",
-        tokio::spawn(async move { provision_or_update_rtk_binary(&rtk_client).await }),
     ));
 
     let memory_client = client.clone();
@@ -437,10 +383,10 @@ async fn update_self(client: &reqwest::Client) -> ComponentReport {
 }
 
 /// Shared fetch-release -> parse-tag -> compare-versions -> pick-asset ->
-/// install -> [`ComponentReport`] sequence used by `update_self` and the three
-/// managed provisioners (`provision_or_update_rtk_binary`,
-/// `provision_or_update_memory_binary`, `provision_or_update_rg_binary`), once
-/// each has arrived at its own `current` version (or `None`).
+/// install -> [`ComponentReport`] sequence used by `update_self` and the two
+/// managed provisioners (`provision_or_update_memory_binary`,
+/// `provision_or_update_rg_binary`), once each has arrived at its own
+/// `current` version (or `None`).
 ///
 /// `install_if_missing` controls what a `None` `current` means: `false` (a
 /// managed copy that exists but whose version couldn't be probed) means "don't
@@ -1254,31 +1200,19 @@ mod tests {
         } else {
             "codebase-memory-mcp"
         };
-        let rtk = if cfg!(windows) { "rtk.exe" } else { "rtk" };
         let rg = if cfg!(windows) { "rg.exe" } else { "rg" };
         assert_eq!(memory_binary_file_name(), mem);
-        assert_eq!(rtk_binary_file_name(), rtk);
         assert_eq!(rg_binary_file_name(), rg);
     }
 
     #[test]
-    fn managed_rtk_and_memory_share_a_parent_dir() {
-        let rtk = dedicated_rtk_binary_path().expect("rtk path resolves in the test env");
+    fn managed_rg_and_memory_share_a_parent_dir() {
         let mem = dedicated_memory_binary_path().expect("memory path resolves in the test env");
         let rg = dedicated_rg_binary_path().expect("rg path resolves in the test env");
-        assert_eq!(
-            rtk.parent(),
-            mem.parent(),
-            "both managed binaries must live in the same shared bin dir"
-        );
         assert_eq!(
             rg.parent(),
             mem.parent(),
             "the managed rg fallback must live in the same shared bin dir"
-        );
-        assert_eq!(
-            rtk.file_name().unwrap(),
-            std::ffi::OsStr::new(rtk_binary_file_name())
         );
         assert_eq!(
             mem.file_name().unwrap(),

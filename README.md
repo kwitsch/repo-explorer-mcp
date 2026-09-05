@@ -3,7 +3,7 @@
 A Rust MCP server that exposes the `explore_repository` tool over an rmcp stdio
 transport, shipped for Linux (`x86_64-unknown-linux-gnu`) and Windows
 (`x86_64-pc-windows-msvc`). It drives an internal LLM exploration loop over a
-managed `codebase-memory-mcp` backend and mandatory `rtk` text search — both
+managed `codebase-memory-mcp` backend and ripgrep-based text search — both
 provisioned by `repo-explorer-mcp --update` into a shared per-user bin dir
 (`$XDG_BIN_HOME` if set to an absolute path, else `~/.local/bin`, on Linux;
 `%LOCALAPPDATA%\repo-explorer-mcp` on Windows), never a global PATH install.
@@ -35,7 +35,7 @@ package manager is found, `rg` is instead provisioned on demand (latest GitHub
 release) into the shared bin dir by `repo-explorer-mcp --update`. A system `rg`
 already on PATH is always preferred and left untouched — the managed copy is a
 fallback, created only when none is present.
-`rtk` and `codebase-memory-mcp` are not taken from PATH: the installer invokes `repo-explorer-mcp --update` to install both as managed per-user copies in the shared bin dir above (best-effort; if that step fails, run `repo-explorer-mcp --update` later). `rtk` is mandatory — the server refuses to start if it cannot be resolved, pointing you at `--update`.
+`codebase-memory-mcp` is not taken from PATH: the installer invokes `repo-explorer-mcp --update` to install it as a managed per-user copy in the shared bin dir above (best-effort; if that step fails, run `repo-explorer-mcp --update` later). Search uses `rg`: a system `rg` on PATH is preferred, and a managed `rg` copy is provisioned into that shared bin dir only when none is present. The server fails fast if no `rg` can be resolved, pointing you at `--update`.
 
 ## Install (manual fallback)
 
@@ -127,9 +127,9 @@ args = ["--stdio"]
 
 [search]
 timeout_seconds = 45
-# rtk_path may be set explicitly; omitted => the absolute managed rtk path
-# `setup` writes, or PATH auto-detection via `which`. rtk is mandatory — there
-# is no ripgrep fallback.
+# rg_path may be set explicitly to an existing rg binary; omitted => runtime
+# resolution — a system `rg` on PATH (via `which`) is preferred, and the
+# managed `rg` copy provisioned by `--update` is used only as a fallback.
 
 # Exploration pipeline knobs (all optional; shown with their defaults).
 [agent]

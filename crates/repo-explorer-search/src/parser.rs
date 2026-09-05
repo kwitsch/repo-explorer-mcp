@@ -1,15 +1,13 @@
-//! A tolerant parser turning raw `rtk rg -H -n` output into `ExplorationFinding`s.
+//! A tolerant parser turning raw `rg -H -n` output into `ExplorationFinding`s.
 //!
-//! `parse_rtk` reads the fixed `rtk rg -H -n` line grammar (`path:line:content`
+//! `parse_rg` reads the fixed `rg -H -n` line grammar (`path:line:content`
 //! for matches, `path-line-content` for context). It is tolerant of malformed
 //! individual rows (skip, not fatal) and saturates `u64`->`u32` line numbers
-//! (never a bare `as` cast). The one row it does *not* tolerate is rtk's own
-//! truncation-footer line (see `is_truncation_marker`): that line is proof rtk
-//! silently dropped real matches for a file, so it is a decode error, not a
-//! skippable row.
+//! (never a bare `as` cast). It never returns an error: any row it cannot
+//! interpret is skipped, never fatal, so a single odd line can never discard
+//! the findings already collected.
 
 use repo_explorer_core::domain::{ExplorationFinding, FileLocation, saturate_u32};
-use repo_explorer_core::search::SearchError;
 use std::path::PathBuf;
 
 /// Find the leftmost *plausible* `<sep><digits><sep>` run for one separator
@@ -289,7 +287,7 @@ fn split_grep_line(line: &str) -> Option<(&str, u32, &str, bool)> {
 
 /// Build one finding for a match line, prepending any buffered before-context
 /// collected since the last group boundary (and clearing the buffer). Used by
-/// `parse_rtk`.
+/// `parse_rg`.
 fn push_finding(
     findings: &mut Vec<ExplorationFinding>,
     pending_before: &mut Vec<String>,
@@ -339,7 +337,7 @@ fn append_context(findings: &mut [ExplorationFinding], text: &str) {
 /// Route one context line's text to the right place depending on where it
 /// falls relative to a group boundary: text seen since a boundary leads the
 /// next, not yet created, finding and is buffered; otherwise it trails the
-/// previous finding. Used by `parse_rtk`.
+/// previous finding. Used by `parse_rg`.
 fn handle_context_line(
     findings: &mut [ExplorationFinding],
     pending_before: &mut Vec<String>,
@@ -353,47 +351,18 @@ fn handle_context_line(
     }
 }
 
-/// True for either of rtk's own truncation-footer lines: the per-file footer,
-/// e.g. `  +35 more in many.txt [see remaining: tail -n +26
-/// ~/.local/share/rtk/tee/....log]`, emitted in place of a file's remaining
-/// match lines once its real match count exceeds rtk's undocumented,
-/// non-configurable per-file cap; and the whole-files-skipped footer, e.g.
-/// `+21 more files [see remaining: tail -n +1
-/// ~/.local/share/rtk/tee/..._grep_skipped.log]`, emitted once the number of
-/// matching files exceeds rtk's separate, also non-configurable total-files
-/// cap -- dropping entire files' worth of matches that never appear in stdout
-/// at all. Neither shape matches `split_grep_line`'s `path:line:content` /
-/// `path-line-content` grammar (no plausible `<sep><digits><sep>` run exists
-/// in either), so both must be recognized explicitly -- see `parse_rtk` for
-/// why silently falling through to its catch-all `None` arm, as for ordinary
-/// unparsable garbage, is wrong here specifically: unlike garbage, these
-/// lines are proof that real matches were dropped before `parse_rtk` ever saw
-/// them.
-fn is_truncation_marker(line: &str) -> bool {
-    let Some(rest) = line.trim_start().strip_prefix('+') else {
-        return false;
-    };
-    let digits_end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    digits_end > 0
-        && (rest[digits_end..].starts_with(" more in ")
-            || rest[digits_end..].starts_with(" more files "))
-}
-
-/// Parse `rtk rg -H -n` output. Each match line becomes one finding. A context
+/// Parse `rg -H -n` output. Each match line becomes one finding. A context
 /// line before any group boundary (`--`) appends to the previous finding's
 /// snippet; a context line after a boundary -- including before the very
 /// first match, since the stream starts at a boundary -- is buffered and
 /// prepended to the next finding instead, since it leads that match rather
 /// than trailing the one before the boundary.
 ///
-/// Errors with `SearchError::Decode` the moment a truncation-footer line (see
-/// `is_truncation_marker`) is seen: that line means rtk itself dropped real
-/// matches for a file, so the findings collected so far (from this file and
-/// any other) are known-incomplete and must not be reported as a complete,
-/// silent `Ok` result.
-pub(crate) fn parse_rtk(stdout: &str) -> Result<Vec<ExplorationFinding>, SearchError> {
+/// Infallible: every row it cannot interpret is skipped rather than fatal. A
+/// parser that cannot return `Err` can never trigger the caller's whole-leg
+/// discard, which is the structural root fix for the pre-migration 100%-loss
+/// bug.
+pub(crate) fn parse_rg(stdout: &str) -> Vec<ExplorationFinding> {
     let mut findings: Vec<ExplorationFinding> = Vec::new();
     let mut pending_before: Vec<String> = Vec::new();
     // Starts true: any context before the first match in the whole stream is
@@ -407,12 +376,6 @@ pub(crate) fn parse_rtk(stdout: &str) -> Result<Vec<ExplorationFinding>, SearchE
             at_boundary = true;
             continue;
         }
-        if is_truncation_marker(line) {
-            return Err(SearchError::Decode {
-                backend: "rtk",
-                message: format!("rtk truncated its own results and dropped matches: {line}"),
-            });
-        }
         match split_grep_line(line) {
             Some((path, num, content, true)) => {
                 push_finding(&mut findings, &mut pending_before, path, num, Some(content));
@@ -424,7 +387,7 @@ pub(crate) fn parse_rtk(stdout: &str) -> Result<Vec<ExplorationFinding>, SearchE
             None => {}
         }
     }
-    Ok(findings)
+    findings
 }
 
 #[cfg(test)]
@@ -441,8 +404,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_rtk_extracts_matches_and_appends_context() {
-        let findings = parse_rtk(&fixture("rtk_rg_output.txt")).unwrap();
+    fn parse_rg_extracts_matches_and_appends_context() {
+        let findings = parse_rg(&fixture("rg_output.txt"));
         // Two match lines (70, 71); the leading context line (69), coming
         // before any "--" boundary, is prepended as findings[0]'s leading
         // context, and the trailing context line (72) appends to 71.
@@ -466,91 +429,39 @@ mod tests {
     }
 
     #[test]
-    fn parse_rtk_skips_group_separators_and_garbage() {
+    fn parse_rg_skips_group_separators_and_garbage() {
         let input = "--\nnotavalidline\nsrc/x.rs:5:hello\n";
-        let findings = parse_rtk(input).unwrap();
+        let findings = parse_rg(input);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].location.line_start, 5);
         assert_eq!(findings[0].snippet.as_deref(), Some("hello"));
     }
 
     #[test]
-    fn parse_rtk_errors_on_truncation_footer() {
-        // Real rtk shape: a header, 25 real match rows (elided here), then a
-        // footer in place of the remaining rows once a file's match count
-        // exceeds rtk's internal per-file cap. The footer must not be
-        // silently dropped like ordinary garbage -- it is proof matches were
-        // lost, so it must surface as an error instead of a falsely-complete
-        // `Ok` result.
-        let input = "60 matches in 1 files:\nmany.txt:1:needle\n  +35 more in many.txt [see remaining: tail -n +26 ~/.local/share/rtk/tee/x.log]\n";
-        let err = parse_rtk(input).unwrap_err();
-        assert_eq!(
-            err,
-            SearchError::Decode {
-                backend: "rtk",
-                message: "rtk truncated its own results and dropped matches:   \
-                          +35 more in many.txt [see remaining: tail -n +26 ~/.local/share/rtk/tee/x.log]"
-                    .to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_rtk_errors_on_files_skipped_footer() {
-        // Real rtk shape: a header, real match rows across many files
-        // (elided here), then a second, distinct footer -- once the number
-        // of matching files exceeds rtk's separate total-files cap -- that
-        // drops entire files' worth of matches never shown in stdout at all.
-        // This must surface as an error just like the per-file footer above,
-        // not fall through to the catch-all `None` arm as ordinary garbage.
+    fn parse_rg_skips_files_skipped_footer_keeping_prior_matches() {
+        // A footer-shaped line matches no `split_grep_line` grammar, so it
+        // falls into the generic skip arm, not fatal; the prior real match
+        // survives.
         let input = "many.txt:1:needle\n+21 more files [see remaining: tail -n +1 ~/.local/share/rtk/tee/x_skipped.log]\n";
-        let err = parse_rtk(input).unwrap_err();
-        assert_eq!(
-            err,
-            SearchError::Decode {
-                backend: "rtk",
-                message: "rtk truncated its own results and dropped matches: +21 more files \
-                          [see remaining: tail -n +1 ~/.local/share/rtk/tee/x_skipped.log]"
-                    .to_string(),
-            }
-        );
+        let findings = parse_rg(input);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].location.line_start, 1);
+        assert_eq!(findings[0].snippet.as_deref(), Some("needle"));
     }
 
     #[test]
-    fn is_truncation_marker_matches_rtk_footer_shape() {
-        assert!(is_truncation_marker(
-            "  +35 more in many.txt [see remaining: tail -n +26 ~/x.log]"
-        ));
-        assert!(is_truncation_marker("+1 more in a.rs"));
-    }
-
-    #[test]
-    fn is_truncation_marker_matches_rtk_files_skipped_footer_shape() {
-        // rtk's separate, total-files cap footer -- distinct from the
-        // per-file `+N more in <file>` footer above -- drops entire files'
-        // worth of matches and must be recognized too.
-        assert!(is_truncation_marker(
-            "+21 more files [see remaining: tail -n +1 ~/.local/share/rtk/tee/x_skipped.log]"
-        ));
-        assert!(is_truncation_marker("+1 more files [see remaining: x]"));
-    }
-
-    #[test]
-    fn is_truncation_marker_rejects_non_footer_lines() {
-        // The summary header shares the digits-then-word shape but not the
-        // `+N more in ` prefix, and must stay a tolerated, skippable row.
-        assert!(!is_truncation_marker("60 matches in 1 files:"));
-        assert!(!is_truncation_marker("src/x.rs:5:hello"));
-        assert!(!is_truncation_marker(""));
-        assert!(!is_truncation_marker("notavalidline"));
-        // A `+`-prefixed content line whose digits aren't followed by the
-        // exact `" more in "` marker must not false-positive.
-        assert!(!is_truncation_marker("+35 more info"));
-        assert!(!is_truncation_marker("+more in x.rs"));
-        // Same for the `" more files "` marker: a merely similar word must
-        // not false-positive.
-        assert!(!is_truncation_marker("+21 more filesystems"));
-        assert!(!is_truncation_marker("+more files x"));
+    fn parse_rg_skips_truncation_footer_keeping_prior_matches() {
+        // Regression test for the pre-migration 100%-loss bug: a real match
+        // line followed by an rtk-shaped truncation footer. The footer
+        // matches no grammar and is skipped like any other unparsable row,
+        // and the real match survives instead of the whole parse aborting to
+        // an empty result.
+        let input = "60 matches in 1 files:\nmany.txt:1:needle\n  +35 more in many.txt [see remaining: tail -n +26 ~/.local/share/rtk/tee/x.log]\n";
+        let findings = parse_rg(input);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].location.path, PathBuf::from("many.txt"));
+        assert_eq!(findings[0].location.line_start, 1);
+        assert_eq!(findings[0].snippet.as_deref(), Some("needle"));
     }
 
     #[test]
