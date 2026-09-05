@@ -3,11 +3,16 @@
 
 Run with: uv run --with pyyaml eval/score.py results/<run-id>
 
-Computes the metrics that are derivable from the response + filesystem + Mode-B stderr parsing
-today. Metrics that need the observability patch's structured lines (`cand_recall@top_k`,
-`llm_calls`, `provider_events`, `model_served`, `forced_finish`) are left as `None` and flagged
-in the summary rather than silently omitted — see the "not yet available (needs patch)" note in
-the printed report.
+The installed binary is 0.5.3 (the §3.1 observability patch), so `run.py`'s rows carry the full
+field set: `candidates_ranked` (the pre-stage's own ranked list, independent of what
+verify/fallback ultimately returned), `provider_calls`, `llm_calls`, `forced_finish`,
+`index_status`, per-leg `leg_timings`, `git_probe_ms`. This script uses all of them —
+`cand_recall@top_k`/`cand_rank` (§7.4 failure attribution: was the primary ever retrieved, at
+what rank, independent of what the LLM stages did with it), provider outcomes and model-drift
+detection against the run's pinned model, per-leg latency, and the `exploration_failed` line for
+hard failures that never reach `is_error` reporting inconsistently. A row from an older
+(pre-0.5.3) binary would simply have these fields as `None`/`[]`, so a Mode-B run scores fine —
+those sections just report zero rows.
 
 Wilson score interval is used for all proportions (n is small in the pilot; a naive normal
 approximation is misleading at n<30).
@@ -57,6 +62,27 @@ def load_repos() -> dict[str, dict]:
     with open(EVAL_DIR / "repos.toml", "rb") as f:
         data = tomllib.load(f)
     return {r["id"]: r for r in data["repo"]}
+
+
+def load_pinned_model(out_dir: Path) -> str | None:
+    """The model this run was pinned to, read from the eval config the manifest recorded — used
+    to flag any `provider_calls` row whose `model_served` drifted (§3.2/§8.1: a floating alias or
+    mid-run failover means the row's model differs from what the run intended)."""
+    import tomllib
+
+    manifest_path = out_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    manifest = json.loads(manifest_path.read_text())
+    config_path = manifest.get("config")
+    if not config_path or not Path(config_path).exists():
+        return None
+    with open(config_path, "rb") as f:
+        config = tomllib.load(f)
+    providers = config.get("llm", {}).get("providers", [])
+    if providers and providers[0].get("models"):
+        return providers[0]["models"][0]
+    return None
 
 
 def normalize_snippet(s: str | None) -> str:
@@ -237,8 +263,55 @@ def match_expected(response_findings: list[dict], expect: dict) -> dict:
     }
 
 
+def compute_cand_recall(candidates_ranked: list[dict] | None, expect: dict) -> dict:
+    """§7.4 failure attribution: was a primary/equivalent target ever in the pre-stage's own
+    ranked candidate list (`candidates_ranked`, independent of what verify/fallback did with
+    it), and at what rank? Distinguishes `retrieval-miss` (never a candidate) from `rank>k`
+    (a candidate, just not surfaced by the LLM stage) from everything downstream of retrieval."""
+    if candidates_ranked is None:
+        return {"cand_recall_at_topk": None, "cand_rank": None}
+    primary = expect.get("primary", []) or []
+    target_files = {p["path"] for p in primary}
+    for group in expect.get("equivalent", []) or []:
+        for member in group:
+            target_files.add(member["path"])
+    if not target_files:
+        return {"cand_recall_at_topk": None, "cand_rank": None}  # negative query: nothing to find
+    best_rank = None
+    for c in candidates_ranked:
+        rel = normalize_finding_path(c.get("path", ""))
+        if rel in target_files:
+            rank = c.get("rank")
+            if best_rank is None or (rank is not None and rank < best_rank):
+                best_rank = rank
+    return {"cand_recall_at_topk": best_rank is not None, "cand_rank": best_rank}
+
+
+def attribution_class(row: dict, match: dict, cand: dict) -> str | None:
+    """§7.4: one failure class per failed query, ordered so the first applicable one wins."""
+    if match["file_hit_any"] or (match["is_negative"] and match["negative_ok"] == 1.0):
+        return None
+    if row.get("timeout"):
+        return "timeout"
+    if row.get("is_error"):
+        return "error"
+    if any(h["hallucination"] in ("fabricated_path", "fabricated_snippet") for h in row.get("hallucination_detail", [])):
+        return "fabricated-path"
+    if cand["cand_recall_at_topk"] is False:
+        return "retrieval-miss"
+    if cand["cand_recall_at_topk"] is True:
+        stage = row.get("stage")
+        if stage == "verify":
+            return "verify-rejected-correct"
+        if stage == "fallback":
+            return "fallback-budget" if row.get("forced_finish") else "fallback-miss"
+        return "rank>k"
+    return "fallback-miss" if row.get("stage") == "fallback" else None
+
+
 def score_run(out_dir: Path) -> dict:
     repos = load_repos()
+    pinned_model = load_pinned_model(out_dir)
     per_query_rows = defaultdict(list)  # (repo, query_id) -> [scored row per pass]
     all_scored = []
 
@@ -279,6 +352,7 @@ def score_run(out_dir: Path) -> dict:
                             path_valid_all = False
 
                     match = match_expected(findings, qspec.get("expect", {}))
+                    cand = compute_cand_recall(row.get("candidates_ranked"), qspec.get("expect", {}))
                     expected_stage = qspec.get("expect", {}).get("stage")
                     stage_match = expected_stage is None or expected_stage == row.get("stage")
 
@@ -293,7 +367,9 @@ def score_run(out_dir: Path) -> dict:
                         "stage_match": stage_match,
                         "confident_wrong": (row.get("stage") == "early-exit" and not match["file_hit_any"]),
                         **match,
+                        **cand,
                     }
+                    scored["attribution"] = attribution_class(scored, match, cand)
                     all_scored.append(scored)
                     per_query_rows[(repo_id, qid)].append(scored)
 
@@ -318,12 +394,13 @@ def score_run(out_dir: Path) -> dict:
             }
         )
 
-    return {"scored_rows": all_scored, "query_summary": query_summary}
+    return {"scored_rows": all_scored, "query_summary": query_summary, "pinned_model": pinned_model}
 
 
 def print_report(result: dict) -> None:
     rows = result["scored_rows"]
     qs = result["query_summary"]
+    pinned_model = result.get("pinned_model")
 
     print(f"\n=== Query-level pass@1 summary ({len(qs)} queries) ===")
     for q in qs:
@@ -375,15 +452,82 @@ def print_report(result: dict) -> None:
     if not any_mismatch:
         print("  none (or no stage expectations set)")
 
-    print("\n=== NOT YET AVAILABLE (needs the §3.1 observability patch) ===")
-    print("  cand_recall@top_k, cand_rank, llm_calls, model_served, forced_finish, provider_events,")
-    print("  per-leg duration_ms, index_status.commit, git_probe_ms — all None in every row above.")
+    print("\n=== Failure attribution (§7.4) ===")
+    by_attr = defaultdict(int)
+    for r in rows:
+        if r.get("attribution"):
+            by_attr[r["attribution"]] += 1
+    if by_attr:
+        for attr, n in sorted(by_attr.items(), key=lambda kv: -kv[1]):
+            print(f"  {attr:26s} {n}")
+    else:
+        print("  none (no failed queries, or candidates_ranked unavailable — Mode B run)")
+
+    cand_rows = [r for r in rows if r.get("cand_recall_at_topk") is not None]
+    if cand_rows:
+        hits = sum(1 for r in cand_rows if r["cand_recall_at_topk"])
+        p, lo, hi = wilson_ci(hits, len(cand_rows))
+        print(f"\n=== Candidate recall@top_k (pre-stage, before any LLM stage) ===")
+        print(f"  n={len(cand_rows)}  cand_recall@top_k={p:.2f}  95% CI [{lo:.2f}, {hi:.2f}]")
+        ranked = [r["cand_rank"] for r in cand_rows if r["cand_rank"] is not None]
+        if ranked:
+            ranked.sort()
+            print(f"  cand_rank (of hits): median={ranked[len(ranked)//2]}  max={max(ranked)}")
+
+    provider_rows = [pc for r in rows for pc in r.get("provider_calls", [])]
+    if provider_rows:
+        print(f"\n=== Provider calls ({len(provider_rows)} total) ===")
+        by_outcome = defaultdict(int)
+        for pc in provider_rows:
+            by_outcome[pc.get("outcome")] += 1
+        for outcome, n in sorted(by_outcome.items(), key=lambda kv: -kv[1]):
+            print(f"  outcome={outcome:14s} {n}")
+        models_served = sorted({pc["model_served"] for pc in provider_rows if pc.get("model_served")})
+        print(f"  models served this run: {models_served}")
+        if pinned_model:
+            drift = sorted({m for m in models_served if m != pinned_model})
+            print(f"  pinned model: {pinned_model!r}  drift: {drift or 'none'}")
+        else:
+            print("  pinned model: unknown (manifest.json/config not found — can't check drift)")
+        provider_events = sum(1 for pc in provider_rows if pc.get("outcome") != "ok")
+        print(f"  provider_events (non-ok outcomes): {provider_events}")
+    else:
+        print("\n=== Provider calls === none recorded (every query early-exited, or Mode B)")
+
+    forced = [r for r in rows if r.get("forced_finish")]
+    print(f"\n=== Forced finish ({len(forced)} rows) ===")
+    for r in forced:
+        print(f"  {r['repo']}/{r['query_id']} pass{r['pass']}: stage={r['stage']} tokens={r['tokens']}")
+
+    leg_rows = [lt for r in rows for lt in r.get("leg_timings", [])]
+    if leg_rows:
+        print(f"\n=== Per-leg latency ({len(leg_rows)} legs across {len(rows)} calls) ===")
+        by_leg = defaultdict(list)
+        for lt in leg_rows:
+            by_leg[lt.get("leg")].append(lt.get("duration_ms") or 0)
+        for leg, durs in sorted(by_leg.items()):
+            durs.sort()
+            print(f"  {leg:10s} n={len(durs):4d}  median={durs[len(durs)//2]:.0f}ms  max={max(durs):.0f}ms")
+
+    index_statuses = [r["index_status"] for r in rows if r.get("index_status")]
+    if index_statuses:
+        by_status = defaultdict(int)
+        for s in index_statuses:
+            by_status[s] += 1
+        print(f"\n=== Index status ({len(index_statuses)} calls with a status) ===")
+        for s, n in sorted(by_status.items(), key=lambda kv: -kv[1]):
+            print(f"  {s:16s} {n}")
 
     latencies = [r["latency_ms"] for r in rows]
     if latencies:
         latencies.sort()
         p50 = latencies[len(latencies) // 2]
         print(f"\n=== Latency ===\n  n={len(latencies)}  p50={p50:.0f}ms  max={max(latencies):.0f}ms")
+
+    git_probe = [r["git_probe_ms"] for r in rows if r.get("git_probe_ms") is not None]
+    if git_probe:
+        git_probe.sort()
+        print(f"  git_probe_ms: median={git_probe[len(git_probe)//2]}  max={max(git_probe)}")
 
 
 def main() -> None:
