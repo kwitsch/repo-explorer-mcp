@@ -7,12 +7,8 @@ Run with:  python eval/test_score.py   (prints OK; non-zero exit on failure)
 """
 import sys
 import tempfile
-import types
 from pathlib import Path
 
-# score.py imports pyyaml at module top for load_queries(), which this check
-# never calls; stub it so the file imports under a bare `python` with no deps.
-sys.modules.setdefault("yaml", types.ModuleType("yaml"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from score import snippet_found_at
@@ -47,10 +43,32 @@ def main() -> None:
         ) == "not_found"
 
         # 4. line_end is None must not raise TypeError; chunk (index 5) sits
-        #    inside the fallback window (end := line_start).
+        #    inside the legacy line_start-4..line_start+3 fallback window.
         assert snippet_found_at(
             repo, "sample.py", 5, None, "SENTINEL_005_line_content"
         ) == "ok"
+
+        # 5. Tightened fallback: line_end is None must NOT silently gain the
+        #    forward pad. Chunk at index 8 sits just past the legacy
+        #    line_start+3 upper bound (window is indices 1..7), so it must be
+        #    "misaligned" — it would wrongly be "ok" if the fallback still
+        #    added the full +4 pad instead of the old +3.
+        assert snippet_found_at(
+            repo, "sample.py", 5, None, "SENTINEL_008_line_content"
+        ) == "misaligned"
+
+        # 6. Location genuinely unknown (line_start=None, the DTO convention
+        #    for a symbol-only finding): a real in-file snippet must be "ok",
+        #    never "misaligned" — there is no known range for it to fall
+        #    outside of.
+        assert snippet_found_at(
+            repo, "sample.py", None, None, "SENTINEL_020_line_content"
+        ) == "ok"
+
+        # 7. Location unknown but the snippet is fabricated: still "not_found".
+        assert snippet_found_at(
+            repo, "sample.py", None, None, "TOTALLY_ABSENT_SENTINEL_STRING"
+        ) == "not_found"
 
     print("OK")
 
