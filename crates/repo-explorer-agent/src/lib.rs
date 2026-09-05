@@ -15,6 +15,8 @@ mod dispatch;
 mod pipeline;
 mod render;
 mod skeleton;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 mod tools;
 mod verify;
 

@@ -65,20 +65,22 @@ fn query(text: &str) -> ExplorationQuery {
 
 /// Temp repo whose `src/` holds the files the finish-payload tests reference,
 /// each 40 lines long, so `finish` path validation accepts the model's
-/// findings and clamps nothing. Named per test + pid so parallel tests never
-/// collide. Caller removes the dir.
+/// findings and clamps nothing, via the crate's shared
+/// `test_support::temp_repo_with` fixture. Caller removes the dir.
 fn temp_repo(test: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("agent_integ_{test}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("src")).unwrap();
     let body = (1..=40)
         .map(|i| format!("l{i}"))
         .collect::<Vec<_>>()
         .join("\n");
-    for name in ["main.rs", "fresh_a.rs", "fresh_b.rs"] {
-        std::fs::write(dir.join("src").join(name), &body).unwrap();
-    }
-    dir
+    repo_explorer_agent::test_support::temp_repo_with(
+        "agent_integ",
+        test,
+        &[
+            ("src/main.rs", body.as_str()),
+            ("src/fresh_a.rs", body.as_str()),
+            ("src/fresh_b.rs", body.as_str()),
+        ],
+    )
 }
 
 fn router(

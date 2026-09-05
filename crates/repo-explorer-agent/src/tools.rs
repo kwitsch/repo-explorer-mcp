@@ -433,20 +433,15 @@ pub(crate) async fn resolve_finish(
 mod tests {
     use super::*;
 
-    /// Create a unique temp repo (named per test + pid, so parallel tests
-    /// never collide) containing `src/main.rs` with `n_lines` numbered lines.
-    /// Caller removes the dir at the end.
+    /// Temp repo containing `src/main.rs` with `n_lines` numbered lines, via
+    /// the crate's shared `test_support::temp_repo_with` fixture. Caller
+    /// removes the dir at the end.
     fn temp_repo_main(test: &str, n_lines: usize) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("agent_tools_finish_{test}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("src")).unwrap();
         let body = (1..=n_lines)
             .map(|i| format!("l{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        std::fs::write(dir.join("src").join("main.rs"), body).unwrap();
-        dir
+        crate::test_support::temp_repo_with("agent_tools_finish", test, &[("src/main.rs", &body)])
     }
 
     const NAMES: [&str; 10] = [

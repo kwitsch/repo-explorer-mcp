@@ -874,14 +874,14 @@ mod tests {
     }
 
     /// Temp repo containing the finding paths the fallback `finish` tests
-    /// reference, so path validation accepts them. Caller removes the dir.
+    /// reference, so path validation accepts them, via the crate's shared
+    /// `test_support::temp_repo_with` fixture. Caller removes the dir.
     fn temp_repo(test: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("agent_run_{test}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src").join("lib.rs"), "a\nb\nc\n").unwrap();
-        std::fs::write(dir.join("src").join("other.rs"), "d\ne\nf\n").unwrap();
-        dir
+        crate::test_support::temp_repo_with(
+            "agent_run",
+            test,
+            &[("src/lib.rs", "a\nb\nc\n"), ("src/other.rs", "d\ne\nf\n")],
+        )
     }
 
     fn tool_calls(
