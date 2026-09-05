@@ -33,8 +33,12 @@ import yaml
 EVAL_DIR = Path(__file__).resolve().parent
 REPO_ROOT = EVAL_DIR.parent
 
-TRUNCATION_MARKER_RE = re.compile(r"\s*\.\.\.\s*\(truncated\)\s*$", re.I)
 WS_RE = re.compile(r"\s+")
+# A snippet line that is only an omission marker ("...", the unicode ellipsis, optionally
+# annotated "(truncated)"/"[truncated]") separates two chunks of a multi-line snippet rather
+# than being real quoted content — the LLM (or the tool's own compressed rendering, which the
+# LLM sometimes echoes verbatim) uses this to elide the middle of a long span.
+ELLIPSIS_LINE_RE = re.compile(r"^(\.\.\.|…)\s*(\(truncated\)|\[truncated\])?$", re.I)
 
 
 def wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float, float]:
@@ -85,12 +89,35 @@ def load_pinned_model(out_dir: Path) -> str | None:
     return None
 
 
-def normalize_snippet(s: str | None) -> str:
-    if not s:
-        return ""
-    s = TRUNCATION_MARKER_RE.sub("", s)
-    s = WS_RE.sub(" ", s).strip()
-    return s[:100]
+def snippet_chunks(snippet: str) -> list[list[str]]:
+    """Split a (possibly multi-line) snippet into contiguous chunks of real content, breaking
+    at any line that is only an omission marker. Each chunk is a list of whitespace-normalized
+    lines, in order — a chunk must match a contiguous run of file lines, but chunks themselves
+    need not be adjacent (the LLM may elide the middle of a long span)."""
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    for raw_line in snippet.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if ELLIPSIS_LINE_RE.match(stripped):
+            if current:
+                chunks.append(current)
+                current = []
+            continue
+        current.append(WS_RE.sub(" ", stripped))
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def find_chunk(file_lines: list[str], chunk: list[str]) -> int | None:
+    """First index in file_lines where `chunk` matches a contiguous run (each chunk line must
+    be a substring of the corresponding file line), or None."""
+    for i in range(len(file_lines) - len(chunk) + 1):
+        if all(chunk[j] in file_lines[i + j] for j in range(len(chunk))):
+            return i
+    return None
 
 
 def path_exists(repo_path: Path, rel: str) -> bool:
@@ -107,36 +134,42 @@ def file_len(repo_path: Path, rel: str) -> int | None:
         return None
 
 
-def snippet_found_at(repo_path: Path, rel: str, line_start: int | None, snippet: str) -> str:
-    """Returns 'ok' (matches at/near the claimed range), 'misaligned' (found elsewhere in the
-    file), or 'not_found' (fabricated) — the §7.1 hallucinated classification, minus the
-    'fabricated path'/'range outside file' cases which are checked separately."""
+def snippet_found_at(
+    repo_path: Path, rel: str, line_start: int | None, line_end: int | None, snippet: str
+) -> str:
+    """Returns 'ok' (matches at/near the claimed range, or the range is a whole-file span so
+    "near" is moot), 'misaligned' (found elsewhere in the file), or 'not_found' (fabricated) —
+    the §7.1 hallucinated classification, minus the 'fabricated path'/'range outside file' cases
+    checked separately. Matches per-chunk (see snippet_chunks) so a genuine multi-line quote
+    isn't flagged fabricated just because no single physical line equals the whole snippet."""
     p = repo_path / rel
     if not p.exists() or not p.is_file():
         return "not_found"
-    norm_target = normalize_snippet(snippet)
-    if not norm_target:
+    chunks = snippet_chunks(snippet)
+    if not chunks:
         return "ok"  # nothing to check
     try:
         lines = p.read_text(errors="replace").splitlines()
     except OSError:
         return "not_found"
+    file_lines = [WS_RE.sub(" ", line.strip()) for line in lines]
+    # A whole-file (or near-whole-file) span has no meaningful "near line_start" — a module-level
+    # semantic match legitimately cites a representative line from anywhere in the file.
+    whole_file = line_start is not None and line_end is not None and (line_end - line_start) >= len(lines) - 2
     near = set()
-    if line_start:
+    if line_start and not whole_file:
         near = set(range(max(0, line_start - 4), min(len(lines), line_start + 3)))
-    found_near = False
-    found_anywhere = False
-    for i, line in enumerate(lines):
-        nline = normalize_snippet(line)
-        if norm_target and norm_target in nline:
-            found_anywhere = True
-            if i in near:
-                found_near = True
-    if found_near:
-        return "ok"
-    if found_anywhere:
-        return "misaligned"
-    return "not_found"
+    # Every chunk must exist somewhere in the file (a chunk that's missing is fabricated
+    # content, even if the rest of the snippet is real); "misaligned" only if all chunks exist
+    # but at least one falls outside the claimed range.
+    any_far = False
+    for chunk in chunks:
+        idx = find_chunk(file_lines, chunk)
+        if idx is None:
+            return "not_found"
+        if not (whole_file or idx in near):
+            any_far = True
+    return "misaligned" if any_far else "ok"
 
 
 def normalize_finding_path(raw: str) -> str:
@@ -159,7 +192,7 @@ def score_finding(finding: dict, repo_path: Path) -> dict:
     elif line_valid is False:
         hallucination = "range_outside_file"
     elif finding.get("snippet"):
-        cls = snippet_found_at(repo_path, rel, line_start, finding["snippet"])
+        cls = snippet_found_at(repo_path, rel, line_start, line_end, finding["snippet"])
         if cls == "not_found":
             hallucination = "fabricated_snippet"
         elif cls == "misaligned":
@@ -384,7 +417,7 @@ def score_run(out_dir: Path) -> dict:
                 "classification": classification,
                 "any_hallucination": any(r["hallucinated"] for r in rows),
                 "any_confident_wrong": any(r["confident_wrong"] for r in rows),
-                "stages_seen": sorted({r.get("stage") for r in rows}),
+                "stages_seen": sorted({r.get("stage") for r in rows if r.get("stage") is not None}),
             }
         )
 
