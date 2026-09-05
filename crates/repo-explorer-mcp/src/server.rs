@@ -17,8 +17,11 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::Instrument;
 
 /// The concrete agent type wired to the production backends. All backend trait
 /// methods and `AgentLoop::run` take `&self`, so a shared `Arc<Agent>` (no
@@ -97,12 +100,27 @@ impl From<ExplorationResult> for ExplorationResultDto {
     }
 }
 
+/// Build a short per-call correlation id — the first 8 hex chars of a
+/// SHA-256 over the same normalized query cache key `AgentLoop` uses
+/// internally, plus a per-process monotonically increasing counter — so
+/// every log line for one call (including concurrent calls) can be
+/// correlated by an external harness without fragile timestamp-slicing.
+fn build_req_id(query: &ExplorationQuery, counter: &AtomicU64) -> String {
+    let key = Agent::query_cache_key(query);
+    let hash = hex::encode(Sha256::digest(key.as_bytes()));
+    let n = counter.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{n}", &hash[..8])
+}
+
 /// The MCP server handler: a shared `Arc<Agent>` plus the repo root to explore.
 #[derive(Clone)]
 pub struct RepoExplorerServer {
     tool_router: ToolRouter<Self>,
     agent: Arc<Agent>,
     repo_root: Arc<PathBuf>,
+    /// Per-process counter feeding [`build_req_id`]; shared (not per-clone)
+    /// so every `RepoExplorerServer` clone contributes to one sequence.
+    req_counter: Arc<AtomicU64>,
 }
 
 #[tool_router]
@@ -112,6 +130,7 @@ impl RepoExplorerServer {
             tool_router: Self::tool_router(),
             agent,
             repo_root: Arc::new(repo_root),
+            req_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -135,12 +154,20 @@ impl RepoExplorerServer {
             scope_hint: req.scope_hint.map(PathBuf::from),
             max_results: req.max_results,
         };
+        let req_id = build_req_id(&query, &self.req_counter);
+        let span = tracing::info_span!("explore", req_id = %req_id);
         let result = self
             .agent
             .run(self.repo_root.as_ref(), &query)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(Json(ExplorationResultDto::from(result)))
+            .instrument(span)
+            .await;
+        match result {
+            Ok(result) => Ok(Json(ExplorationResultDto::from(result))),
+            Err(e) => {
+                tracing::warn!(error_class = "provider", message = %e, "exploration failed");
+                Err(e.to_string())
+            }
+        }
     }
 }
 

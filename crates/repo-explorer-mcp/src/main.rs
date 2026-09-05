@@ -492,10 +492,19 @@ fn tracing_level_filter(level: LogLevel) -> tracing::level_filters::LevelFilter 
 /// Initialize `tracing` to **stderr** at the configured level. Best-effort:
 /// a `try_init` failure (e.g. a subscriber already set) is ignored so this is
 /// safe to call more than once.
+///
+/// At `debug`/`trace`, `rmcp`/`hyper`/`reqwest` are held to `warn` so turning
+/// on debug logging for this crate's own targets doesn't flood stderr with
+/// transport library noise; `info` (the default) is unaffected, since those
+/// targets emit nothing above `warn` anyway.
 fn init_tracing(level: LogLevel) {
+    let filter = tracing_subscriber::EnvFilter::new(format!(
+        "{},rmcp=warn,hyper=warn,reqwest=warn",
+        tracing_level_filter(level)
+    ));
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_max_level(tracing_level_filter(level))
+        .with_env_filter(filter)
         .try_init();
 }
 

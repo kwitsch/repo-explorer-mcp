@@ -832,8 +832,11 @@ fn findings_and_summary(tool: &'static str, json: &Value, repo_root: &Path) -> E
     result_with_finding_count(tool, columnar_findings(json).unwrap_or_default())
 }
 
-impl MemoryBackend for MemoryClientBackend {
-    async fn ensure_fresh_index(&self, repo_root: &Path) -> Result<IndexStatus, MemoryError> {
+impl MemoryClientBackend {
+    /// The actual freshness-check/reindex sequence, unwrapped so the trait
+    /// method below can time and log it uniformly across every early-return
+    /// path (`?` on the freshness probes included).
+    async fn ensure_fresh_index_inner(&self, repo_root: &Path) -> Result<IndexStatus, MemoryError> {
         // Canonicalize once and derive the project name from that same
         // resolved path, instead of calling `project_name` (which
         // canonicalizes again internally) and then re-canonicalizing a
@@ -870,6 +873,35 @@ impl MemoryBackend for MemoryClientBackend {
             FreshnessDecision::UpToDate => Ok(IndexStatus::UpToDate),
             FreshnessDecision::Reindex => self.run_index(&abs).await,
         }
+    }
+}
+
+/// Map `ensure_fresh_index`'s result onto a short label for the `index
+/// status` log line -- `Unavailable` covers the `Err` arm, which carries no
+/// `IndexStatus` value of its own. The connected backend's
+/// `index_repository`/`index_status` responses expose no indexed commit/ref
+/// of their own (live-verified elsewhere in this file), so no commit field
+/// is logged here.
+fn index_status_label(result: &Result<IndexStatus, MemoryError>) -> &'static str {
+    match result {
+        Ok(IndexStatus::Reindexed) => "Reindexed",
+        Ok(IndexStatus::UpToDate) => "UpToDate",
+        Ok(IndexStatus::IndexingFailed { .. }) => "IndexingFailed",
+        Err(_) => "Unavailable",
+    }
+}
+
+impl MemoryBackend for MemoryClientBackend {
+    async fn ensure_fresh_index(&self, repo_root: &Path) -> Result<IndexStatus, MemoryError> {
+        let start = std::time::Instant::now();
+        let result = self.ensure_fresh_index_inner(repo_root).await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+        tracing::info!(
+            outcome = index_status_label(&result),
+            duration_ms,
+            "index status"
+        );
+        result
     }
 
     async fn search_code(

@@ -124,6 +124,9 @@ pub struct GenaiProvider {
     /// Mark system messages with a provider-side prompt-cache hint. Only the
     /// Anthropic adapter supports the content-level `cache_control` marker.
     cache_system_prompt: bool,
+    /// 1-based call counter for this provider/model slot, logged as
+    /// `provider call`'s `attempt` field — exists purely to be logged.
+    call_counter: std::sync::atomic::AtomicU64,
 }
 
 impl GenaiProvider {
@@ -138,6 +141,7 @@ impl GenaiProvider {
             client: shared.client.clone(),
             adapter_kind: shared.adapter_kind,
             cache_system_prompt: shared.adapter_kind == genai::adapter::AdapterKind::Anthropic,
+            call_counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -521,6 +525,21 @@ fn build_chat_request(
     (request, chat_options)
 }
 
+/// Bucket a `ProviderError` into the six `provider call` outcome labels,
+/// reusing the same rate/quota/auth/invalid classification `GenaiProvider`
+/// already applies via `classify_genai_error` — never a new one.
+fn outcome_label(err: &ProviderError) -> &'static str {
+    match err {
+        ProviderError::RateLimited { .. } => "rate_limited",
+        ProviderError::QuotaExceeded { .. } => "quota",
+        ProviderError::Authentication { .. } => "auth",
+        ProviderError::InvalidRequest { .. } => "invalid",
+        ProviderError::Transport { .. }
+        | ProviderError::InvalidResponse { .. }
+        | ProviderError::Configuration { .. } => "other",
+    }
+}
+
 impl LlmProvider for GenaiProvider {
     async fn complete_with_tools(
         &self,
@@ -532,17 +551,68 @@ impl LlmProvider for GenaiProvider {
         let genai_tools = to_genai_tools(&self.name, self.adapter_kind, tools)?;
         let (request, chat_options) = build_chat_request(chat_messages, genai_tools, options);
 
+        let attempt = self
+            .call_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let start = std::time::Instant::now();
         match self
             .client
             .exec_chat(self.model.as_str(), request, Some(&chat_options))
             .await
         {
             Ok(response) => {
+                let latency_ms = start.elapsed().as_millis() as u64;
                 let usage = usage_from(&response.usage);
+                let reasoning_tokens = response
+                    .usage
+                    .completion_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.reasoning_tokens);
+                let model_served = response.provider_model_iden.model_name.as_str();
+                let prompt_tokens = usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
+                let completion_tokens = usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0);
+                match reasoning_tokens {
+                    Some(reasoning_tokens) => tracing::info!(
+                        provider = %self.name,
+                        model_requested = %self.model,
+                        model_served,
+                        attempt,
+                        outcome = "ok",
+                        latency_ms,
+                        prompt_tokens,
+                        completion_tokens,
+                        reasoning_tokens,
+                        "provider call"
+                    ),
+                    None => tracing::info!(
+                        provider = %self.name,
+                        model_requested = %self.model,
+                        model_served,
+                        attempt,
+                        outcome = "ok",
+                        latency_ms,
+                        prompt_tokens,
+                        completion_tokens,
+                        "provider call"
+                    ),
+                }
                 let response = from_genai_response(&self.name, response)?;
                 Ok(Completion { response, usage })
             }
-            Err(err) => Err(classify_genai_error(&self.name, &err)),
+            Err(err) => {
+                let latency_ms = start.elapsed().as_millis() as u64;
+                let classified = classify_genai_error(&self.name, &err);
+                tracing::info!(
+                    provider = %self.name,
+                    model_requested = %self.model,
+                    attempt,
+                    outcome = outcome_label(&classified),
+                    latency_ms,
+                    "provider call"
+                );
+                Err(classified)
+            }
         }
     }
 }

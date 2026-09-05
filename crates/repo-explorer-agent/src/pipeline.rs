@@ -47,6 +47,13 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
     leg_cache: LegCache<'_>,
 ) -> RetrievalOutcome {
     let patterns = derive_patterns(&query.text);
+    tracing::debug!(
+        literals = ?patterns.literals,
+        identifiers = ?patterns.identifiers,
+        path_tokens = ?patterns.path_tokens,
+        grep_patterns = ?patterns.grep_patterns,
+        "retrieval patterns"
+    );
     // Unlike the LLM's own grep/find scope argument (validated in dispatch.rs
     // via `reject_escaping_path`), this top-level query's `scope_hint` comes
     // straight from the MCP caller with no validation applied upstream. Drop
@@ -225,8 +232,19 @@ async fn soft_leg<T, E: std::fmt::Display>(
     fut: impl Future<Output = Result<T, E>>,
     classify: impl FnOnce(T) -> Vec<Candidate>,
 ) -> Option<Vec<Candidate>> {
+    let start = std::time::Instant::now();
     match fut.await {
-        Ok(res) => Some(classify(res)),
+        Ok(res) => {
+            let candidates = classify(res);
+            tracing::debug!(
+                leg,
+                %ctx,
+                hits = candidates.len(),
+                duration_ms = start.elapsed().as_millis() as u64,
+                "retrieval leg done"
+            );
+            Some(candidates)
+        }
         Err(e) => {
             tracing::debug!(leg, %ctx, error = %e, "retrieval leg failed");
             None

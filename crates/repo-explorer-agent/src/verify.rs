@@ -84,9 +84,14 @@ where
                         // Check for a successful finish before cloning anything: the
                         // common case (finish on the first turn) returns right here.
                         let mut responses = match resolve_finish(&calls) {
-                            Ok(result) => return VerifyOutcome::Finished(result),
+                            Ok(result) => {
+                                let action = if last { "forced_finish" } else { "finish" };
+                                tracing::debug!(turn, action, "verify action");
+                                return VerifyOutcome::Finished(result);
+                            }
                             Err(rejections) => rejections,
                         };
+                        tracing::debug!(turn, action = "expand", "verify action");
                         for call in calls.iter().filter(|c| c.name != "finish") {
                             let content = match call.name.as_str() {
                                 "expand" => {
@@ -106,6 +111,7 @@ where
                         messages.extend(responses);
                     }
                     ProviderResponse::ToolCalls(_) => {
+                        tracing::debug!(turn, action = "nudge", "verify action");
                         push_nudge(
                             &mut messages,
                             Message::assistant_tool_calls(Vec::new()),
@@ -113,6 +119,7 @@ where
                         );
                     }
                     ProviderResponse::Text(text) => {
+                        tracing::debug!(turn, action = "nudge", "verify action");
                         push_nudge(
                             &mut messages,
                             Message::assistant_text(text),

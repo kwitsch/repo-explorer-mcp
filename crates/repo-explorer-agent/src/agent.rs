@@ -24,7 +24,7 @@ use repo_explorer_core::llm::{
     CallOptions, Clock, LlmProvider, Message, ProviderResponse, ProviderRouter, SystemClock,
     TokenUsage, ToolCall,
 };
-use repo_explorer_core::memory::{IndexStatus, MemoryBackend};
+use repo_explorer_core::memory::{IndexStatus, MemoryBackend, MemoryError};
 use repo_explorer_core::retrieval::{finding_from_candidate, is_unknown_location};
 use repo_explorer_core::search::SearchBackend;
 use std::collections::HashSet;
@@ -52,14 +52,22 @@ pub enum AgentLoopError {
 pub(crate) struct TokenBudget {
     limit: u64,
     spent: u64,
+    /// Number of `Completion`s returned to the agent so far this run —
+    /// exists purely to be logged on `exploration complete`.
+    llm_calls: u32,
 }
 
 impl TokenBudget {
     pub(crate) fn new(limit: u64) -> Self {
-        Self { limit, spent: 0 }
+        Self {
+            limit,
+            spent: 0,
+            llm_calls: 0,
+        }
     }
 
     pub(crate) fn add(&mut self, usage: Option<TokenUsage>) {
+        self.llm_calls += 1;
         if let Some(usage) = usage {
             self.spent = self.spent.saturating_add(usage.total());
         }
@@ -71,6 +79,10 @@ impl TokenBudget {
 
     pub(crate) fn spent(&self) -> u64 {
         self.spent
+    }
+
+    pub(crate) fn llm_calls(&self) -> u32 {
+        self.llm_calls
     }
 }
 
@@ -133,27 +145,44 @@ where
         }
     }
 
+    /// Deterministic per-query cache key, exposed so a caller (the MCP
+    /// server's `explore` observability span) can derive a short
+    /// request-correlation id from the same normalization the query cache
+    /// uses internally.
+    pub fn query_cache_key(query: &ExplorationQuery) -> String {
+        ResultCache::query_key(query)
+    }
+
     pub async fn run(
         &self,
         repo_root: &Path,
         query: &ExplorationQuery,
     ) -> Result<ExplorationResult, AgentLoopError> {
         // Stage 0: query cache.
+        let git_probe_start = std::time::Instant::now();
         let fingerprint = match &self.cache {
             Some(_) => self.probe.fingerprint(repo_root).await,
             None => None,
         };
+        let git_probe_ms = git_probe_start.elapsed().as_millis() as u64;
         let query_key = ResultCache::query_key(query);
         if let Some(hit) = self
             .query_cache_lookup(repo_root, &query_key, &fingerprint)
             .await
         {
-            tracing::info!(path = "cache", "exploration served from query cache");
+            tracing::info!(
+                path = "cache",
+                tokens = 0u64,
+                git_probe_ms,
+                "exploration served from query cache"
+            );
             return Ok(hit);
         }
 
         // Stage 1: ensure a fresh index (once). Failures are non-fatal notes.
-        let index_note = match self.memory.ensure_fresh_index(repo_root).await {
+        let index_result = self.memory.ensure_fresh_index(repo_root).await;
+        let index_status = index_status_label(&index_result);
+        let index_note = match index_result {
             Ok(IndexStatus::Reindexed) | Ok(IndexStatus::UpToDate) => None,
             Ok(IndexStatus::IndexingFailed { reason }) => Some(format!(
                 "Note: the memory index could not be refreshed ({reason}); memory results may be stale."
@@ -174,6 +203,10 @@ where
             leg_cache,
         )
         .await;
+        tracing::debug!(
+            candidates = %candidates_json(&outcome.candidates),
+            "retrieval candidates"
+        );
         tracing::info!(
             candidates = outcome.candidates.len(),
             confidence = outcome.confidence,
@@ -192,7 +225,17 @@ where
                 outcome.confidence,
                 index_note.as_deref(),
             );
-            return Ok(self.complete_run("early-exit", 0, &query_key, fingerprint, result));
+            return Ok(self.complete_run(
+                "early-exit",
+                0,
+                0,
+                false,
+                index_status,
+                git_probe_ms,
+                &query_key,
+                fingerprint,
+                result,
+            ));
         }
 
         // Stage 4: LLM verification over the candidates.
@@ -216,6 +259,9 @@ where
                     result,
                     query.max_results,
                     &budget,
+                    false,
+                    index_status,
+                    git_probe_ms,
                     &query_key,
                     fingerprint,
                 ));
@@ -224,7 +270,7 @@ where
         }
 
         // Stage 5: explorative fallback loop.
-        let result = self
+        let (result, forced_finish) = self
             .fallback_loop(
                 repo_root,
                 query,
@@ -239,6 +285,9 @@ where
             result,
             query.max_results,
             &budget,
+            forced_finish,
+            index_status,
+            git_probe_ms,
             &query_key,
             fingerprint,
         ))
@@ -279,32 +328,59 @@ where
     /// The shared tail of every `run()` branch: log completion, persist to
     /// the query cache, and hand back the result for the caller to wrap in
     /// `Ok`.
+    #[allow(clippy::too_many_arguments)]
     fn complete_run(
         &self,
         path: &'static str,
         tokens: u64,
+        llm_calls: u32,
+        forced_finish: bool,
+        index_status: &'static str,
+        git_probe_ms: u64,
         query_key: &str,
         fingerprint: Option<RepoFingerprint>,
         result: ExplorationResult,
     ) -> ExplorationResult {
-        tracing::info!(path, tokens, "exploration complete");
+        tracing::info!(
+            path,
+            tokens,
+            llm_calls,
+            forced_finish,
+            index_status,
+            git_probe_ms,
+            "exploration complete"
+        );
         self.store_query_cache(query_key, fingerprint, &result);
         result
     }
 
     /// The shared tail of the verify/fallback branches: finalize the result,
     /// then run it through `complete_run` with the tokens spent so far.
+    #[allow(clippy::too_many_arguments)]
     fn finalize_and_complete(
         &self,
         stage: &'static str,
         result: ExplorationResult,
         max_results: Option<u32>,
         budget: &TokenBudget,
+        forced_finish: bool,
+        index_status: &'static str,
+        git_probe_ms: u64,
         query_key: &str,
         fingerprint: Option<RepoFingerprint>,
     ) -> ExplorationResult {
         let result = self.finalize(result, max_results);
-        self.complete_run(stage, budget.spent(), query_key, fingerprint, result)
+        self.complete_run(
+            stage,
+            budget.spent(),
+            budget.llm_calls(),
+            forced_finish,
+            index_status,
+            git_probe_ms,
+            query_key,
+            fingerprint,
+            result,
+        )
     }
 
     /// The cache is usable this call only when caching is enabled and a
@@ -402,6 +478,10 @@ where
     /// The explorative loop, now the low-confidence escalation path: hard turn
     /// and token budgets, 2-strike batch enforcement, concurrent batch
     /// execution, tool-result memoization, and a forced final `finish`.
+    ///
+    /// Returns the result plus whether it came from the forced-finish path or
+    /// the deterministic synthesis fallback (`true`), as opposed to a normal
+    /// in-loop `finish` call (`false`) — logged on `exploration complete`.
     async fn fallback_loop(
         &self,
         repo_root: &Path,
@@ -410,7 +490,7 @@ where
         candidates: Vec<Candidate>,
         fingerprint: Option<&RepoFingerprint>,
         budget: &mut TokenBudget,
-    ) -> Result<ExplorationResult, AgentLoopError> {
+    ) -> Result<(ExplorationResult, bool), AgentLoopError> {
         let tools = tool_catalog();
         let mut messages: Vec<Message> = vec![
             Message::system(FALLBACK_SYSTEM_PROMPT),
@@ -422,7 +502,7 @@ where
         let mut single_call_rejections = 0u32;
         let mut turn_limit_hit = true;
 
-        for _turn in 0..self.settings.max_fallback_iterations {
+        for turn in 0..self.settings.max_fallback_iterations {
             if budget.exhausted() {
                 turn_limit_hit = false;
                 break;
@@ -436,6 +516,14 @@ where
                     budget.add(completion.usage);
                     match completion.response {
                         ProviderResponse::ToolCalls(calls) if calls.is_empty() => {
+                            tracing::debug!(
+                                turn,
+                                tool_names = "",
+                                rejected_single_call = false,
+                                strikes = single_call_rejections,
+                                budget_spent = budget.spent(),
+                                "fallback turn"
+                            );
                             push_nudge(
                                 &mut messages,
                                 Message::assistant_tool_calls(Vec::new()),
@@ -449,7 +537,7 @@ where
                             // common immediate-finish path we return before any of that
                             // is needed, skipping the allocation entirely.
                             let mut turn_messages: Vec<Message> = match resolve_finish(&calls) {
-                                Ok(result) => return Ok(result),
+                                Ok(result) => return Ok((result, false)),
                                 Err(rejections) => rejections,
                             };
                             let non_finish: Vec<&ToolCall> =
@@ -459,6 +547,14 @@ where
                                 && single_call_rejections < MAX_SINGLE_CALL_REJECTIONS
                             {
                                 single_call_rejections += 1;
+                                tracing::debug!(
+                                    turn,
+                                    tool_names = non_finish[0].name.as_str(),
+                                    rejected_single_call = true,
+                                    strikes = single_call_rejections,
+                                    budget_spent = budget.spent(),
+                                    "fallback turn"
+                                );
                                 turn_messages.push(Message::tool(
                                     &non_finish[0].id,
                                     "call rejected: batch ALL independent tool calls of a turn into one response (they execute concurrently); resend this call together with the other lookups you need",
@@ -470,6 +566,14 @@ where
                             if !non_finish.is_empty() {
                                 single_call_rejections = 0;
                             }
+                            tracing::debug!(
+                                turn,
+                                tool_names = %tool_names_joined(&non_finish),
+                                rejected_single_call = false,
+                                strikes = single_call_rejections,
+                                budget_spent = budget.spent(),
+                                "fallback turn"
+                            );
                             let results =
                                 futures_util::future::join_all(non_finish.iter().map(|call| {
                                     self.cached_dispatch(repo_root, call, fingerprint)
@@ -485,6 +589,14 @@ where
                             }
                         }
                         ProviderResponse::Text(text) => {
+                            tracing::debug!(
+                                turn,
+                                tool_names = "",
+                                rejected_single_call = false,
+                                strikes = single_call_rejections,
+                                budget_spent = budget.spent(),
+                                "fallback turn"
+                            );
                             push_nudge(
                                 &mut messages,
                                 Message::assistant_text(text),
@@ -502,7 +614,7 @@ where
         // Budget exhausted without finish: one forced final answer, then a
         // deterministic synthesis from everything gathered so far.
         if let Some(result) = self.forced_finish(&mut messages, budget).await {
-            return Ok(result);
+            return Ok((result, true));
         }
         for candidate in candidates {
             accumulate(&mut findings, &mut seen, finding_from_candidate(candidate));
@@ -515,12 +627,15 @@ where
         } else {
             format!("token budget ({})", self.settings.token_budget)
         };
-        Ok(ExplorationResult {
-            findings,
-            summary: format!(
-                "Exploration stopped after reaching the {cause} without an explicit finish; returning best-effort findings gathered so far."
-            ),
-        })
+        Ok((
+            ExplorationResult {
+                findings,
+                summary: format!(
+                    "Exploration stopped after reaching the {cause} without an explicit finish; returning best-effort findings gathered so far."
+                ),
+            },
+            true,
+        ))
     }
 
     /// One last call offering only `finish`, with the tool choice forced.
@@ -588,6 +703,50 @@ where
             Err(msg) => (Message::tool(&call.id, msg), Vec::new()),
         }
     }
+}
+
+/// Map `ensure_fresh_index`'s result onto a short label for the
+/// `exploration complete` log line — `Unavailable` covers the `Err` arm,
+/// which carries no `IndexStatus` value of its own.
+fn index_status_label(result: &Result<IndexStatus, MemoryError>) -> &'static str {
+    match result {
+        Ok(IndexStatus::Reindexed) => "Reindexed",
+        Ok(IndexStatus::UpToDate) => "UpToDate",
+        Ok(IndexStatus::IndexingFailed { .. }) => "IndexingFailed",
+        Err(_) => "Unavailable",
+    }
+}
+
+/// One JSON-array line of the ranked candidate list — rank, kind, score,
+/// path, line range, symbol — for the `retrieval candidates` debug log, so a
+/// harness can compute candidate-recall-at-top-k without re-deriving the
+/// ranking itself.
+fn candidates_json(candidates: &[Candidate]) -> String {
+    let dump: Vec<serde_json::Value> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            serde_json::json!({
+                "rank": i + 1,
+                "kind": format!("{:?}", c.kind),
+                "score": c.score,
+                "path": c.location.path.to_string_lossy(),
+                "line_start": c.location.line_start,
+                "line_end": c.location.line_end,
+                "symbol": c.symbol,
+            })
+        })
+        .collect();
+    serde_json::to_string(&dump).unwrap_or_default()
+}
+
+/// Comma-joined tool names for the `fallback turn` debug log.
+fn tool_names_joined(calls: &[&ToolCall]) -> String {
+    calls
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Push `f` unless a finding with the same dedupe key is already present
