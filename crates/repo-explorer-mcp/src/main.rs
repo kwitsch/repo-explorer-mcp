@@ -177,10 +177,9 @@ async fn run(config: repo_explorer_core::config::Config) -> anyhow::Result<()> {
             );
         })
         .ok();
-    let search = CliSearchBackend::new(&config.search, managed_rg_path);
+    let search = CliSearchBackend::new(&config.search, managed_rg_path.clone());
     if !search.rg_available() {
-        let managed = update::dedicated_rg_binary_path().ok();
-        anyhow::bail!("{}", rg_unresolved_message(managed.as_deref()));
+        anyhow::bail!("{}", rg_unresolved_message(managed_rg_path.as_deref()));
     }
     let router = repo_explorer_llm::build_router(&config.llm)
         .context("failed to build LLM provider router")?;
