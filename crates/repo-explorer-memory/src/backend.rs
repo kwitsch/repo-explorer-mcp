@@ -195,12 +195,7 @@ impl MemoryClientBackend {
     /// for `project_name_from_abs`; canonicalizing twice per reindex would
     /// duplicate a blocking filesystem syscall for no benefit.
     async fn run_index(&self, abs_repo_root: &Path) -> Result<IndexStatus, MemoryError> {
-        let mut args = Map::new();
-        insert_str(
-            &mut args,
-            "path",
-            abs_repo_root.to_string_lossy().into_owned(),
-        );
+        let args = index_repository_args(abs_repo_root);
         match self.client().call("index_repository", args).await {
             Ok(_) => {
                 // Record when *we* just rebuilt it — the only clock available,
@@ -300,6 +295,19 @@ fn base_args(project: String) -> Map<String, Value> {
     args
 }
 
+/// Build the `index_repository` argument map — the one place the upstream
+/// `repo_path` key name lives (CBM 0.10.8 requires `repo_path`, not `path`;
+/// sending `path` hard-fails with "repo_path is required").
+fn index_repository_args(abs_repo_root: &Path) -> Map<String, Value> {
+    let mut args = Map::new();
+    insert_str(
+        &mut args,
+        "repo_path",
+        abs_repo_root.to_string_lossy().into_owned(),
+    );
+    args
+}
+
 /// Read the first present field among `keys`, in order — the single place
 /// every "which key name did the upstream tool use this time" guess goes
 /// through, instead of a separate `.or_else()` chain per call site.
@@ -338,6 +346,29 @@ fn insert_opt_str(args: &mut Map<String, Value>, key: &str, v: &Option<String>) 
 /// tool arg that is always present rather than optional.
 fn insert_str(args: &mut Map<String, Value>, key: &str, v: impl Into<String>) {
     args.insert(key.to_string(), Value::String(v.into()));
+}
+
+/// Add `query_graph`'s per-tool args onto the map `call_memory_tool_with`
+/// already seeded with `base_args`. The upstream row cap key is `max_rows`
+/// (CBM 0.10.8), not `limit` — sending `limit` silently drops the cap.
+fn insert_query_graph_args(args: &mut Map<String, Value>, query: &str, max_results: Option<u32>) {
+    insert_str(args, "query", query);
+    insert_opt_u32(args, "max_rows", max_results);
+}
+
+/// Add `trace_path`'s per-tool args onto the base map. The upstream depth cap
+/// key is `depth` (CBM 0.10.8), not `max_depth` — sending `max_depth` silently
+/// drops the cap. `from` maps onto the tool's single `function_name` and both
+/// directions are requested (see the `trace_path` method for why `to` is
+/// dropped).
+fn insert_trace_path_args(
+    args: &mut Map<String, Value>,
+    function_name: &str,
+    max_depth: Option<u32>,
+) {
+    insert_str(args, "function_name", function_name);
+    insert_str(args, "direction", "both");
+    insert_opt_u32(args, "depth", max_depth);
 }
 
 /// Turn a bare directory path prefix (the shape `scope_hint` is documented
@@ -960,8 +991,7 @@ impl MemoryBackend for MemoryClientBackend {
         max_results: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
         self.call_memory_tool("query_graph", repo_root, |args| {
-            insert_str(args, "query", query);
-            insert_opt_u32(args, "limit", max_results);
+            insert_query_graph_args(args, query, max_results);
         })
         .await
     }
@@ -983,9 +1013,7 @@ impl MemoryBackend for MemoryClientBackend {
         // two-endpoint intent -- and drop `to`, which the tool has nowhere
         // to put.
         self.call_memory_tool("trace_path", repo_root, |args| {
-            insert_str(args, "function_name", from);
-            insert_str(args, "direction", "both");
-            insert_opt_u32(args, "max_depth", max_depth);
+            insert_trace_path_args(args, from, max_depth);
         })
         .await
     }
@@ -993,12 +1021,17 @@ impl MemoryBackend for MemoryClientBackend {
     async fn get_architecture(
         &self,
         repo_root: &Path,
-        depth: Option<u32>,
+        _depth: Option<u32>,
     ) -> Result<ExplorationResult, MemoryError> {
-        self.call_memory_tool("get_architecture", repo_root, |args| {
-            insert_opt_u32(args, "depth", depth);
-        })
-        .await
+        // CBM 0.10.8's `get_architecture` exposes no depth knob (only
+        // `project`/`path`/`aspects`), so the caller's `depth` is
+        // intentionally not forwarded — mirroring `trace_path`'s dropped `to`
+        // (kept as `_to`). The closure adds nothing beyond the
+        // `base_args(project)` that `call_memory_tool` already seeds. Keep the
+        // core trait / DTO `depth` field; drop it only here at the wire
+        // boundary.
+        self.call_memory_tool("get_architecture", repo_root, |_args| {})
+            .await
     }
 
     async fn get_code_snippet(
@@ -1477,6 +1510,39 @@ docs/project-plan/9b-open_weights_finetune.md\nseed_symbols: 0\n";
             scope_glob(Path::new("crates/repo-explorer-memory/")),
             "crates/repo-explorer-memory/**"
         );
+    }
+
+    #[test]
+    fn index_repository_args_uses_repo_path_key() {
+        // CBM 0.10.8 requires `repo_path`; the old `path` key hard-fails.
+        let args = index_repository_args(Path::new("/abs/repo"));
+        assert_eq!(
+            args.get("repo_path").and_then(Value::as_str),
+            Some("/abs/repo")
+        );
+        assert!(!args.contains_key("path"));
+    }
+
+    #[test]
+    fn query_graph_args_uses_max_rows_key() {
+        // CBM 0.10.8's row cap is `max_rows`, not `limit` (silent drop).
+        // No `project` assertion — the helper never sees `project`;
+        // `call_memory_tool_with` seeds it via `base_args`.
+        let mut args = Map::new();
+        insert_query_graph_args(&mut args, "q", Some(5));
+        assert_eq!(args.get("max_rows").and_then(Value::as_u64), Some(5));
+        assert!(!args.contains_key("limit"));
+        assert_eq!(args.get("query").and_then(Value::as_str), Some("q"));
+    }
+
+    #[test]
+    fn trace_path_args_uses_depth_key() {
+        // CBM 0.10.8's depth cap is `depth`, not `max_depth` (silent drop).
+        let mut args = Map::new();
+        insert_trace_path_args(&mut args, "f", Some(3));
+        assert_eq!(args.get("depth").and_then(Value::as_u64), Some(3));
+        assert!(!args.contains_key("max_depth"));
+        assert_eq!(args.get("function_name").and_then(Value::as_str), Some("f"));
     }
 
     #[test]
