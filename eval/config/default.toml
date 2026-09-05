@@ -1,0 +1,37 @@
+# Pilot eval config (docs/eval/real-world-test-plan.md §3.2, §8.1).
+#
+# This is the live user config (~/.config/repo-explorer/repo-explorer.toml as of 2026-09-05)
+# verbatim, MINUS the 11-model failover chain: pinned to the single dated model
+# `gemini-3.8-flash`, confirmed by a live API call on 2026-09-05 to be exactly what the
+# `gemini-flash-latest` alias at the top of the live chain currently resolves to
+# (modelVersion echoed back by generateContent). Using a dated id instead of the floating
+# alias means every eval call is served by the same model, so no run needs to be flagged and
+# re-run because the alias moved mid-pass.
+#
+# The bare `command = "codebase-memory-mcp"` and the inert `prefer_rtk = true` (F-12 — not a
+# real SearchConfig field, silently accepted) are kept exactly as the live config has them, per
+# §3.2 ("keep prefer_rtk so F-12 is observed as-is").
+#
+# api_key_env only NAMES the environment variable; the harness never reads or copies the key
+# itself, and this file is committed with that in mind.
+
+[llm]
+cooldown_seconds = 60
+
+[[llm.providers]]
+name = "gemini"
+kind = "gemini"
+api_key_env = "GOOGLE_API_KEY"
+models = ["gemini-3.8-flash"]
+
+[codebase_memory]
+command = "codebase-memory-mcp"
+args = ["--stdio"]
+staleness_seconds = 3600
+
+[search]
+timeout_seconds = 30
+prefer_rtk = true
+
+[logging]
+level = "debug"

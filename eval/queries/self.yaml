@@ -1,0 +1,202 @@
+# Query corpus for the `self` repo (docs/eval/real-world-test-plan.md §6.3).
+# Pin: 91eebde05c9cf761d1226c8658994edbf18e872c (~/repos/eval-corpus/self).
+# Ground truth verified against that exact pin on 2026-09-05 (Phase 0). Every query carries
+# scope_hint: crates — this repo's own docs/eval/ and eval/ directories contain every query
+# string and expected path verbatim, and `rg` searches untracked files too (§3.2 corpus
+# contamination rule), so the search space is restricted to crates/ to keep the run honest.
+
+- id: self-P1-01
+  cat: P1
+  lang: en
+  query: "where is derive_patterns defined"
+  scope_hint: crates
+  expect:
+    primary_mode: all
+    primary:
+      - { path: crates/repo-explorer-core/src/retrieval.rs, symbol: derive_patterns, span: [150, 215] }
+  notes: "21 grep hits for 'derive_patterns' concentrated in retrieval.rs — grep leg should survive; early-exit expected. span is the full function body (150-215), confirmed live during Phase-0 harness validation: the tool correctly returns the whole function, and a def-line-only span [150,150] would wrongly fail range_hit's 3x/40-line cap"
+
+- id: self-P1-DE-01
+  cat: P1-DE
+  lang: de
+  query: "wo ist wait_for_running_memory_binary definiert"
+  scope_hint: crates
+  expect:
+    primary_mode: all
+    primary:
+      - { path: crates/repo-explorer-mcp/src/main.rs, symbol: wait_for_running_memory_binary, span: [261, 274] }
+
+- id: self-P1t-01
+  cat: P1t
+  lang: en
+  query: "running_memory_binary"
+  scope_hint: crates
+  expect:
+    primary_mode: any
+    equivalent:
+      - { path: crates/repo-explorer-mcp/src/main.rs, span: [279, 297] }
+      - { path: crates/repo-explorer-mcp/src/main.rs, span: [300, 302] }
+    stage: verify
+  notes: "two cfg-gated definitions of the same name (Linux vs. non-Linux) in the same file — margin ~0, verify expected; a returned range hitting either counts, but both being returned is a dedupe_defect since they occupy the same file"
+
+- id: self-P2-01
+  cat: P2
+  lang: en
+  query: "crates/repo-explorer-agent/src/verify.rs:35 what does this constant do"
+  expect:
+    primary_mode: all
+    primary:
+      - { path: crates/repo-explorer-agent/src/verify.rs, symbol: VERIFY_SYSTEM_PROMPT, span: [35, 43] }
+  notes: "no symbol token in the query text itself — cannot early-exit by construction (§2.1)"
+
+- id: self-P3-01
+  cat: P3
+  lang: en
+  query: 'where is the error "run `repo-explorer-mcp --update` to provision it" raised'
+  scope_hint: crates
+  expect:
+    primary_mode: any
+    primary:
+      - { path: crates/repo-explorer-mcp/src/main.rs, span: [144, 144] }
+      - { path: crates/repo-explorer-mcp/src/setup.rs, span: [343, 343] }
+      - { path: crates/repo-explorer-mcp/src/setup.rs, span: [386, 386] }
+
+- id: self-P4-01
+  cat: P4
+  lang: en
+  query: "who calls merge_and_rank"
+  scope_hint: crates
+  expect:
+    primary_mode: all
+    primary:
+      - { path: crates/repo-explorer-agent/src/pipeline.rs, symbol: merge_and_rank, span: [183, 183] }
+    acceptable:
+      - { path: crates/repo-explorer-core/src/retrieval.rs }
+
+- id: self-I1-01
+  cat: I1
+  lang: en
+  query: "why does a second identical call come back instantly without hitting the model"
+  scope_hint: crates
+  expect:
+    primary_mode: any
+    primary:
+      - { path: crates/repo-explorer-agent/src/agent.rs, span: [142, 152] }
+    acceptable:
+      - { path: crates/repo-explorer-agent/src/cache.rs }
+    stage: fallback
+  notes: "span is run()'s Stage-0 cache-lookup block (agent.rs), not query_cache_lookup's own definition (agent.rs:328) — deliberately no symbol: field to avoid implying otherwise"
+
+- id: self-I1-02
+  cat: I1
+  lang: en
+  query: "what stops the tool from searching outside the checkout"
+  scope_hint: crates
+  expect:
+    primary_mode: any
+    primary:
+      - { path: crates/repo-explorer-agent/src/dispatch.rs, symbol: escapes_repo_root, span: [193, 198] }
+      - { path: crates/repo-explorer-agent/src/pipeline.rs, span: [56, 59] }
+    stage: fallback
+
+- id: self-I1a-01
+  cat: I1a
+  lang: en
+  query: "the thing that strips additionalProperties for gemini"
+  scope_hint: crates
+  expect:
+    primary_mode: all
+    primary:
+      - { path: crates/repo-explorer-llm/src/lib.rs, symbol: strip_additional_properties, span: [444, 453] }
+    distractor:
+      - { path: crates/repo-explorer-agent/src/tools.rs }
+    stage: verify
+  notes: "distractor has 14 literal 'additionalProperties' hits — density bonus makes it a plausible wrong top candidate"
+
+- id: self-I2-01
+  cat: I2
+  lang: en
+  query: "Claude Code says the server exited instead of starting the setup wizard"
+  scope_hint: crates
+  expect:
+    primary_mode: any
+    primary:
+      - { path: crates/repo-explorer-mcp/src/main.rs, symbol: is_terminal, span: [93, 93] }
+    acceptable:
+      - { path: crates/repo-explorer-mcp/src/setup.rs }
+    stage: fallback
+
+- id: self-I2x-01
+  cat: I2x
+  lang: en
+  query: "how does the scope hint interact with the query cache key"
+  scope_hint: crates
+  expect:
+    primary_mode: all
+    primary:
+      - { path: crates/repo-explorer-agent/src/cache.rs, symbol: query_key, span: [164, 173] }
+      - { path: crates/repo-explorer-agent/src/pipeline.rs, span: [56, 59] }
+    stage: fallback
+
+- id: self-I3-01
+  cat: I3
+  sub: de
+  lang: de
+  query: "wo wird das tokenbudget geprüft und was passiert wenn es aufgebraucht ist"
+  scope_hint: crates
+  expect:
+    primary_mode: all
+    primary:
+      - { path: crates/repo-explorer-agent/src/agent.rs, symbol: TokenBudget, span: [52, 55] }
+      - { path: crates/repo-explorer-agent/src/agent.rs, symbol: forced_finish, span: [527, 558] }
+    stage: fallback
+  notes: "compound noun 'tokenbudget' intended — not in derive_patterns' identifier-splitting vocabulary"
+
+- id: self-I3-02
+  cat: I3
+  sub: typo
+  lang: en
+  query: "derivePatterns"
+  scope_hint: crates
+  expect:
+    primary_mode: all
+    primary:
+      - { path: crates/repo-explorer-core/src/retrieval.rs, symbol: derive_patterns, span: [150, 150] }
+  notes: "casing typo (camelCase vs snake_case) — 0 candidates expected, tests fallback recovery"
+
+- id: self-I4-01
+  cat: I4
+  lang: en
+  query: "how are errors surfaced to the MCP client"
+  scope_hint: crates
+  expect:
+    primary_mode: any
+    primary:
+      - { path: crates/repo-explorer-mcp/src/server.rs, span: [128, 144] }
+    acceptable:
+      - { path: crates/repo-explorer-mcp/src/main.rs }
+    stage: fallback
+
+- id: self-M-01
+  cat: M
+  lang: en
+  query: "all places where a tracing::info! line reports the exploration path"
+  scope_hint: crates
+  max_results: 10
+  expect:
+    primary_mode: all
+    primary:
+      - { path: crates/repo-explorer-agent/src/agent.rs, span: [151, 151] }
+      - { path: crates/repo-explorer-agent/src/agent.rs, span: [290, 290] }
+  notes: "exactly 2 matching lines at this pin — recall is necessarily 0, .5, or 1"
+
+- id: self-N-01
+  cat: N
+  sub: far
+  lang: en
+  query: "where is the SQLite schema migration"
+  scope_hint: crates
+  negative: { kind: far }
+  expect:
+    primary_mode: all
+    primary: []

@@ -1,0 +1,204 @@
+# Query corpus for the `requests` repo (docs/eval/real-world-test-plan.md §6.3).
+# Pin: dae7ef63b4df6eded86637f251fc4e3a06c3b479 (~/repos/eval-corpus/requests, psf/requests main
+# as of 2026-09-05). Ground truth verified against this exact pin on 2026-09-05 (Phase 0).
+#
+# Two entries drifted from the plan's 2026-09-04 hypothesis and were corrected here:
+# - requests-I1-02: rebuild_auth is at sessions.py:309 (recent commits added type hints that
+#   shifted lines), not :155 as guessed; :155 actually pointed near should_strip_auth (:154),
+#   which is the decision function rebuild_auth calls — both are now primary.
+# - requests-I3-02: the plan's "adapters.py" pointer was generic; BaseAdapter.send's abstract
+#   `timeout` parameter is at :132, but the actual timeout handling lives in HTTPAdapter.send
+#   (:634) where ConnectTimeoutError/ReadTimeoutError are caught (~:714) — set as primary,
+#   :132 as acceptable.
+# This is exactly the drift the plan's Phase-0 verification step exists to catch.
+#
+# All symbol-definition `span`s below are the FULL def-to-end-of-body extent (verified via
+# sibling-`def`-line boundaries), not just the `def` line, per §6.2's "definition start to end"
+# schema note. A def-line-only span was tried first and found (during Phase-0 harness smoke
+# testing against `self`) to wrongly fail range_hit's 3x/40-line-over-span cap, since the tool
+# correctly returns whole functions, not single lines — call-site references (P4 callers, P2
+# pastes) and single-line literals (P3) correctly stay single-line.
+
+- id: requests-P1-01
+  cat: P1
+  lang: en
+  query: "where is resolve_redirects defined"
+  expect:
+    primary_mode: all
+    primary:
+      - { path: src/requests/sessions.py, symbol: resolve_redirects, span: [186, 307] }
+  notes: "early-exit expected (unique definition); span verified via next sibling def (rebuild_auth:309)"
+
+- id: requests-P1-DE-01
+  cat: P1-DE
+  lang: de
+  query: "wo ist HTTPBasicAuth definiert"
+  expect:
+    primary_mode: all
+    primary:
+      - { path: src/requests/auth.py, symbol: HTTPBasicAuth, span: [85, 113] }
+
+- id: requests-P1d-01
+  cat: P1d
+  lang: en
+  query: "Session.request"
+  expect:
+    primary_mode: any
+    primary:
+      - { path: src/requests/sessions.py, symbol: request, span: [557, 653] }
+    distractor:
+      - { path: src/requests/api.py, symbol: request, span: [24, 71] }
+    stage: verify
+  notes: "dotted symbol splits into two identifiers; api.py also defines a top-level `request` — verify expected, not early-exit"
+
+- id: requests-P2-01
+  cat: P2
+  lang: en
+  query: "src/requests/models.py what does prepare_url do"
+  expect:
+    primary_mode: all
+    primary:
+      - { path: src/requests/models.py, symbol: prepare_url, span: [483, 563] }
+  notes: "contains a symbol token (prepare_url) — early-exit on the correct file is possible despite being a P2 query"
+
+- id: requests-P3-01
+  cat: P3
+  lang: en
+  query: 'where does the error text "Invalid URL" come from'
+  expect:
+    primary_mode: any
+    primary:
+      - { path: src/requests/models.py, span: [517, 517] }
+      - { path: src/requests/models.py, span: [522, 522] }
+
+- id: requests-P4-01
+  cat: P4
+  lang: en
+  query: "who calls dispatch_hook"
+  expect:
+    primary_mode: all
+    primary:
+      - { path: src/requests/sessions.py, symbol: dispatch_hook, span: [791, 791] }
+    acceptable:
+      - { path: src/requests/hooks.py, symbol: dispatch_hook, span: [32, 48] }
+  notes: "models.py does NOT call dispatch_hook (only sessions.py does) — a finding there would be a rank/precision miss, not a hit"
+
+- id: requests-I1-01
+  cat: I1
+  lang: en
+  query: "where does the library decide to follow a 3xx and re-send the request"
+  expect:
+    primary_mode: any
+    primary:
+      - { path: src/requests/sessions.py, symbol: resolve_redirects, span: [186, 186] }
+    stage: fallback
+  notes: "grep legs: library, decide, follow, 3xx, send, request — 'request' has >25 hits/file in this repo and is expected to be dropped by rtk's per-file cap (F-02)"
+
+- id: requests-I1-02
+  cat: I1
+  lang: en
+  query: "something removes the Authorization header when a redirect hops to another host"
+  expect:
+    primary_mode: any
+    primary:
+      - { path: src/requests/sessions.py, symbol: rebuild_auth, span: [309, 332] }
+      - { path: src/requests/sessions.py, symbol: should_strip_auth, span: [154, 184] }
+    stage: fallback
+  notes: "CORRECTED from the plan's :155 guess — see file header. should_strip_auth decides, rebuild_auth deletes the header"
+
+- id: requests-I1a-01
+  cat: I1a
+  lang: en
+  query: "how does basic auth get attached to a request"
+  expect:
+    primary_mode: any
+    primary:
+      - { path: src/requests/auth.py, symbol: HTTPBasicAuth, span: [85, 113] }
+      - { path: src/requests/models.py, symbol: prepare_auth, span: [670, 697] }
+    stage: verify
+
+- id: requests-I2-01
+  cat: I2
+  lang: en
+  query: "my proxy settings from the shell are being ignored"
+  expect:
+    primary_mode: any
+    primary:
+      - { path: src/requests/sessions.py, symbol: merge_environment_settings, span: [831, 868] }
+      - { path: src/requests/utils.py, symbol: get_environ_proxies, span: [873, 882] }
+    acceptable:
+      - { path: src/requests/sessions.py, span: [330, 330] }
+      - { path: src/requests/sessions.py, span: [353, 353] }
+    stage: fallback
+  notes: "acceptable entries are the two trust_env use sites feeding into the primaries"
+
+- id: requests-I2x-01
+  cat: I2x
+  lang: en
+  query: "where do cookies from a redirect response get merged into the session jar"
+  expect:
+    primary_mode: all
+    primary:
+      - { path: src/requests/sessions.py, symbol: resolve_redirects, span: [186, 186] }
+      - { path: src/requests/cookies.py }
+    stage: fallback
+
+- id: requests-I3-01
+  cat: I3
+  sub: de
+  lang: de
+  query: "wo ist die fehlerbehandlung für zeitüberschreitungen"
+  expect:
+    primary_mode: any
+    primary:
+      - { path: src/requests/adapters.py, symbol: send, span: [634, 748] }
+    stage: fallback
+  notes: "compound noun 'zeitüberschreitungen' (timeouts) — not a derive_patterns stopword"
+
+- id: requests-I3-02
+  cat: I3
+  sub: typo
+  lang: en
+  query: "resolveRedirects"
+  expect:
+    primary_mode: all
+    primary:
+      - { path: src/requests/sessions.py, symbol: resolve_redirects, span: [186, 186] }
+  notes: "casing typo — 0 candidates expected"
+
+- id: requests-I4-01
+  cat: I4
+  lang: en
+  query: "where do I start reading if I want to follow a requests.get call down to the socket"
+  expect:
+    primary_mode: all
+    primary:
+      - { path: src/requests/api.py, symbol: get, span: [74, 87] }
+      - { path: src/requests/sessions.py, symbol: request, span: [557, 653] }
+      - { path: src/requests/adapters.py, symbol: send, span: [634, 748] }
+    stage: fallback
+
+- id: requests-M-01
+  cat: M
+  lang: en
+  query: "all exception classes raised for connection problems"
+  max_results: 10
+  expect:
+    primary_mode: all
+    primary:
+      - { path: src/requests/exceptions.py, symbol: ConnectionError, span: [70, 71] }
+      - { path: src/requests/exceptions.py, symbol: ProxyError, span: [74, 75] }
+      - { path: src/requests/exceptions.py, symbol: SSLError, span: [78, 79] }
+      - { path: src/requests/exceptions.py, symbol: ConnectTimeout, span: [91, 95] }
+    acceptable:
+      - { path: src/requests/exceptions.py, symbol: Timeout, span: [82, 88] }
+
+- id: requests-N-01
+  cat: N
+  sub: far
+  lang: en
+  query: "where is HTTP/2 stream multiplexing implemented"
+  negative: { kind: far }
+  expect:
+    primary_mode: all
+    primary: []

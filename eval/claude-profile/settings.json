@@ -1,0 +1,3 @@
+{
+  "_comment": "Template only (docs/eval/real-world-test-plan.md §8.3). No plugins, hooks, or rules — Layer C measures the tool's effect, not this user's Claude Code setup. eval/claude_loop.sh copies this into a fresh CLAUDE_CONFIG_DIR at run time alongside a copied .credentials.json and a minimal .claude.json (both git-ignored, never committed)."
+}

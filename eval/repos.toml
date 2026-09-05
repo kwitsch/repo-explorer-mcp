@@ -1,0 +1,35 @@
+# Pilot-scope repository registry for docs/eval/real-world-test-plan.md.
+# Only self + requests are populated (the "pilot first" scope, Phases 0-1). The remaining
+# Tier-1/Tier-2 repos from the plan (§5) are added here only if/when the pilot is extended.
+#
+# `pin` is the commit each repo is checked out at (`git checkout --detach <pin>`) before every
+# run; `path` is the clone location outside this workspace. `git_probe_ms` is the Phase-0
+# measurement from §5 step 1 (median of 5 warm `git status --porcelain && git diff HEAD` runs) —
+# used as the cache-latency threshold in §7.5. `files`/`loc_by_ext` are the Phase-0 probe from
+# §5 step 1 too.
+
+[[repo]]
+id = "self"
+tier = 1
+lang = "rust"
+url = "file:///home/kwitsch/repos/repo-explorer-mcp"
+branch = "main"
+pin = "91eebde05c9cf761d1226c8658994edbf18e872c"
+shallow = false
+path = "~/repos/eval-corpus/self"
+files = 76
+git_probe_ms = 2
+notes = "dogfood; exact ground truth; author bias; all queries use scope_hint=crates (§3.2, corpus contamination)"
+
+[[repo]]
+id = "requests"
+tier = 1
+lang = "python"
+url = "https://github.com/psf/requests"
+branch = "main"
+pin = "dae7ef63b4df6eded86637f251fc4e3a06c3b479"
+shallow = false
+path = "~/repos/eval-corpus/requests"
+files = 130
+git_probe_ms = 2
+notes = "canonical small lib; typed; decorators, hooks"

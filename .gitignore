@@ -5,3 +5,14 @@
 .vscode/
 .idea/
 .DS_Store
+
+# Real-world eval (docs/eval/real-world-test-plan.md §3.2, §14): run output is reproducible from
+# eval/ + the pinned repos, never worth committing, and may contain query/response text from
+# private corpora (e.g. the `plugins` repo).
+/results
+
+# Runtime-only Claude Code profile for eval Layer C (§8.3) — a copied OAuth credential, never a
+# secret meant for this repo.
+/eval/claude-profile/.credentials.json
+/eval/claude-profile/.claude.json
+__pycache__/

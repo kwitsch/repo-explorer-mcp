@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "repo-explorer-mcp": {
+      "command": "/home/kwitsch/.local/bin/repo-explorer-mcp",
+      "args": [],
+      "env": {
+        "REPO_EXPLORER_CONFIG": "/home/kwitsch/repos/repo-explorer-mcp/eval/config/default.toml",
+        "NO_COLOR": "1"
+      }
+    }
+  }
+}
