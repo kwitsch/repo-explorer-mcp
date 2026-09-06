@@ -111,6 +111,11 @@ api_key_env = "ANTHROPIC_API_KEY"   # names an env var; never the key itself
                                     # omit it to use the kind's default var
 # Ordered model list: the first is tried first; on a usage-limit error the
 # router advances to the next model, then to the next provider entry.
+# Exception: a gemini/google entry instead rotates which model it starts at
+# on every request (still failing over through the rest of the list on a
+# usage-limit error), since Gemini's per-model rate limits are unusually
+# tight and spreading requests across the configured models up front reduces
+# the error rate.
 models = ["claude-sonnet-4", "claude-haiku-4"]
 
 [[llm.providers]]

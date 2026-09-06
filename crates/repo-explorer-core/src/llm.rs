@@ -145,6 +145,17 @@ pub struct CallOptions {
     pub force_tool: Option<String>,
     /// Cap the completion length, where the provider supports it.
     pub max_tokens: Option<u32>,
+    /// Which rotated start-model index a rotating entry (see
+    /// `ProviderRouter::with_clock_and_rotation`) should use for this call,
+    /// modulo that entry's model count. The caller must generate one fresh
+    /// value per top-level conversation (e.g. one `explore_repository` call)
+    /// and pass the SAME value on every raw `complete_with_tools` call that
+    /// conversation makes — otherwise a later turn can rotate onto a
+    /// different model than an earlier turn already committed
+    /// provider-specific continuation state to (e.g. Gemini thought
+    /// signatures), which the new model may reject. `None` behaves like a
+    /// fixed-order entry (starts at model 0).
+    pub rotation_seed: Option<usize>,
 }
 
 /// Provider-call failures. Fully comparable so mock-based tests can `assert_eq!`
@@ -265,10 +276,21 @@ impl<P> ModelSlot<P> {
     }
 }
 
+/// One `(name, models, rotate_start)` entry config, as accepted by
+/// `ProviderRouter::new_with_rotation`/`with_clock_and_rotation` — see
+/// `with_clock_and_rotation` for what `rotate_start` does.
+pub type RotatingEntryConfig<P> = (String, Vec<(String, P)>, bool);
+
 /// One provider entry: a name plus its ordered model slots.
 struct Entry<P> {
     name: String,
     models: Vec<ModelSlot<P>>,
+    /// When true, this entry's failover start point is `options.rotation_seed
+    /// % models.len()` instead of always `models[0]` — see
+    /// `with_clock_and_rotation`. The seed is caller-supplied (via
+    /// `CallOptions`) rather than tracked here, so that every raw call within
+    /// one conversation can be made to agree on the same start model.
+    rotate_start: bool,
 }
 
 /// Failover router over an ordered set of providers of one concrete type.
@@ -289,18 +311,50 @@ impl<P: LlmProvider> ProviderRouter<P, SystemClock> {
     pub fn new(providers: Vec<(String, Vec<(String, P)>)>, cooldown_seconds: u64) -> Self {
         Self::with_clock(providers, cooldown_seconds, SystemClock)
     }
+
+    /// Like `new`, but each entry carries a `rotate_start` flag — see
+    /// `with_clock_and_rotation`.
+    pub fn new_with_rotation(
+        providers: Vec<RotatingEntryConfig<P>>,
+        cooldown_seconds: u64,
+    ) -> Self {
+        Self::with_clock_and_rotation(providers, cooldown_seconds, SystemClock)
+    }
 }
 
 impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
-    /// Construct with an explicit clock (tests inject a `FakeClock`).
+    /// Construct with an explicit clock (tests inject a `FakeClock`). No entry
+    /// rotates its start model.
     pub fn with_clock(
         providers: Vec<(String, Vec<(String, P)>)>,
         cooldown_seconds: u64,
         clock: C,
     ) -> Self {
+        Self::with_clock_and_rotation(
+            providers.into_iter().map(|(n, m)| (n, m, false)).collect(),
+            cooldown_seconds,
+            clock,
+        )
+    }
+
+    /// Like `with_clock`, but each entry carries a `rotate_start` flag: when
+    /// true, a call's `CallOptions::rotation_seed` (not tracked by the
+    /// router — see that field's doc comment) picks that entry's failover
+    /// start point instead of always starting at `models[0]`, so a caller
+    /// that hands out a fresh seed per top-level conversation spreads its
+    /// calls across the configured models — e.g. with models `m1, m2, m3`,
+    /// seed 0 tries `m1 -> m2 -> m3`, seed 1 `m2 -> m3 -> m1`, seed 2
+    /// `m3 -> m1 -> m2`. Intended for Gemini entries, whose per-model rate
+    /// limits are unusually tight; every other provider kind passes `false`
+    /// and keeps the fixed configured order regardless of any seed passed.
+    pub fn with_clock_and_rotation(
+        providers: Vec<RotatingEntryConfig<P>>,
+        cooldown_seconds: u64,
+        clock: C,
+    ) -> Self {
         let entries = providers
             .into_iter()
-            .map(|(name, models)| Entry {
+            .map(|(name, models, rotate_start)| Entry {
                 name,
                 models: models
                     .into_iter()
@@ -310,6 +364,7 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
                         cooling_until: std::sync::Mutex::new(None),
                     })
                     .collect(),
+                rotate_start,
             })
             .collect();
         Self {
@@ -341,7 +396,20 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
         let mut limited: Vec<String> = Vec::new();
 
         for entry in &self.entries {
-            for slot in &entry.models {
+            let model_count = entry.models.len();
+            if model_count == 0 {
+                continue;
+            }
+            // Rotating entries start at the caller-supplied seed (see
+            // `with_clock_and_rotation` and `CallOptions::rotation_seed`);
+            // others always start at index 0, i.e. the configured order.
+            let start = if entry.rotate_start {
+                options.rotation_seed.unwrap_or(0) % model_count
+            } else {
+                0
+            };
+            for offset in 0..model_count {
+                let slot = &entry.models[(start + offset) % model_count];
                 {
                     let mut guard = slot.lock_cooling();
                     match *guard {
@@ -1012,5 +1080,67 @@ mod tests {
             .await;
         assert_eq!(third, Ok(text("a recovered")));
         assert_eq!(a.calls().len(), 2, "a retried after cooldown elapsed");
+    }
+
+    #[tokio::test]
+    async fn rotating_entry_starts_at_the_callers_seed() {
+        // Regression: Gemini's tight per-model rate limits are spread out by
+        // letting the caller pick which model a rotating entry starts at
+        // (one fresh seed per top-level conversation — see
+        // `CallOptions::rotation_seed`), instead of always hammering the
+        // first configured model.
+        let a = MockLlmProvider::new().with_fallback(Ok(text("from a")));
+        let b = MockLlmProvider::new().with_fallback(Ok(text("from b")));
+        let c = MockLlmProvider::new().with_fallback(Ok(text("from c")));
+        let router = ProviderRouter::new_with_rotation(
+            vec![(
+                "gemini".to_string(),
+                vec![
+                    ("a".to_string(), a.clone()),
+                    ("b".to_string(), b.clone()),
+                    ("c".to_string(), c.clone()),
+                ],
+                true,
+            )],
+            60,
+        );
+
+        for (seed, expected) in [(0, "from a"), (1, "from b"), (2, "from c"), (3, "from a")] {
+            let options = CallOptions {
+                rotation_seed: Some(seed),
+                ..Default::default()
+            };
+            let got = router.complete_with_tools(&[], &[], &options).await;
+            assert_eq!(got, Ok(text(expected)));
+        }
+    }
+
+    #[tokio::test]
+    async fn rotating_entry_ignores_seed_changes_within_a_call_but_not_across_calls() {
+        // The whole point of a caller-supplied (rather than router-tracked)
+        // seed: reusing the same seed for every raw call of one conversation
+        // keeps that conversation's start model stable, no matter how many
+        // turns it takes — only a genuinely new seed (a new conversation)
+        // moves the start point.
+        let a = MockLlmProvider::new().with_fallback(Ok(text("from a")));
+        let b = MockLlmProvider::new().with_fallback(Ok(text("from b")));
+        let router = ProviderRouter::new_with_rotation(
+            vec![(
+                "gemini".to_string(),
+                vec![("a".to_string(), a.clone()), ("b".to_string(), b.clone())],
+                true,
+            )],
+            60,
+        );
+        let same_seed = CallOptions {
+            rotation_seed: Some(1),
+            ..Default::default()
+        };
+
+        // Two "turns" of one conversation, same seed: both land on `b`.
+        for _ in 0..2 {
+            let got = router.complete_with_tools(&[], &[], &same_seed).await;
+            assert_eq!(got, Ok(text("from b")));
+        }
     }
 }

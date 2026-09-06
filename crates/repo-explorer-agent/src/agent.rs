@@ -55,15 +55,28 @@ pub(crate) struct TokenBudget {
     /// Number of `Completion`s returned to the agent so far this run —
     /// exists purely to be logged on `exploration complete`.
     llm_calls: u32,
+    /// This run's `CallOptions::rotation_seed` — one value picked by `run`
+    /// per top-level conversation and reused by every raw
+    /// `complete_with_tools` call the verification stage and the fallback
+    /// loop make for it (piggybacked on `TokenBudget` since it's already
+    /// threaded to every call site that builds `CallOptions`), so a rotating
+    /// entry's start model stays stable across that conversation's turns —
+    /// see `CallOptions::rotation_seed`'s doc comment for why that matters.
+    rotation_seed: usize,
 }
 
 impl TokenBudget {
-    pub(crate) fn new(limit: u64) -> Self {
+    pub(crate) fn new(limit: u64, rotation_seed: usize) -> Self {
         Self {
             limit,
             spent: 0,
             llm_calls: 0,
+            rotation_seed,
         }
+    }
+
+    pub(crate) fn rotation_seed(&self) -> usize {
+        self.rotation_seed
     }
 
     pub(crate) fn add(&mut self, usage: Option<TokenUsage>) {
@@ -109,6 +122,9 @@ where
     settings: AgentSettings,
     cache: Option<ResultCache>,
     caps: RenderCaps,
+    /// Advanced once per `run` call to hand each conversation a fresh
+    /// `CallOptions::rotation_seed` (see `TokenBudget::rotation_seed`).
+    rotation_seed: std::sync::atomic::AtomicUsize,
 }
 
 impl<M, S, P, R, C> AgentLoop<M, S, P, R, C>
@@ -142,6 +158,7 @@ where
             settings,
             cache,
             caps,
+            rotation_seed: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -234,7 +251,14 @@ where
             (!combined.is_empty()).then_some(combined)
         };
 
-        let mut budget = TokenBudget::new(self.settings.token_budget);
+        // One fresh seed per conversation — reused (via `budget`) by every
+        // raw provider call the verification stage and the fallback loop
+        // make for this `run`, so a rotating entry's start model can't move
+        // mid-conversation (see `TokenBudget::rotation_seed`).
+        let rotation_seed = self
+            .rotation_seed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut budget = TokenBudget::new(self.settings.token_budget, rotation_seed);
 
         // Stage 3: early exit — the pre-stage already answered. Guarded by
         // has_exact_symbol_match: high confidence alone isn't proof the query
@@ -547,9 +571,13 @@ where
                 turn_limit_hit = false;
                 break;
             }
+            let options = CallOptions {
+                rotation_seed: Some(budget.rotation_seed()),
+                ..Default::default()
+            };
             match self
                 .router
-                .complete_with_tools(&messages, tools, &CallOptions::default())
+                .complete_with_tools(&messages, tools, &options)
                 .await
             {
                 Ok(completion) => {
@@ -691,7 +719,11 @@ where
         ));
         match self
             .router
-            .complete_with_tools(messages, finish_only_catalog(), &force_finish_options())
+            .complete_with_tools(
+                messages,
+                finish_only_catalog(),
+                &force_finish_options(budget),
+            )
             .await
         {
             Ok(completion) => {
@@ -838,10 +870,13 @@ pub(crate) fn push_nudge(messages: &mut Vec<Message>, assistant: Message, nudge:
 
 /// Call options that force the `finish` tool — the shape shared by this
 /// loop's `forced_finish` and the verification stage's last-turn call.
-pub(crate) fn force_finish_options() -> CallOptions {
+/// Carries `budget`'s rotation seed so this call agrees with every other
+/// call of the same conversation on a rotating entry's start model.
+pub(crate) fn force_finish_options(budget: &TokenBudget) -> CallOptions {
     CallOptions {
         force_tool: Some("finish".to_string()),
         max_tokens: None,
+        rotation_seed: Some(budget.rotation_seed()),
     }
 }
 
@@ -1376,14 +1411,14 @@ mod tests {
 
     #[test]
     fn token_budget_boundaries() {
-        let mut b = TokenBudget::new(0);
+        let mut b = TokenBudget::new(0, 0);
         b.add(Some(TokenUsage {
             prompt_tokens: u64::MAX,
             completion_tokens: 1,
         }));
         assert!(!b.exhausted(), "0 means unlimited");
 
-        let mut b = TokenBudget::new(10);
+        let mut b = TokenBudget::new(10, 0);
         assert!(!b.exhausted());
         b.add(None);
         assert!(!b.exhausted());
@@ -1420,5 +1455,63 @@ mod tests {
             preamble.contains("Scope hint: src"),
             "a valid in-root scope hint must still be rendered: {preamble}"
         );
+    }
+
+    #[tokio::test]
+    async fn rotating_router_keeps_one_conversations_turns_on_the_same_model() {
+        // Regression: a caller-supplied rotation seed (see
+        // `ProviderRouter::with_clock_and_rotation`) must stay fixed for
+        // every raw provider call one `run()` conversation makes. Before
+        // `TokenBudget::rotation_seed` pinned it, each raw call re-derived
+        // its own rotation, so a later turn of the SAME exploration could
+        // land on a different rotated model than an earlier turn already
+        // committed provider-specific continuation state to (e.g. Gemini
+        // thought signatures) — exactly the failure this pins down.
+        let bogus_call = ToolCall {
+            id: "c0".to_string(),
+            name: "not_a_real_tool".to_string(),
+            arguments_json: "{}".to_string(),
+            thought_signatures: None,
+        };
+        let a = MockLlmProvider::new().with_responses(vec![
+            tool_calls(vec![bogus_call]),
+            tool_calls(vec![finish_call()]),
+        ]);
+        let b = MockLlmProvider::new();
+        let router = ProviderRouter::new_with_rotation(
+            vec![(
+                "gemini".to_string(),
+                vec![("a".to_string(), a.clone()), ("b".to_string(), b.clone())],
+                true,
+            )],
+            60,
+        );
+        let agent = AgentLoop::new(
+            MockMemoryBackend::new(),
+            MockSearchBackend::new(),
+            router,
+            MockRepoStateProbe::new(),
+            AgentSettings::default(),
+            CacheSettings::default(),
+        );
+        let query = ExplorationQuery {
+            text: "where is main".to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let dir = temp_repo("rotation_stable_within_conversation");
+        let got = agent.run(&dir, &query).await.unwrap();
+        assert_eq!(got.summary, "done");
+        assert_eq!(
+            a.calls().len(),
+            2,
+            "both turns of one conversation must land on the model the seed picked"
+        );
+        assert_eq!(
+            b.calls().len(),
+            0,
+            "the rotation seed must not move mid-conversation"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
