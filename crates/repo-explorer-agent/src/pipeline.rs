@@ -10,7 +10,7 @@ use repo_explorer_core::domain::{
 use repo_explorer_core::fingerprint::RepoFingerprint;
 use repo_explorer_core::memory::{GraphQuery, MemoryBackend};
 use repo_explorer_core::retrieval::{
-    confidence, derive_patterns, is_symbol_token, leg_identifiers, merge_and_rank,
+    QueryPatterns, confidence, derive_patterns, leg_identifiers, merge_and_rank,
 };
 use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use std::collections::HashSet;
@@ -34,10 +34,20 @@ pub(crate) struct RetrievalOutcome {
     pub candidates: Vec<Candidate>,
     /// 0-100; see `repo_explorer_core::retrieval::confidence`.
     pub confidence: u32,
-    /// True when the query text contains at least one symbol-shaped token
-    /// (see `repo_explorer_core::retrieval::is_symbol_token`). Gates the Stage 3
-    /// early-exit route: a query that names no symbol can never early-exit (F-16).
-    pub has_symbol_token: bool,
+    /// True when a ranked candidate is a genuine, backend-confirmed exact
+    /// symbol match for a token the user typed as a standalone query word —
+    /// not merely a fragment pulled out of decomposing a path/qualified-name
+    /// compound. Gates the Stage 3 early-exit route (F-16).
+    ///
+    /// The token's *shape* (snake_case/camelCase/digit-bearing) used to gate
+    /// this instead, which wrongly rejected a real, exact match on an
+    /// all-lowercase symbol name like `verify`. The backend confirming the
+    /// match is the trustworthy signal — except when that match is only
+    /// incidental to a path reference elsewhere in the query (e.g.
+    /// `.../verify.rs:35 what does this constant do` coincidentally matching
+    /// the real `verify` module), which is what produced the original F-16
+    /// false early-exit and is still excluded via `is_trusted_symbol_match`.
+    pub has_exact_symbol_match: bool,
     /// True when the query's top-level `scope_hint` was present but escapes
     /// the repository root (`dispatch::escapes_repo_root`), and was therefore
     /// dropped for every leg above. Computed once here so `agent::run`'s
@@ -214,13 +224,29 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
 
     let candidates = merge_and_rank(raw, &patterns, top_k);
     let confidence = confidence(&candidates);
-    let has_symbol_token = patterns.identifiers.iter().any(|t| is_symbol_token(t));
+    let has_exact_symbol_match = candidates
+        .iter()
+        .any(|c| is_trusted_symbol_match(c, &patterns));
     RetrievalOutcome {
         candidates,
         confidence,
-        has_symbol_token,
+        has_exact_symbol_match,
         scope_hint_escaped,
     }
+}
+
+/// A `SymbolExact` candidate is trustworthy for the early-exit gate only when
+/// its matched name was typed as a standalone query word, not merely a
+/// fragment extracted from decomposing a path/qualified-name compound (F-16:
+/// `.../verify.rs:35 what does this constant do` coincidentally matches the
+/// real `verify` module via the path's own basename, but the query never
+/// named `verify` as a symbol to look up).
+fn is_trusted_symbol_match(candidate: &Candidate, patterns: &QueryPatterns) -> bool {
+    candidate.kind == CandidateKind::SymbolExact
+        && candidate.symbol.as_deref().is_some_and(|name| {
+            let matched = last_segment(name);
+            !patterns.path_tokens.iter().any(|p| p.contains(matched))
+        })
 }
 
 /// Wrap a leg future with the leg cache: return the memoized candidates when
@@ -455,26 +481,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retrieve_sets_has_symbol_token_true_for_snake_case() {
-        let memory = MockMemoryBackend::new();
+    async fn retrieve_sets_has_exact_symbol_match_true_for_standalone_lowercase_symbol() {
+        // F-16: "verify" is all-lowercase with no underscore/digit, so the old
+        // is_symbol_token shape check would have rejected it — but the symbol
+        // leg confirms a real exact match on it as a standalone query word, so
+        // it must be trusted regardless of shape.
+        let memory = MockMemoryBackend::new().with_search_graph_result(Ok(ExplorationResult {
+            findings: vec![finding(
+                "crates/repo-explorer-agent/src/verify.rs",
+                10,
+                Some("verify"),
+            )],
+            summary: "1 row".to_string(),
+        }));
         let search = MockSearchBackend::new().with_search_result(Ok(vec![]));
         let query = ExplorationQuery {
-            text: "decide_freshness".to_string(),
+            text: "explain verify".to_string(),
             scope_hint: None,
             max_results: None,
         };
         let out = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
+        assert_eq!(out.candidates[0].kind, CandidateKind::SymbolExact);
         assert!(
-            out.has_symbol_token,
-            "a snake_case query names a symbol and must set has_symbol_token"
+            out.has_exact_symbol_match,
+            "a real exact symbol hit on a standalone query word must be trusted regardless of token shape"
         );
     }
 
     #[tokio::test]
-    async fn retrieve_sets_has_symbol_token_false_for_symbol_free_query() {
+    async fn retrieve_sets_has_exact_symbol_match_false_when_no_symbol_leg_hit() {
         // The F-16 self-P2-01 repro: every token is a path segment or a long
-        // prose word (crates/repo/explorer/agent/verify/constant) — none is
-        // snake_case / camelCase / digit-bearing, so has_symbol_token is false.
+        // prose word, and no backend match ever comes back (default empty
+        // search_graph result), so there is no exact symbol match to trust.
         let memory = MockMemoryBackend::new();
         let search = MockSearchBackend::new().with_search_result(Ok(vec![]));
         let query = ExplorationQuery {
@@ -485,8 +523,38 @@ mod tests {
         };
         let out = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
         assert!(
-            !out.has_symbol_token,
-            "a query with only prose/path tokens must not set has_symbol_token"
+            !out.has_exact_symbol_match,
+            "a query with no confirmed symbol match must not set has_exact_symbol_match"
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieve_does_not_trust_symbol_match_that_is_only_a_path_fragment() {
+        // F-16 self-P2-01 repro, with the backend now confirming an exact
+        // match: "crates" is only a fragment of the path token
+        // "crates/.../verify.rs", not a standalone query word — an incidental
+        // match must not be trusted for early-exit, since the query never
+        // named "crates" as a symbol to look up.
+        let memory = MockMemoryBackend::new().with_search_graph_result(Ok(ExplorationResult {
+            findings: vec![finding(
+                "crates/repo-explorer-agent/src/verify.rs",
+                35,
+                Some("crates"),
+            )],
+            summary: "1 row".to_string(),
+        }));
+        let search = MockSearchBackend::new().with_search_result(Ok(vec![]));
+        let query = ExplorationQuery {
+            text: "crates/repo-explorer-agent/src/verify.rs:35 what does this constant do"
+                .to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let out = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
+        assert_eq!(out.candidates[0].kind, CandidateKind::SymbolExact);
+        assert!(
+            !out.has_exact_symbol_match,
+            "a symbol match that is only a path fragment must not be trusted for early-exit"
         );
     }
 

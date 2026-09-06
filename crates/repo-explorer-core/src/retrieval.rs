@@ -364,17 +364,24 @@ fn canonical_coverage_key(s: &str) -> String {
     out
 }
 
-/// Number of distinct query identifiers/literals (pre-lowercased by the
-/// caller) appearing in the candidate's symbol, path, or snippet.
+/// Coverage-matching floor: a canonical key shorter than this is too short
+/// for a safe substring match. Folding strips underscores, so a short
+/// snake_case identifier that clears the 3-char identifier-like floor (e.g.
+/// `a_b`, `id_x`, `s_id`) can collapse to a 2-3 char key (`ab`, `idx`, `sid`)
+/// that then coincidentally substring-matches unrelated candidate text
+/// (F-15).
+const MIN_COVERAGE_KEY_LEN: usize = 4;
+
+/// Number of distinct query identifiers/literals (already folded via
+/// `canonical_coverage_key` by the caller, short keys excluded) appearing in
+/// the candidate's symbol, path, or snippet.
 fn coverage(candidate: &Candidate, lowered_patterns: &[String]) -> u32 {
-    let mut haystack = format!(
+    let haystack = canonical_coverage_key(&format!(
         "{} {} {}",
         candidate.symbol.as_deref().unwrap_or(""),
         candidate.location.path.to_string_lossy(),
         candidate.snippet.as_deref().unwrap_or("")
-    );
-    haystack.make_ascii_lowercase();
-    haystack.retain(|c| c != '_');
+    ));
     lowered_patterns
         .iter()
         .filter(|token| haystack.contains(token.as_str()))
@@ -445,10 +452,15 @@ pub fn merge_and_rank(raw: Vec<Candidate>, patterns: &QueryPatterns, top_k: u32)
     // deduped post-canonicalization so a term repeated under different casing
     // or convention (or as both identifier and literal, or as an original and
     // its case-fold variant) isn't double-counted by coverage()'s
-    // distinct-match contract.
+    // distinct-match contract. A key that folds below MIN_COVERAGE_KEY_LEN is
+    // dropped entirely rather than handed to coverage()'s substring match
+    // (F-15).
     let mut lowered_patterns: Vec<String> = Vec::new();
     for token in patterns.identifiers.iter().chain(patterns.literals.iter()) {
-        push_unique(&mut lowered_patterns, canonical_coverage_key(token));
+        let key = canonical_coverage_key(token);
+        if key.len() >= MIN_COVERAGE_KEY_LEN {
+            push_unique(&mut lowered_patterns, key);
+        }
     }
 
     let mut normalized: Vec<Candidate> = raw
@@ -970,6 +982,19 @@ mod tests {
             ranked[0].score,
             kind_base_score(CandidateKind::ContentHit) + 30
         );
+    }
+
+    #[test]
+    fn short_folded_key_does_not_substring_match_unrelated_text() {
+        // F-15: "s_id" clears the 3-char identifier-like floor and folds to
+        // "sid" (3 chars), which is a substring of "considering" purely by
+        // coincidence. An unrelated candidate must not get the identifier
+        // coverage boost from that collision.
+        let p = derive_patterns("s_id");
+        let mut c = candidate("a.rs", 1, 1, CandidateKind::ContentHit);
+        c.snippet = Some("considering the options".to_string());
+        let ranked = merge_and_rank(vec![c], &p, 10);
+        assert_eq!(ranked[0].score, kind_base_score(CandidateKind::ContentHit));
     }
 
     // --- confidence boundaries ---

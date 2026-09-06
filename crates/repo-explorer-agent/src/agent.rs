@@ -237,13 +237,14 @@ where
         let mut budget = TokenBudget::new(self.settings.token_budget);
 
         // Stage 3: early exit — the pre-stage already answered. Guarded by
-        // has_symbol_token: a query that names no symbol-shaped token can never
-        // early-exit, even at high confidence — a coincidental path/prose match
-        // is not proof the query named a real code symbol (F-16).
+        // has_exact_symbol_match: high confidence alone isn't proof the query
+        // named a real code symbol — a coincidental path/prose match must not
+        // early-exit, even though a genuine exact symbol match should, whatever
+        // the matched token's case/shape (F-16).
         if outcome.confidence >= self.settings.early_exit_confidence
             && !outcome.candidates.is_empty()
         {
-            if outcome.has_symbol_token {
+            if outcome.has_exact_symbol_match {
                 let result = self.result_from_candidates(
                     outcome.candidates,
                     query,
@@ -264,7 +265,7 @@ where
             }
             tracing::info!(
                 confidence = outcome.confidence,
-                "early-exit vetoed: query has no symbol-shaped token"
+                "early-exit vetoed: no trusted exact symbol match"
             );
         }
 
@@ -1200,14 +1201,14 @@ mod tests {
 
     #[tokio::test]
     async fn symbol_free_query_is_vetoed_from_early_exit() {
-        // Regression: F-16 — a query that names no symbol-shaped token
-        // (snake_case / camelCase / digit-bearing) must never take the
-        // deterministic early-exit route, even when a coincidental candidate
-        // clears the confidence threshold. The self-P2-01 repro string tokenizes
-        // to only path segments / long prose words (crates, repo, explorer,
-        // agent, verify, constant) — zero symbol tokens — so has_symbol_token is
-        // false and the Stage 3 gate is vetoed. A lone SymbolExact candidate here
-        // scores >= 90, so the guard (not the confidence check) is the blocker.
+        // Regression: F-16 — the self-P2-01 repro string names a file path,
+        // not a symbol to look up ("what does this constant do"). The symbol
+        // leg still comes back with an exact match on "crates" only because
+        // it's a fragment of that path, not because the query deliberately
+        // named a "crates" symbol — is_trusted_symbol_match excludes a match
+        // that's just a path fragment, so has_exact_symbol_match stays false
+        // and the Stage 3 gate is vetoed even though a lone SymbolExact
+        // candidate here scores >= early_exit_confidence (90).
         let memory = MockMemoryBackend::new().with_search_graph_result(Ok(ExplorationResult {
             findings: vec![ExplorationFinding {
                 location: FileLocation {
@@ -1218,7 +1219,10 @@ mod tests {
                 snippet: None,
                 // Last segment "crates" == the query's first symbol-lookup token,
                 // so the symbol leg classifies this as SymbolExact -> confidence
-                // clears early_exit_confidence (90). Only the guard blocks it.
+                // clears early_exit_confidence (90). But "crates" is also a
+                // fragment of the query's own path token
+                // ("crates/repo-explorer-agent/src/verify.rs"), so the guard
+                // (not the confidence check) is what blocks early-exit here.
                 note: Some("crates".to_string()),
             }],
             summary: "1 row".to_string(),
