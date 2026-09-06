@@ -286,7 +286,11 @@ pub(crate) async fn read_file_canonical(
 /// (`end_line` before `start_line`) yields an empty string — `saturating_sub`
 /// alone would clamp the negative span to 0 and then `+1` it back into a
 /// bogus single line.
-fn slice_lines(contents: String, start_line: Option<u32>, end_line: Option<u32>) -> String {
+pub(crate) fn slice_lines(
+    contents: String,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+) -> String {
     if start_line.is_none() && end_line.is_none() {
         return contents;
     }

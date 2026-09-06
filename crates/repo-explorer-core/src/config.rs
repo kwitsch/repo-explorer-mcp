@@ -429,7 +429,13 @@ impl ValidationError {
 }
 
 /// Read, parse, and validate a config file. The single public entry point.
-pub fn load(path: &Path) -> Result<Config, ConfigError> {
+/// Returns the unrecognized-key warnings (F-12) alongside the `Config`
+/// instead of only logging and discarding them: `run_config_test` needs the
+/// list itself, and deriving it from a second, independent file read (as it
+/// once did) meant that read's failure silently reported a config with real
+/// unknown keys as clean — returning what this one read already computed
+/// removes both the extra I/O and that failure mode in one step.
+pub fn load(path: &Path) -> Result<(Config, Vec<String>), ConfigError> {
     let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.to_path_buf(),
         source,
@@ -439,7 +445,81 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
         ConfigError::Parse { source, location }
     })?;
     config.validate()?;
-    Ok(config)
+    let warnings = unknown_key_warnings(&contents);
+    for warning in &warnings {
+        tracing::warn!(warning = %warning, "unrecognized config key (ignored)");
+    }
+    Ok((config, warnings))
+}
+
+/// (top-level section name, known field names within it) — hand-maintained
+/// alongside `Config`'s nested structs. A key present in the raw TOML but
+/// absent here is reported by [`unknown_key_warnings`] instead of going
+/// unnoticed. `Config` deliberately doesn't use `#[serde(deny_unknown_fields)]`
+/// (see its doc comment) so an unrecognized key still loads successfully —
+/// this only makes sure a typo or dead key (e.g. a stray `prefer_rtk` under
+/// `[search]`, F-12) doesn't go unnoticed.
+const KNOWN_SECTIONS: &[(&str, &[&str])] = &[
+    ("llm", &["providers", "cooldown_seconds", "https_proxy"]),
+    (
+        "codebase_memory",
+        &["command", "args", "endpoint", "staleness_seconds"],
+    ),
+    ("search", &["rg_path", "timeout_seconds"]),
+    (
+        "agent",
+        &[
+            "max_fallback_iterations",
+            "max_verify_iterations",
+            "token_budget",
+            "top_k",
+            "early_exit_confidence",
+            "fallback_confidence",
+            "snippet_max_chars",
+        ],
+    ),
+    ("cache", &["enabled", "max_entries"]),
+    ("logging", &["level"]),
+];
+
+const KNOWN_PROVIDER_FIELDS: &[&str] = &["name", "kind", "api_key_env", "models", "base_url"];
+
+/// Scan raw TOML text for keys that don't map to any known field, one
+/// human-readable warning per stray key (`section.key`, or
+/// `llm.providers[i].key` for a provider entry). Purely diagnostic — an
+/// unknown key is still accepted by [`load`] — so a malformed TOML string
+/// (which `load` would already have rejected) just yields no warnings here.
+pub fn unknown_key_warnings(raw: &str) -> Vec<String> {
+    let Ok(root) = raw.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    for (key, value) in &root {
+        match KNOWN_SECTIONS.iter().find(|(name, _)| name == key) {
+            None => warnings.push(format!("unrecognized top-level key `{key}`")),
+            Some((_, known_fields)) => {
+                if let toml::Value::Table(section) = value {
+                    for field in section.keys() {
+                        if !known_fields.contains(&field.as_str()) {
+                            warnings.push(format!("unrecognized key `{key}.{field}`"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(toml::Value::Array(providers)) = root.get("llm").and_then(|l| l.get("providers")) {
+        for (i, provider) in providers.iter().enumerate() {
+            if let toml::Value::Table(p) = provider {
+                for field in p.keys() {
+                    if !KNOWN_PROVIDER_FIELDS.contains(&field.as_str()) {
+                        warnings.push(format!("unrecognized key `llm.providers[{i}].{field}`"));
+                    }
+                }
+            }
+        }
+    }
+    warnings
 }
 
 /// Render a byte offset into `text` as a `line N, column M` string (1-based).
@@ -611,7 +691,8 @@ mod tests {
             std::env::set_var(var, "not-a-real-key");
         }
 
-        let config = load(&fixture_path("valid.toml")).expect("valid config should load");
+        let (config, _warnings) =
+            load(&fixture_path("valid.toml")).expect("valid config should load");
 
         // Failover order is file order.
         assert_eq!(config.llm.providers.len(), 2);
@@ -944,6 +1025,18 @@ mod tests {
             config.codebase_memory.staleness_seconds
         );
         assert_eq!(parsed.search.timeout_seconds, config.search.timeout_seconds);
+        // Schema-drift guard for `KNOWN_SECTIONS`/`KNOWN_PROVIDER_FIELDS`
+        // (F-12): `to_toml_string` serializes every field on `Config` and its
+        // nested structs (no `skip_serializing_if` beyond the `Option` ones
+        // already asserted above), so a real field these tables don't yet
+        // know about — a rename or a new field added without updating them —
+        // shows up here as a spurious warning, the same day it's introduced.
+        assert_eq!(
+            unknown_key_warnings(&toml),
+            Vec::<String>::new(),
+            "a fully-populated Config must not trip its own unknown-key detector — \
+             KNOWN_SECTIONS/KNOWN_PROVIDER_FIELDS have drifted from Config's real fields"
+        );
     }
 
     #[test]
@@ -977,5 +1070,87 @@ mod tests {
         );
         let parsed: Config = toml::from_str(&toml).expect("parse back");
         parsed.validate_with_env(every_env).expect("validate");
+    }
+
+    #[test]
+    fn unknown_key_warnings_is_empty_for_a_clean_config() {
+        let toml = r#"
+[llm]
+cooldown_seconds = 60
+[[llm.providers]]
+name = "gemini"
+kind = "gemini"
+models = ["m"]
+[codebase_memory]
+command = "codebase-memory-mcp"
+[search]
+timeout_seconds = 30
+[logging]
+level = "info"
+"#;
+        assert_eq!(unknown_key_warnings(toml), Vec::<String>::new());
+    }
+
+    #[test]
+    fn unknown_key_warnings_flags_a_stray_section_key() {
+        // The real-world F-12 case: an inert `prefer_rtk` under `[search]`.
+        let toml = r#"
+[llm]
+[[llm.providers]]
+name = "gemini"
+kind = "gemini"
+models = ["m"]
+[codebase_memory]
+command = "codebase-memory-mcp"
+[search]
+timeout_seconds = 30
+prefer_rtk = true
+"#;
+        let warnings = unknown_key_warnings(toml);
+        assert_eq!(warnings, vec!["unrecognized key `search.prefer_rtk`"]);
+    }
+
+    #[test]
+    fn unknown_key_warnings_flags_a_stray_top_level_section() {
+        let toml = r#"
+[llm]
+[[llm.providers]]
+name = "gemini"
+kind = "gemini"
+models = ["m"]
+[codebase_memory]
+command = "codebase-memory-mcp"
+[bogus_section]
+x = 1
+"#;
+        let warnings = unknown_key_warnings(toml);
+        assert_eq!(warnings, vec!["unrecognized top-level key `bogus_section`"]);
+    }
+
+    #[test]
+    fn unknown_key_warnings_flags_a_stray_provider_field() {
+        let toml = r#"
+[llm]
+[[llm.providers]]
+name = "gemini"
+kind = "gemini"
+models = ["m"]
+bogus_field = 1
+[codebase_memory]
+command = "codebase-memory-mcp"
+"#;
+        let warnings = unknown_key_warnings(toml);
+        assert_eq!(
+            warnings,
+            vec!["unrecognized key `llm.providers[0].bogus_field`"]
+        );
+    }
+
+    #[test]
+    fn unknown_key_warnings_is_empty_for_unparseable_toml() {
+        assert_eq!(
+            unknown_key_warnings("not valid toml =[["),
+            Vec::<String>::new()
+        );
     }
 }

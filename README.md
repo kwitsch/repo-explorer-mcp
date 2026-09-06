@@ -96,7 +96,9 @@ Example `repo-explorer.toml`:
 
 ```toml
 [llm]
-# Failover cooldown after a provider errors, in seconds.
+# Failover cooldown after a provider hits a rate limit, quota, or
+# unavailable-model error, in seconds. Other errors (e.g. an invalid model
+# name, bad credentials) fail immediately instead of triggering cooldown.
 cooldown_seconds = 90
 # Optional HTTPS proxy for all model upstream requests; omit for none.
 # https_proxy = "https://proxy.example.com:8443"

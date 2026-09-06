@@ -141,7 +141,9 @@ async fn fake_provider_dispatch_and_assembly() {
     let dir = temp_repo("dispatch");
     let result = agent.run(&dir, &query("where is main")).await.unwrap();
 
-    // Returned result equals the finish payload.
+    // Returned result equals the finish payload, except the snippet: a real
+    // location always gets its snippet derived from the file on disk (F-18),
+    // not left as whatever the model's finish call did or didn't supply.
     assert_eq!(result.summary, "found main");
     assert_eq!(
         result.findings,
@@ -151,7 +153,7 @@ async fn fake_provider_dispatch_and_assembly() {
                 line_start: 1,
                 line_end: 3,
             },
-            snippet: None,
+            snippet: Some("l1\nl2\nl3".to_string()),
             note: None,
         }]
     );

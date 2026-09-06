@@ -124,6 +124,29 @@ fn reject_blank_query(query: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Reject `max_results: 0` before it reaches the agent loop. `0` truncates
+/// `findings` to an empty list (F-09) while the model-authored `summary`
+/// passes through unchanged, so the response can describe findings that
+/// aren't there. `max_results` has no documented "return nothing" mode —
+/// `None` already means unlimited — so `0` is an unintended edge case, not a
+/// valid request, and is rejected the same way as a blank query.
+fn reject_zero_max_results(max_results: Option<u32>) -> Result<(), String> {
+    if max_results == Some(0) {
+        return Err("max_results must be greater than 0; omit it for unlimited".to_string());
+    }
+    Ok(())
+}
+
+/// Every `explore_repository` boundary check, in order — the single place
+/// new request-shape validation (one per discovered bug so far: F-04, F-09)
+/// gets added, instead of each check's caller re-pasting its own
+/// log-and-return wrapper.
+fn validate_request(req: &ExploreRepositoryRequest) -> Result<(), String> {
+    reject_blank_query(&req.query)?;
+    reject_zero_max_results(req.max_results)?;
+    Ok(())
+}
+
 /// The MCP server handler: a shared `Arc<Agent>` plus the repo root to explore.
 #[derive(Clone)]
 pub struct RepoExplorerServer {
@@ -161,7 +184,7 @@ impl RepoExplorerServer {
         params: Parameters<ExploreRepositoryRequest>,
     ) -> Result<Json<ExplorationResultDto>, String> {
         let req = params.0;
-        if let Err(e) = reject_blank_query(&req.query) {
+        if let Err(e) = validate_request(&req) {
             tracing::warn!(error_class = "validation", message = %e, "exploration rejected");
             return Err(e);
         }
@@ -341,5 +364,40 @@ mod tests {
             reject_blank_query("").unwrap_err(),
             "query must not be empty"
         );
+    }
+
+    #[test]
+    fn rejects_zero_max_results() {
+        assert!(reject_zero_max_results(Some(0)).is_err());
+    }
+
+    #[test]
+    fn accepts_missing_or_positive_max_results() {
+        assert!(reject_zero_max_results(None).is_ok());
+        assert!(reject_zero_max_results(Some(1)).is_ok());
+        assert!(reject_zero_max_results(Some(5)).is_ok());
+    }
+
+    #[test]
+    fn zero_max_results_error_message_is_pinned() {
+        assert_eq!(
+            reject_zero_max_results(Some(0)).unwrap_err(),
+            "max_results must be greater than 0; omit it for unlimited"
+        );
+    }
+
+    #[test]
+    fn validate_request_runs_both_boundary_checks() {
+        let ok: ExploreRepositoryRequest =
+            serde_json::from_str(r#"{"query":"q","max_results":5}"#).unwrap();
+        assert!(validate_request(&ok).is_ok());
+
+        let blank: ExploreRepositoryRequest =
+            serde_json::from_str(r#"{"query":"  ","max_results":5}"#).unwrap();
+        assert!(validate_request(&blank).is_err());
+
+        let zero: ExploreRepositoryRequest =
+            serde_json::from_str(r#"{"query":"q","max_results":0}"#).unwrap();
+        assert!(validate_request(&zero).is_err());
     }
 }

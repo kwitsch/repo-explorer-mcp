@@ -88,7 +88,18 @@ async fn main() -> ExitCode {
     // whether this is a first run: a config that exists but is unreadable or
     // malformed must report its real error, not "no config".
     let config = match repo_explorer_core::config::load(&config_path) {
-        Ok(config) => config,
+        Ok((config, warnings)) => {
+            // `load`'s own `tracing::warn!` for these is a no-op here:
+            // `init_tracing` only runs inside `run()`, below, so on this —
+            // the actual, primary way this binary is ever launched — no
+            // subscriber exists yet to receive it. stderr, matching the
+            // `rtk_path` check just below, is the only channel that reaches
+            // the user on this path.
+            for warning in &warnings {
+                eprintln!("repo-explorer-mcp: {warning}");
+            }
+            config
+        }
         Err(e) if e.is_not_found() => {
             if std::io::stdin().is_terminal() {
                 return setup::run_setup(&config_path);
@@ -433,6 +444,8 @@ fn wants_config_test(args: &[String]) -> bool {
 struct ConfigTestReport {
     status: &'static str,
     config_path: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<ConfigTestError>,
 }
@@ -450,10 +463,11 @@ struct ConfigTestError {
 /// on any load/parse/validation failure.
 fn run_config_test(config_path: &Path) -> ExitCode {
     match repo_explorer_core::config::load(config_path) {
-        Ok(_) => {
+        Ok((_, warnings)) => {
             let report = ConfigTestReport {
                 status: "valid",
                 config_path: config_path.display().to_string(),
+                warnings,
                 error: None,
             };
             print_report(&report, "config-test");
@@ -463,6 +477,7 @@ fn run_config_test(config_path: &Path) -> ExitCode {
             let report = ConfigTestReport {
                 status: "invalid",
                 config_path: config_path.display().to_string(),
+                warnings: Vec::new(),
                 error: Some(ConfigTestError {
                     message: format!("{e}"),
                     toml_path: e.toml_path(),

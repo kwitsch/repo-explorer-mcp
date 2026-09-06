@@ -346,6 +346,11 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
                     let mut guard = slot.lock_cooling();
                     match *guard {
                         Some(until) if self.clock.now() < until => {
+                            tracing::debug!(
+                                provider = %entry.name,
+                                model = %slot.model,
+                                "skipping provider, still cooling"
+                            );
                             cooling.push(format!("{}/{}", entry.name, slot.model));
                             continue;
                         }
@@ -361,14 +366,36 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
                     .complete_with_tools(messages, tools, options)
                     .await
                 {
-                    Ok(resp) => return Ok(resp),
+                    Ok(resp) => {
+                        tracing::debug!(
+                            provider = %entry.name,
+                            model = %slot.model,
+                            "provider call succeeded"
+                        );
+                        return Ok(resp);
+                    }
                     Err(e) if e.is_failover_trigger() => {
+                        tracing::warn!(
+                            provider = %entry.name,
+                            model = %slot.model,
+                            error = %e,
+                            cooldown_s = self.cooldown.as_secs(),
+                            "provider limited, entering cooldown"
+                        );
                         let mut guard = slot.lock_cooling();
                         *guard = Some(self.clock.now() + self.cooldown);
                         limited.push(format!("{}/{}", entry.name, slot.model));
                         continue;
                     }
-                    Err(e) => return Err(RouterError::Provider(e)),
+                    Err(e) => {
+                        tracing::error!(
+                            provider = %entry.name,
+                            model = %slot.model,
+                            error = %e,
+                            "provider call failed, no failover"
+                        );
+                        return Err(RouterError::Provider(e));
+                    }
                 }
             }
         }
@@ -380,7 +407,9 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
         if !cooling.is_empty() {
             parts.push(format!("cooling: {}", cooling.join(", ")));
         }
-        Err(RouterError::AllExhausted(parts.join("; ")))
+        let summary = parts.join("; ");
+        tracing::error!(summary = %summary, "all LLM providers exhausted or cooling");
+        Err(RouterError::AllExhausted(summary))
     }
 }
 

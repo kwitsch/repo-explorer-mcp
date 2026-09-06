@@ -2,8 +2,10 @@
 //! `finish` validation. `repo_root` is never a tool parameter — the dispatcher
 //! supplies it from loop state.
 
-use crate::dispatch::{canonical_repo_root, read_file_canonical};
-use repo_explorer_core::domain::{ExplorationFinding, ExplorationResult, FileLocation};
+use crate::dispatch::{canonical_repo_root, read_file_canonical, slice_lines};
+use repo_explorer_core::domain::{
+    ExplorationFinding, ExplorationResult, FileLocation, saturate_u32,
+};
 use repo_explorer_core::llm::{Message, Tool, ToolCall};
 use repo_explorer_core::retrieval::normalize_location;
 use serde::Deserialize;
@@ -370,14 +372,32 @@ async fn validate_finding(
             format!("finding location.path `{path_str}` does not exist in the repository")
         })?;
     // Clamp a line_end past EOF to the file length, never below line_start.
-    let line_count = content.lines().count() as u32;
+    let line_count = saturate_u32(content.lines().count() as u64);
     let line_end = location.line_end.min(line_count.max(location.line_start));
+    // Don't trust the model's own snippet text (F-18: seen paraphrased
+    // signatures, wrong base classes, invented bodies at an otherwise-correct
+    // path+range) — derive it from the file we already just read instead.
+    // Only a location with NOTHING resolvable at all (both bounds still the
+    // `0` sentinel after `normalize_location`) falls back to the model's
+    // text. Deliberately NOT gated on `is_unknown_location` alone: that only
+    // checks `line_start`, so a model could set `line_start: 0` next to a
+    // real, nonzero `line_end` to make an otherwise-real path look "unknown"
+    // and bypass verification entirely — `slice_lines` already treats a `0`/
+    // absent start as "from line 1", so a real `line_end` alone is enough to
+    // derive a genuine slice instead of trusting `f.snippet`.
+    let nothing_to_slice = location.line_start == 0 && location.line_end == 0;
+    let snippet = if nothing_to_slice {
+        f.snippet
+    } else {
+        let real = slice_lines(content, Some(location.line_start), Some(line_end));
+        if real.is_empty() { None } else { Some(real) }
+    };
     Ok(ExplorationFinding {
         location: FileLocation {
             line_end,
             ..location
         },
-        snippet: f.snippet,
+        snippet,
         note: f.note,
     })
 }
@@ -572,6 +592,73 @@ mod tests {
             }
         );
         assert_eq!(result.findings[0].note, Some("here".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F-18: a finding's snippet must come from the real file, not the model's
+    /// own transcription of it.
+    #[tokio::test]
+    async fn parse_finish_ignores_a_fabricated_snippet_at_a_real_location() {
+        let dir = temp_repo_main("fabricated_snippet", 5);
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":2,"line_end":3},"snippet":"this is not what's really there"}],"summary":"done"}"#;
+        let result = parse_finish(json, &dir).await.unwrap();
+        assert_eq!(
+            result.findings[0].snippet.as_deref(),
+            Some("l2\nl3"),
+            "snippet must come from the real file, not the model's own text"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F-18 follow-up: a hallucinated `line_start` past EOF at an otherwise
+    /// real path is a KNOWN location (not the `line_start==0` sentinel), so it
+    /// must not fall back to the model's fabricated snippet either — the real
+    /// slice is empty, and an empty slice must stay empty (`None`), never
+    /// silently re-admit `f.snippet`.
+    #[tokio::test]
+    async fn parse_finish_drops_fabricated_snippet_when_line_start_is_past_eof() {
+        let dir = temp_repo_main("out_of_range_snippet", 5);
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":99,"line_end":120},"snippet":"this is fabricated, the file has 5 lines"}],"summary":"done"}"#;
+        let result = parse_finish(json, &dir).await.unwrap();
+        assert_eq!(
+            result.findings[0].snippet, None,
+            "an out-of-range known location has nothing real to slice; the model's \
+             fabricated text must not be substituted back in"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F-18 follow-up: `line_start: 0` paired with a real, nonzero `line_end`
+    /// is NOT a genuinely unknown location — `is_unknown_location` alone
+    /// would call it "unknown" (it only checks `line_start`), letting a model
+    /// bypass all snippet verification on an otherwise-real path just by
+    /// setting `line_start: 0`. Only a location with nothing resolvable at
+    /// all (`line_start` AND `line_end` both the sentinel) may fall back to
+    /// the model's text.
+    #[tokio::test]
+    async fn parse_finish_drops_fabricated_snippet_when_line_start_is_zero_but_line_end_is_real() {
+        let dir = temp_repo_main("zero_start_real_end_snippet", 5);
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":0,"line_end":3},"snippet":"this is fabricated, not what lines 1-3 say"}],"summary":"done"}"#;
+        let result = parse_finish(json, &dir).await.unwrap();
+        assert_eq!(
+            result.findings[0].snippet.as_deref(),
+            Some("l1\nl2\nl3"),
+            "line_start:0 with a real line_end must still be sliced from disk, \
+             not treated as a free pass for the model's own text"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn parse_finish_keeps_model_snippet_for_unknown_location() {
+        let dir = temp_repo_main("unknown_location_snippet", 5);
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":0,"line_end":0},"snippet":"symbol described in prose only"}],"summary":"done"}"#;
+        let result = parse_finish(json, &dir).await.unwrap();
+        assert_eq!(
+            result.findings[0].snippet.as_deref(),
+            Some("symbol described in prose only"),
+            "an unknown-location finding has nothing on disk to slice, so the model's own text is kept"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

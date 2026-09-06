@@ -37,6 +37,13 @@ WS_RE = re.compile(r"\s+")
 # than being real quoted content — the LLM (or the tool's own compressed rendering, which the
 # LLM sometimes echoes verbatim) uses this to elide the middle of a long span.
 ELLIPSIS_LINE_RE = re.compile(r"^(\.\.\.|…)\s*(\(truncated\)|\[truncated\])?$", re.I)
+# The tool's own rendering (render.rs's `TRUNCATION_MARKER`) appends "…[truncated]" — or, for a
+# capped `read_file`, "…[truncated after N lines; request a narrower line range]" — to the *end*
+# of an otherwise-real line rather than putting it on its own line (F-19: this used to make a
+# legitimately truncated line fail find_chunk's exact substring match and get flagged
+# fabricated_snippet/misaligned_snippet even though the untruncated portion is real, in-range
+# content). Stripped off before matching so only the real prefix is compared.
+TRUNCATION_SUFFIX_RE = re.compile(r"…\[truncated(?:[^\]]*)?\]\s*$")
 
 
 def wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float, float]:
@@ -93,7 +100,10 @@ def snippet_chunks(snippet: str) -> list[list[str]]:
     """Split a (possibly multi-line) snippet into contiguous chunks of real content, breaking
     at any line that is only an omission marker. Each chunk is a list of whitespace-normalized
     lines, in order — a chunk must match a contiguous run of file lines, but chunks themselves
-    need not be adjacent (the LLM may elide the middle of a long span)."""
+    need not be adjacent (the LLM may elide the middle of a long span). A line ending in the
+    tool's own truncation marker (F-19) has that suffix stripped first: a non-empty remainder is
+    real content to match (just shorter than the untruncated file line), while an empty remainder
+    (the marker occupied the whole line) is treated as an elision like an ELLIPSIS_LINE_RE line."""
     chunks: list[list[str]] = []
     current: list[str] = []
     for raw_line in snippet.splitlines():
@@ -101,6 +111,12 @@ def snippet_chunks(snippet: str) -> list[list[str]]:
         if not stripped:
             continue
         if ELLIPSIS_LINE_RE.match(stripped):
+            if current:
+                chunks.append(current)
+                current = []
+            continue
+        stripped = TRUNCATION_SUFFIX_RE.sub("", stripped).strip()
+        if not stripped:
             if current:
                 chunks.append(current)
                 current = []
