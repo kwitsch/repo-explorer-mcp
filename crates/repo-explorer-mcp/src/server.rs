@@ -137,6 +137,16 @@ fn reject_zero_max_results(max_results: Option<u32>) -> Result<(), String> {
     Ok(())
 }
 
+/// Every `explore_repository` boundary check, in order — the single place
+/// new request-shape validation (one per discovered bug so far: F-04, F-09)
+/// gets added, instead of each check's caller re-pasting its own
+/// log-and-return wrapper.
+fn validate_request(req: &ExploreRepositoryRequest) -> Result<(), String> {
+    reject_blank_query(&req.query)?;
+    reject_zero_max_results(req.max_results)?;
+    Ok(())
+}
+
 /// The MCP server handler: a shared `Arc<Agent>` plus the repo root to explore.
 #[derive(Clone)]
 pub struct RepoExplorerServer {
@@ -174,11 +184,7 @@ impl RepoExplorerServer {
         params: Parameters<ExploreRepositoryRequest>,
     ) -> Result<Json<ExplorationResultDto>, String> {
         let req = params.0;
-        if let Err(e) = reject_blank_query(&req.query) {
-            tracing::warn!(error_class = "validation", message = %e, "exploration rejected");
-            return Err(e);
-        }
-        if let Err(e) = reject_zero_max_results(req.max_results) {
+        if let Err(e) = validate_request(&req) {
             tracing::warn!(error_class = "validation", message = %e, "exploration rejected");
             return Err(e);
         }
@@ -378,5 +384,20 @@ mod tests {
             reject_zero_max_results(Some(0)).unwrap_err(),
             "max_results must be greater than 0; omit it for unlimited"
         );
+    }
+
+    #[test]
+    fn validate_request_runs_both_boundary_checks() {
+        let ok: ExploreRepositoryRequest =
+            serde_json::from_str(r#"{"query":"q","max_results":5}"#).unwrap();
+        assert!(validate_request(&ok).is_ok());
+
+        let blank: ExploreRepositoryRequest =
+            serde_json::from_str(r#"{"query":"  ","max_results":5}"#).unwrap();
+        assert!(validate_request(&blank).is_err());
+
+        let zero: ExploreRepositoryRequest =
+            serde_json::from_str(r#"{"query":"q","max_results":0}"#).unwrap();
+        assert!(validate_request(&zero).is_err());
     }
 }
