@@ -1,0 +1,14 @@
+{
+  "extraKnownMarketplaces": {
+    "kwitsch-plugins": {
+      "source": {
+        "source": "github",
+        "repo": "kwitsch/claude-plugins"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "universal-lint@kwitsch-plugins": true,
+    "universal-format@kwitsch-plugins": true
+  }
+}
