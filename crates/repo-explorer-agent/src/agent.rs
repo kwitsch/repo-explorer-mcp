@@ -31,7 +31,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::cache::{QueryEntry, ResultCache};
-use crate::dispatch::dispatch_inner;
+use crate::dispatch::{dispatch_inner, escapes_repo_root};
 use crate::pipeline;
 use crate::render::{RenderCaps, dedupe_key, tidy_findings};
 use crate::tools::{finish_only_catalog, parse_finish_lenient, resolve_finish, tool_catalog};
@@ -815,10 +815,16 @@ pub(crate) fn force_finish_options() -> CallOptions {
 }
 
 /// The 4-part preamble shared by the fallback loop's and the verification
-/// stage's user prompts: query text, scope hint, max_results, index note.
+/// stage's user prompts: query text, scope hint, max_results, index note. A
+/// scope hint that escapes the repository root (`dispatch::escapes_repo_root`)
+/// is omitted rather than rendered as an in-effect scope — the honest "was
+/// ignored" caveat is carried once by the threaded `index_note`, so an inline
+/// tag here would duplicate (and could contradict) it.
 pub(crate) fn query_preamble(query: &ExplorationQuery, index_note: Option<&str>) -> String {
     let mut s = format!("Exploration query: {}", query.text);
-    if let Some(scope) = &query.scope_hint {
+    if let Some(scope) = query.scope_hint.as_deref()
+        && !escapes_repo_root(scope)
+    {
         s.push_str(&format!("\nScope hint: {}", scope.display()));
     }
     if let Some(max) = query.max_results {
@@ -1299,5 +1305,33 @@ mod tests {
             completion_tokens: 3,
         }));
         assert!(b.exhausted(), "exactly at the limit counts as exhausted");
+    }
+
+    #[test]
+    fn query_preamble_omits_escaping_scope_hint() {
+        // An escaping scope hint is dropped for the legs, so the preamble must
+        // not render it as an in-effect "Scope hint:" — that would tell the LLM
+        // the search was scoped when it was not. A valid in-root hint still is.
+        let escaping = ExplorationQuery {
+            text: "where is main".to_string(),
+            scope_hint: Some(PathBuf::from("../../etc")),
+            max_results: None,
+        };
+        let preamble = query_preamble(&escaping, None);
+        assert!(
+            !preamble.contains("Scope hint:"),
+            "escaping scope hint must not be rendered as in-effect: {preamble}"
+        );
+
+        let valid = ExplorationQuery {
+            text: "where is main".to_string(),
+            scope_hint: Some(PathBuf::from("src")),
+            max_results: None,
+        };
+        let preamble = query_preamble(&valid, None);
+        assert!(
+            preamble.contains("Scope hint: src"),
+            "a valid in-root scope hint must still be rendered: {preamble}"
+        );
     }
 }
