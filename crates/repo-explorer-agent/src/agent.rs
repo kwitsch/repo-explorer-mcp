@@ -192,6 +192,30 @@ where
             )),
         };
 
+        // If the top-level scope_hint escapes the repo root it is dropped for
+        // the legs (see `pipeline::retrieve`); surface a generic caveat so the
+        // returned summary/prose stops pretending the hint was honored. Generic
+        // (not the raw value) because the cache key coalesces all escaping
+        // hints, so a value-specific note could be served for a different
+        // input; the specific value stays in the per-run WARN log.
+        let scope_note = query
+            .scope_hint
+            .as_deref()
+            .filter(|p| escapes_repo_root(p))
+            .map(|_| {
+                "Note: the requested scope hint escapes the repository root and was \
+                 ignored; the search covered the entire repository."
+                    .to_string()
+            });
+        let note: Option<String> = {
+            let combined = [index_note, scope_note]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!combined.is_empty()).then_some(combined)
+        };
+
         // Stage 2: deterministic retrieval — no LLM.
         let leg_cache = self.cache_for(fingerprint.as_ref());
         let outcome = pipeline::retrieve(
@@ -227,7 +251,7 @@ where
                     outcome.candidates,
                     query,
                     outcome.confidence,
-                    index_note.as_deref(),
+                    note.as_deref(),
                 );
                 return Ok(self.complete_run(
                     "early-exit",
@@ -255,7 +279,7 @@ where
                 &self.router,
                 repo_root,
                 query,
-                index_note.as_deref(),
+                note.as_deref(),
                 &outcome.candidates,
                 self.settings.max_verify_iterations,
                 &mut budget,
@@ -283,7 +307,7 @@ where
             .fallback_loop(
                 repo_root,
                 query,
-                index_note.as_deref(),
+                note.as_deref(),
                 outcome.candidates,
                 fingerprint.as_ref(),
                 &mut budget,
@@ -1111,6 +1135,53 @@ mod tests {
         assert!(
             got.summary.contains("memory index could not be refreshed"),
             "early-exit summary must surface the index-freshness note: {}",
+            got.summary
+        );
+    }
+
+    #[tokio::test]
+    async fn early_exit_surfaces_scope_hint_ignored_note_in_summary() {
+        // F-06: an escaping top-level scope_hint is dropped for the legs, but
+        // the deterministic early-exit summary must say so — not silently
+        // pretend the scope was honored. Same high-confidence SymbolExact setup
+        // as the stale-index-note test, but with an escaping scope_hint.
+        let memory = MockMemoryBackend::new().with_search_graph_result(Ok(ExplorationResult {
+            findings: vec![ExplorationFinding {
+                location: FileLocation {
+                    path: PathBuf::from("crates/x/src/freshness.rs"),
+                    line_start: 12,
+                    line_end: 12,
+                },
+                snippet: None,
+                note: Some("decide_freshness".to_string()),
+            }],
+            summary: "1 row".to_string(),
+        }));
+        let router = ProviderRouter::with_clock(
+            vec![(
+                "primary".to_string(),
+                vec![("m".to_string(), MockLlmProvider::new())],
+            )],
+            60,
+            FakeClock::new(),
+        );
+        let agent = AgentLoop::new(
+            memory,
+            MockSearchBackend::new(),
+            router,
+            MockRepoStateProbe::new(),
+            AgentSettings::default(),
+            CacheSettings::default(),
+        );
+        let query = ExplorationQuery {
+            text: "decide_freshness".to_string(),
+            scope_hint: Some(PathBuf::from("../../etc")),
+            max_results: None,
+        };
+        let got = agent.run(&PathBuf::from("/repo"), &query).await.unwrap();
+        assert!(
+            got.summary.contains("escapes the repository root"),
+            "early-exit summary must surface the ignored-scope note: {}",
             got.summary
         );
     }
