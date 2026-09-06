@@ -1580,7 +1580,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "repo-explorer-agent"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "futures-util",
  "repo-explorer-agent",
@@ -1594,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "repo-explorer-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "thiserror",
@@ -1605,7 +1605,7 @@ dependencies = [
 
 [[package]]
 name = "repo-explorer-llm"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "genai",
  "repo-explorer-core",
@@ -1616,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "repo-explorer-mcp"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1646,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "repo-explorer-memory"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "repo-explorer-core",
  "rmcp",
@@ -1657,7 +1657,7 @@ dependencies = [
 
 [[package]]
 name = "repo-explorer-search"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "hex",
  "repo-explorer-core",
