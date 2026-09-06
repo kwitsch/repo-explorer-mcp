@@ -2,12 +2,9 @@
 //! `finish` validation. `repo_root` is never a tool parameter — the dispatcher
 //! supplies it from loop state.
 
-use crate::dispatch::{canonical_repo_root, read_file_canonical, slice_lines};
-use repo_explorer_core::domain::{
-    ExplorationFinding, ExplorationResult, FileLocation, saturate_u32,
-};
+use crate::dispatch::{canonical_repo_root, slice_lines, verify_location};
+use repo_explorer_core::domain::{ExplorationFinding, ExplorationResult, FileLocation};
 use repo_explorer_core::llm::{Message, Tool, ToolCall};
-use repo_explorer_core::retrieval::normalize_location;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -345,10 +342,13 @@ pub(crate) struct FinishLocation {
 }
 
 /// Validate one finding's location against the filesystem under `repo_root`:
-/// non-empty path, `normalize_location`, then existence/escape/inside-repo
-/// check by reusing `read_file_canonical`. A `line_end` past the file's real
-/// length is clamped to the line count (never below `line_start`), the same
-/// defect class as F-13. Returns a human-readable reason string on rejection.
+/// non-empty path, then the shared existence/line-range gate
+/// [`verify_location`] (path exists inside the repo; `line_start` within the
+/// file; `line_end` clamped to the file length). The gate's neutral reason is
+/// wrapped with the existing `"finding "` prefix so error text is unchanged.
+/// The snippet is then re-derived from the file `verify_location` already read
+/// (F-18), except the `(0,0)` unknown-location sentinel, which keeps the
+/// model's own text.
 async fn validate_finding(
     f: FinishFinding,
     repo_root: &Path,
@@ -357,46 +357,30 @@ async fn validate_finding(
     if f.location.path.trim().is_empty() {
         return Err("finding location.path must be non-empty".to_string());
     }
-    let location = normalize_location(FileLocation {
+    let raw = FileLocation {
         path: PathBuf::from(&f.location.path),
         line_start: f.location.line_start,
         line_end: f.location.line_end,
-    });
-    let path_str = location.path.to_string_lossy();
-    // Existence + escape + inside-repo check, reusing the read_file safe-read.
-    // ponytail: reads the whole file just to count lines; swap for a
-    // stat-only helper if finish-time I/O ever profiles hot.
-    let content = read_file_canonical(repo_root, canonical_root, &path_str, None, None)
+    };
+    let (location, content) = verify_location(raw, repo_root, canonical_root)
         .await
-        .map_err(|_| {
-            format!("finding location.path `{path_str}` does not exist in the repository")
-        })?;
-    // Clamp a line_end past EOF to the file length, never below line_start.
-    let line_count = saturate_u32(content.lines().count() as u64);
-    let line_end = location.line_end.min(line_count.max(location.line_start));
-    // Don't trust the model's own snippet text (F-18: seen paraphrased
-    // signatures, wrong base classes, invented bodies at an otherwise-correct
-    // path+range) — derive it from the file we already just read instead.
-    // Only a location with NOTHING resolvable at all (both bounds still the
-    // `0` sentinel after `normalize_location`) falls back to the model's
-    // text. Deliberately NOT gated on `is_unknown_location` alone: that only
-    // checks `line_start`, so a model could set `line_start: 0` next to a
-    // real, nonzero `line_end` to make an otherwise-real path look "unknown"
-    // and bypass verification entirely — `slice_lines` already treats a `0`/
-    // absent start as "from line 1", so a real `line_end` alone is enough to
-    // derive a genuine slice instead of trusting `f.snippet`.
+        .map_err(|reason| format!("finding {reason}"))?;
+    // F-18: don't trust the model's own snippet text (paraphrased signatures,
+    // invented bodies at an otherwise-correct path+range) — derive it from the
+    // file verify_location already read. Only a location with NOTHING
+    // resolvable (both bounds still the `0` sentinel) falls back to the model's
+    // text; NOT gated on is_unknown_location alone (which checks line_start
+    // only), so a `line_start: 0` next to a real line_end still slices from
+    // disk — slice_lines treats a `0`/absent start as "from line 1".
     let nothing_to_slice = location.line_start == 0 && location.line_end == 0;
     let snippet = if nothing_to_slice {
         f.snippet
     } else {
-        let real = slice_lines(content, Some(location.line_start), Some(line_end));
+        let real = slice_lines(content, Some(location.line_start), Some(location.line_end));
         if real.is_empty() { None } else { Some(real) }
     };
     Ok(ExplorationFinding {
-        location: FileLocation {
-            line_end,
-            ..location
-        },
+        location,
         snippet,
         note: f.note,
     })
@@ -610,20 +594,23 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// F-18 follow-up: a hallucinated `line_start` past EOF at an otherwise
-    /// real path is a KNOWN location (not the `line_start==0` sentinel), so it
-    /// must not fall back to the model's fabricated snippet either — the real
-    /// slice is empty, and an empty slice must stay empty (`None`), never
-    /// silently re-admit `f.snippet`.
+    /// A hallucinated `line_start` past EOF at an otherwise-real path has no
+    /// real anchor, so it is rejected outright (not clamped, not merely
+    /// stripped to `snippet: None`) — `verify_location`'s
+    /// `line_start > line_count` guard. The reason names the file's real line
+    /// count so the model can correct itself on retry.
     #[tokio::test]
-    async fn parse_finish_drops_fabricated_snippet_when_line_start_is_past_eof() {
-        let dir = temp_repo_main("out_of_range_snippet", 5);
+    async fn parse_finish_rejects_line_start_past_eof() {
+        let dir = temp_repo_main("line_start_past_eof_reject", 5);
         let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":99,"line_end":120},"snippet":"this is fabricated, the file has 5 lines"}],"summary":"done"}"#;
-        let result = parse_finish(json, &dir).await.unwrap();
-        assert_eq!(
-            result.findings[0].snippet, None,
-            "an out-of-range known location has nothing real to slice; the model's \
-             fabricated text must not be substituted back in"
+        let err = parse_finish(json, &dir).await.unwrap_err();
+        assert!(
+            err.contains("line_start"),
+            "reason must name line_start: {err}"
+        );
+        assert!(
+            err.contains('5'),
+            "reason must name the real line count (5): {err}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -808,5 +795,57 @@ mod tests {
             .unwrap();
         assert!(result.findings.is_empty());
         assert_eq!(result.summary, "nothing found");
+    }
+
+    /// Lenient (forced-finish) path: a `line_start` past EOF is dropped, not
+    /// admitted. A sole past-EOF finding empties a non-empty set (error); a
+    /// mix keeps only the valid finding.
+    #[tokio::test]
+    async fn parse_finish_lenient_drops_line_start_past_eof() {
+        let dir = temp_repo_main("lenient_past_eof_sole", 5);
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":99,"line_end":120}}],"summary":"s"}"#;
+        assert!(parse_finish_lenient(json, &dir).await.is_err());
+        std::fs::remove_dir_all(&dir).ok();
+
+        let dir = temp_repo_main("lenient_past_eof_mixed", 5);
+        let json = r#"{"findings":[
+            {"location":{"path":"src/main.rs","line_start":1,"line_end":2}},
+            {"location":{"path":"src/main.rs","line_start":99,"line_end":120}}
+        ],"summary":"partial"}"#;
+        let result = parse_finish_lenient(json, &dir).await.unwrap();
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].location.line_start, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The strict finish path turns a past-EOF `line_start` into a
+    /// `Role::Tool` retry message (via `resolve_finish`), like the
+    /// nonexistent-path case — same contract, new trigger.
+    #[tokio::test]
+    async fn resolve_finish_asks_model_to_retry_on_line_start_past_eof() {
+        let dir = temp_repo_main("resolve_past_eof", 5);
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":99,"line_end":120}}],"summary":"s"}"#;
+        let call = ToolCall {
+            id: "call-1".to_string(),
+            name: "finish".to_string(),
+            arguments_json: json.to_string(),
+            thought_signatures: None,
+        };
+        let rejections = resolve_finish(&[call], &dir).await.unwrap_err();
+        assert_eq!(rejections.len(), 1);
+        let msg = &rejections[0];
+        assert_eq!(msg.role, repo_explorer_core::llm::Role::Tool);
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call-1"));
+        assert!(
+            msg.content.contains("finish rejected"),
+            "content: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("line_start"),
+            "content: {}",
+            msg.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

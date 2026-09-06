@@ -4,11 +4,14 @@
 //! `read_file` IO/path-escape failures all become `Role::Tool` messages — never
 //! panics, never fatal. `finish` is handled by the loop, not here.
 
-use repo_explorer_core::domain::{ExplorationFinding, ExplorationQuery, ExplorationResult};
+use repo_explorer_core::domain::{
+    ExplorationFinding, ExplorationQuery, ExplorationResult, FileLocation, saturate_u32,
+};
 #[cfg(test)]
 use repo_explorer_core::llm::Message;
 use repo_explorer_core::llm::ToolCall;
 use repo_explorer_core::memory::{GraphQuery, MemoryBackend, SnippetTarget};
+use repo_explorer_core::retrieval::normalize_location;
 use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use std::path::{Component, Path, PathBuf};
 
@@ -305,6 +308,49 @@ pub(crate) fn slice_lines(
         .take(end - start + 1)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Verify a `location` against the live file under `repo_root`: the path must
+/// exist inside the repo (existence + escape + inside-repo, via
+/// [`read_file_canonical`]) and `line_start` must fall within the file's real
+/// extent. Returns the location with `line_end` clamped to the file length
+/// (never below `line_start`), together with the file contents already read to
+/// count lines, so a caller wanting a disk-derived snippet can slice without a
+/// second read. `Err(reason)` (human-readable) when the path is missing or
+/// `line_start` is past EOF; the caller decides what that means: the `finish`
+/// path rejects the finding and lets the model retry, the early-exit path
+/// drops the candidate. The `(0,0)` / `(0, N)` unknown-line shapes pass
+/// through — `line_start == 0` can never exceed the line count, and
+/// `read_file_canonical` still enforces that the path itself exists (F-05).
+/// `normalize_location` is applied here, so callers pass the raw location.
+///
+/// ponytail: reads the whole file just to count lines; swap for a stat+count
+/// helper if this ever profiles hot (up to top_k reads per early-exit query).
+pub(crate) async fn verify_location(
+    location: FileLocation,
+    repo_root: &Path,
+    canonical_root: &Path,
+) -> Result<(FileLocation, String), String> {
+    let location = normalize_location(location);
+    let path_str = location.path.to_string_lossy();
+    let content = read_file_canonical(repo_root, canonical_root, &path_str, None, None)
+        .await
+        .map_err(|_| format!("location.path `{path_str}` does not exist in the repository"))?;
+    let line_count = saturate_u32(content.lines().count() as u64);
+    if location.line_start > line_count {
+        return Err(format!(
+            "location.path `{path_str}` cites line_start {} but the file has only {line_count} line(s)",
+            location.line_start
+        ));
+    }
+    let line_end = location.line_end.min(line_count.max(location.line_start));
+    Ok((
+        FileLocation {
+            line_end,
+            ..location
+        },
+        content,
+    ))
 }
 
 #[cfg(test)]
