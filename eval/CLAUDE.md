@@ -18,10 +18,8 @@ How to run it: the `run-eval` skill (`.claude/skills/run-eval/SKILL.md`).
   partway through that first call. This is why a warm-up call exists before
   the scored passes and must never itself be scored.
 - Always rescore an older `results/<run-id>` with the _current_ `score.py`
-  before trusting its numbers. `score.py` has had multiple real scoring bugs
-  (multi-line snippet matching, the alignment-window width vs. `line_end`,
-  `equivalent`'s list shape, an unprinted `negative_ok`) that materially
-  changed historical counts.
+  before trusting its numbers — past scoring bugs have materially changed
+  historical counts (see `git log -- eval/score.py` for specifics).
 - Ground-truth `span`s for symbol _definitions_ in `queries/*.yaml` must cover
   the full function/class body (brace/indent-aware), not just the `def`/`fn`
   line — the tool correctly returns whole functions, and `score.py`'s
