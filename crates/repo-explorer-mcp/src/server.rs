@@ -124,6 +124,19 @@ fn reject_blank_query(query: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Reject `max_results: 0` before it reaches the agent loop. `0` truncates
+/// `findings` to an empty list (F-09) while the model-authored `summary`
+/// passes through unchanged, so the response can describe findings that
+/// aren't there. `max_results` has no documented "return nothing" mode —
+/// `None` already means unlimited — so `0` is an unintended edge case, not a
+/// valid request, and is rejected the same way as a blank query.
+fn reject_zero_max_results(max_results: Option<u32>) -> Result<(), String> {
+    if max_results == Some(0) {
+        return Err("max_results must be greater than 0; omit it for unlimited".to_string());
+    }
+    Ok(())
+}
+
 /// The MCP server handler: a shared `Arc<Agent>` plus the repo root to explore.
 #[derive(Clone)]
 pub struct RepoExplorerServer {
@@ -162,6 +175,10 @@ impl RepoExplorerServer {
     ) -> Result<Json<ExplorationResultDto>, String> {
         let req = params.0;
         if let Err(e) = reject_blank_query(&req.query) {
+            tracing::warn!(error_class = "validation", message = %e, "exploration rejected");
+            return Err(e);
+        }
+        if let Err(e) = reject_zero_max_results(req.max_results) {
             tracing::warn!(error_class = "validation", message = %e, "exploration rejected");
             return Err(e);
         }
@@ -340,6 +357,26 @@ mod tests {
         assert_eq!(
             reject_blank_query("").unwrap_err(),
             "query must not be empty"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_max_results() {
+        assert!(reject_zero_max_results(Some(0)).is_err());
+    }
+
+    #[test]
+    fn accepts_missing_or_positive_max_results() {
+        assert!(reject_zero_max_results(None).is_ok());
+        assert!(reject_zero_max_results(Some(1)).is_ok());
+        assert!(reject_zero_max_results(Some(5)).is_ok());
+    }
+
+    #[test]
+    fn zero_max_results_error_message_is_pinned() {
+        assert_eq!(
+            reject_zero_max_results(Some(0)).unwrap_err(),
+            "max_results must be greater than 0; omit it for unlimited"
         );
     }
 }
