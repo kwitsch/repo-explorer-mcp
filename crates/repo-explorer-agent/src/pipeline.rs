@@ -64,10 +64,14 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
     // an escaping hint rather than handing it to `search.search` unchecked —
     // fall back to unscoped (still repo_root-bounded) instead of leaking
     // content from outside the repository.
-    let scope = query
-        .scope_hint
-        .as_deref()
-        .filter(|p| !escapes_repo_root(p));
+    let raw_scope = query.scope_hint.as_deref();
+    let scope = raw_scope.filter(|p| !escapes_repo_root(p));
+    if let (Some(hint), None) = (raw_scope, scope) {
+        tracing::warn!(
+            scope_hint = %hint.display(),
+            "top-level scope_hint escapes the repository root; ignored (searched whole repo)"
+        );
+    }
 
     let symbol_legs = join_all(patterns.identifiers.iter().take(SYMBOL_LOOKUP_TOKENS).map(
         |token| {
