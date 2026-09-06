@@ -433,6 +433,8 @@ fn wants_config_test(args: &[String]) -> bool {
 struct ConfigTestReport {
     status: &'static str,
     config_path: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<ConfigTestError>,
 }
@@ -451,9 +453,17 @@ struct ConfigTestError {
 fn run_config_test(config_path: &Path) -> ExitCode {
     match repo_explorer_core::config::load(config_path) {
         Ok(_) => {
+            // Re-read the same file `load` just parsed to also surface any
+            // unrecognized key (F-12) in the report — `load`'s signature stays
+            // unchanged for its other callers, this is the one place that
+            // wants the raw text too, and the file is tiny.
+            let warnings = std::fs::read_to_string(config_path)
+                .map(|raw| repo_explorer_core::config::unknown_key_warnings(&raw))
+                .unwrap_or_default();
             let report = ConfigTestReport {
                 status: "valid",
                 config_path: config_path.display().to_string(),
+                warnings,
                 error: None,
             };
             print_report(&report, "config-test");
@@ -463,6 +473,7 @@ fn run_config_test(config_path: &Path) -> ExitCode {
             let report = ConfigTestReport {
                 status: "invalid",
                 config_path: config_path.display().to_string(),
+                warnings: Vec::new(),
                 error: Some(ConfigTestError {
                     message: format!("{e}"),
                     toml_path: e.toml_path(),
