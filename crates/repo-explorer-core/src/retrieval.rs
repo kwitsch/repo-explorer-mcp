@@ -46,6 +46,20 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+// A capitalized stopword (e.g. "How") still has_lower && has_upper and would
+// otherwise pass the shape test in `is_symbol_token`/`is_identifier_like`, so
+// both guard on this before the shape check. Shared so the two functions
+// can't drift out of sync on what counts as a stopword.
+fn is_stopword(token: &str) -> bool {
+    STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(token))
+}
+
+// Pure numerals (e.g. a stripped line number) carry no lexical identity.
+// Shared for the same reason as `is_stopword`.
+fn is_all_digits(token: &str) -> bool {
+    token.chars().all(|c| c.is_ascii_digit())
+}
+
 /// True for tokens that look like a real code symbol: snake_case, camelCase, or
 /// digit-bearing. Excludes plain long prose words and bare path segments — the
 /// permissive `len() >= 4` fallback that `is_identifier_like` adds on top of
@@ -53,16 +67,7 @@ fn is_word_char(c: char) -> bool {
 /// exactly why the early-exit gate misfires on symbol-free queries (F-16).
 /// Pure, I/O-free, no dependencies.
 pub fn is_symbol_token(token: &str) -> bool {
-    if token.len() < 3 {
-        return false;
-    }
-    // A capitalized stopword (e.g. "How") still has_lower && has_upper and would
-    // otherwise pass the shape test below, so reject stopwords first.
-    if STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(token)) {
-        return false;
-    }
-    // Pure numerals (e.g. a stripped line number) carry no lexical identity.
-    if token.chars().all(|c| c.is_ascii_digit()) {
+    if token.len() < 3 || is_stopword(token) || is_all_digits(token) {
         return false;
     }
     let has_underscore = token.contains('_');
@@ -73,26 +78,16 @@ pub fn is_symbol_token(token: &str) -> bool {
 }
 
 /// True for tokens worth treating as identifiers: snake_case, camelCase,
-/// digit-bearing, or any sufficiently long non-stopword word.
+/// digit-bearing, or any sufficiently long non-stopword word. Composes on
+/// top of `is_symbol_token` (rather than repeating its guard clauses) so the
+/// two can never silently disagree on stopword/numeral handling.
 fn is_identifier_like(token: &str) -> bool {
-    if token.len() < 3 {
-        return false;
-    }
-    // Stopword check must precede the shape checks: a capitalized stopword
-    // (e.g. "How") still has_lower && has_upper and would otherwise short-
-    // circuit past the filter.
-    if STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(token)) {
-        return false;
-    }
-    // Pure numerals (e.g. a stripped line number) carry no lexical identity;
-    // exclude them before the digit check inside is_symbol_token would
-    // otherwise wave them through.
-    if token.chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-    // Symbol-shaped tokens always qualify; otherwise fall back to the permissive
-    // "any long word" rule, kept for the grep/symbol fanout's broad recall.
-    is_symbol_token(token) || token.len() >= 4
+    // Symbol-shaped tokens always qualify; otherwise fall back to the
+    // permissive "any long word" rule, kept for the grep/symbol fanout's
+    // broad recall — re-applying the same guards `is_symbol_token` uses,
+    // since its length/stopword/numeral rejections don't imply this token
+    // clears the shorter `len() >= 4` bar on their own.
+    is_symbol_token(token) || (token.len() >= 4 && !is_stopword(token) && !is_all_digits(token))
 }
 
 /// Strip up to two trailing `:<digits>` groups (a `:line` or `:line:col`
