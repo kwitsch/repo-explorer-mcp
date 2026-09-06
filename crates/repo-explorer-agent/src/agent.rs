@@ -25,13 +25,15 @@ use repo_explorer_core::llm::{
     TokenUsage, ToolCall,
 };
 use repo_explorer_core::memory::{IndexStatus, MemoryBackend, MemoryError};
-use repo_explorer_core::retrieval::{finding_from_candidate, is_unknown_location};
+use repo_explorer_core::retrieval::{
+    finding_from_candidate, is_unknown_location, normalize_location,
+};
 use repo_explorer_core::search::SearchBackend;
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::cache::{QueryEntry, ResultCache};
-use crate::dispatch::{canonical_repo_root, dispatch_inner, verify_location};
+use crate::dispatch::{canonical_repo_root, clamp_location, dispatch_inner, read_verified_file};
 use crate::pipeline;
 use crate::render::{RenderCaps, dedupe_key, tidy_findings};
 use crate::tools::{finish_only_catalog, parse_finish_lenient, resolve_finish, tool_catalog};
@@ -514,15 +516,20 @@ where
     }
 
     /// Build the early-exit result from the ranked candidates, verifying each
-    /// against the live file first via the shared [`verify_location`] gate:
-    /// drop any candidate whose path is missing or whose `line_start` is past
-    /// EOF, and clamp `line_end` on survivors — but keep the backend-provided
-    /// snippet (it is not LLM-authored, so the finish path's F-18
-    /// disk-re-derivation does not apply). The canonical root is resolved once
-    /// for the whole batch; if it cannot be resolved the repo is unreadable, so
-    /// every candidate is dropped and the caller falls through to the LLM
-    /// stages. `index_note` (e.g. a failed reindex) is appended to the summary
-    /// — this is the only stage that doesn't thread it into an LLM prompt.
+    /// against the live file first: drop any candidate whose path is missing
+    /// or whose `line_start` is past EOF, and clamp `line_end` on survivors —
+    /// but keep the backend-provided snippet (it is not LLM-authored, so the
+    /// finish path's F-18 disk-re-derivation does not apply). The canonical
+    /// root is resolved once for the whole batch; if it cannot be resolved
+    /// the repo is unreadable, so every candidate is dropped and the caller
+    /// falls through to the LLM stages. `index_note` (e.g. a failed reindex)
+    /// is appended to the summary — this is the only stage that doesn't
+    /// thread it into an LLM prompt.
+    ///
+    /// Several candidates commonly point at the same file (e.g. multiple
+    /// symbol/content hits in one large source file), so the per-path
+    /// read+line-count ([`read_verified_file`]) is cached for the batch
+    /// instead of re-reading a shared file once per candidate.
     async fn result_from_candidates(
         &self,
         candidates: &[Candidate],
@@ -534,9 +541,21 @@ where
         let canonical_root = canonical_repo_root(repo_root).await.ok();
         let mut verified = Vec::with_capacity(candidates.len());
         if let Some(root) = &canonical_root {
+            let mut line_counts: HashMap<PathBuf, Result<u32, String>> = HashMap::new();
             for candidate in candidates {
-                match verify_location(candidate.location.clone(), repo_root, root).await {
-                    Ok((location, _content)) => {
+                let location = normalize_location(candidate.location.clone());
+                let line_count = match line_counts.get(&location.path) {
+                    Some(cached) => cached.clone(),
+                    None => {
+                        let result = read_verified_file(&location.path, repo_root, root)
+                            .await
+                            .map(|(_content, line_count)| line_count);
+                        line_counts.insert(location.path.clone(), result.clone());
+                        result
+                    }
+                };
+                match line_count.and_then(|line_count| clamp_location(location, line_count)) {
+                    Ok(location) => {
                         // Keep the backend-provided snippet (not LLM-authored,
                         // so F-18 does not apply); only the location is verified.
                         let mut candidate = candidate.clone();

@@ -326,31 +326,54 @@ pub(crate) fn slice_lines(
 ///
 /// ponytail: reads the whole file just to count lines; swap for a stat+count
 /// helper if this ever profiles hot (up to top_k reads per early-exit query).
+///
+/// Split out of [`verify_location`] so a caller batching several locations
+/// (the early-exit path's `result_from_candidates`, which commonly sees
+/// several candidates pointing at the same file) can cache this read per
+/// unique path instead of re-reading it once per location.
+pub(crate) async fn read_verified_file(
+    path: &Path,
+    repo_root: &Path,
+    canonical_root: &Path,
+) -> Result<(String, u32), String> {
+    let path_str = path.to_string_lossy();
+    let content = read_file_canonical(repo_root, canonical_root, &path_str, None, None)
+        .await
+        .map_err(|_| format!("location.path `{path_str}` does not exist in the repository"))?;
+    let line_count = saturate_u32(content.lines().count() as u64);
+    Ok((content, line_count))
+}
+
+/// Check `location.line_start` against `line_count` and clamp `line_end`
+/// (never below `line_start`). `location` must already be normalized.
+pub(crate) fn clamp_location(
+    location: FileLocation,
+    line_count: u32,
+) -> Result<FileLocation, String> {
+    if location.line_start > line_count {
+        return Err(format!(
+            "location.path `{}` cites line_start {} but the file has only {line_count} line(s)",
+            location.path.to_string_lossy(),
+            location.line_start
+        ));
+    }
+    let line_end = location.line_end.min(line_count.max(location.line_start));
+    Ok(FileLocation {
+        line_end,
+        ..location
+    })
+}
+
 pub(crate) async fn verify_location(
     location: FileLocation,
     repo_root: &Path,
     canonical_root: &Path,
 ) -> Result<(FileLocation, String), String> {
     let location = normalize_location(location);
-    let path_str = location.path.to_string_lossy();
-    let content = read_file_canonical(repo_root, canonical_root, &path_str, None, None)
-        .await
-        .map_err(|_| format!("location.path `{path_str}` does not exist in the repository"))?;
-    let line_count = saturate_u32(content.lines().count() as u64);
-    if location.line_start > line_count {
-        return Err(format!(
-            "location.path `{path_str}` cites line_start {} but the file has only {line_count} line(s)",
-            location.line_start
-        ));
-    }
-    let line_end = location.line_end.min(line_count.max(location.line_start));
-    Ok((
-        FileLocation {
-            line_end,
-            ..location
-        },
-        content,
-    ))
+    let (content, line_count) =
+        read_verified_file(&location.path, repo_root, canonical_root).await?;
+    let location = clamp_location(location, line_count)?;
+    Ok((location, content))
 }
 
 #[cfg(test)]
