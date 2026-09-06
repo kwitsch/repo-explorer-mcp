@@ -103,12 +103,18 @@ def snippet_chunks(snippet: str) -> list[list[str]]:
     need not be adjacent (the LLM may elide the middle of a long span). A line ending in the
     tool's own truncation marker (F-19) has that suffix stripped first: a non-empty remainder is
     real content to match (just shorter than the untruncated file line), while an empty remainder
-    (the marker occupied the whole line) is treated as an elision like an ELLIPSIS_LINE_RE line."""
+    (the marker occupied the whole line) is treated as an elision like an ELLIPSIS_LINE_RE line.
+    A genuinely blank line (F-20) is real content too — e.g. inside a docstring, or between two
+    top-level items quoted together — so it's kept as a "" wildcard placeholder within the
+    current chunk (matching find_chunk's substring check unconditionally) rather than dropped,
+    which would otherwise misalign the chunk's contiguous-run length against the file."""
     chunks: list[list[str]] = []
     current: list[str] = []
     for raw_line in snippet.splitlines():
         stripped = raw_line.strip()
         if not stripped:
+            if current:
+                current.append("")
             continue
         if ELLIPSIS_LINE_RE.match(stripped):
             if current:

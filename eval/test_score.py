@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Assert-based self-check for eval/score.py's snippet_found_at window (F-17).
+"""Assert-based self-check for eval/score.py's snippet_found_at window (F-17)
+and snippet_chunks' blank-line handling (F-20).
 
 No test framework, no fixtures, no results/ directory, no external corpus:
 writes a synthetic file to a tempdir and asserts the classifications directly.
@@ -69,6 +70,26 @@ def main() -> None:
         assert snippet_found_at(
             repo, "sample.py", None, None, "TOTALLY_ABSENT_SENTINEL_STRING"
         ) == "not_found"
+
+        # 8. F-20: a real blank line inside an otherwise-real multi-line
+        #    snippet (e.g. a blank docstring line) must not break contiguous
+        #    chunk matching. blank.py has a genuine blank line at index 2
+        #    (0-based) between SENTINEL_001 and SENTINEL_003 — the same shape
+        #    a docstring with a blank line, or two module members quoted
+        #    together, produces.
+        (repo / "blank.py").write_text(
+            "SENTINEL_000_line_content\n"
+            "SENTINEL_001_line_content\n"
+            "\n"
+            "SENTINEL_003_line_content\n"
+        )
+        assert snippet_found_at(
+            repo,
+            "blank.py",
+            2,
+            4,
+            "SENTINEL_001_line_content\n\nSENTINEL_003_line_content",
+        ) == "ok"
 
     print("OK")
 
