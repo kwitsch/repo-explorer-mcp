@@ -133,13 +133,24 @@ def snippet_chunks(snippet: str) -> list[list[str]]:
     return chunks
 
 
-def find_chunk(file_lines: list[str], chunk: list[str]) -> int | None:
-    """First index in file_lines where `chunk` matches a contiguous run (each chunk line must
-    be a substring of the corresponding file line), or None."""
+def find_chunk(
+    file_lines: list[str], chunk: list[str], near_range: tuple[int, int] | None = None
+) -> int | None:
+    """Index in file_lines where `chunk` matches a contiguous run (each chunk line must be a
+    substring of the corresponding file line) — preferring a match inside `near_range` (F-17
+    follow-up) when the chunk's content is duplicated elsewhere in the file (e.g. two functions
+    with the same signature, or a repeated test assertion): without this, the first (possibly
+    out-of-range) occurrence would be reported even when a second occurrence sits exactly at the
+    claimed line range, falsely classifying a correct finding as misaligned. Falls back to the
+    first match anywhere if none falls inside `near_range`. None if the chunk isn't found at all."""
+    fallback: int | None = None
     for i in range(len(file_lines) - len(chunk) + 1):
         if all(chunk[j] in file_lines[i + j] for j in range(len(chunk))):
-            return i
-    return None
+            if near_range is not None and near_range[0] <= i < near_range[1]:
+                return i
+            if fallback is None:
+                fallback = i
+    return fallback
 
 
 def path_exists(repo_path: Path, rel: str) -> bool:
@@ -195,7 +206,7 @@ def snippet_found_at(
     # range to fall outside of, so it can only ever be "ok" or "not_found" here.
     any_far = False
     for chunk in chunks:
-        idx = find_chunk(file_lines, chunk)
+        idx = find_chunk(file_lines, chunk, near_range)
         if idx is None:
             return "not_found"
         in_near = near_range is not None and near_range[0] <= idx < near_range[1]

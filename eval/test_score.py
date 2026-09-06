@@ -91,6 +91,21 @@ def main() -> None:
             "SENTINEL_001_line_content\n\nSENTINEL_003_line_content",
         ) == "ok"
 
+        # 9. F-17 follow-up: duplicated content (e.g. two functions with the
+        #    same signature) must prefer the occurrence inside the claimed
+        #    range over an earlier out-of-range duplicate. dup.py repeats
+        #    "DUP_line_content" at indices 2 and 20 (1-based lines 3, 21);
+        #    claiming line 21 must be "ok", not "misaligned" from latching
+        #    onto the line-3 occurrence.
+        (repo / "dup.py").write_text(
+            "\n".join(
+                "DUP_line_content" if i in (2, 20) else f"filler_{i:03d}"
+                for i in range(30)
+            )
+            + "\n"
+        )
+        assert snippet_found_at(repo, "dup.py", 21, 21, "DUP_line_content") == "ok"
+
     print("OK")
 
 
