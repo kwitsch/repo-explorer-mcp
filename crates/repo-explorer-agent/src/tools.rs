@@ -371,8 +371,12 @@ async fn validate_finding(
     // resolvable (both bounds still the `0` sentinel) falls back to the model's
     // text; NOT gated on is_unknown_location alone (which checks line_start
     // only), so a `line_start: 0` next to a real line_end still slices from
-    // disk — slice_lines treats a `0`/absent start as "from line 1".
-    let nothing_to_slice = location.line_start == 0 && location.line_end == 0;
+    // disk — slice_lines treats a `0`/absent start as "from line 1". Tested
+    // against `f.location`'s original bounds, not `location`'s: `verify_location`
+    // EOF-clamps `line_end` down to 0 for a real-but-empty file, and reading the
+    // clamped value here would misread a real `(0, N)` finding as the sentinel,
+    // letting the model's fabricated snippet back in.
+    let nothing_to_slice = f.location.line_start == 0 && f.location.line_end == 0;
     let snippet = if nothing_to_slice {
         f.snippet
     } else {
@@ -632,6 +636,25 @@ mod tests {
             Some("l1\nl2\nl3"),
             "line_start:0 with a real line_end must still be sliced from disk, \
              not treated as a free pass for the model's own text"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F-18 follow-up: a real-but-empty target file makes `verify_location`
+    /// clamp `line_end` down to 0 (`line_count.max(line_start)` is 0), so a
+    /// finding with `line_start: 0` and a real, nonzero `line_end` collapses
+    /// to `(0, 0)` post-clamp. That must not be misread as the genuine
+    /// unknown-location sentinel — the model's fabricated snippet must still
+    /// be dropped in favor of `None` (there is nothing to slice).
+    #[tokio::test]
+    async fn parse_finish_drops_fabricated_snippet_for_real_empty_file() {
+        let dir = temp_repo_main("empty_file_real_range_snippet", 0);
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":0,"line_end":3},"snippet":"FABRICATED TEXT NOT ON DISK"}],"summary":"done"}"#;
+        let result = parse_finish(json, &dir).await.unwrap();
+        assert_eq!(
+            result.findings[0].snippet, None,
+            "an empty file has nothing to slice; the model's fabricated \
+             snippet must not be kept just because EOF-clamping zeroed line_end"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
