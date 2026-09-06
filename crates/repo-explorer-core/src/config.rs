@@ -1128,6 +1128,9 @@ command = "codebase-memory-mcp"
 
     #[test]
     fn unknown_key_warnings_is_empty_for_unparseable_toml() {
-        assert_eq!(unknown_key_warnings("not valid toml =[["), Vec::<String>::new());
+        assert_eq!(
+            unknown_key_warnings("not valid toml =[["),
+            Vec::<String>::new()
+        );
     }
 }
