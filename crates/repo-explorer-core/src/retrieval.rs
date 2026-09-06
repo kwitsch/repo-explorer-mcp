@@ -20,6 +20,13 @@ pub struct QueryPatterns {
     /// Regex-escaped patterns for the grep fanout (literals first, then
     /// identifiers), capped at [`MAX_GREP_PATTERNS`].
     pub grep_patterns: Vec<String>,
+    /// Number of leading entries in `identifiers` that are as-typed originals;
+    /// entries from this index onward are F-15 case/convention variants
+    /// (`case_fold_variant`), appended after every original. `pub` so
+    /// `leg_identifiers` (and any other caller that must keep a variant
+    /// paired with its original instead of losing it to a flat `.take(N)`)
+    /// can find the split.
+    pub original_identifier_count: usize,
 }
 
 /// Upper bound on grep fanout width per query.
@@ -39,6 +46,20 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+// A capitalized stopword (e.g. "How") still has_lower && has_upper and would
+// otherwise pass the shape test in `is_symbol_token`/`is_identifier_like`, so
+// both guard on this before the shape check. Shared so the two functions
+// can't drift out of sync on what counts as a stopword.
+fn is_stopword(token: &str) -> bool {
+    STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(token))
+}
+
+// Pure numerals (e.g. a stripped line number) carry no lexical identity.
+// Shared for the same reason as `is_stopword`.
+fn is_all_digits(token: &str) -> bool {
+    token.chars().all(|c| c.is_ascii_digit())
+}
+
 /// True for tokens that look like a real code symbol: snake_case, camelCase, or
 /// digit-bearing. Excludes plain long prose words and bare path segments — the
 /// permissive `len() >= 4` fallback that `is_identifier_like` adds on top of
@@ -46,16 +67,7 @@ fn is_word_char(c: char) -> bool {
 /// exactly why the early-exit gate misfires on symbol-free queries (F-16).
 /// Pure, I/O-free, no dependencies.
 pub fn is_symbol_token(token: &str) -> bool {
-    if token.len() < 3 {
-        return false;
-    }
-    // A capitalized stopword (e.g. "How") still has_lower && has_upper and would
-    // otherwise pass the shape test below, so reject stopwords first.
-    if STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(token)) {
-        return false;
-    }
-    // Pure numerals (e.g. a stripped line number) carry no lexical identity.
-    if token.chars().all(|c| c.is_ascii_digit()) {
+    if token.len() < 3 || is_stopword(token) || is_all_digits(token) {
         return false;
     }
     let has_underscore = token.contains('_');
@@ -66,26 +78,16 @@ pub fn is_symbol_token(token: &str) -> bool {
 }
 
 /// True for tokens worth treating as identifiers: snake_case, camelCase,
-/// digit-bearing, or any sufficiently long non-stopword word.
+/// digit-bearing, or any sufficiently long non-stopword word. Composes on
+/// top of `is_symbol_token` (rather than repeating its guard clauses) so the
+/// two can never silently disagree on stopword/numeral handling.
 fn is_identifier_like(token: &str) -> bool {
-    if token.len() < 3 {
-        return false;
-    }
-    // Stopword check must precede the shape checks: a capitalized stopword
-    // (e.g. "How") still has_lower && has_upper and would otherwise short-
-    // circuit past the filter.
-    if STOPWORDS.iter().any(|s| s.eq_ignore_ascii_case(token)) {
-        return false;
-    }
-    // Pure numerals (e.g. a stripped line number) carry no lexical identity;
-    // exclude them before the digit check inside is_symbol_token would
-    // otherwise wave them through.
-    if token.chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-    // Symbol-shaped tokens always qualify; otherwise fall back to the permissive
-    // "any long word" rule, kept for the grep/symbol fanout's broad recall.
-    is_symbol_token(token) || token.len() >= 4
+    // Symbol-shaped tokens always qualify; otherwise fall back to the
+    // permissive "any long word" rule, kept for the grep/symbol fanout's
+    // broad recall — re-applying the same guards `is_symbol_token` uses,
+    // since its length/stopword/numeral rejections don't imply this token
+    // clears the shorter `len() >= 4` bar on their own.
+    is_symbol_token(token) || (token.len() >= 4 && !is_stopword(token) && !is_all_digits(token))
 }
 
 /// Strip up to two trailing `:<digits>` groups (a `:line` or `:line:col`
@@ -279,6 +281,9 @@ pub fn derive_patterns(query: &str) -> QueryPatterns {
     // prioritizing the genuinely-distinct query terms; push_unique collapses a
     // variant that coincides with an already-collected token. Collect into a
     // temporary Vec first to avoid borrowing patterns.identifiers while pushing.
+    // Record the original/variant boundary first: `leg_identifiers` needs it
+    // to keep a variant paired with its original past a `.take(N)` cutoff.
+    patterns.original_identifier_count = patterns.identifiers.len();
     let variants: Vec<String> = patterns
         .identifiers
         .iter()
@@ -296,6 +301,39 @@ pub fn derive_patterns(query: &str) -> QueryPatterns {
     }
 
     patterns
+}
+
+/// Identifiers to drive a fanout leg capped at `limit` original tokens: the
+/// first `limit` as-typed originals from `patterns.identifiers`, plus — for
+/// each included original — its F-15 case-fold variant, if `derive_patterns`
+/// produced one. A plain `patterns.identifiers.iter().take(limit)` silently
+/// drops a variant whenever the query names `limit` or more real
+/// identifiers, because every variant is appended after all originals; this
+/// keeps a variant paired with its original past that cutoff instead.
+pub fn leg_identifiers(patterns: &QueryPatterns, limit: usize) -> Vec<&String> {
+    let boundary = patterns
+        .original_identifier_count
+        .min(patterns.identifiers.len());
+    let originals: Vec<&String> = patterns.identifiers[..boundary]
+        .iter()
+        .take(limit)
+        .collect();
+    let mut out = originals.clone();
+    for token in &originals {
+        let Some(variant) = case_fold_variant(token) else {
+            continue;
+        };
+        let Some(found) = patterns.identifiers[boundary..]
+            .iter()
+            .find(|t| t.as_str() == variant)
+        else {
+            continue;
+        };
+        if !out.contains(&found) {
+            out.push(found);
+        }
+    }
+    out
 }
 
 /// Strip a leading `./` so the same file never appears under two spellings
@@ -555,6 +593,28 @@ mod tests {
                 "decideFreshness",
                 "staleness_window"
             ]
+        );
+    }
+
+    #[test]
+    fn leg_identifiers_keeps_a_variant_paired_with_its_original_past_the_cutoff() {
+        // Regression: with 4 real identifiers, both F-15 variants land at
+        // positions 4 and 5 in `patterns.identifiers` -- past a flat
+        // `.take(4)` -- and a naive leg fanout would silently drop them.
+        let p = derive_patterns("how does decide_freshness handle StalenessWindow timeouts");
+        let toks: Vec<&str> = leg_identifiers(&p, 4)
+            .into_iter()
+            .map(String::as_str)
+            .collect();
+        assert!(toks.contains(&"decide_freshness"));
+        assert!(toks.contains(&"StalenessWindow"));
+        assert!(
+            toks.contains(&"decideFreshness"),
+            "variant of decide_freshness must survive the take(4) cutoff, got {toks:?}"
+        );
+        assert!(
+            toks.contains(&"staleness_window"),
+            "variant of StalenessWindow must survive the take(4) cutoff, got {toks:?}"
         );
     }
 

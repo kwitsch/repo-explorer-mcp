@@ -31,7 +31,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::cache::{QueryEntry, ResultCache};
-use crate::dispatch::dispatch_inner;
+use crate::dispatch::{dispatch_inner, escapes_repo_root};
 use crate::pipeline;
 use crate::render::{RenderCaps, dedupe_key, tidy_findings};
 use crate::tools::{finish_only_catalog, parse_finish_lenient, resolve_finish, tool_catalog};
@@ -192,6 +192,30 @@ where
             )),
         };
 
+        // If the top-level scope_hint escapes the repo root it is dropped for
+        // the legs (see `pipeline::retrieve`); surface a generic caveat so the
+        // returned summary/prose stops pretending the hint was honored. Generic
+        // (not the raw value) because the cache key coalesces all escaping
+        // hints, so a value-specific note could be served for a different
+        // input; the specific value stays in the per-run WARN log.
+        let scope_note = query
+            .scope_hint
+            .as_deref()
+            .filter(|p| escapes_repo_root(p))
+            .map(|_| {
+                "Note: the requested scope hint escapes the repository root and was \
+                 ignored; the search covered the entire repository."
+                    .to_string()
+            });
+        let note: Option<String> = {
+            let combined = [index_note, scope_note]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!combined.is_empty()).then_some(combined)
+        };
+
         // Stage 2: deterministic retrieval — no LLM.
         let leg_cache = self.cache_for(fingerprint.as_ref());
         let outcome = pipeline::retrieve(
@@ -227,7 +251,7 @@ where
                     outcome.candidates,
                     query,
                     outcome.confidence,
-                    index_note.as_deref(),
+                    note.as_deref(),
                 );
                 return Ok(self.complete_run(
                     "early-exit",
@@ -255,7 +279,7 @@ where
                 &self.router,
                 repo_root,
                 query,
-                index_note.as_deref(),
+                note.as_deref(),
                 &outcome.candidates,
                 self.settings.max_verify_iterations,
                 &mut budget,
@@ -283,7 +307,7 @@ where
             .fallback_loop(
                 repo_root,
                 query,
-                index_note.as_deref(),
+                note.as_deref(),
                 outcome.candidates,
                 fingerprint.as_ref(),
                 &mut budget,
@@ -815,10 +839,16 @@ pub(crate) fn force_finish_options() -> CallOptions {
 }
 
 /// The 4-part preamble shared by the fallback loop's and the verification
-/// stage's user prompts: query text, scope hint, max_results, index note.
+/// stage's user prompts: query text, scope hint, max_results, index note. A
+/// scope hint that escapes the repository root (`dispatch::escapes_repo_root`)
+/// is omitted rather than rendered as an in-effect scope — the honest "was
+/// ignored" caveat is carried once by the threaded `index_note`, so an inline
+/// tag here would duplicate (and could contradict) it.
 pub(crate) fn query_preamble(query: &ExplorationQuery, index_note: Option<&str>) -> String {
     let mut s = format!("Exploration query: {}", query.text);
-    if let Some(scope) = &query.scope_hint {
+    if let Some(scope) = query.scope_hint.as_deref()
+        && !escapes_repo_root(scope)
+    {
         s.push_str(&format!("\nScope hint: {}", scope.display()));
     }
     if let Some(max) = query.max_results {
@@ -1110,6 +1140,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn early_exit_surfaces_scope_hint_ignored_note_in_summary() {
+        // F-06: an escaping top-level scope_hint is dropped for the legs, but
+        // the deterministic early-exit summary must say so — not silently
+        // pretend the scope was honored. Same high-confidence SymbolExact setup
+        // as the stale-index-note test, but with an escaping scope_hint.
+        let memory = MockMemoryBackend::new().with_search_graph_result(Ok(ExplorationResult {
+            findings: vec![ExplorationFinding {
+                location: FileLocation {
+                    path: PathBuf::from("crates/x/src/freshness.rs"),
+                    line_start: 12,
+                    line_end: 12,
+                },
+                snippet: None,
+                note: Some("decide_freshness".to_string()),
+            }],
+            summary: "1 row".to_string(),
+        }));
+        let router = ProviderRouter::with_clock(
+            vec![(
+                "primary".to_string(),
+                vec![("m".to_string(), MockLlmProvider::new())],
+            )],
+            60,
+            FakeClock::new(),
+        );
+        let agent = AgentLoop::new(
+            memory,
+            MockSearchBackend::new(),
+            router,
+            MockRepoStateProbe::new(),
+            AgentSettings::default(),
+            CacheSettings::default(),
+        );
+        let query = ExplorationQuery {
+            text: "decide_freshness".to_string(),
+            scope_hint: Some(PathBuf::from("../../etc")),
+            max_results: None,
+        };
+        let got = agent.run(&PathBuf::from("/repo"), &query).await.unwrap();
+        assert!(
+            got.summary.contains("escapes the repository root"),
+            "early-exit summary must surface the ignored-scope note: {}",
+            got.summary
+        );
+    }
+
+    #[tokio::test]
     async fn symbol_free_query_is_vetoed_from_early_exit() {
         // Regression: F-16 — a query that names no symbol-shaped token
         // (snake_case / camelCase / digit-bearing) must never take the
@@ -1299,5 +1376,33 @@ mod tests {
             completion_tokens: 3,
         }));
         assert!(b.exhausted(), "exactly at the limit counts as exhausted");
+    }
+
+    #[test]
+    fn query_preamble_omits_escaping_scope_hint() {
+        // An escaping scope hint is dropped for the legs, so the preamble must
+        // not render it as an in-effect "Scope hint:" — that would tell the LLM
+        // the search was scoped when it was not. A valid in-root hint still is.
+        let escaping = ExplorationQuery {
+            text: "where is main".to_string(),
+            scope_hint: Some(PathBuf::from("../../etc")),
+            max_results: None,
+        };
+        let preamble = query_preamble(&escaping, None);
+        assert!(
+            !preamble.contains("Scope hint:"),
+            "escaping scope hint must not be rendered as in-effect: {preamble}"
+        );
+
+        let valid = ExplorationQuery {
+            text: "where is main".to_string(),
+            scope_hint: Some(PathBuf::from("src")),
+            max_results: None,
+        };
+        let preamble = query_preamble(&valid, None);
+        assert!(
+            preamble.contains("Scope hint: src"),
+            "a valid in-root scope hint must still be rendered: {preamble}"
+        );
     }
 }

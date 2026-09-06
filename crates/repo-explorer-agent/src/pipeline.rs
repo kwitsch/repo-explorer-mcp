@@ -9,7 +9,9 @@ use repo_explorer_core::domain::{
 };
 use repo_explorer_core::fingerprint::RepoFingerprint;
 use repo_explorer_core::memory::{GraphQuery, MemoryBackend};
-use repo_explorer_core::retrieval::{confidence, derive_patterns, is_symbol_token, merge_and_rank};
+use repo_explorer_core::retrieval::{
+    confidence, derive_patterns, is_symbol_token, leg_identifiers, merge_and_rank,
+};
 use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use std::collections::HashSet;
 use std::path::Path;
@@ -64,34 +66,40 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
     // an escaping hint rather than handing it to `search.search` unchecked —
     // fall back to unscoped (still repo_root-bounded) instead of leaking
     // content from outside the repository.
-    let scope = query
-        .scope_hint
-        .as_deref()
-        .filter(|p| !escapes_repo_root(p));
+    let raw_scope = query.scope_hint.as_deref();
+    let scope = raw_scope.filter(|p| !escapes_repo_root(p));
+    if let (Some(hint), None) = (raw_scope, scope) {
+        tracing::warn!(
+            scope_hint = %hint.display(),
+            "top-level scope_hint escapes the repository root; ignored (searched whole repo)"
+        );
+    }
 
-    let symbol_legs = join_all(patterns.identifiers.iter().take(SYMBOL_LOOKUP_TOKENS).map(
-        |token| {
-            memoized(
-                leg_cache,
-                move || leg_key("symbol", token, scope),
-                async move {
-                    let graph_query = GraphQuery {
-                        name_pattern: Some(token.clone()),
-                        file_pattern: scope.map(|p| p.to_string_lossy().into_owned()),
-                        max_results: Some(PER_LEG_MAX_RESULTS),
-                        ..GraphQuery::default()
-                    };
-                    soft_leg(
-                        "symbol",
-                        token,
-                        memory.search_graph(repo_root, &graph_query),
-                        |res| symbol_candidates(res.findings, token),
-                    )
-                    .await
-                },
-            )
-        },
-    ));
+    let symbol_legs = join_all(
+        leg_identifiers(&patterns, SYMBOL_LOOKUP_TOKENS)
+            .into_iter()
+            .map(|token| {
+                memoized(
+                    leg_cache,
+                    move || leg_key("symbol", token, scope),
+                    async move {
+                        let graph_query = GraphQuery {
+                            name_pattern: Some(token.clone()),
+                            file_pattern: scope.map(|p| p.to_string_lossy().into_owned()),
+                            max_results: Some(PER_LEG_MAX_RESULTS),
+                            ..GraphQuery::default()
+                        };
+                        soft_leg(
+                            "symbol",
+                            token,
+                            memory.search_graph(repo_root, &graph_query),
+                            |res| symbol_candidates(res.findings, token),
+                        )
+                        .await
+                    },
+                )
+            }),
+    );
 
     // The connected backend's `search_code` is a literal-substring search, not
     // semantic search (confirmed live): the raw free-text `query.text` almost
@@ -99,12 +107,16 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
     // Fan out one call per derived literal/identifier token instead — the
     // same tokens the grep legs search for, but against the memory backend's
     // own index (a distinct corpus from the CLI search backend).
+    // Literals get first claim on the shared budget; whatever's left goes to
+    // identifiers via `leg_identifiers` so a case-fold variant isn't dropped
+    // just because it landed past a flat take(N) cutoff (see symbol_legs).
+    let semantic_identifier_budget = SEMANTIC_LOOKUP_TOKENS.saturating_sub(patterns.literals.len());
     let semantic_legs = join_all(
         patterns
             .literals
             .iter()
-            .chain(patterns.identifiers.iter())
             .take(SEMANTIC_LOOKUP_TOKENS)
+            .chain(leg_identifiers(&patterns, semantic_identifier_budget))
             .map(|token| {
                 memoized(
                     leg_cache,

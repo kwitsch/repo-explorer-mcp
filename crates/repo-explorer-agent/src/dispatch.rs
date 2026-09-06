@@ -188,8 +188,9 @@ fn snippet_target(args: GetCodeSnippetArgs) -> SnippetTarget {
 /// via a prefix component — `Component::Prefix` also catches a drive-relative
 /// path like `C:foo`, which is neither `is_absolute()` nor `has_root()` since
 /// it resolves against that drive's own current directory rather than
-/// `repo_root`. Shared with `pipeline`'s top-level query `scope_hint` check so
-/// the two call sites can't drift apart on what counts as an escape.
+/// `repo_root`. Shared with `pipeline`'s top-level query `scope_hint` check and
+/// `cache::scope_display`'s cache-key filter so the call sites can't drift
+/// apart on what counts as an escape.
 pub(crate) fn escapes_repo_root(path: &Path) -> bool {
     path.has_root()
         || path
