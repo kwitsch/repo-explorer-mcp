@@ -13,6 +13,8 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::dispatch::escapes_repo_root;
+
 /// A capped `String`-keyed map with FIFO eviction (oldest inserted first out).
 struct CappedMap<V> {
     map: HashMap<String, V>,
@@ -73,11 +75,18 @@ pub(crate) fn encode_field_into(out: &mut String, s: &str) {
     out.push_str(s);
 }
 
-/// Render an optional scope path for cache-key inclusion. Shared by
-/// `query_key` below and `leg_key` in `pipeline.rs` so the two can never
-/// encode a scope hint differently.
+/// Render an optional scope path for cache-key inclusion, dropping a scope
+/// that escapes the repository root (`dispatch::escapes_repo_root`) so an
+/// escaping hint coalesces to the empty field — identical to `scope_hint:
+/// None` — instead of minting a distinct cache entry per escaping string.
+/// Shared by `query_key` below and `leg_key` in `pipeline.rs` (whose scope is
+/// already pre-filtered, so the drop is a harmless no-op there) so the call
+/// sites can never encode a scope hint differently.
 pub(crate) fn scope_display(scope: Option<&Path>) -> String {
-    scope.map(|p| p.display().to_string()).unwrap_or_default()
+    scope
+        .filter(|p| !escapes_repo_root(p))
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
 }
 
 /// Render an optional value for cache-key inclusion.
@@ -224,6 +233,7 @@ impl ResultCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn fp(sha: &str) -> RepoFingerprint {
         RepoFingerprint {
@@ -341,5 +351,31 @@ mod tests {
             max_results: None,
         };
         assert_eq!(ResultCache::query_key(&q1), ResultCache::query_key(&q2));
+    }
+
+    #[test]
+    fn query_key_treats_escaping_scope_hint_as_absent() {
+        // A scope_hint that escapes the repo root (absolute, or `..`-walking)
+        // is dropped for the actual search legs; it must therefore fold to the
+        // same cache key as `scope_hint: None`, so N distinct escaping strings
+        // for what is semantically one unscoped query do not mint N entries.
+        let none = ExplorationQuery {
+            text: "where is main".to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let absolute = ExplorationQuery {
+            text: "where is main".to_string(),
+            scope_hint: Some(PathBuf::from("/etc")),
+            max_results: None,
+        };
+        let parent = ExplorationQuery {
+            text: "where is main".to_string(),
+            scope_hint: Some(PathBuf::from("../../etc")),
+            max_results: None,
+        };
+        let none_key = ResultCache::query_key(&none);
+        assert_eq!(ResultCache::query_key(&absolute), none_key);
+        assert_eq!(ResultCache::query_key(&parent), none_key);
     }
 }
