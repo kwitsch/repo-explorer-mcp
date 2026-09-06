@@ -35,6 +35,33 @@ impl GitStateProbe {
     }
 }
 
+/// Fold each untracked file's `(size, mtime)` into a stable string, so an
+/// edit to an already-untracked file's bytes changes the dirty fingerprint
+/// even though neither `git status --porcelain` nor `git diff HEAD` would
+/// notice (F-07). Cheap stat, not a full read — avoids the perf risk of
+/// hashing content across a large untracked directory that isn't gitignored.
+/// Untracked paths are read straight out of the already-fetched `status`
+/// text (lines prefixed `"?? "`), so no extra `git` subprocess call is
+/// needed. `parts` is sorted so this is stable regardless of `status`'s own
+/// line order.
+///
+/// ponytail: git's C-style quoting of exotic filenames in `--porcelain`
+/// output isn't unescaped here, so such a path won't resolve via
+/// `repo_root.join(rel)` and falls into the `Err` "missing" arm — no worse
+/// than the total blind spot this replaces; unquote it if it ever bites.
+fn untracked_fingerprint(repo_root: &Path, status: &str) -> String {
+    let mut parts: Vec<String> = status
+        .lines()
+        .filter_map(|l| l.strip_prefix("?? "))
+        .map(|rel| match std::fs::metadata(repo_root.join(rel)) {
+            Ok(meta) => format!("{rel}:{}:{:?}", meta.len(), meta.modified().ok()),
+            Err(_) => format!("{rel}:missing"),
+        })
+        .collect();
+    parts.sort();
+    parts.join("\n")
+}
+
 fn sha256_hex(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
     for part in parts {
@@ -50,7 +77,10 @@ impl RepoStateProbe for GitStateProbe {
         // untracked files) plus the full `git diff HEAD` patch text, whose
         // `index` lines pin the base blobs — so an equal digest means equal
         // dirty *content* for tracked files, not merely an equal path set.
-        // Blind spot: content edits inside an already-untracked file.
+        // `untracked_fingerprint` covers the remaining blind spot: content
+        // edits inside an already-untracked file (F-07) — `diff HEAD` never
+        // covers untracked content, and `status` only ever shows the same
+        // one-line "??" entry regardless of what changed inside.
         let (head, status, diff) = tokio::join!(
             self.git(repo_root, &["rev-parse", "HEAD"]),
             self.git(repo_root, &["status", "--porcelain"]),
@@ -62,9 +92,10 @@ impl RepoStateProbe for GitStateProbe {
         }
         let status = status?;
         let diff = diff?;
+        let untracked = untracked_fingerprint(repo_root, &status);
         Some(RepoFingerprint {
             head_sha,
-            dirty_hash: sha256_hex(&[&status, &diff]),
+            dirty_hash: sha256_hex(&[&status, &diff, &untracked]),
         })
     }
 
@@ -186,6 +217,37 @@ mod tests {
             Some(Vec::new())
         );
         assert_eq!(probe.changed_paths(&dir, &clean, &dirty).await, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F-07: editing bytes inside an already-untracked file must change the
+    /// fingerprint even though neither `status --porcelain` nor `diff HEAD`
+    /// notices the content change (only the file's continued presence).
+    #[tokio::test]
+    async fn untracked_file_content_edit_changes_the_fingerprint() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let dir = temp_dir("untracked");
+        init_repo(&dir).await;
+        std::fs::write(dir.join("tracked.txt"), "one\n").unwrap();
+        commit_all(&dir, "c1").await;
+
+        let probe = GitStateProbe::new(30);
+        std::fs::write(dir.join("scratch.txt"), "one\n").unwrap();
+        let before = probe.fingerprint(&dir).await.expect("fingerprint");
+
+        // Editing the untracked file's bytes (no `git add`) must change it —
+        // this is a *size* change, so it's visible regardless of mtime
+        // resolution on the test filesystem.
+        std::fs::write(dir.join("scratch.txt"), "one\ntwo\n").unwrap();
+        let after = probe.fingerprint(&dir).await.expect("fingerprint");
+        assert_ne!(
+            before.dirty_hash, after.dirty_hash,
+            "content edit inside an already-untracked file must be visible"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
