@@ -366,7 +366,14 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
                     .complete_with_tools(messages, tools, options)
                     .await
                 {
-                    Ok(resp) => return Ok(resp),
+                    Ok(resp) => {
+                        tracing::debug!(
+                            provider = %entry.name,
+                            model = %slot.model,
+                            "provider call succeeded"
+                        );
+                        return Ok(resp);
+                    }
                     Err(e) if e.is_failover_trigger() => {
                         tracing::warn!(
                             provider = %entry.name,
