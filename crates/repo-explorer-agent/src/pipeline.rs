@@ -38,6 +38,14 @@ pub(crate) struct RetrievalOutcome {
     /// (see `repo_explorer_core::retrieval::is_symbol_token`). Gates the Stage 3
     /// early-exit route: a query that names no symbol can never early-exit (F-16).
     pub has_symbol_token: bool,
+    /// True when the query's top-level `scope_hint` was present but escapes
+    /// the repository root (`dispatch::escapes_repo_root`), and was therefore
+    /// dropped for every leg above. Computed once here so `agent::run`'s
+    /// user-facing caveat and `query_preamble`'s "Scope hint:" line don't
+    /// each re-derive it (F-06). `cache::scope_display`'s cache-key folding
+    /// still derives it independently: the query cache key is computed
+    /// before this outcome exists.
+    pub scope_hint_escaped: bool,
 }
 
 /// Memoization handle for the fanout legs: only active when both a cache and
@@ -67,10 +75,11 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
     // fall back to unscoped (still repo_root-bounded) instead of leaking
     // content from outside the repository.
     let raw_scope = query.scope_hint.as_deref();
-    let scope = raw_scope.filter(|p| !escapes_repo_root(p));
-    if let (Some(hint), None) = (raw_scope, scope) {
+    let scope_hint_escaped = raw_scope.is_some_and(escapes_repo_root);
+    let scope = raw_scope.filter(|_| !scope_hint_escaped);
+    if scope_hint_escaped {
         tracing::warn!(
-            scope_hint = %hint.display(),
+            scope_hint = %raw_scope.unwrap().display(),
             "top-level scope_hint escapes the repository root; ignored (searched whole repo)"
         );
     }
@@ -210,6 +219,7 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
         candidates,
         confidence,
         has_symbol_token,
+        scope_hint_escaped,
     }
 }
 

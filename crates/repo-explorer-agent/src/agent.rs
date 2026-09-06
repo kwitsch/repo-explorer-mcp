@@ -31,7 +31,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::cache::{QueryEntry, ResultCache};
-use crate::dispatch::{dispatch_inner, escapes_repo_root};
+use crate::dispatch::dispatch_inner;
 use crate::pipeline;
 use crate::render::{RenderCaps, dedupe_key, tidy_findings};
 use crate::tools::{finish_only_catalog, parse_finish_lenient, resolve_finish, tool_catalog};
@@ -192,30 +192,6 @@ where
             )),
         };
 
-        // If the top-level scope_hint escapes the repo root it is dropped for
-        // the legs (see `pipeline::retrieve`); surface a generic caveat so the
-        // returned summary/prose stops pretending the hint was honored. Generic
-        // (not the raw value) because the cache key coalesces all escaping
-        // hints, so a value-specific note could be served for a different
-        // input; the specific value stays in the per-run WARN log.
-        let scope_note = query
-            .scope_hint
-            .as_deref()
-            .filter(|p| escapes_repo_root(p))
-            .map(|_| {
-                "Note: the requested scope hint escapes the repository root and was \
-                 ignored; the search covered the entire repository."
-                    .to_string()
-            });
-        let note: Option<String> = {
-            let combined = [index_note, scope_note]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" ");
-            (!combined.is_empty()).then_some(combined)
-        };
-
         // Stage 2: deterministic retrieval — no LLM.
         let leg_cache = self.cache_for(fingerprint.as_ref());
         let outcome = pipeline::retrieve(
@@ -236,6 +212,27 @@ where
             confidence = outcome.confidence,
             "retrieval pre-stage complete"
         );
+
+        // If the top-level scope_hint escaped the repo root, `outcome` already
+        // dropped it for every leg (`pipeline::retrieve` computes this once);
+        // surface a generic caveat so the returned summary/prose stops
+        // pretending the hint was honored. Generic (not the raw value)
+        // because the cache key coalesces all escaping hints, so a
+        // value-specific note could be served for a different input; the
+        // specific value stays in the per-run WARN log.
+        let scope_note = outcome.scope_hint_escaped.then(|| {
+            "Note: the requested scope hint escapes the repository root and was \
+             ignored; the search covered the entire repository."
+                .to_string()
+        });
+        let note: Option<String> = {
+            let combined = [index_note, scope_note]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!combined.is_empty()).then_some(combined)
+        };
 
         let mut budget = TokenBudget::new(self.settings.token_budget);
 
@@ -279,6 +276,7 @@ where
                 &self.router,
                 repo_root,
                 query,
+                outcome.scope_hint_escaped,
                 note.as_deref(),
                 &outcome.candidates,
                 self.settings.max_verify_iterations,
@@ -307,6 +305,7 @@ where
             .fallback_loop(
                 repo_root,
                 query,
+                outcome.scope_hint_escaped,
                 note.as_deref(),
                 outcome.candidates,
                 fingerprint.as_ref(),
@@ -515,10 +514,12 @@ where
     /// Returns the result plus whether it came from the forced-finish path or
     /// the deterministic synthesis fallback (`true`), as opposed to a normal
     /// in-loop `finish` call (`false`) — logged on `exploration complete`.
+    #[allow(clippy::too_many_arguments)]
     async fn fallback_loop(
         &self,
         repo_root: &Path,
         query: &ExplorationQuery,
+        scope_hint_escaped: bool,
         index_note: Option<&str>,
         candidates: Vec<Candidate>,
         fingerprint: Option<&RepoFingerprint>,
@@ -527,7 +528,12 @@ where
         let tools = tool_catalog();
         let mut messages: Vec<Message> = vec![
             Message::system(FALLBACK_SYSTEM_PROMPT),
-            Message::user(user_prompt(query, index_note, &candidates)),
+            Message::user(user_prompt(
+                query,
+                scope_hint_escaped,
+                index_note,
+                &candidates,
+            )),
         ];
 
         let mut findings: Vec<ExplorationFinding> = Vec::new();
@@ -840,14 +846,19 @@ pub(crate) fn force_finish_options() -> CallOptions {
 
 /// The 4-part preamble shared by the fallback loop's and the verification
 /// stage's user prompts: query text, scope hint, max_results, index note. A
-/// scope hint that escapes the repository root (`dispatch::escapes_repo_root`)
-/// is omitted rather than rendered as an in-effect scope — the honest "was
-/// ignored" caveat is carried once by the threaded `index_note`, so an inline
-/// tag here would duplicate (and could contradict) it.
-pub(crate) fn query_preamble(query: &ExplorationQuery, index_note: Option<&str>) -> String {
+/// scope hint that escapes the repository root (`scope_hint_escaped`, computed
+/// once by `pipeline::retrieve`) is omitted rather than rendered as an
+/// in-effect scope — the honest "was ignored" caveat is carried once by the
+/// threaded `index_note`, so an inline tag here would duplicate (and could
+/// contradict) it.
+pub(crate) fn query_preamble(
+    query: &ExplorationQuery,
+    scope_hint_escaped: bool,
+    index_note: Option<&str>,
+) -> String {
     let mut s = format!("Exploration query: {}", query.text);
     if let Some(scope) = query.scope_hint.as_deref()
-        && !escapes_repo_root(scope)
+        && !scope_hint_escaped
     {
         s.push_str(&format!("\nScope hint: {}", scope.display()));
     }
@@ -863,10 +874,11 @@ pub(crate) fn query_preamble(query: &ExplorationQuery, index_note: Option<&str>)
 
 fn user_prompt(
     query: &ExplorationQuery,
+    scope_hint_escaped: bool,
     index_note: Option<&str>,
     candidates: &[Candidate],
 ) -> String {
-    let mut s = query_preamble(query, index_note);
+    let mut s = query_preamble(query, scope_hint_escaped, index_note);
     if !candidates.is_empty() {
         s.push_str(
             "\nStarting points found by the deterministic retrieval pre-stage (ranked, may be incomplete):",
@@ -1388,7 +1400,7 @@ mod tests {
             scope_hint: Some(PathBuf::from("../../etc")),
             max_results: None,
         };
-        let preamble = query_preamble(&escaping, None);
+        let preamble = query_preamble(&escaping, true, None);
         assert!(
             !preamble.contains("Scope hint:"),
             "escaping scope hint must not be rendered as in-effect: {preamble}"
@@ -1399,7 +1411,7 @@ mod tests {
             scope_hint: Some(PathBuf::from("src")),
             max_results: None,
         };
-        let preamble = query_preamble(&valid, None);
+        let preamble = query_preamble(&valid, false, None);
         assert!(
             preamble.contains("Scope hint: src"),
             "a valid in-root scope hint must still be rendered: {preamble}"
