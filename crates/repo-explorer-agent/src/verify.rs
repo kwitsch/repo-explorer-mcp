@@ -48,6 +48,7 @@ pub(crate) async fn verify<M, P, C>(
     router: &ProviderRouter<P, C>,
     repo_root: &Path,
     query: &ExplorationQuery,
+    scope_hint_escaped: bool,
     index_note: Option<&str>,
     candidates: &[Candidate],
     max_verify_iterations: u32,
@@ -62,7 +63,12 @@ where
     let block = candidates_block(memory, repo_root, candidates, caps).await;
     let mut messages = vec![
         Message::system(VERIFY_SYSTEM_PROMPT),
-        Message::user(verify_user_prompt(query, index_note, &block)),
+        Message::user(verify_user_prompt(
+            query,
+            scope_hint_escaped,
+            index_note,
+            &block,
+        )),
     ];
 
     let turns = max_verify_iterations.max(1);
@@ -137,8 +143,13 @@ where
     VerifyOutcome::Escalate
 }
 
-fn verify_user_prompt(query: &ExplorationQuery, index_note: Option<&str>, block: &str) -> String {
-    let mut s = crate::agent::query_preamble(query, index_note);
+fn verify_user_prompt(
+    query: &ExplorationQuery,
+    scope_hint_escaped: bool,
+    index_note: Option<&str>,
+    block: &str,
+) -> String {
+    let mut s = crate::agent::query_preamble(query, scope_hint_escaped, index_note);
     s.push_str("\n\nCandidates:\n");
     s.push_str(block);
     s
