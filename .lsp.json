@@ -17,5 +17,54 @@
       ".jsx": "javascript"
     },
     "startupTimeout": 60000
+  },
+  "taplo": {
+    "command": "taplo",
+    "args": ["lsp", "stdio"],
+    "extensionToLanguage": {
+      ".toml": "toml"
+    },
+    "startupTimeout": 60000
+  },
+  "pyright": {
+    "command": "pyright-langserver",
+    "args": ["--stdio"],
+    "extensionToLanguage": {
+      ".py": "python"
+    },
+    "startupTimeout": 60000
+  },
+  "yaml-language-server": {
+    "command": "yaml-language-server",
+    "args": ["--stdio"],
+    "extensionToLanguage": {
+      ".yml": "yaml",
+      ".yaml": "yaml"
+    },
+    "startupTimeout": 60000
+  },
+  "vscode-json-language-server": {
+    "command": "vscode-json-language-server",
+    "args": ["--stdio"],
+    "extensionToLanguage": {
+      ".json": "json"
+    },
+    "startupTimeout": 60000
+  },
+  "bash-language-server": {
+    "command": "bash-language-server",
+    "args": ["start"],
+    "extensionToLanguage": {
+      ".sh": "shellscript"
+    },
+    "startupTimeout": 60000
+  },
+  "marksman": {
+    "command": "marksman",
+    "args": ["server"],
+    "extensionToLanguage": {
+      ".md": "markdown"
+    },
+    "startupTimeout": 60000
   }
 }
