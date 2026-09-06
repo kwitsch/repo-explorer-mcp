@@ -75,9 +75,12 @@ where
     for turn in 0..turns {
         let last = turn + 1 == turns || budget.exhausted();
         let options = if last {
-            force_finish_options()
+            force_finish_options(budget)
         } else {
-            CallOptions::default()
+            CallOptions {
+                rotation_seed: Some(budget.rotation_seed()),
+                ..Default::default()
+            }
         };
         match router
             .complete_with_tools(&messages, verify_catalog(), &options)

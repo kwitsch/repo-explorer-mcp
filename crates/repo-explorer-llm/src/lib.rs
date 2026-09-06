@@ -627,6 +627,15 @@ impl LlmProvider for GenaiProvider {
 /// Build the production router from validated config: one `GenaiProvider` per
 /// entry, in file (= failover) order, with the configured cooldown window.
 ///
+/// Gemini entries are marked `rotate_start` (see
+/// `ProviderRouter::with_clock_and_rotation`): the caller (`repo-explorer-agent`)
+/// hands each top-level conversation a fresh `CallOptions::rotation_seed`,
+/// which such an entry uses to pick its failover start model instead of
+/// always starting at the first configured one. Gemini's per-model rate
+/// limits are unusually tight, so spreading conversations across the
+/// configured models this way reduces the error rate. Every other provider
+/// kind keeps the fixed configured order regardless of any seed passed.
+///
 /// The composition helper the `repo-explorer-mcp` binary calls in a later stage.
 pub fn build_router(cfg: &LlmConfig) -> Result<ProviderRouter<GenaiProvider>, ProviderError> {
     let mut providers = Vec::with_capacity(cfg.providers.len());
@@ -636,9 +645,13 @@ pub fn build_router(cfg: &LlmConfig) -> Result<ProviderRouter<GenaiProvider>, Pr
         for model in &entry.models {
             models.push((model.clone(), GenaiProvider::bind_model(&shared, model)));
         }
-        providers.push((entry.name.clone(), models));
+        let rotate_start = shared.adapter_kind == genai::adapter::AdapterKind::Gemini;
+        providers.push((entry.name.clone(), models, rotate_start));
     }
-    Ok(ProviderRouter::new(providers, cfg.cooldown_seconds))
+    Ok(ProviderRouter::new_with_rotation(
+        providers,
+        cfg.cooldown_seconds,
+    ))
 }
 
 #[cfg(test)]
