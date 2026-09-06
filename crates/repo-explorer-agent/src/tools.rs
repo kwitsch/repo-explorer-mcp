@@ -2,10 +2,10 @@
 //! `finish` validation. `repo_root` is never a tool parameter — the dispatcher
 //! supplies it from loop state.
 
-use crate::dispatch::{canonical_repo_root, read_file_canonical};
+use crate::dispatch::{canonical_repo_root, read_file_canonical, slice_lines};
 use repo_explorer_core::domain::{ExplorationFinding, ExplorationResult, FileLocation};
 use repo_explorer_core::llm::{Message, Tool, ToolCall};
-use repo_explorer_core::retrieval::normalize_location;
+use repo_explorer_core::retrieval::{is_unknown_location, normalize_location};
 use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -372,12 +372,23 @@ async fn validate_finding(
     // Clamp a line_end past EOF to the file length, never below line_start.
     let line_count = content.lines().count() as u32;
     let line_end = location.line_end.min(line_count.max(location.line_start));
+    // Don't trust the model's own snippet text (F-18: seen paraphrased
+    // signatures, wrong base classes, invented bodies at an otherwise-correct
+    // path+range) — derive it from the file we already just read instead. Only
+    // a genuinely unknown location (no real range to slice) falls back to the
+    // model's text.
+    let snippet = if is_unknown_location(&location) {
+        f.snippet
+    } else {
+        let real = slice_lines(content, Some(location.line_start), Some(line_end));
+        Some(real).filter(|s| !s.is_empty()).or(f.snippet)
+    };
     Ok(ExplorationFinding {
         location: FileLocation {
             line_end,
             ..location
         },
-        snippet: f.snippet,
+        snippet,
         note: f.note,
     })
 }
@@ -572,6 +583,34 @@ mod tests {
             }
         );
         assert_eq!(result.findings[0].note, Some("here".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F-18: a finding's snippet must come from the real file, not the model's
+    /// own transcription of it.
+    #[tokio::test]
+    async fn parse_finish_ignores_a_fabricated_snippet_at_a_real_location() {
+        let dir = temp_repo_main("fabricated_snippet", 5);
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":2,"line_end":3},"snippet":"this is not what's really there"}],"summary":"done"}"#;
+        let result = parse_finish(json, &dir).await.unwrap();
+        assert_eq!(
+            result.findings[0].snippet.as_deref(),
+            Some("l2\nl3"),
+            "snippet must come from the real file, not the model's own text"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn parse_finish_keeps_model_snippet_for_unknown_location() {
+        let dir = temp_repo_main("unknown_location_snippet", 5);
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":0,"line_end":0},"snippet":"symbol described in prose only"}],"summary":"done"}"#;
+        let result = parse_finish(json, &dir).await.unwrap();
+        assert_eq!(
+            result.findings[0].snippet.as_deref(),
+            Some("symbol described in prose only"),
+            "an unknown-location finding has nothing on disk to slice, so the model's own text is kept"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
