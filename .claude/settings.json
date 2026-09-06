@@ -1,0 +1,28 @@
+{
+  "extraKnownMarketplaces": {
+    "kwitsch-plugins": {
+      "source": {
+        "source": "github",
+        "repo": "kwitsch/claude-plugins"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "universal-lint@kwitsch-plugins": true,
+    "universal-format@kwitsch-plugins": true
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/block-lockfile-edit.mjs"]
+          }
+        ]
+      }
+    ]
+  }
+}
