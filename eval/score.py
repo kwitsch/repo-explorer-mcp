@@ -103,12 +103,18 @@ def snippet_chunks(snippet: str) -> list[list[str]]:
     need not be adjacent (the LLM may elide the middle of a long span). A line ending in the
     tool's own truncation marker (F-19) has that suffix stripped first: a non-empty remainder is
     real content to match (just shorter than the untruncated file line), while an empty remainder
-    (the marker occupied the whole line) is treated as an elision like an ELLIPSIS_LINE_RE line."""
+    (the marker occupied the whole line) is treated as an elision like an ELLIPSIS_LINE_RE line.
+    A genuinely blank line (F-20) is real content too — e.g. inside a docstring, or between two
+    top-level items quoted together — so it's kept as a "" wildcard placeholder within the
+    current chunk (matching find_chunk's substring check unconditionally) rather than dropped,
+    which would otherwise misalign the chunk's contiguous-run length against the file."""
     chunks: list[list[str]] = []
     current: list[str] = []
     for raw_line in snippet.splitlines():
         stripped = raw_line.strip()
         if not stripped:
+            if current:
+                current.append("")
             continue
         if ELLIPSIS_LINE_RE.match(stripped):
             if current:
@@ -127,13 +133,24 @@ def snippet_chunks(snippet: str) -> list[list[str]]:
     return chunks
 
 
-def find_chunk(file_lines: list[str], chunk: list[str]) -> int | None:
-    """First index in file_lines where `chunk` matches a contiguous run (each chunk line must
-    be a substring of the corresponding file line), or None."""
+def find_chunk(
+    file_lines: list[str], chunk: list[str], near_range: tuple[int, int] | None = None
+) -> int | None:
+    """Index in file_lines where `chunk` matches a contiguous run (each chunk line must be a
+    substring of the corresponding file line) — preferring a match inside `near_range` (F-17
+    follow-up) when the chunk's content is duplicated elsewhere in the file (e.g. two functions
+    with the same signature, or a repeated test assertion): without this, the first (possibly
+    out-of-range) occurrence would be reported even when a second occurrence sits exactly at the
+    claimed line range, falsely classifying a correct finding as misaligned. Falls back to the
+    first match anywhere if none falls inside `near_range`. None if the chunk isn't found at all."""
+    fallback: int | None = None
     for i in range(len(file_lines) - len(chunk) + 1):
         if all(chunk[j] in file_lines[i + j] for j in range(len(chunk))):
-            return i
-    return None
+            if near_range is not None and near_range[0] <= i < near_range[1]:
+                return i
+            if fallback is None:
+                fallback = i
+    return fallback
 
 
 def path_exists(repo_path: Path, rel: str) -> bool:
@@ -189,7 +206,7 @@ def snippet_found_at(
     # range to fall outside of, so it can only ever be "ok" or "not_found" here.
     any_far = False
     for chunk in chunks:
-        idx = find_chunk(file_lines, chunk)
+        idx = find_chunk(file_lines, chunk, near_range)
         if idx is None:
             return "not_found"
         in_near = near_range is not None and near_range[0] <= idx < near_range[1]
