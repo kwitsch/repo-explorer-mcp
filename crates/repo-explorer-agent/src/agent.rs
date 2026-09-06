@@ -31,7 +31,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::cache::{QueryEntry, ResultCache};
-use crate::dispatch::dispatch_inner;
+use crate::dispatch::{canonical_repo_root, dispatch_inner, verify_location};
 use crate::pipeline;
 use crate::render::{RenderCaps, dedupe_key, tidy_findings};
 use crate::tools::{finish_only_catalog, parse_finish_lenient, resolve_finish, tool_catalog};
@@ -269,28 +269,38 @@ where
             && !outcome.candidates.is_empty()
         {
             if outcome.has_exact_symbol_match {
-                let result = self.result_from_candidates(
-                    outcome.candidates,
-                    query,
-                    outcome.confidence,
-                    note.as_deref(),
+                let result = self
+                    .result_from_candidates(
+                        &outcome.candidates,
+                        query,
+                        outcome.confidence,
+                        note.as_deref(),
+                        repo_root,
+                    )
+                    .await;
+                if !result.findings.is_empty() {
+                    return Ok(self.complete_run(
+                        "early-exit",
+                        0,
+                        0,
+                        false,
+                        index_status,
+                        git_probe_ms,
+                        &query_key,
+                        fingerprint,
+                        result,
+                    ));
+                }
+                tracing::info!(
+                    "early-exit produced no filesystem-verified candidate; falling through to verification"
                 );
-                return Ok(self.complete_run(
-                    "early-exit",
-                    0,
-                    0,
-                    false,
-                    index_status,
-                    git_probe_ms,
-                    &query_key,
-                    fingerprint,
-                    result,
-                ));
+                // fall through to Stage 4
+            } else {
+                tracing::info!(
+                    confidence = outcome.confidence,
+                    "early-exit vetoed: no trusted exact symbol match"
+                );
             }
-            tracing::info!(
-                confidence = outcome.confidence,
-                "early-exit vetoed: no trusted exact symbol match"
-            );
         }
 
         // Stage 4: LLM verification over the candidates.
@@ -503,23 +513,43 @@ where
         );
     }
 
-    /// Build the early-exit result straight from the ranked candidates, via
-    /// the same dedupe-then-truncate contract as `finalize()`. `index_note`
-    /// (e.g. a failed reindex) is appended to the summary — this is the only
-    /// stage that doesn't already thread it into an LLM prompt, so it must be
-    /// surfaced here or a confident answer from a stale index would carry no
-    /// warning at all.
-    fn result_from_candidates(
+    /// Build the early-exit result from the ranked candidates, verifying each
+    /// against the live file first via the shared [`verify_location`] gate:
+    /// drop any candidate whose path is missing or whose `line_start` is past
+    /// EOF, and clamp `line_end` on survivors — but keep the backend-provided
+    /// snippet (it is not LLM-authored, so the finish path's F-18
+    /// disk-re-derivation does not apply). The canonical root is resolved once
+    /// for the whole batch; if it cannot be resolved the repo is unreadable, so
+    /// every candidate is dropped and the caller falls through to the LLM
+    /// stages. `index_note` (e.g. a failed reindex) is appended to the summary
+    /// — this is the only stage that doesn't thread it into an LLM prompt.
+    async fn result_from_candidates(
         &self,
-        candidates: Vec<Candidate>,
+        candidates: &[Candidate],
         query: &ExplorationQuery,
         confidence: u32,
         index_note: Option<&str>,
+        repo_root: &Path,
     ) -> ExplorationResult {
-        let findings = self.tidy_and_truncate(
-            candidates.into_iter().map(finding_from_candidate).collect(),
-            query.max_results,
-        );
+        let canonical_root = canonical_repo_root(repo_root).await.ok();
+        let mut verified = Vec::with_capacity(candidates.len());
+        if let Some(root) = &canonical_root {
+            for candidate in candidates {
+                match verify_location(candidate.location.clone(), repo_root, root).await {
+                    Ok((location, _content)) => {
+                        // Keep the backend-provided snippet (not LLM-authored,
+                        // so F-18 does not apply); only the location is verified.
+                        let mut candidate = candidate.clone();
+                        candidate.location = location;
+                        verified.push(finding_from_candidate(candidate));
+                    }
+                    Err(reason) => {
+                        tracing::debug!(reason = %reason, "early-exit dropped an unverifiable candidate")
+                    }
+                }
+            }
+        }
+        let findings = self.tidy_and_truncate(verified, query.max_results);
         let mut summary = format!(
             "Resolved deterministically by the retrieval pre-stage (confidence {confidence}/100, no LLM involved): {} location(s) matching \"{}\".",
             findings.len(),
@@ -979,6 +1009,15 @@ mod tests {
         )
     }
 
+    /// `n` numbered lines ("l1\nl2\n...") — a body long enough for a given
+    /// line range to fall within the file's extent.
+    fn numbered_lines(n: usize) -> String {
+        (1..=n)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn tool_calls(
         calls: Vec<ToolCall>,
     ) -> Result<Completion, repo_explorer_core::llm::ProviderError> {
@@ -1052,8 +1091,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn early_exit_dedupes_before_truncating_to_max_results() {
+    #[tokio::test]
+    async fn early_exit_dedupes_before_truncating_to_max_results() {
         // Regression: result_from_candidates must dedupe (collapsing true
         // duplicates at the "unknown location" (0, 0) sentinel) before
         // truncating to max_results, matching finalize()'s dedupe-then-
@@ -1113,13 +1152,24 @@ mod tests {
                 200,
             ),
         ];
+        let dir = crate::test_support::temp_repo_with(
+            "agent_run",
+            "early_exit_dedupe",
+            &[
+                ("a.rs", &numbered_lines(20)),
+                ("b.rs", "x\n"),
+                ("another.rs", &numbered_lines(5)),
+            ],
+        );
         let agent = agent_with(MockLlmProvider::new());
         let query = ExplorationQuery {
             text: "x".to_string(),
             scope_hint: None,
             max_results: Some(3),
         };
-        let result = agent.result_from_candidates(candidates, &query, 100, None);
+        let result = agent
+            .result_from_candidates(&candidates, &query, 100, None, &dir)
+            .await;
         assert_eq!(
             result.findings.len(),
             3,
@@ -1134,6 +1184,162 @@ mod tests {
             paths.contains(&PathBuf::from("another.rs")),
             "pre-dedupe truncation must not drop the distinct 4th candidate"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn early_exit_drops_candidate_with_line_start_past_eof() {
+        let dir = crate::test_support::temp_repo_with(
+            "agent_run",
+            "early_exit_drop_past_eof",
+            &[("f.rs", &numbered_lines(5))],
+        );
+        let candidates = vec![
+            Candidate {
+                location: FileLocation {
+                    path: PathBuf::from("f.rs"),
+                    line_start: 2,
+                    line_end: 3,
+                },
+                symbol: Some("ok".to_string()),
+                kind: CandidateKind::SymbolExact,
+                score: 900,
+                snippet: None,
+            },
+            Candidate {
+                location: FileLocation {
+                    path: PathBuf::from("f.rs"),
+                    line_start: 99,
+                    line_end: 120,
+                },
+                symbol: Some("bad".to_string()),
+                kind: CandidateKind::SymbolExact,
+                score: 900,
+                snippet: None,
+            },
+        ];
+        let agent = agent_with(MockLlmProvider::new());
+        let query = ExplorationQuery {
+            text: "x".to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let result = agent
+            .result_from_candidates(&candidates, &query, 100, None, &dir)
+            .await;
+        assert_eq!(
+            result.findings.len(),
+            1,
+            "past-EOF candidate must be dropped"
+        );
+        assert_eq!(result.findings[0].location.line_start, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn early_exit_drops_candidate_with_nonexistent_path() {
+        let dir = crate::test_support::temp_repo_with(
+            "agent_run",
+            "early_exit_drop_missing",
+            &[("real.rs", &numbered_lines(5))],
+        );
+        let candidates = vec![Candidate {
+            location: FileLocation {
+                path: PathBuf::from("gone.rs"),
+                line_start: 1,
+                line_end: 2,
+            },
+            symbol: Some("x".to_string()),
+            kind: CandidateKind::SymbolExact,
+            score: 900,
+            snippet: None,
+        }];
+        let agent = agent_with(MockLlmProvider::new());
+        let query = ExplorationQuery {
+            text: "x".to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let result = agent
+            .result_from_candidates(&candidates, &query, 100, None, &dir)
+            .await;
+        assert!(
+            result.findings.is_empty(),
+            "a candidate at a nonexistent path must be dropped"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn early_exit_clamps_candidate_line_end_past_eof() {
+        let dir = crate::test_support::temp_repo_with(
+            "agent_run",
+            "early_exit_clamp",
+            &[("f.rs", &numbered_lines(3))],
+        );
+        let candidates = vec![Candidate {
+            location: FileLocation {
+                path: PathBuf::from("f.rs"),
+                line_start: 2,
+                line_end: 99,
+            },
+            symbol: Some("x".to_string()),
+            kind: CandidateKind::SymbolExact,
+            score: 900,
+            snippet: None,
+        }];
+        let agent = agent_with(MockLlmProvider::new());
+        let query = ExplorationQuery {
+            text: "x".to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let result = agent
+            .result_from_candidates(&candidates, &query, 100, None, &dir)
+            .await;
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].location.line_start, 2);
+        assert_eq!(
+            result.findings[0].location.line_end, 3,
+            "line_end past EOF must be clamped to the file length"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn early_exit_keeps_backend_snippet_without_rederiving_from_disk() {
+        let dir = crate::test_support::temp_repo_with(
+            "agent_run",
+            "early_exit_keep_snippet",
+            &[("f.rs", &numbered_lines(5))],
+        );
+        let candidates = vec![Candidate {
+            location: FileLocation {
+                path: PathBuf::from("f.rs"),
+                line_start: 2,
+                line_end: 3,
+            },
+            symbol: Some("x".to_string()),
+            kind: CandidateKind::SymbolExact,
+            score: 900,
+            snippet: Some("backend text".to_string()),
+        }];
+        let agent = agent_with(MockLlmProvider::new());
+        let query = ExplorationQuery {
+            text: "x".to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        let result = agent
+            .result_from_candidates(&candidates, &query, 100, None, &dir)
+            .await;
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(
+            result.findings[0].snippet.as_deref(),
+            Some("backend text"),
+            "early-exit must keep the backend snippet, not re-derive it from disk (real lines 2-3 are \"l2\\nl3\")"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -1179,12 +1385,18 @@ mod tests {
             scope_hint: None,
             max_results: None,
         };
-        let got = agent.run(&PathBuf::from("/repo"), &query).await.unwrap();
+        let dir = crate::test_support::temp_repo_with(
+            "agent_run",
+            "early_exit_stale_note",
+            &[("crates/x/src/freshness.rs", &numbered_lines(12))],
+        );
+        let got = agent.run(&dir, &query).await.unwrap();
         assert!(
             got.summary.contains("memory index could not be refreshed"),
             "early-exit summary must surface the index-freshness note: {}",
             got.summary
         );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -1226,12 +1438,18 @@ mod tests {
             scope_hint: Some(PathBuf::from("../../etc")),
             max_results: None,
         };
-        let got = agent.run(&PathBuf::from("/repo"), &query).await.unwrap();
+        let dir = crate::test_support::temp_repo_with(
+            "agent_run",
+            "early_exit_scope_note",
+            &[("crates/x/src/freshness.rs", &numbered_lines(12))],
+        );
+        let got = agent.run(&dir, &query).await.unwrap();
         assert!(
             got.summary.contains("escapes the repository root"),
             "early-exit summary must surface the ignored-scope note: {}",
             got.summary
         );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

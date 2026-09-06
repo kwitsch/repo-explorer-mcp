@@ -63,10 +63,11 @@ fn query(text: &str) -> ExplorationQuery {
     }
 }
 
-/// Temp repo whose `src/` holds the files the finish-payload tests reference,
-/// each 40 lines long, so `finish` path validation accepts the model's
-/// findings and clamps nothing, via the crate's shared
-/// `test_support::temp_repo_with` fixture. Caller removes the dir.
+/// Temp repo whose files the finish-payload AND early-exit tests reference,
+/// each 40 lines long, so both `finish` path validation and the early-exit
+/// `verify_location` gate accept the findings and clamp nothing, via the
+/// crate's shared `test_support::temp_repo_with` fixture. Caller removes the
+/// dir.
 fn temp_repo(test: &str) -> PathBuf {
     let body = (1..=40)
         .map(|i| format!("l{i}"))
@@ -79,6 +80,8 @@ fn temp_repo(test: &str) -> PathBuf {
             ("src/main.rs", body.as_str()),
             ("src/fresh_a.rs", body.as_str()),
             ("src/fresh_b.rs", body.as_str()),
+            ("src/fresh.rs", body.as_str()),
+            ("crates/x/src/freshness.rs", body.as_str()),
         ],
     )
 }
@@ -306,10 +309,11 @@ async fn exact_symbol_early_exit_makes_zero_llm_calls() {
         AgentSettings::default(),
         CacheSettings::default(),
     );
-    let result = agent
-        .run(&PathBuf::from("/repo"), &query("decide_freshness"))
-        .await
-        .unwrap();
+    // The early-exit path now verifies each candidate against disk, so the
+    // referenced file must exist under the repo root for the candidate to
+    // survive (else it falls through to the LLM stages).
+    let dir = temp_repo("exact_symbol_early_exit");
+    let result = agent.run(&dir, &query("decide_freshness")).await.unwrap();
 
     assert!(provider_probe.calls().is_empty(), "no LLM call may happen");
     assert!(result.summary.contains("Resolved deterministically"));
@@ -317,6 +321,7 @@ async fn exact_symbol_early_exit_makes_zero_llm_calls() {
         result.findings[0].location.path,
         PathBuf::from("crates/x/src/freshness.rs")
     );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Two rival exact symbols in different files: strong but ambiguous, so the
@@ -540,17 +545,15 @@ async fn repeated_query_is_served_from_cache() {
         AgentSettings::default(),
         CacheSettings::default(),
     );
+    // The early-exit path verifies each candidate against disk, so the
+    // referenced file must exist under the repo root for the first run to
+    // resolve deterministically (and its result to be the one cached).
+    let dir = temp_repo("repeated_query_cache");
 
-    let first = agent
-        .run(&PathBuf::from("/repo"), &query("decide_freshness"))
-        .await
-        .unwrap();
+    let first = agent.run(&dir, &query("decide_freshness")).await.unwrap();
     let calls_after_first = mem_probe.calls().len();
 
-    let second = agent
-        .run(&PathBuf::from("/repo"), &query("decide_freshness"))
-        .await
-        .unwrap();
+    let second = agent.run(&dir, &query("decide_freshness")).await.unwrap();
     assert_eq!(first, second);
     assert_eq!(
         mem_probe.calls().len(),
@@ -558,6 +561,7 @@ async fn repeated_query_is_served_from_cache() {
         "cache hit must not touch the backends"
     );
     assert!(provider_probe.calls().is_empty());
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
@@ -581,20 +585,16 @@ async fn fingerprint_change_with_no_diff_keeps_cache_entry() {
         AgentSettings::default(),
         CacheSettings::default(),
     );
+    let dir = temp_repo("no_diff_keeps_cache");
 
-    let first = agent
-        .run(&PathBuf::from("/repo"), &query("decide_freshness"))
-        .await
-        .unwrap();
+    let first = agent.run(&dir, &query("decide_freshness")).await.unwrap();
     let calls_after_first = mem_probe.calls().len();
 
     probe_handle.set_fingerprint(Some(fp("bbb")));
-    let second = agent
-        .run(&PathBuf::from("/repo"), &query("decide_freshness"))
-        .await
-        .unwrap();
+    let second = agent.run(&dir, &query("decide_freshness")).await.unwrap();
     assert_eq!(first, second);
     assert_eq!(mem_probe.calls().len(), calls_after_first);
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
@@ -620,22 +620,18 @@ async fn fingerprint_change_touching_unrelated_path_recomputes() {
         AgentSettings::default(),
         CacheSettings::default(),
     );
+    let dir = temp_repo("unrelated_path_recomputes");
 
-    let _ = agent
-        .run(&PathBuf::from("/repo"), &query("decide_freshness"))
-        .await
-        .unwrap();
+    let _ = agent.run(&dir, &query("decide_freshness")).await.unwrap();
     let calls_after_first = mem_probe.calls().len();
 
     probe_handle.set_fingerprint(Some(fp("bbb")));
-    let _ = agent
-        .run(&PathBuf::from("/repo"), &query("decide_freshness"))
-        .await
-        .unwrap();
+    let _ = agent.run(&dir, &query("decide_freshness")).await.unwrap();
     assert!(
         mem_probe.calls().len() > calls_after_first,
         "a change to any path, even one unrelated to the old answer, must recompute"
     );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
@@ -657,20 +653,16 @@ async fn fingerprint_change_touching_result_paths_recomputes() {
         AgentSettings::default(),
         CacheSettings::default(),
     );
+    let dir = temp_repo("result_paths_recomputes");
 
-    let _ = agent
-        .run(&PathBuf::from("/repo"), &query("decide_freshness"))
-        .await
-        .unwrap();
+    let _ = agent.run(&dir, &query("decide_freshness")).await.unwrap();
     let calls_after_first = mem_probe.calls().len();
 
     probe_handle.set_fingerprint(Some(fp("bbb")));
-    let _ = agent
-        .run(&PathBuf::from("/repo"), &query("decide_freshness"))
-        .await
-        .unwrap();
+    let _ = agent.run(&dir, &query("decide_freshness")).await.unwrap();
     assert!(
         mem_probe.calls().len() > calls_after_first,
         "a change to a contributing path must recompute"
     );
+    std::fs::remove_dir_all(&dir).ok();
 }
