@@ -112,6 +112,18 @@ fn build_req_id(query: &ExplorationQuery, counter: &AtomicU64) -> String {
     format!("{}-{n}", &hash[..8])
 }
 
+/// Reject a query that is empty or whitespace-only before it reaches the
+/// agent loop. Such a query derives zero retrieval patterns and would burn
+/// the full LLM fallback budget on an effectively empty prompt with no
+/// signal to act on (F-04). Boundary-level check: constructs no
+/// `ExplorationQuery` and does no agent work.
+fn reject_blank_query(query: &str) -> Result<(), String> {
+    if query.trim().is_empty() {
+        return Err("query must not be empty".to_string());
+    }
+    Ok(())
+}
+
 /// The MCP server handler: a shared `Arc<Agent>` plus the repo root to explore.
 #[derive(Clone)]
 pub struct RepoExplorerServer {
@@ -149,6 +161,10 @@ impl RepoExplorerServer {
         params: Parameters<ExploreRepositoryRequest>,
     ) -> Result<Json<ExplorationResultDto>, String> {
         let req = params.0;
+        if let Err(e) = reject_blank_query(&req.query) {
+            tracing::warn!(error_class = "validation", message = %e, "exploration rejected");
+            return Err(e);
+        }
         let query = ExplorationQuery {
             text: req.query,
             scope_hint: req.scope_hint.map(PathBuf::from),
@@ -290,5 +306,40 @@ mod tests {
     fn rejects_unknown_field() {
         let err = serde_json::from_str::<ExploreRepositoryRequest>(r#"{"query":"q","bogus":true}"#);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn rejects_empty_query() {
+        assert!(reject_blank_query("").is_err());
+    }
+
+    #[test]
+    fn rejects_whitespace_only_spaces() {
+        assert!(reject_blank_query("   ").is_err());
+    }
+
+    #[test]
+    fn rejects_whitespace_only_tabs_newlines() {
+        assert!(reject_blank_query("\t\n ").is_err());
+    }
+
+    #[test]
+    fn accepts_normal_query() {
+        assert!(reject_blank_query("where is main").is_ok());
+    }
+
+    #[test]
+    fn accepts_content_surrounded_by_whitespace() {
+        // Real content with surrounding whitespace must pass; the guard trims
+        // only for the emptiness test and never mutates the value.
+        assert!(reject_blank_query("  q  ").is_ok());
+    }
+
+    #[test]
+    fn blank_query_error_message_is_pinned() {
+        assert_eq!(
+            reject_blank_query("").unwrap_err(),
+            "query must not be empty"
+        );
     }
 }
