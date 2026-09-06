@@ -429,7 +429,13 @@ impl ValidationError {
 }
 
 /// Read, parse, and validate a config file. The single public entry point.
-pub fn load(path: &Path) -> Result<Config, ConfigError> {
+/// Returns the unrecognized-key warnings (F-12) alongside the `Config`
+/// instead of only logging and discarding them: `run_config_test` needs the
+/// list itself, and deriving it from a second, independent file read (as it
+/// once did) meant that read's failure silently reported a config with real
+/// unknown keys as clean — returning what this one read already computed
+/// removes both the extra I/O and that failure mode in one step.
+pub fn load(path: &Path) -> Result<(Config, Vec<String>), ConfigError> {
     let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.to_path_buf(),
         source,
@@ -439,10 +445,11 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
         ConfigError::Parse { source, location }
     })?;
     config.validate()?;
-    for warning in unknown_key_warnings(&contents) {
+    let warnings = unknown_key_warnings(&contents);
+    for warning in &warnings {
         tracing::warn!(warning = %warning, "unrecognized config key (ignored)");
     }
-    Ok(config)
+    Ok((config, warnings))
 }
 
 /// (top-level section name, known field names within it) — hand-maintained
@@ -684,7 +691,8 @@ mod tests {
             std::env::set_var(var, "not-a-real-key");
         }
 
-        let config = load(&fixture_path("valid.toml")).expect("valid config should load");
+        let (config, _warnings) =
+            load(&fixture_path("valid.toml")).expect("valid config should load");
 
         // Failover order is file order.
         assert_eq!(config.llm.providers.len(), 2);
@@ -1017,6 +1025,18 @@ mod tests {
             config.codebase_memory.staleness_seconds
         );
         assert_eq!(parsed.search.timeout_seconds, config.search.timeout_seconds);
+        // Schema-drift guard for `KNOWN_SECTIONS`/`KNOWN_PROVIDER_FIELDS`
+        // (F-12): `to_toml_string` serializes every field on `Config` and its
+        // nested structs (no `skip_serializing_if` beyond the `Option` ones
+        // already asserted above), so a real field these tables don't yet
+        // know about — a rename or a new field added without updating them —
+        // shows up here as a spurious warning, the same day it's introduced.
+        assert_eq!(
+            unknown_key_warnings(&toml),
+            Vec::<String>::new(),
+            "a fully-populated Config must not trip its own unknown-key detector — \
+             KNOWN_SECTIONS/KNOWN_PROVIDER_FIELDS have drifted from Config's real fields"
+        );
     }
 
     #[test]

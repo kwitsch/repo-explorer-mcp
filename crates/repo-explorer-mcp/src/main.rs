@@ -88,7 +88,18 @@ async fn main() -> ExitCode {
     // whether this is a first run: a config that exists but is unreadable or
     // malformed must report its real error, not "no config".
     let config = match repo_explorer_core::config::load(&config_path) {
-        Ok(config) => config,
+        Ok((config, warnings)) => {
+            // `load`'s own `tracing::warn!` for these is a no-op here:
+            // `init_tracing` only runs inside `run()`, below, so on this —
+            // the actual, primary way this binary is ever launched — no
+            // subscriber exists yet to receive it. stderr, matching the
+            // `rtk_path` check just below, is the only channel that reaches
+            // the user on this path.
+            for warning in &warnings {
+                eprintln!("repo-explorer-mcp: {warning}");
+            }
+            config
+        }
         Err(e) if e.is_not_found() => {
             if std::io::stdin().is_terminal() {
                 return setup::run_setup(&config_path);
@@ -452,14 +463,7 @@ struct ConfigTestError {
 /// on any load/parse/validation failure.
 fn run_config_test(config_path: &Path) -> ExitCode {
     match repo_explorer_core::config::load(config_path) {
-        Ok(_) => {
-            // Re-read the same file `load` just parsed to also surface any
-            // unrecognized key (F-12) in the report — `load`'s signature stays
-            // unchanged for its other callers, this is the one place that
-            // wants the raw text too, and the file is tiny.
-            let warnings = std::fs::read_to_string(config_path)
-                .map(|raw| repo_explorer_core::config::unknown_key_warnings(&raw))
-                .unwrap_or_default();
+        Ok((_, warnings)) => {
             let report = ConfigTestReport {
                 status: "valid",
                 config_path: config_path.display().to_string(),
