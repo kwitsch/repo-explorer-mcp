@@ -41,9 +41,14 @@ errors are consumed via `?`/`.context(...)`).
 - Subcommand/flag detection runs over `args_without_config_value(argv)`, never raw `argv`: the value of a `--config <path>` pair must never be read as a subcommand (`--config setup` names a file, not the wizard).
 - `--install` registers this binary with Claude Code and is fully headless: it shells out to `claude mcp add repo-explorer-mcp --scope user -- <current_exe>` (idempotent remove-then-add, never hand-editing `~/.claude.json`); only once that registration succeeds does it write a Haiku subagent to `<home>/.claude/agents/explore.md`.
 - The agent file uses `name: Explore` (capital E, deliberately matching Claude Code's built-in `Explore` agent's `agentType` exactly, since overriding/shadowing a built-in is a literal, case-sensitive name match — a lowercase `explore` would just add a second, separate agent instead of replacing the built-in one).
-- Skip-vs-error semantics, shared by install and uninstall: a failed MCP registration reports the agent-file step `skipped` instead, so a broken/unregistered server is never left shadowing the built-in agent; install leaves a pre-existing file at that path alone (`skipped`) if its contents don't match what install would write; `--uninstall` tolerates an absent `claude` and an already-deleted agent file (both reported as `skipped`, not errors), and only deletes the agent file if its contents still match what `--install` wrote — a hand-edited or replaced file at that path is left in place (`skipped`), never silently destroyed.
+- Skip-vs-error semantics (shared by install and uninstall): a failed MCP registration reports the agent-file step `skipped` instead, so a broken/unregistered server is never left shadowing the built-in agent.
+- Install leaves a pre-existing file at that path alone (`skipped`) if its contents don't match what install would write.
+- `--uninstall` tolerates an absent `claude` and an already-deleted agent file (both reported as `skipped`, not errors).
+- `--uninstall` only deletes the agent file if its contents still match what `--install` wrote — a hand-edited or replaced file at that path is left in place (`skipped`), never silently destroyed.
 - `--install` fails fast with a non-zero exit and `claude_code_detected: false` when `claude` is not on PATH.
-- Reporting and dispatch precedence: both print a per-step (`mcp-server`, `agent-file`) JSON report to stdout and exit non-zero only when a step errors, mirroring `--update`. Both are dispatched before config resolution, so neither loads or creates `repo-explorer.toml`; `--update` (checked first) takes precedence over both, and when `--install`/`--uninstall` are both passed without `--update`, `--install` wins (checked first).
+- Both print a per-step (`mcp-server`, `agent-file`) JSON report to stdout and exit non-zero only when a step errors, mirroring `--update`.
+- Both are dispatched before config resolution, so neither loads or creates `repo-explorer.toml`.
+- Dispatch precedence: `--update` (checked first) takes precedence over both; when `--install`/`--uninstall` are both passed without `--update`, `--install` wins (checked first).
 
 ## Self-update (`src/update.rs`)
 

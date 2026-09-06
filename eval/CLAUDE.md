@@ -20,10 +20,8 @@ How to run it: the `run-eval` skill (`.claude/skills/run-eval/SKILL.md`).
 - Always rescore an older `results/<run-id>` with the _current_ `score.py`
   before trusting its numbers — past scoring bugs have materially changed
   historical counts (see `git log -- eval/score.py` for specifics).
-- Ground-truth `span`s for symbol _definitions_ in `queries/*.yaml` must cover
-  the full function/class body (brace/indent-aware), not just the `def`/`fn`
-  line — the tool correctly returns whole functions, and `score.py`'s
-  `range_hit` will flag a too-narrow hand-authored span as a miss.
+- Ground-truth span authoring rules for `queries/*.yaml` live in
+  `eval/queries/CLAUDE.md`.
 - `mcp.json`, `empty-mcp.json`, `claude-profile/settings.json`, and
   `fixtures/make_r18.sh` are scaffolded for later plan phases, not yet
   exercised by anything in this directory — don't assume they're dead weight.
