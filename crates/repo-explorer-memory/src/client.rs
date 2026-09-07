@@ -11,6 +11,7 @@ use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 /// A connected `rmcp` client to `codebase-memory-mcp`.
@@ -115,15 +116,20 @@ pub(crate) async fn project_name(repo_root: &Path) -> Result<String, MemoryError
 /// canonicalized path itself and must not `canonicalize` twice for one
 /// logical resolution.
 pub(crate) fn project_name_from_abs(repo_root: &Path, abs: &Path) -> Result<String, MemoryError> {
-    abs.file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            MemoryError::InvalidInput(format!(
-                "cannot derive project name from repo_root `{}`",
-                repo_root.display()
-            ))
-        })
+    let base = abs.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        MemoryError::InvalidInput(format!(
+            "cannot derive project name from repo_root `{}`",
+            repo_root.display()
+        ))
+    })?;
+    // Hash the CANONICAL abs path (not the raw repo_root): `.` and the
+    // absolute spelling of one repo must resolve to one stable upstream
+    // project, the opposite of the raw-path in-process cache keys. 8 hex chars
+    // (32 bits) is plenty to keep basename collisions across many repos
+    // astronomically unlikely; it is not a security boundary (a collision only
+    // costs a shared index), so a truncated prefix is fine.
+    let hash = hex::encode(Sha256::digest(abs.to_string_lossy().as_bytes()));
+    Ok(format!("{base}-{}", &hash[..8]))
 }
 
 /// Canonicalize `repo_root` off the async runtime thread (the blocking
@@ -163,9 +169,36 @@ mod tests {
 
     #[tokio::test]
     async fn project_name_from_directory() {
-        assert_eq!(
-            project_name(Path::new("/home/user/my-repo")).await.unwrap(),
-            "my-repo".to_string()
+        // The name is now `{basename}-{8 hex chars of Sha256 over the
+        // canonical abs path}` so two different repos that share a basename
+        // never collide upstream. `/home/user/my-repo` does not exist, so
+        // canonicalize falls back to the raw path and the hash is taken over
+        // that exact string.
+        let name = project_name(Path::new("/home/user/my-repo")).await.unwrap();
+        assert!(
+            name.starts_with("my-repo-"),
+            "name must keep the human-readable basename prefix: {name}"
+        );
+        let suffix = name.strip_prefix("my-repo-").unwrap();
+        assert_eq!(suffix.len(), 8, "hash suffix must be 8 hex chars: {name}");
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash suffix must be hex: {name}"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_name_disambiguates_shared_basename_across_parents() {
+        // Two distinct repositories that share a directory basename must
+        // derive DIFFERENT project names (the whole point of the hash suffix).
+        // Neither path exists, so canonicalize falls back to the raw path and
+        // the hash is taken over the distinct full paths.
+        let a = project_name(Path::new("/home/a/my-repo")).await.unwrap();
+        let b = project_name(Path::new("/home/b/my-repo")).await.unwrap();
+        assert!(a.starts_with("my-repo-") && b.starts_with("my-repo-"));
+        assert_ne!(
+            a, b,
+            "same basename under different parents must not collide"
         );
     }
 
