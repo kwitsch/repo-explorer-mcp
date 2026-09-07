@@ -178,8 +178,9 @@ struct SymbolPromptArgs {
 struct LocateAtLineArgs {
     /// Repo-relative file path, written exactly as it appears in the source.
     path: String,
-    /// 1-based line number within `path`.
-    line: u32,
+    /// 1-based line number within `path`, as sent by the MCP client (prompt
+    /// arguments are always strings on the wire per the MCP spec).
+    line: String,
     /// The exact code identifier or symbol at that location, in English.
     symbol: String,
 }
