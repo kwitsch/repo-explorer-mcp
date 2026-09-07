@@ -24,9 +24,9 @@ is declined.
 ## 1. Goal, decision, non-goals
 
 Goal: measure how well the tool locates code for **real exploration
-requests** — precise and vague, several languages, English and German — and
-turn every failure into a backlog item that names the owning code and the
-metric it is expected to move.
+requests** — precise and vague, English only, across a range of phrasings —
+and turn every failure into a backlog item that names the owning code and
+the metric it is expected to move.
 
 The decision this run must support: _what to improve first_. That requires
 knowing, per failed query, **which stage lost the answer** (retrieval never
@@ -83,7 +83,7 @@ tool call {query, scope_hint?, max_results?}
              identifiers = tokens ≥3 chars, not in STOPWORDS (36 EN + 8 DE:
                            der die das und wird wie welche wo), not all-digit, having
                            _ / digit / mixed case — or plain tokens ≥4 chars.
-                           Prose words like "defined", "definiert", "raised", "3xx"
+                           Prose words like "defined", "raised", "3xx"
                            are identifiers too.
              path_tokens = tokens containing '/' or with a file extension
                            (":line[:col]" suffix stripped) — `Session.request`,
@@ -308,7 +308,7 @@ crates`; the report says so.
 | Language / ecosystem | Rust (2 repos), Python, JavaScript, TypeScript, Go, Java, C#, C, C++ (header-only), Ruby, PHP (optional), polyglot docs/shell                                                                                                                  |
 | Repo shape           | single crate; multi-module Maven; monorepo (gems / packages); duplicated sources (`single_include` vs `include`); platform twins (`unix/` vs `win/`; 7 `uv__io_poll` definitions); test-file siblings (`*.test.ts` next to source); docs-heavy |
 | Query precision      | P → I → N; "anchored" imprecise (contains an identifier) vs identifier-free; see §6.1                                                                                                                                                          |
-| Query language       | EN, DE (incl. compound nouns), mixed with code formatting, typos (edit and casing)                                                                                                                                                             |
+| Query language       | EN only; phrasing variety (bare symbol / natural-language sentence / paraphrase); unsplit multi-word compounds and camelCase runs; mixed with code formatting; typos (edit and casing)                                                         |
 | Parameters           | none; `scope_hint` dir / file / glob / `./` / abs / `../` / missing / ignored dir / Windows-style; `max_results` 0 / 1 / 3 / 50 / invalid                                                                                                      |
 | Repo state           | first call (reindex), warm, cached, dirty tracked file, new untracked file, edited untracked file, no-`.git` copy, cwd in a subdirectory, shallow clone                                                                                        |
 | Operational          | CBM unavailable at start vs after connect; rtk timeout; provider 429 (mocked); invalid model; tiny budget; concurrency                                                                                                                         |
@@ -385,7 +385,7 @@ HEAD` (this feeds the cache-latency threshold).
 | Cat   | Name                                                             | Shape                                                                              | Expected stage (from §2.1)                                       | Primary metric                           |
 | ----- | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------- | ---------------------------------------- |
 | P1    | exact bare symbol                                                | `where is derive_patterns defined`                                                 | early-exit if unique def and grep leg survives; else verify      | range_hit@1                              |
-| P1-DE | same, German                                                     | `wo ist derive_patterns definiert`                                                 | same                                                             | range_hit@1                              |
+| P1-DE | same target, natural-language sentence phrasing                  | `where is derive_patterns defined`                                                 | same                                                             | range_hit@1                              |
 | P1t   | bare symbol with **twin** definitions                            | `running_memory_binary`, `Hono`, `uv_run`                                          | verify (margin ≈ 0)                                              | range_hit@3, `equivalent` handling       |
 | P1d   | dotted symbol                                                    | `Session.request`, `res.json`                                                      | verify (two identifiers; file-leg glob matches nothing)          | range_hit@3                              |
 | P2    | path / path:line paste                                           | `crates/…/verify.rs:35 what is this`                                               | verify (no symbol token) or early-exit via a symbol in the query | file_hit@1                               |
@@ -395,14 +395,14 @@ HEAD` (this feeds the cache-latency threshold).
 | I1a   | conceptual, **anchored** (contains an identifier or literal key) | `how does trust proxy affect req.ip`                                               | verify                                                           | file_hit@3 — reported separately from I1 |
 | I2    | symptom-first / bug-hunt                                         | `my proxy settings from the shell are being ignored`                               | fallback                                                         | file_hit@3, summary rubric               |
 | I2x   | two concepts                                                     | `where do cookies from a redirect response get merged into the session jar`        | fallback                                                         | recall over `primary`                    |
-| I3    | vague / noisy / German compound / typo                           | `wo ist die fehlerbehandlung für zeitüberschreitungen`, `resolveRedirects`         | fallback                                                         | file_hit@3, no hallucination             |
+| I3    | vague / noisy / unsplit compound / typo                          | `where is the error handling for connectiontimeout`, `resolveRedirects`            | fallback                                                         | file_hit@3, no hallucination             |
 | I4    | orientation / cross-cutting                                      | `how does an incoming request travel through this codebase from entry to response` | fallback                                                         | precision, summary rubric                |
 | M     | multi-target                                                     | `all shell completion generators`                                                  | verify                                                           | recall@max_results                       |
 | N     | negative, `sub: near` (exists in docs / a dependency) or `far`   | `where is the SOAP envelope parsed`                                                | verify / fallback                                                | negative_ok, path_valid = 1.0            |
 
 Tier-1 template, 16 per repo: P1, P1-DE, P1t-or-P1d, P2, P3, P4, I1 ×2,
-I1a, I2, I2x, I3 ×2 (DE compound, typo), I4, M, N. Tier-2 template, 9 per
-repo: P1, P1t-or-P1d, P3, P4, I1, I1a, I3-DE, M, N. **Every Tier-2 set is
+I1a, I2, I2x, I3 ×2 (unsplit compound, typo), I4, M, N. Tier-2 template, 9 per
+repo: P1, P1t-or-P1d, P3, P4, I1, I1a, I3-compound, M, N. **Every Tier-2 set is
 filled to the full template in Phase 0** — the anchor lists in §6.3 are
 partial. Hand-written total: 6×16 + 7×9 = **159** (6×16 + 6×9 = 150 without
 `guzzle`). Plus:
@@ -437,7 +437,7 @@ type == "tool_use" and name == "mcp__repo-explorer-mcp__explore_repository"
 ```yaml
 - id: requests-I1-01
   cat: I1 # enum: P1 P1-DE P1t P1d P2 P3 P4 I1 I1a I2 I2x I3 I4 M N
-  sub: null # optional: de | typo | near | far
+  sub: null # optional: de | typo | near | far | compound
   lang: en # en | de | mixed
   query: "where does the library decide to follow a 3xx and re-send the request"
   scope_hint: null # optional
@@ -474,113 +474,113 @@ at pin time.
 
 **`self` (Rust; all queries `scope_hint: crates`)**
 
-| id            | cat     | query                                                                            | primary / notes                                                                                                           |
-| ------------- | ------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| self-P1-01    | P1      | `where is derive_patterns defined`                                               | `core/src/retrieval.rs:150` (v); 21 grep hits in one file → leg survives; early-exit expected                             |
-| self-P1-DE-01 | P1-DE   | `wo ist wait_for_running_memory_binary definiert`                                | `mcp/src/main.rs:261` (v)                                                                                                 |
-| self-P1t-01   | P1t     | `running_memory_binary`                                                          | `cfg`-gated twins `main.rs:279`, `:300` (v) → `equivalent` group; verify expected                                         |
-| self-P2-01    | P2      | `crates/repo-explorer-agent/src/verify.rs:35 what does this constant do`         | `VERIFY_SYSTEM_PROMPT` span 35–43 (v); no symbol token → cannot early-exit                                                |
-| self-P3-01    | P3      | `where is the error "run \`repo-explorer-mcp --update\` to provision it" raised` | `primary_mode: any` over `main.rs:144`, `setup.rs:343`, `setup.rs:386` (v)                                                |
-| self-P4-01    | P4      | `who calls merge_and_rank`                                                       | `agent/src/pipeline.rs:183` (v); acceptable `retrieval.rs` tests                                                          |
-| self-I1-01    | I1      | `why does a second identical call come back instantly without hitting the model` | `agent.rs:142-152`, `cache.rs` (v)                                                                                        |
-| self-I1-02    | I1      | `what stops the tool from searching outside the checkout`                        | `dispatch.rs:193` (`escapes_repo_root`), `pipeline.rs:56` (v)                                                             |
-| self-I1a-01   | I1a     | `the thing that strips additionalProperties for gemini`                          | `llm/src/lib.rs:444` `strip_additional_properties` (v); distractor `agent/src/tools.rs` (14 literal hits → density bonus) |
-| self-I2-01    | I2      | `Claude Code says the server exited instead of starting the setup wizard`        | `main.rs:93` (`is_terminal`) (v); acceptable `setup.rs`                                                                   |
-| self-I2x-01   | I2x     | `how does the scope hint interact with the query cache key`                      | `cache.rs:166`, `pipeline.rs:56` (v)                                                                                      |
-| self-I3-01    | I3-de   | `wo wird das tokenbudget geprüft und was passiert wenn es aufgebraucht ist`      | `agent.rs:52` (`TokenBudget`), `:527` (`forced_finish`) (v); compound `tokenbudget` intended                              |
-| self-I3-02    | I3-typo | `derivePatterns`                                                                 | `retrieval.rs:150`                                                                                                        |
-| self-I4-01    | I4      | `how are errors surfaced to the MCP client`                                      | `mcp/src/server.rs:128-144`, `main.rs` (v)                                                                                |
-| self-M-01     | M       | `all places where a tracing::info! line reports the exploration path`            | exactly `agent.rs:151`, `:290` at pin `91eebde` (v) → recall ∈ {0, .5, 1}                                                 |
-| self-N-01     | N-far   | `where is the SQLite schema migration`                                           | none under `crates/` (v)                                                                                                  |
+| id            | cat         | query                                                                            | primary / notes                                                                                                                     |
+| ------------- | ----------- | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| self-P1-01    | P1          | `where is derive_patterns defined`                                               | `core/src/retrieval.rs:150` (v); 21 grep hits in one file → leg survives; early-exit expected                                       |
+| self-P1-DE-01 | P1-DE       | `where is wait_for_running_memory_binary defined`                                | `mcp/src/main.rs:261` (v)                                                                                                           |
+| self-P1t-01   | P1t         | `running_memory_binary`                                                          | `cfg`-gated twins `main.rs:279`, `:300` (v) → `equivalent` group; verify expected                                                   |
+| self-P2-01    | P2          | `crates/repo-explorer-agent/src/verify.rs:35 what does this constant do`         | `VERIFY_SYSTEM_PROMPT` span 35–43 (v); no symbol token → cannot early-exit                                                          |
+| self-P3-01    | P3          | `where is the error "run \`repo-explorer-mcp --update\` to provision it" raised` | `primary_mode: any` over `main.rs:144`, `setup.rs:343`, `setup.rs:386` (v)                                                          |
+| self-P4-01    | P4          | `who calls merge_and_rank`                                                       | `agent/src/pipeline.rs:183` (v); acceptable `retrieval.rs` tests                                                                    |
+| self-I1-01    | I1          | `why does a second identical call come back instantly without hitting the model` | `agent.rs:142-152`, `cache.rs` (v)                                                                                                  |
+| self-I1-02    | I1          | `what stops the tool from searching outside the checkout`                        | `dispatch.rs:193` (`escapes_repo_root`), `pipeline.rs:56` (v)                                                                       |
+| self-I1a-01   | I1a         | `the thing that strips additionalProperties for gemini`                          | `llm/src/lib.rs:444` `strip_additional_properties` (v); distractor `agent/src/tools.rs` (14 literal hits → density bonus)           |
+| self-I2-01    | I2          | `Claude Code says the server exited instead of starting the setup wizard`        | `main.rs:93` (`is_terminal`) (v); acceptable `setup.rs`                                                                             |
+| self-I2x-01   | I2x         | `how does the scope hint interact with the query cache key`                      | `cache.rs:166`, `pipeline.rs:56` (v)                                                                                                |
+| self-I3-01    | I3-compound | `where is the tokenbudget checked and what happens when it is exhausted`         | `agent.rs:52` (`TokenBudget`), `:527` (`forced_finish`) (v); unsplit compound `tokenbudget` — never decomposed by case_fold_variant |
+| self-I3-02    | I3-typo     | `derivePatterns`                                                                 | `retrieval.rs:150`                                                                                                                  |
+| self-I4-01    | I4          | `how are errors surfaced to the MCP client`                                      | `mcp/src/server.rs:128-144`, `main.rs` (v)                                                                                          |
+| self-M-01     | M           | `all places where a tracing::info! line reports the exploration path`            | exactly `agent.rs:151`, `:290` at pin `91eebde` (v) → recall ∈ {0, .5, 1}                                                           |
+| self-N-01     | N-far       | `where is the SQLite schema migration`                                           | none under `crates/` (v)                                                                                                            |
 
 **`requests` (Python)**
 
-| id                | cat     | query                                                                                 | primary / notes                                                                  |
-| ----------------- | ------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| requests-P1-01    | P1      | `where is resolve_redirects defined`                                                  | `src/requests/sessions.py:186` (v); early-exit expected                          |
-| requests-P1-DE-01 | P1-DE   | `wo ist HTTPBasicAuth definiert`                                                      | `auth.py:85` (v)                                                                 |
-| requests-P1d-01   | P1d     | `Session.request`                                                                     | `sessions.py:557` (v); `request` also in `api.py` → verify                       |
-| requests-P2-01    | P2      | `src/requests/models.py what does prepare_url do`                                     | `models.py:483` (v); contains a symbol → early-exit on the correct file possible |
-| requests-P3-01    | P3      | `where does the error text "Invalid URL" come from`                                   | `models.py:517`, `:522` (v)                                                      |
-| requests-P4-01    | P4      | `who calls dispatch_hook`                                                             | `sessions.py:791` (v); acceptable def `hooks.py:32`; **not** `models.py`         |
-| requests-I1-01    | I1      | `where does the library decide to follow a 3xx and re-send the request`               | `sessions.py:186` (v)                                                            |
-| requests-I1-02    | I1      | `something removes the Authorization header when a redirect hops to another host`     | `sessions.py:155` `rebuild_auth` (v)                                             |
-| requests-I1a-01   | I1a     | `how does basic auth get attached to a request`                                       | `auth.py:85`, `models.py:670` `prepare_auth` (v)                                 |
-| requests-I2-01    | I2      | `my proxy settings from the shell are being ignored`                                  | `sessions.py:330/353` (`trust_env`), `:831`, `utils.py:873` (v)                  |
-| requests-I2x-01   | I2x     | `where do cookies from a redirect response get merged into the session jar`           | `sessions.py` (`resolve_redirects`), `cookies.py` (v)                            |
-| requests-I3-01    | I3-de   | `wo ist die fehlerbehandlung für zeitüberschreitungen`                                | `adapters.py` (`ConnectTimeout`/`ReadTimeout`, `:132`) (v)                       |
-| requests-I3-02    | I3-typo | `resolveRedirects`                                                                    | `sessions.py:186`                                                                |
-| requests-I4-01    | I4      | `where do I start reading if I want to follow a requests.get call down to the socket` | `api.py` → `sessions.py:557` → `adapters.py:634` (v)                             |
-| requests-M-01     | M       | `all exception classes raised for connection problems`                                | `exceptions.py:70,74,78,91` (v); acceptable `:82`                                |
-| requests-N-01     | N-far   | `where is HTTP/2 stream multiplexing implemented`                                     | none in `src/` (v)                                                               |
+| id                | cat         | query                                                                                 | primary / notes                                                                  |
+| ----------------- | ----------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| requests-P1-01    | P1          | `where is resolve_redirects defined`                                                  | `src/requests/sessions.py:186` (v); early-exit expected                          |
+| requests-P1-DE-01 | P1-DE       | `where is HTTPBasicAuth defined`                                                      | `auth.py:85` (v)                                                                 |
+| requests-P1d-01   | P1d         | `Session.request`                                                                     | `sessions.py:557` (v); `request` also in `api.py` → verify                       |
+| requests-P2-01    | P2          | `src/requests/models.py what does prepare_url do`                                     | `models.py:483` (v); contains a symbol → early-exit on the correct file possible |
+| requests-P3-01    | P3          | `where does the error text "Invalid URL" come from`                                   | `models.py:517`, `:522` (v)                                                      |
+| requests-P4-01    | P4          | `who calls dispatch_hook`                                                             | `sessions.py:791` (v); acceptable def `hooks.py:32`; **not** `models.py`         |
+| requests-I1-01    | I1          | `where does the library decide to follow a 3xx and re-send the request`               | `sessions.py:186` (v)                                                            |
+| requests-I1-02    | I1          | `something removes the Authorization header when a redirect hops to another host`     | `sessions.py:155` `rebuild_auth` (v)                                             |
+| requests-I1a-01   | I1a         | `how does basic auth get attached to a request`                                       | `auth.py:85`, `models.py:670` `prepare_auth` (v)                                 |
+| requests-I2-01    | I2          | `my proxy settings from the shell are being ignored`                                  | `sessions.py:330/353` (`trust_env`), `:831`, `utils.py:873` (v)                  |
+| requests-I2x-01   | I2x         | `where do cookies from a redirect response get merged into the session jar`           | `sessions.py` (`resolve_redirects`), `cookies.py` (v)                            |
+| requests-I3-01    | I3-compound | `where is the error handling for connectiontimeout`                                   | `adapters.py` (`ConnectTimeout`/`ReadTimeout`, `:132`) (v)                       |
+| requests-I3-02    | I3-typo     | `resolveRedirects`                                                                    | `sessions.py:186`                                                                |
+| requests-I4-01    | I4          | `where do I start reading if I want to follow a requests.get call down to the socket` | `api.py` → `sessions.py:557` → `adapters.py:634` (v)                             |
+| requests-M-01     | M           | `all exception classes raised for connection problems`                                | `exceptions.py:70,74,78,91` (v); acceptable `:82`                                |
+| requests-N-01     | N-far       | `where is HTTP/2 stream multiplexing implemented`                                     | none in `src/` (v)                                                               |
 
 **`express` (JavaScript, `master` = 5.2.1)**
 
-| id               | cat     | query                                                                                     | primary / notes                                                                   |
-| ---------------- | ------- | ----------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| express-P1-01    | P1      | `where is createApplication defined`                                                      | `lib/express.js:36` (v)                                                           |
-| express-P1-DE-01 | P1-DE   | `wo ist compileETag definiert`                                                            | `lib/utils.js:130` (v)                                                            |
-| express-P1d-01   | P1d     | `res.json`                                                                                | `lib/response.js:234` (v); tokenizer keeps only `json` → verify                   |
-| express-P2-01    | P2      | `lib/view.js how are view engines resolved`                                               | `lib/view.js` (v); no symbol token → cannot early-exit                            |
-| express-P3-01    | P3      | `where is "No default engine was specified and no extension was provided." thrown`        | `lib/view.js:61` (v)                                                              |
-| express-P4-01    | P4      | `where is compileETag used`                                                               | `application.js:21,365` (v); acceptable def `utils.js:130`                        |
-| express-I1-01    | I1      | `where does the framework work out the client's real address when behind a load balancer` | `request.js:340`, `utils.js:194` (v)                                              |
-| express-I1-02    | I1      | `what happens when the template engine cannot be figured out from the file name`          | `view.js:61` (v)                                                                  |
-| express-I1a-01   | I1a     | `how does trust proxy affect req.ip`                                                      | `request.js:340`, `utils.js:194` (v)                                              |
-| express-I2-01    | I2      | `my app answers 304 to requests I never cached`                                           | `request.js:469` (`fresh`), `response.js` (`send`) (v)                            |
-| express-I2x-01   | I2x     | `how does the etag setting interact with the 304 freshness check`                         | `application.js:365`, `utils.js:130`, `response.js`, `request.js:469` (v)         |
-| express-I3-01    | I3-de   | `wo wird geprüft ob der client noch eine gültige version im cache hat und ein 304 reicht` | `request.js:469` (v)                                                              |
-| express-I3-02    | I3-typo | `createAplication`                                                                        | `express.js:36`                                                                   |
-| express-I4-01    | I4      | `how does an incoming request travel through this codebase from entry to response`        | `express.js:36`, `application.js` (`handle`), `request.js`, `response.js` (v)     |
-| express-M-01     | M       | `every place that reads the compiled 'trust proxy fn' setting`                            | `request.js:301,341,358,419`, `application.js:112-114,371` (v)                    |
-| express-N-01     | N-near  | `where is Layer.prototype.handle_request implemented`                                     | none under `lib/` (v); bonus if the summary says it moved to the `router` package |
+| id               | cat         | query                                                                                         | primary / notes                                                                   |
+| ---------------- | ----------- | --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| express-P1-01    | P1          | `where is createApplication defined`                                                          | `lib/express.js:36` (v)                                                           |
+| express-P1-DE-01 | P1-DE       | `where is compileETag defined`                                                                | `lib/utils.js:130` (v)                                                            |
+| express-P1d-01   | P1d         | `res.json`                                                                                    | `lib/response.js:234` (v); tokenizer keeps only `json` → verify                   |
+| express-P2-01    | P2          | `lib/view.js how are view engines resolved`                                                   | `lib/view.js` (v); no symbol token → cannot early-exit                            |
+| express-P3-01    | P3          | `where is "No default engine was specified and no extension was provided." thrown`            | `lib/view.js:61` (v)                                                              |
+| express-P4-01    | P4          | `where is compileETag used`                                                                   | `application.js:21,365` (v); acceptable def `utils.js:130`                        |
+| express-I1-01    | I1          | `where does the framework work out the client's real address when behind a load balancer`     | `request.js:340`, `utils.js:194` (v)                                              |
+| express-I1-02    | I1          | `what happens when the template engine cannot be figured out from the file name`              | `view.js:61` (v)                                                                  |
+| express-I1a-01   | I1a         | `how does trust proxy affect req.ip`                                                          | `request.js:340`, `utils.js:194` (v)                                              |
+| express-I2-01    | I2          | `my app answers 304 to requests I never cached`                                               | `request.js:469` (`fresh`), `response.js` (`send`) (v)                            |
+| express-I2x-01   | I2x         | `how does the etag setting interact with the 304 freshness check`                             | `application.js:365`, `utils.js:130`, `response.js`, `request.js:469` (v)         |
+| express-I3-01    | I3-compound | `where is it checked whether the client still has a valid cached version and a 304 is enough` | `request.js:469` (v)                                                              |
+| express-I3-02    | I3-typo     | `createAplication`                                                                            | `express.js:36`                                                                   |
+| express-I4-01    | I4          | `how does an incoming request travel through this codebase from entry to response`            | `express.js:36`, `application.js` (`handle`), `request.js`, `response.js` (v)     |
+| express-M-01     | M           | `every place that reads the compiled 'trust proxy fn' setting`                                | `request.js:301,341,358,419`, `application.js:112-114,371` (v)                    |
+| express-N-01     | N-near      | `where is Layer.prototype.handle_request implemented`                                         | none under `lib/` (v); bonus if the summary says it moved to the `router` package |
 
 **`cobra` (Go)**
 
-| id             | cat     | query                                                                         | primary / notes                                          |
-| -------------- | ------- | ----------------------------------------------------------------------------- | -------------------------------------------------------- |
-| cobra-P1-01    | P1      | `where is MinimumNArgs defined`                                               | `args.go:87` (v)                                         |
-| cobra-P1-DE-01 | P1-DE   | `wo ist ExecuteC definiert`                                                   | `command.go:1084` (v); near-name `ExecuteContextC:1078`  |
-| cobra-P1d-01   | P1d     | `Command.Find`                                                                | `command.go` (pin)                                       |
-| cobra-P2-01    | P2      | `completions.go how are ShellCompDirective values combined`                   | `completions.go:45` (v); contains a symbol               |
-| cobra-P3-01    | P3      | `where is the text "Did you mean this?" generated`                            | `command.go:790` (v)                                     |
-| cobra-P4-01    | P4      | `where is EnableTraverseRunHooks consulted`                                   | `cobra.go:66` def, `command.go:974-1038` uses (v)        |
-| cobra-I1-01    | I1      | `when a user mistypes a subcommand, where does the suggestion list come from` | `command.go:790` (v)                                     |
-| cobra-I1-02    | I1      | `where does the library complain about too few positional arguments`          | `args.go:87` (v)                                         |
-| cobra-I1a-01   | I1a     | `how are markdown docs generated from commands`                               | `doc/md_docs.go` (v)                                     |
-| cobra-I2-01    | I2      | `a flag I defined on the root command is unknown when I run a subcommand`     | `command.go:1898` `mergePersistentFlags`, `:1775` (v)    |
-| cobra-I2x-01   | I2x     | `how does a parent's before-run hook end up running for a child command`      | `command.go:905-1038`, `cobra.go:66` (v)                 |
-| cobra-I3-01    | I3-de   | `wo wird die hilfe ausgegeben wenn keine args kommen`                         | `command.go:520`, `:478`, `:1263` (v)                    |
-| cobra-I3-02    | I3-typo | `ExcecuteC`                                                                   | `command.go:1084`                                        |
-| cobra-I4-01    | I4      | `where does the library print the error a user sees when a command fails`     | `command.go:1084ff` (v)                                  |
-| cobra-M-01     | M       | `all shell completion generators`                                             | 5 files (v); ≥ 4 of 5; acceptable `shell_completions.go` |
-| cobra-N-01     | N-far   | `where is the interactive TUI prompt implemented`                             | none (v)                                                 |
+| id             | cat         | query                                                                         | primary / notes                                          |
+| -------------- | ----------- | ----------------------------------------------------------------------------- | -------------------------------------------------------- |
+| cobra-P1-01    | P1          | `where is MinimumNArgs defined`                                               | `args.go:87` (v)                                         |
+| cobra-P1-DE-01 | P1-DE       | `where is ExecuteC defined`                                                   | `command.go:1084` (v); near-name `ExecuteContextC:1078`  |
+| cobra-P1d-01   | P1d         | `Command.Find`                                                                | `command.go` (pin)                                       |
+| cobra-P2-01    | P2          | `completions.go how are ShellCompDirective values combined`                   | `completions.go:45` (v); contains a symbol               |
+| cobra-P3-01    | P3          | `where is the text "Did you mean this?" generated`                            | `command.go:790` (v)                                     |
+| cobra-P4-01    | P4          | `where is EnableTraverseRunHooks consulted`                                   | `cobra.go:66` def, `command.go:974-1038` uses (v)        |
+| cobra-I1-01    | I1          | `when a user mistypes a subcommand, where does the suggestion list come from` | `command.go:790` (v)                                     |
+| cobra-I1-02    | I1          | `where does the library complain about too few positional arguments`          | `args.go:87` (v)                                         |
+| cobra-I1a-01   | I1a         | `how are markdown docs generated from commands`                               | `doc/md_docs.go` (v)                                     |
+| cobra-I2-01    | I2          | `a flag I defined on the root command is unknown when I run a subcommand`     | `command.go:1898` `mergePersistentFlags`, `:1775` (v)    |
+| cobra-I2x-01   | I2x         | `how does a parent's before-run hook end up running for a child command`      | `command.go:905-1038`, `cobra.go:66` (v)                 |
+| cobra-I3-01    | I3-compound | `where is the help printed when no args are given`                            | `command.go:520`, `:478`, `:1263` (v)                    |
+| cobra-I3-02    | I3-typo     | `ExcecuteC`                                                                   | `command.go:1084`                                        |
+| cobra-I4-01    | I4          | `where does the library print the error a user sees when a command fails`     | `command.go:1084ff` (v)                                  |
+| cobra-M-01     | M           | `all shell completion generators`                                             | 5 files (v); ≥ 4 of 5; acceptable `shell_completions.go` |
+| cobra-N-01     | N-far       | `where is the interactive TUI prompt implemented`                             | none (v)                                                 |
 
 **`gson` (Java, multi-module)**
 
-| id            | cat     | query                                                                                                        | primary / notes                                                                                                   |
-| ------------- | ------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
-| gson-P1-01    | P1      | `where is ReflectiveTypeAdapterFactory defined`                                                              | `gson/src/main/java/com/google/gson/internal/bind/ReflectiveTypeAdapterFactory.java` (v)                          |
-| gson-P1-DE-01 | P1-DE   | `wo ist MapTypeAdapterFactory definiert`                                                                     | `internal/bind/MapTypeAdapterFactory.java` (v)                                                                    |
-| gson-P1d-01   | P1d     | `GsonBuilder.setFieldNamingPolicy`                                                                           | `GsonBuilder.java:413` (v)                                                                                        |
-| gson-P2-01    | P2      | `com/google/gson/stream/JsonReader.java how is lenient mode handled`                                         | `JsonReader.java` (v); `JsonReader` fills a symbol slot                                                           |
-| gson-P3-01    | P3      | `where is "Use JsonReader.setStrictness(Strictness.LENIENT) to accept malformed JSON" appended to the error` | `JsonReader.java:1713` (v)                                                                                        |
-| gson-P4-01    | P4      | `who uses the Excluder`                                                                                      | `Gson.java`, `GsonBuilder.java`, `ReflectiveTypeAdapterFactory.java` (v); acceptable def `internal/Excluder.java` |
-| gson-I1-01    | I1      | `how does an annotated field get a different name on the wire`                                               | `ReflectiveTypeAdapterFactory.java`, `annotations/SerializedName.java` (v)                                        |
-| gson-I1-02    | I1      | `where does the parser refuse to escape a line break when running strict`                                    | `JsonReader.java:1901` (v)                                                                                        |
-| gson-I1a-01   | I1a     | `where are java.util.Date values parsed`                                                                     | `internal/bind/DefaultDateTypeAdapter.java` (v); acceptable `JavaTimeTypeAdapters.java`                           |
-| gson-I2-01    | I2      | `my long fields silently turn into doubles`                                                                  | `internal/bind/ObjectTypeAdapter.java`, `ToNumberPolicy.java`, `TypeAdapters.java` (v)                            |
-| gson-I2x-01   | I2x     | `how does strictness change what the reader accepts and which exception it throws`                           | `Strictness.java`, `JsonReader.java`, `stream/MalformedJsonException.java` (pin)                                  |
-| gson-I3-01    | I3-de   | `wo werden maps serialisiert`                                                                                | `internal/bind/MapTypeAdapterFactory.java` (v)                                                                    |
-| gson-I3-02    | I3-typo | `ReflectiveTypeAdaptorFactory`                                                                               | `internal/bind/ReflectiveTypeAdapterFactory.java`                                                                 |
-| gson-I4-01    | I4      | `what is the top-level entry point for turning an object into a JSON string`                                 | `Gson.java` (`toJson`) (v)                                                                                        |
-| gson-M-01     | M       | `all TypeAdapterFactory implementations in internal/bind`                                                    | 5 named impls (v); ≥ 4 of 5; anonymous `FACTORY` fields acceptable                                                |
-| gson-N-01     | N-far   | `where is YAML parsing implemented`                                                                          | none (v)                                                                                                          |
+| id            | cat         | query                                                                                                        | primary / notes                                                                                                   |
+| ------------- | ----------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| gson-P1-01    | P1          | `where is ReflectiveTypeAdapterFactory defined`                                                              | `gson/src/main/java/com/google/gson/internal/bind/ReflectiveTypeAdapterFactory.java` (v)                          |
+| gson-P1-DE-01 | P1-DE       | `where is MapTypeAdapterFactory defined`                                                                     | `internal/bind/MapTypeAdapterFactory.java` (v)                                                                    |
+| gson-P1d-01   | P1d         | `GsonBuilder.setFieldNamingPolicy`                                                                           | `GsonBuilder.java:413` (v)                                                                                        |
+| gson-P2-01    | P2          | `com/google/gson/stream/JsonReader.java how is lenient mode handled`                                         | `JsonReader.java` (v); `JsonReader` fills a symbol slot                                                           |
+| gson-P3-01    | P3          | `where is "Use JsonReader.setStrictness(Strictness.LENIENT) to accept malformed JSON" appended to the error` | `JsonReader.java:1713` (v)                                                                                        |
+| gson-P4-01    | P4          | `who uses the Excluder`                                                                                      | `Gson.java`, `GsonBuilder.java`, `ReflectiveTypeAdapterFactory.java` (v); acceptable def `internal/Excluder.java` |
+| gson-I1-01    | I1          | `how does an annotated field get a different name on the wire`                                               | `ReflectiveTypeAdapterFactory.java`, `annotations/SerializedName.java` (v)                                        |
+| gson-I1-02    | I1          | `where does the parser refuse to escape a line break when running strict`                                    | `JsonReader.java:1901` (v)                                                                                        |
+| gson-I1a-01   | I1a         | `where are java.util.Date values parsed`                                                                     | `internal/bind/DefaultDateTypeAdapter.java` (v); acceptable `JavaTimeTypeAdapters.java`                           |
+| gson-I2-01    | I2          | `my long fields silently turn into doubles`                                                                  | `internal/bind/ObjectTypeAdapter.java`, `ToNumberPolicy.java`, `TypeAdapters.java` (v)                            |
+| gson-I2x-01   | I2x         | `how does strictness change what the reader accepts and which exception it throws`                           | `Strictness.java`, `JsonReader.java`, `stream/MalformedJsonException.java` (pin)                                  |
+| gson-I3-01    | I3-compound | `where are maps serialized`                                                                                  | `internal/bind/MapTypeAdapterFactory.java` (v)                                                                    |
+| gson-I3-02    | I3-typo     | `ReflectiveTypeAdaptorFactory`                                                                               | `internal/bind/ReflectiveTypeAdapterFactory.java`                                                                 |
+| gson-I4-01    | I4          | `what is the top-level entry point for turning an object into a JSON string`                                 | `Gson.java` (`toJson`) (v)                                                                                        |
+| gson-M-01     | M           | `all TypeAdapterFactory implementations in internal/bind`                                                    | 5 named impls (v); ≥ 4 of 5; anonymous `FACTORY` fields acceptable                                                |
+| gson-N-01     | N-far       | `where is YAML parsing implemented`                                                                          | none (v)                                                                                                          |
 
 **`plugins` (polyglot, local)** — authored in Phase 0 by grepping the
 checkout, full 16-slot template. Required: P1 = a bats test name and an mjs
 export; P3 = a literal hook message; I1 = a skill's behaviour in prose
-(identifier-free); I3-de with a compound noun; M = all `SKILL.md` mentioning
+(identifier-free); I3 with an unsplit multi-word compound / camelCase run; M = all `SKILL.md` mentioning
 a term; N-far. Snippets from this repo never enter the report (private).
 
 **Tier-2 anchors** (filled to the 9-slot template in Phase 0; missing slots
@@ -588,40 +588,40 @@ noted):
 
 - `ripgrep` — authored in Phase 0, ideally not by the plan author. Anchors:
   binary `main`, the `--sort` flag definition (P3 on its help text), glob
-  overrides, "wo werden die farben für treffer gesetzt" (I3-de), all
+  overrides, "where are the colors for matches set" (I3), all
   printer types (M), Windows registry (N-far). Needs P4, I1, I1a.
 - `hono` — `Hono` class in `src/hono-base.ts:98` **and** `src/hono.ts` (v) →
   P1t; `RegExpRouter` (v); `HTTPException` (`src/http-exception.ts`) (v);
   `cors` middleware (v); "how is the request path extracted"
-  (`src/utils/url.ts`) (v) → I1; "alle middleware für authentifizierung"
-  (`basic-auth`, `bearer-auth`, `jwt`, `jwk`) (v) → I3-de; all router
+  (`src/utils/url.ts`) (v) → I1; "all middleware for authentication"
+  (`basic-auth`, `bearer-auth`, `jwt`, `jwk`) (v) → I3; all router
   implementations (5, v) → M; N-far `where is the SOAP envelope parsed`
   (GraphQL is N-near: docs/lockfile hits). Needs P3, P4.
 - `humanizer` — `Humanize` (`StringHumanizeExtensions.cs`) (v) → P1;
-  `ToWords` (v); `TimeSpanHumanizeExtensions` (v); "wo werden die
-  pluralregeln für englische wörter definiert" → `Inflections/Vocabularies.cs`
-  / `InflectionEngine.cs` (pin) → I3-de; all `*Formatter` classes
+  `ToWords` (v); `TimeSpanHumanizeExtensions` (v); "where are the plural
+  rules for english words defined" → `Inflections/Vocabularies.cs`
+  / `InflectionEngine.cs` (pin) → I3; all `*Formatter` classes
   (`Localisation/Formatters/` 5 + `CollectionFormatters/` 5) (v) → M;
   Markdown rendering (N, pin). Needs P3, P4, I1, I1a.
 - `libuv` (`v1.x`) — `uv_timer_start` (`src/timer.c:67`) (v) → P1; `uv_run`
   ×2 (`src/unix/core.c:427`, `src/win/core.c:699`) (v) → P1t; `uv__io_poll`
   ×7 (v) → P1t with a 7-member `equivalent` group; `uv_spawn` run **twice**:
   unscoped (M, expect both `process.c`) and `scope_hint: src/unix` (P1,
-  expect one); "where is the thread pool" (`src/threadpool.c`) (v) → I1; "wo
-  werden fehlercodes in strings übersetzt" (`src/uv-common.c` `uv_strerror`)
-  (v) → I3-de; Bluetooth (N-far, v). Needs P3, P4, I1a.
+  expect one); "where is the thread pool" (`src/threadpool.c`) (v) → I1; "where
+  are error codes translated into strings" (`src/uv-common.c` `uv_strerror`)
+  (v) → I3; Bluetooth (N-far, v). Needs P3, P4, I1a.
 - `json` (`develop`, shallow) — `parse_error::create` (two overloads,
   `include/nlohmann/detail/exceptions.hpp:179,187`) (v) → P1d; `json_pointer`
   (v) → P1; `binary_reader` CBOR (v) → I1a; "where is the lexer" →
   `equivalent` {`include/nlohmann/detail/input/lexer.hpp`,
   `single_include/nlohmann/json.hpp`} — ≥ 2 returned = dedupe finding; P
   queries additionally with `scope_hint: include`; XML output (N-far, v).
-  Needs P3, P4, M, I3-de.
+  Needs P3, P4, M, I3-compound.
 - `sinatra` — `Sinatra::Base#route` (`lib/sinatra/base.rb:1776`; near-name
   `route!:1064`) (v) → P1d; `halt` (`:1028`) (v) → P1; `IndifferentHash`
   (`lib/sinatra/indifferent_hash.rb:41`) (v); P3 `"Sinatra doesn't know this
-ditty"` (pin); "wie werden templates gerendert" (`base.rb` Templates) (v) →
-  I3-de; all rack-protection middlewares (17 files, v) with `max_results:
+ditty"` (pin); "how are templates rendered" (`base.rb` Templates) (v) →
+  I3; all rack-protection middlewares (17 files, v) with `max_results:
 50` and `scope_hint: rack-protection` → M; N-far `where is the LDAP bind
 implemented` (WebSocket is N-near). Needs P4, I1, I1a.
 
@@ -905,7 +905,7 @@ graceful / degraded / defect is assigned afterwards.
 | R-17     | two concurrent **different** queries (`--concurrent 2`)                                                                                                                                                                                                                                  | both complete; no cross-talk in leg/tool caches; lines attributable via `req_id`                                                                                                                                          |
 | R-18     | `eval/fixtures/make_r18.sh`: `git init; git submodule add ../requests sub; ln -s . loop; head -c 50M /dev/urandom > blob.bin; git add -A; git commit`; query `where is resolve_redirects defined` with `scope_hint: sub`                                                                 | completes < 300 s; no finding path under `blob.bin`                                                                                                                                                                       |
 | R-19     | scratch repo with `printf 'fn x() {}\n\xff\xfe\n' > $(printf 'bad\xff.rs')`                                                                                                                                                                                                              | lossy path, no panic                                                                                                                                                                                                      |
-| R-20     | `wo ist der einstiegspunkt`                                                                                                                                                                                                                                                              | `wo`, `der` stopwords; `ist` < 4 chars dropped; `einstiegspunkt` a useless grep leg → fallback                                                                                                                            |
+| R-20     | `where is the entrypoint`                                                                                                                                                                                                                                                                | `where`, `the` stopwords; `is` dropped by length; `entrypoint` (one flat run) a useless grep leg → fallback                                                                                                               |
 
 ## 10. Configuration sweep (Phase 5)
 
@@ -955,7 +955,7 @@ the 2 passes, Phase 2 may use 2 passes; otherwise 3.
 | stale cache after change                  | `agent.rs` `query_cache_lookup` (decision), `git_probe.rs` digest (F-07), `cache.rs` CAS helpers          | untracked-edit variant                                                         |
 | high warm latency                         | 3 git subprocesses per call; up to 17 legs; 1 `search_graph` per unique candidate file in verify; F-08    | `retrieval leg done` durations, `git_probe_ms`, `index_ms`                     |
 | `pre_stage_identical` < 1                 | `search/backend.rs` — `rg` without `--sort` (F-03)                                                        | `--sort path` before truncation                                                |
-| German underperformance                   | STOPWORDS (8 DE), no compound splitting, `ist` dropped by length                                          | `retrieval patterns` for DE queries                                            |
+| unsplit-compound underperformance         | no compound splitting (case_fold_variant needs underscore/case transition), short words dropped by length | `retrieval patterns` for flat-compound queries                                 |
 | silent scope drop (F-06)                  | `pipeline.rs:56-59`, `dispatch.rs:193-198`                                                                | log + mention in summary                                                       |
 | empty query runs LLM (F-04)               | `server.rs` request validation                                                                            | reject blank queries at the MCP boundary                                       |
 | inert config keys (F-12)                  | `config.rs` `Config` (no `deny_unknown_fields`)                                                           | warn on unknown keys in `config test`                                          |
@@ -1030,7 +1030,7 @@ B2, the observability patch, issue-derived queries.
 - [x] Every hypothesis (H1–H4) and candidate defect (F-01–F-12) has a probe that can falsify it.
 - [x] Every metric names a data source that exists today or is listed in §3.1.
 - [x] Expected stages follow from §2.1 arithmetic.
-- [x] Corpus covers every precision × language cell at least once; I4 has queries; German appears in P1 as well as I3.
+- [x] Corpus covers every precision cell at least once; I4 has queries; unsplit-compound phrasing appears in P1-DE as well as I3.
 - [x] No step reads the API key or edits the user's live config; variants go through `REPO_EXPLORER_CONFIG`.
 - [x] The installed binary is the SUT; the observability patch is a release with a verification procedure; Mode B is defined.
 - [x] Attempts are independent (fresh process per pass); B2 cannot call the LLM.
