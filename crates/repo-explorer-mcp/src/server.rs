@@ -12,9 +12,12 @@ use repo_explorer_memory::MemoryClientBackend;
 use repo_explorer_search::{CliSearchBackend, GitStateProbe};
 use rmcp::{
     Json, ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
-    tool, tool_handler, tool_router,
+    handler::server::{
+        router::{prompt::PromptRouter, tool::ToolRouter},
+        wrapper::Parameters,
+    },
+    model::{PromptMessage, Role, ServerCapabilities, ServerInfo},
+    prompt, prompt_handler, prompt_router, tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -154,6 +157,7 @@ fn validate_request(req: &ExploreRepositoryRequest) -> Result<(), String> {
 #[derive(Clone)]
 pub struct RepoExplorerServer {
     tool_router: ToolRouter<Self>,
+    prompt_router: PromptRouter<Self>,
     agent: Arc<Agent>,
     repo_root: Arc<PathBuf>,
     /// Per-process counter feeding [`build_req_id`]; shared (not per-clone)
@@ -161,11 +165,32 @@ pub struct RepoExplorerServer {
     req_counter: Arc<AtomicU64>,
 }
 
+/// Arguments for the `find-definition` and `bare-symbol` example prompts.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SymbolPromptArgs {
+    /// The exact code identifier or symbol, written as it appears in the
+    /// source (snake_case, camelCase, or PascalCase), in English.
+    symbol: String,
+}
+
+/// Arguments for the `locate-at-line` example prompt.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct LocateAtLineArgs {
+    /// Repo-relative file path, written exactly as it appears in the source.
+    path: String,
+    /// 1-based line number within `path`.
+    line: u32,
+    /// The exact code identifier or symbol at that location, in English.
+    symbol: String,
+}
+
 #[tool_router]
+#[prompt_router]
 impl RepoExplorerServer {
     pub fn new(agent: Arc<Agent>, repo_root: PathBuf) -> Self {
         Self {
             tool_router: Self::tool_router(),
+            prompt_router: Self::prompt_router(),
             agent,
             repo_root: Arc::new(repo_root),
             req_counter: Arc::new(AtomicU64::new(0)),
@@ -215,12 +240,71 @@ impl RepoExplorerServer {
             }
         }
     }
+
+    /// Example prompt: locate a symbol's definition. Phrase queries in
+    /// English and use the exact code identifier as written in the source.
+    #[prompt(
+        name = "find-definition",
+        description = "Locate where a symbol is defined. Supply the exact \
+                       code identifier as written in the source; the query \
+                       is phrased in English."
+    )]
+    async fn find_definition_prompt(
+        &self,
+        Parameters(args): Parameters<SymbolPromptArgs>,
+    ) -> Vec<PromptMessage> {
+        vec![PromptMessage::new_text(
+            Role::User,
+            format!("where is `{}` defined", args.symbol),
+        )]
+    }
+
+    /// Example prompt: search for a bare exact symbol. Phrase queries in
+    /// English and use the exact code identifier as written in the source.
+    #[prompt(
+        name = "bare-symbol",
+        description = "Search for a bare exact symbol with no surrounding \
+                       prose. Supply the exact code identifier as written in \
+                       the source."
+    )]
+    async fn bare_symbol_prompt(
+        &self,
+        Parameters(args): Parameters<SymbolPromptArgs>,
+    ) -> Vec<PromptMessage> {
+        vec![PromptMessage::new_text(Role::User, args.symbol)]
+    }
+
+    /// Example prompt: ask about a symbol at a specific path and line.
+    /// Phrase queries in English and use the exact code identifier and path
+    /// as written in the source.
+    #[prompt(
+        name = "locate-at-line",
+        description = "Ask what a symbol at a specific path and line does. \
+                       Supply the exact path and code identifier as written \
+                       in the source; the query is phrased in English."
+    )]
+    async fn locate_at_line_prompt(
+        &self,
+        Parameters(args): Parameters<LocateAtLineArgs>,
+    ) -> Vec<PromptMessage> {
+        vec![PromptMessage::new_text(
+            Role::User,
+            format!("{}:{} what does {} do", args.path, args.line, args.symbol),
+        )]
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
+#[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for RepoExplorerServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build(),
+        )
+        .with_instructions(
             "Repository exploration server. Handles English-language requests \
              only — send queries in English. Call `explore_repository` with a \
              free-text query (best results when it names an exact identifier, \
@@ -394,6 +478,17 @@ mod tests {
             reject_zero_max_results(Some(0)).unwrap_err(),
             "max_results must be greater than 0; omit it for unlimited"
         );
+    }
+
+    #[test]
+    fn prompt_router_lists_the_example_prompts() {
+        // list_all() returns prompts sorted by name.
+        let names: Vec<String> = RepoExplorerServer::prompt_router()
+            .list_all()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["bare-symbol", "find-definition", "locate-at-line"]);
     }
 
     #[test]
