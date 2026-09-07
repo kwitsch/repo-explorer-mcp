@@ -16,14 +16,14 @@ use std::sync::Mutex;
 use crate::dispatch::escapes_repo_root;
 
 /// A capped `String`-keyed map with FIFO eviction (oldest inserted first out).
-struct CappedMap<V> {
+pub(crate) struct CappedMap<V> {
     map: HashMap<String, V>,
     order: VecDeque<String>,
     cap: usize,
 }
 
 impl<V: Clone> CappedMap<V> {
-    fn new(cap: usize) -> Self {
+    pub(crate) fn new(cap: usize) -> Self {
         Self {
             map: HashMap::new(),
             order: VecDeque::new(),
@@ -31,7 +31,7 @@ impl<V: Clone> CappedMap<V> {
         }
     }
 
-    fn get(&self, key: &str) -> Option<V> {
+    pub(crate) fn get(&self, key: &str) -> Option<V> {
         self.map.get(key).cloned()
     }
 
@@ -39,7 +39,7 @@ impl<V: Clone> CappedMap<V> {
         self.map.get_mut(key)
     }
 
-    fn insert(&mut self, key: String, value: V) {
+    pub(crate) fn insert(&mut self, key: String, value: V) {
         if self.cap == 0 {
             return;
         }

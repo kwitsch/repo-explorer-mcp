@@ -31,8 +31,9 @@ use repo_explorer_core::retrieval::{
 use repo_explorer_core::search::SearchBackend;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use crate::cache::{QueryEntry, ResultCache};
+use crate::cache::{CappedMap, QueryEntry, ResultCache};
 use crate::dispatch::{canonical_repo_root, clamp_location, dispatch_inner, read_verified_file};
 use crate::pipeline;
 use crate::render::{RenderCaps, dedupe_key, tidy_findings};
@@ -127,6 +128,16 @@ where
     /// Advanced once per `run` call to hand each conversation a fresh
     /// `CallOptions::rotation_seed` (see `TokenBudget::rotation_seed`).
     rotation_seed: std::sync::atomic::AtomicUsize,
+    /// Per-`repo_root` git fingerprint + monotonic instant of the last
+    /// usable `ensure_fresh_index`, so repeat calls on an unchanged repo
+    /// skip the upstream freshness round-trips. Bounded/FIFO-evicting like
+    /// the sibling caches in `cache.rs`, capped by the same
+    /// `cache_settings.max_entries` (independent of whether the query cache
+    /// itself is enabled).
+    index_refresh_seen: std::sync::Mutex<CappedMap<IndexRefreshMark>>,
+    /// Trust window for `index_refresh_seen`, sourced from
+    /// `codebase_memory.staleness_seconds`.
+    index_trust_ttl: Duration,
 }
 
 impl<M, S, P, R, C> AgentLoop<M, S, P, R, C>
@@ -144,6 +155,7 @@ where
         probe: R,
         settings: AgentSettings,
         cache_settings: CacheSettings,
+        index_trust_ttl: Duration,
     ) -> Self {
         let cache = cache_settings
             .enabled
@@ -161,6 +173,8 @@ where
             cache,
             caps,
             rotation_seed: std::sync::atomic::AtomicUsize::new(0),
+            index_refresh_seen: std::sync::Mutex::new(CappedMap::new(cache_settings.max_entries)),
+            index_trust_ttl,
         }
     }
 
@@ -179,10 +193,7 @@ where
     ) -> Result<ExplorationResult, AgentLoopError> {
         // Stage 0: query cache.
         let git_probe_start = std::time::Instant::now();
-        let fingerprint = match &self.cache {
-            Some(_) => self.probe.fingerprint(repo_root).await,
-            None => None,
-        };
+        let fingerprint = self.probe.fingerprint(repo_root).await;
         let git_probe_ms = git_probe_start.elapsed().as_millis() as u64;
         let query_key = ResultCache::query_key(repo_root, query);
         if let Some(hit) = self
@@ -199,8 +210,55 @@ where
         }
 
         // Stage 1: ensure a fresh index (once). Failures are non-fatal notes.
-        let index_result = self.memory.ensure_fresh_index(repo_root).await;
-        let index_status = index_status_label(&index_result);
+        // Repeat calls on an unchanged repo (same git fingerprint, still within
+        // the trust window) skip the upstream freshness round-trip.
+        let now = Instant::now();
+        let index_key = repo_root.to_string_lossy().into_owned();
+        let skip_candidate = {
+            let seen = self
+                .index_refresh_seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            may_skip_index_refresh(
+                fingerprint.as_ref(),
+                seen.get(&index_key).as_ref(),
+                now,
+                self.index_trust_ttl,
+            )
+        };
+        // A skip candidate is still safety-netted by a cheap existence probe:
+        // if the upstream index was lost/invalidated for a reason the local
+        // git fingerprint can't see (daemon restart, external deletion), fall
+        // back to the full flow instead of trusting the fingerprint alone.
+        let skip =
+            skip_candidate && matches!(self.memory.probe_index_ready(repo_root).await, Ok(true));
+        let index_result = if skip {
+            Ok(IndexStatus::UpToDate)
+        } else {
+            let r = self.memory.ensure_fresh_index(repo_root).await;
+            if let (Ok(IndexStatus::UpToDate | IndexStatus::Reindexed), Some(fp)) =
+                (&r, &fingerprint)
+            {
+                self.index_refresh_seen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(
+                        index_key,
+                        IndexRefreshMark {
+                            fingerprint: fp.clone(),
+                            at: now,
+                        },
+                    );
+            }
+            r
+        };
+        // Distinguish a synthesized skip from a real backend round-trip in the
+        // "exploration complete" log line — both otherwise map to "UpToDate".
+        let index_status = if skip {
+            "UpToDateSkipped"
+        } else {
+            index_status_label(&index_result)
+        };
         let index_note = match index_result {
             Ok(IndexStatus::Reindexed) | Ok(IndexStatus::UpToDate) => None,
             Ok(IndexStatus::IndexingFailed { reason }) => Some(format!(
@@ -836,6 +894,30 @@ where
     }
 }
 
+/// One recorded successful `ensure_fresh_index`: the git fingerprint at that
+/// point and the monotonic instant it ran.
+#[derive(Clone)]
+struct IndexRefreshMark {
+    fingerprint: RepoFingerprint,
+    at: Instant,
+}
+
+/// True when a repeat call may skip `ensure_fresh_index`: the repo's git
+/// fingerprint is known and identical to the last refresh, and that refresh
+/// is still within the trust window. Any `None`/unknown input is
+/// conservative (returns false -> run the full flow).
+fn may_skip_index_refresh(
+    current: Option<&RepoFingerprint>,
+    mark: Option<&IndexRefreshMark>,
+    now: Instant,
+    ttl: Duration,
+) -> bool {
+    match (current, mark) {
+        (Some(fp), Some(m)) => *fp == m.fingerprint && now.saturating_duration_since(m.at) < ttl,
+        _ => false,
+    }
+}
+
 /// Map `ensure_fresh_index`'s result onto a short label for the
 /// `exploration complete` log line — `Unavailable` covers the `Err` arm,
 /// which carries no `IndexStatus` value of its own.
@@ -1001,10 +1083,15 @@ mod tests {
     use repo_explorer_core::fingerprint::mock::MockRepoStateProbe;
     use repo_explorer_core::llm::mock::{FakeClock, MockLlmProvider};
     use repo_explorer_core::llm::{Completion, ToolCall};
-    use repo_explorer_core::memory::mock::MockMemoryBackend;
+    use repo_explorer_core::memory::mock::{Call, MockMemoryBackend};
     use repo_explorer_core::search::SearchError;
     use repo_explorer_core::search::mock::MockSearchBackend;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    /// Trust-window TTL used across these tests — centralized so a future
+    /// default change or edge-case TTL needs editing in one place.
+    const TEST_INDEX_TRUST_TTL: Duration = Duration::from_secs(60);
 
     fn finish_call() -> ToolCall {
         ToolCall {
@@ -1064,6 +1151,7 @@ mod tests {
             MockRepoStateProbe::new(),
             AgentSettings::default(),
             CacheSettings::default(),
+            TEST_INDEX_TRUST_TTL,
         )
     }
 
@@ -1398,6 +1486,7 @@ mod tests {
             MockRepoStateProbe::new(),
             AgentSettings::default(),
             CacheSettings::default(),
+            TEST_INDEX_TRUST_TTL,
         );
         let query = ExplorationQuery {
             text: "decide_freshness".to_string(),
@@ -1451,6 +1540,7 @@ mod tests {
             MockRepoStateProbe::new(),
             AgentSettings::default(),
             CacheSettings::default(),
+            TEST_INDEX_TRUST_TTL,
         );
         let query = ExplorationQuery {
             text: "decide_freshness".to_string(),
@@ -1514,6 +1604,7 @@ mod tests {
             MockRepoStateProbe::new(),
             AgentSettings::default(),
             CacheSettings::default(),
+            TEST_INDEX_TRUST_TTL,
         );
         let query = ExplorationQuery {
             text: "crates/repo-explorer-agent/src/verify.rs:35 what does this constant do"
@@ -1544,6 +1635,7 @@ mod tests {
             MockRepoStateProbe::new(),
             AgentSettings::default(),
             CacheSettings::default(),
+            TEST_INDEX_TRUST_TTL,
         );
         let query = ExplorationQuery {
             text: "x".to_string(),
@@ -1578,6 +1670,7 @@ mod tests {
             MockRepoStateProbe::new(),
             AgentSettings::default(),
             CacheSettings::default(),
+            TEST_INDEX_TRUST_TTL,
         );
         let fp = RepoFingerprint {
             head_sha: "abc".to_string(),
@@ -1730,6 +1823,7 @@ mod tests {
             MockRepoStateProbe::new(),
             AgentSettings::default(),
             CacheSettings::default(),
+            TEST_INDEX_TRUST_TTL,
         );
         let query = ExplorationQuery {
             text: "where is main".to_string(),
@@ -1750,5 +1844,346 @@ mod tests {
             "the rotation seed must not move mid-conversation"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn fp(sha: &str) -> RepoFingerprint {
+        RepoFingerprint {
+            head_sha: sha.to_string(),
+            dirty_hash: "d".to_string(),
+        }
+    }
+
+    /// Build an `AgentLoop` over the mocks with an explicit probe and trust TTL,
+    /// so a caller can hold the `MockMemoryBackend` clone to count refreshes.
+    fn agent_with_probe_and_ttl(
+        memory: MockMemoryBackend,
+        provider: MockLlmProvider,
+        probe: MockRepoStateProbe,
+        ttl: Duration,
+    ) -> AgentLoop<
+        MockMemoryBackend,
+        MockSearchBackend,
+        MockLlmProvider,
+        MockRepoStateProbe,
+        FakeClock,
+    > {
+        let router = ProviderRouter::with_clock(
+            vec![("primary".to_string(), vec![("m".to_string(), provider)])],
+            60,
+            FakeClock::new(),
+        );
+        AgentLoop::new(
+            memory,
+            MockSearchBackend::new(),
+            router,
+            probe,
+            AgentSettings::default(),
+            CacheSettings::default(),
+            ttl,
+        )
+    }
+
+    fn count_ensure_fresh(memory: &MockMemoryBackend) -> usize {
+        memory
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, Call::EnsureFreshIndex { .. }))
+            .count()
+    }
+
+    fn q(text: &str) -> ExplorationQuery {
+        ExplorationQuery {
+            text: text.to_string(),
+            scope_hint: None,
+            max_results: None,
+        }
+    }
+
+    #[test]
+    fn may_skip_no_mark_is_false() {
+        // First call for a repo has no recorded mark -> must run the full flow.
+        let now = Instant::now();
+        assert!(!may_skip_index_refresh(
+            Some(&fp("a")),
+            None,
+            now,
+            TEST_INDEX_TRUST_TTL
+        ));
+    }
+
+    #[test]
+    fn may_skip_matching_within_ttl_is_true() {
+        let now = Instant::now();
+        let mark = IndexRefreshMark {
+            fingerprint: fp("a"),
+            at: now - Duration::from_secs(1),
+        };
+        assert!(may_skip_index_refresh(
+            Some(&fp("a")),
+            Some(&mark),
+            now,
+            TEST_INDEX_TRUST_TTL
+        ));
+    }
+
+    #[test]
+    fn may_skip_matching_past_ttl_is_false() {
+        // Staleness backstop: an unchanged repo still re-checks after the window.
+        let now = Instant::now();
+        let mark = IndexRefreshMark {
+            fingerprint: fp("a"),
+            at: now - Duration::from_secs(100),
+        };
+        assert!(!may_skip_index_refresh(
+            Some(&fp("a")),
+            Some(&mark),
+            now,
+            Duration::from_secs(10)
+        ));
+    }
+
+    #[test]
+    fn may_skip_differing_fingerprint_is_false() {
+        // A .git op / branch switch changes the fingerprint -> full flow.
+        let now = Instant::now();
+        let mark = IndexRefreshMark {
+            fingerprint: fp("a"),
+            at: now,
+        };
+        assert!(!may_skip_index_refresh(
+            Some(&fp("b")),
+            Some(&mark),
+            now,
+            TEST_INDEX_TRUST_TTL
+        ));
+    }
+
+    #[test]
+    fn may_skip_no_current_fingerprint_is_false() {
+        // Probe failed / not a git repo -> never skip.
+        let now = Instant::now();
+        let mark = IndexRefreshMark {
+            fingerprint: fp("a"),
+            at: now,
+        };
+        assert!(!may_skip_index_refresh(
+            None,
+            Some(&mark),
+            now,
+            TEST_INDEX_TRUST_TTL
+        ));
+    }
+
+    #[test]
+    fn may_skip_zero_ttl_never_skips() {
+        // staleness_seconds == 0 degrades to today's behavior.
+        let now = Instant::now();
+        let mark = IndexRefreshMark {
+            fingerprint: fp("a"),
+            at: now,
+        };
+        assert!(!may_skip_index_refresh(
+            Some(&fp("a")),
+            Some(&mark),
+            now,
+            Duration::ZERO
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeat_call_same_fingerprint_skips_second_refresh() {
+        // Regression: two explore calls for the same repo_path with distinct
+        // queries (to miss the query cache) on an unchanged repo must run
+        // ensure_fresh_index exactly once — the redundant upstream freshness
+        // round-trip is skipped on the second call.
+        let memory = MockMemoryBackend::new();
+        let mem = memory.clone();
+        let provider = MockLlmProvider::new().with_responses(vec![
+            tool_calls(vec![finish_call()]),
+            tool_calls(vec![finish_call()]),
+        ]);
+        let probe = MockRepoStateProbe::new().with_fingerprint(Some(fp("abc")));
+        let agent = agent_with_probe_and_ttl(memory, provider, probe, Duration::from_secs(3600));
+        let dir = temp_repo("skip_second_refresh");
+        agent.run(&dir, &q("first query")).await.unwrap();
+        agent.run(&dir, &q("second query")).await.unwrap();
+        assert_eq!(
+            count_ensure_fresh(&mem),
+            1,
+            "second call on an unchanged repo must skip the redundant refresh"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fingerprint_change_forces_second_refresh() {
+        // Regression: a `git checkout` / .git op between two calls changes the
+        // fingerprint, which must force a full ensure_fresh_index on the second
+        // call — closing the branch-switch correctness gap.
+        let memory = MockMemoryBackend::new();
+        let mem = memory.clone();
+        let provider = MockLlmProvider::new().with_responses(vec![
+            tool_calls(vec![finish_call()]),
+            tool_calls(vec![finish_call()]),
+        ]);
+        let probe = MockRepoStateProbe::new().with_fingerprint(Some(fp("abc")));
+        let probe_handle = probe.clone();
+        let agent = agent_with_probe_and_ttl(memory, provider, probe, Duration::from_secs(3600));
+        let dir = temp_repo("fp_change_refresh");
+        agent.run(&dir, &q("first query")).await.unwrap();
+        probe_handle.set_fingerprint(Some(fp("def")));
+        agent.run(&dir, &q("second query")).await.unwrap();
+        assert_eq!(
+            count_ensure_fresh(&mem),
+            2,
+            "a changed fingerprint must force a second refresh"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn no_fingerprint_never_skips() {
+        // Not a git repo / probe failure -> no fingerprint -> never skip; every
+        // call runs the full flow, exactly as today.
+        let memory = MockMemoryBackend::new();
+        let mem = memory.clone();
+        let provider = MockLlmProvider::new().with_responses(vec![
+            tool_calls(vec![finish_call()]),
+            tool_calls(vec![finish_call()]),
+        ]);
+        let probe = MockRepoStateProbe::new(); // fingerprint None
+        let agent = agent_with_probe_and_ttl(memory, provider, probe, Duration::from_secs(3600));
+        let dir = temp_repo("no_fp_no_skip");
+        agent.run(&dir, &q("first query")).await.unwrap();
+        agent.run(&dir, &q("second query")).await.unwrap();
+        assert_eq!(
+            count_ensure_fresh(&mem),
+            2,
+            "without a fingerprint, never skip"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_is_not_recorded() {
+        // Regression: a first call whose refresh failed must NOT record a skip
+        // mark, so the second call retries the full flow (never serves against a
+        // never-built index).
+        let memory = MockMemoryBackend::new().with_ensure_fresh_index_result(Ok(
+            IndexStatus::IndexingFailed {
+                reason: "boom".to_string(),
+            },
+        ));
+        let mem = memory.clone();
+        let provider = MockLlmProvider::new().with_responses(vec![
+            tool_calls(vec![finish_call()]),
+            tool_calls(vec![finish_call()]),
+        ]);
+        let probe = MockRepoStateProbe::new().with_fingerprint(Some(fp("abc")));
+        let agent = agent_with_probe_and_ttl(memory, provider, probe, Duration::from_secs(3600));
+        let dir = temp_repo("failed_refresh_retries");
+        agent.run(&dir, &q("first query")).await.unwrap();
+        agent.run(&dir, &q("second query")).await.unwrap();
+        assert_eq!(
+            count_ensure_fresh(&mem),
+            2,
+            "a failed refresh must not be recorded; the next call retries"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same as `agent_with_probe_and_ttl` but with an explicit `CacheSettings`,
+    /// so a test can shrink `max_entries` to exercise `index_refresh_seen`'s
+    /// eviction.
+    fn agent_with_probe_ttl_and_cache(
+        memory: MockMemoryBackend,
+        provider: MockLlmProvider,
+        probe: MockRepoStateProbe,
+        ttl: Duration,
+        cache_settings: CacheSettings,
+    ) -> AgentLoop<
+        MockMemoryBackend,
+        MockSearchBackend,
+        MockLlmProvider,
+        MockRepoStateProbe,
+        FakeClock,
+    > {
+        let router = ProviderRouter::with_clock(
+            vec![("primary".to_string(), vec![("m".to_string(), provider)])],
+            60,
+            FakeClock::new(),
+        );
+        AgentLoop::new(
+            memory,
+            MockSearchBackend::new(),
+            router,
+            probe,
+            AgentSettings::default(),
+            cache_settings,
+            ttl,
+        )
+    }
+
+    #[tokio::test]
+    async fn probe_index_ready_false_forces_refresh_despite_skip_candidate() {
+        // Regression: a skip candidate (unchanged fingerprint, within TTL) must
+        // still be safety-netted by a cheap existence probe — if the upstream
+        // index was lost for a reason the git fingerprint can't see, the full
+        // flow must run instead of trusting the local skip.
+        let memory = MockMemoryBackend::new().with_probe_index_ready_result(Ok(false));
+        let mem = memory.clone();
+        let provider = MockLlmProvider::new().with_responses(vec![
+            tool_calls(vec![finish_call()]),
+            tool_calls(vec![finish_call()]),
+        ]);
+        let probe = MockRepoStateProbe::new().with_fingerprint(Some(fp("abc")));
+        let agent = agent_with_probe_and_ttl(memory, provider, probe, Duration::from_secs(3600));
+        let dir = temp_repo("probe_not_ready_forces_refresh");
+        agent.run(&dir, &q("first query")).await.unwrap();
+        agent.run(&dir, &q("second query")).await.unwrap();
+        assert_eq!(
+            count_ensure_fresh(&mem),
+            2,
+            "a not-ready safety probe must force the full flow even for a skip candidate"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn index_refresh_seen_evicts_oldest_beyond_cache_cap() {
+        // Regression: index_refresh_seen is bounded by cache_settings.max_entries
+        // (FIFO), not an unbounded per-repo map — a third call for the first repo,
+        // after a second distinct repo pushed it out, forces the full flow again.
+        let memory = MockMemoryBackend::new();
+        let mem = memory.clone();
+        let provider = MockLlmProvider::new().with_responses(vec![
+            tool_calls(vec![finish_call()]),
+            tool_calls(vec![finish_call()]),
+            tool_calls(vec![finish_call()]),
+        ]);
+        let probe = MockRepoStateProbe::new().with_fingerprint(Some(fp("abc")));
+        let cache_settings = CacheSettings {
+            enabled: true,
+            max_entries: 1,
+        };
+        let agent = agent_with_probe_ttl_and_cache(
+            memory,
+            provider,
+            probe,
+            Duration::from_secs(3600),
+            cache_settings,
+        );
+        let dir_a = temp_repo("evict_repo_a");
+        let dir_b = temp_repo("evict_repo_b");
+        agent.run(&dir_a, &q("a1")).await.unwrap();
+        agent.run(&dir_b, &q("b1")).await.unwrap();
+        agent.run(&dir_a, &q("a2")).await.unwrap();
+        assert_eq!(
+            count_ensure_fresh(&mem),
+            3,
+            "repo A's mark must be evicted once repo B's mark is inserted past the cap"
+        );
+        std::fs::remove_dir_all(&dir_a).ok();
+        std::fs::remove_dir_all(&dir_b).ok();
     }
 }

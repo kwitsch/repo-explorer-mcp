@@ -80,6 +80,13 @@ pub trait MemoryBackend {
     /// only an unusable backend is `Err`.
     async fn ensure_fresh_index(&self, repo_root: &Path) -> Result<IndexStatus, MemoryError>;
 
+    /// Cheap existence-only check for `repo_root`'s upstream index (`index_status`
+    /// only, no `detect_changes` round trip) — used to safety-net a caller's own
+    /// skip decision against upstream index loss for a reason no local signal
+    /// (e.g. a git fingerprint) can see, such as a daemon restart or another
+    /// process invalidating the index. Does not detect content-level staleness.
+    async fn probe_index_ready(&self, repo_root: &Path) -> Result<bool, MemoryError>;
+
     async fn search_code(
         &self,
         repo_root: &Path,
@@ -134,6 +141,9 @@ pub mod mock {
         EnsureFreshIndex {
             repo_root: PathBuf,
         },
+        ProbeIndexReady {
+            repo_root: PathBuf,
+        },
         SearchCode {
             repo_root: PathBuf,
             query: ExplorationQuery,
@@ -174,6 +184,7 @@ pub mod mock {
     #[derive(Clone)]
     pub struct MockMemoryBackend {
         ensure_fresh_index: Result<IndexStatus, MemoryError>,
+        probe_index_ready: Result<bool, MemoryError>,
         search_code: Result<ExplorationResult, MemoryError>,
         search_graph: Result<ExplorationResult, MemoryError>,
         query_graph: Result<ExplorationResult, MemoryError>,
@@ -187,6 +198,7 @@ pub mod mock {
         fn default() -> Self {
             Self {
                 ensure_fresh_index: Ok(IndexStatus::UpToDate),
+                probe_index_ready: Ok(true),
                 search_code: Ok(empty_result()),
                 search_graph: Ok(empty_result()),
                 query_graph: Ok(empty_result()),
@@ -208,6 +220,10 @@ pub mod mock {
             r: Result<IndexStatus, MemoryError>,
         ) -> Self {
             self.ensure_fresh_index = r;
+            self
+        }
+        pub fn with_probe_index_ready_result(mut self, r: Result<bool, MemoryError>) -> Self {
+            self.probe_index_ready = r;
             self
         }
         pub fn with_search_code_result(
@@ -269,6 +285,13 @@ pub mod mock {
                 repo_root: repo_root.to_path_buf(),
             });
             self.ensure_fresh_index.clone()
+        }
+
+        async fn probe_index_ready(&self, repo_root: &Path) -> Result<bool, MemoryError> {
+            self.record(Call::ProbeIndexReady {
+                repo_root: repo_root.to_path_buf(),
+            });
+            self.probe_index_ready.clone()
         }
 
         async fn search_code(
