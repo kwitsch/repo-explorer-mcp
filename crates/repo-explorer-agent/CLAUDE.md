@@ -14,7 +14,12 @@ Owns `serde_json` — core stays free of it. Full pipeline design:
   when the local git `RepoFingerprint` is unchanged since the last refresh and
   still within the trust window (`codebase_memory.staleness_seconds`); any git
   change (commit, checkout, working-tree edit) or an elapsed window forces the
-  full flow. No fingerprint (not a git repo / probe failure) never skips.
+  full flow. No fingerprint (not a git repo / probe failure) never skips. A
+  skip candidate is still safety-netted by `MemoryBackend::probe_index_ready`
+  (a cheap existence-only check, no `detect_changes`) — if the upstream index
+  was lost/invalidated for a reason the fingerprint can't see, the full flow
+  runs instead. `index_refresh_seen` (the per-repo mark map) is bounded/FIFO
+  by `cache_settings.max_entries`, like the sibling caches in `cache.rs`.
 - **LLM verification stage** — runs over the top-k candidate skeletons the
   pre-stage produced.
 - **Explorative fallback loop** — the hardened path when verification isn't

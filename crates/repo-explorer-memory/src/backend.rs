@@ -965,6 +965,11 @@ impl MemoryBackend for MemoryClientBackend {
         result
     }
 
+    async fn probe_index_ready(&self, repo_root: &Path) -> Result<bool, MemoryError> {
+        let project = self.cached_project_name(repo_root).await?;
+        self.probe_status(&project).await
+    }
+
     async fn search_code(
         &self,
         repo_root: &Path,

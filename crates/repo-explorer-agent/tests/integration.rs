@@ -18,6 +18,10 @@ use repo_explorer_core::memory::mock::{Call as MemCall, MockMemoryBackend};
 use repo_explorer_core::search::mock::{Call as SearchCall, MockSearchBackend};
 use std::path::PathBuf;
 
+/// Trust-window TTL passed to `AgentLoop::new` in every test — centralized so
+/// a future default change or edge-case TTL needs editing in one place.
+const TEST_INDEX_TRUST_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn tc(id: &str, name: &str, args: &str) -> ToolCall {
     ToolCall {
         id: id.to_string(),
@@ -140,7 +144,7 @@ async fn fake_provider_dispatch_and_assembly() {
         MockRepoStateProbe::new(),
         fallback_only(),
         CacheSettings::default(),
-        std::time::Duration::from_secs(60),
+        TEST_INDEX_TRUST_TTL,
     );
     let dir = temp_repo("dispatch");
     let result = agent.run(&dir, &query("where is main")).await.unwrap();
@@ -229,7 +233,7 @@ async fn iteration_limit_degrades_gracefully() {
             ..fallback_only()
         },
         CacheSettings::default(),
-        std::time::Duration::from_secs(60),
+        TEST_INDEX_TRUST_TTL,
     );
     let result = agent
         .run(&PathBuf::from("/repo"), &query("q"))
@@ -278,7 +282,7 @@ async fn mid_exploration_failover_across_providers() {
         MockRepoStateProbe::new(),
         fallback_only(),
         CacheSettings::default(),
-        std::time::Duration::from_secs(60),
+        TEST_INDEX_TRUST_TTL,
     );
     let result = agent
         .run(&PathBuf::from("/repo"), &query("widget"))
@@ -311,7 +315,7 @@ async fn exact_symbol_early_exit_makes_zero_llm_calls() {
         MockRepoStateProbe::new(),
         AgentSettings::default(),
         CacheSettings::default(),
-        std::time::Duration::from_secs(60),
+        TEST_INDEX_TRUST_TTL,
     );
     // The early-exit path now verifies each candidate against disk, so the
     // referenced file must exist under the repo root for the candidate to
@@ -355,7 +359,7 @@ async fn medium_confidence_verifies_in_one_turn() {
         MockRepoStateProbe::new(),
         AgentSettings::default(),
         CacheSettings::default(),
-        std::time::Duration::from_secs(60),
+        TEST_INDEX_TRUST_TTL,
     );
     let dir = temp_repo("medium");
     let result = agent.run(&dir, &query("decide_freshness")).await.unwrap();
@@ -392,7 +396,7 @@ async fn verify_finish_is_capped_by_max_results() {
         MockRepoStateProbe::new(),
         AgentSettings::default(),
         CacheSettings::default(),
-        std::time::Duration::from_secs(60),
+        TEST_INDEX_TRUST_TTL,
     );
     let mut q = query("decide_freshness");
     q.max_results = Some(1);
@@ -425,7 +429,7 @@ async fn verify_expand_turn_then_forced_finish() {
         MockRepoStateProbe::new(),
         AgentSettings::default(),
         CacheSettings::default(),
-        std::time::Duration::from_secs(60),
+        TEST_INDEX_TRUST_TTL,
     );
     let result = agent
         .run(&PathBuf::from("/repo"), &query("decide_freshness"))
@@ -468,7 +472,7 @@ async fn failed_verification_escalates_to_fallback_loop() {
         MockRepoStateProbe::new(),
         AgentSettings::default(),
         CacheSettings::default(),
-        std::time::Duration::from_secs(60),
+        TEST_INDEX_TRUST_TTL,
     );
     let result = agent
         .run(&PathBuf::from("/repo"), &query("decide_freshness"))
@@ -514,7 +518,7 @@ async fn token_budget_exhaustion_forces_final_finish() {
             ..fallback_only()
         },
         CacheSettings::default(),
-        std::time::Duration::from_secs(60),
+        TEST_INDEX_TRUST_TTL,
     );
     let result = agent
         .run(&PathBuf::from("/repo"), &query("q"))
@@ -553,7 +557,7 @@ async fn repeated_query_is_served_from_cache() {
         probe,
         AgentSettings::default(),
         CacheSettings::default(),
-        std::time::Duration::from_secs(60),
+        TEST_INDEX_TRUST_TTL,
     );
     // The early-exit path verifies each candidate against disk, so the
     // referenced file must exist under the repo root for the first run to
@@ -594,7 +598,7 @@ async fn fingerprint_change_with_no_diff_keeps_cache_entry() {
         probe,
         AgentSettings::default(),
         CacheSettings::default(),
-        std::time::Duration::from_secs(60),
+        TEST_INDEX_TRUST_TTL,
     );
     let dir = temp_repo("no_diff_keeps_cache");
 
@@ -630,7 +634,7 @@ async fn fingerprint_change_touching_unrelated_path_recomputes() {
         probe,
         AgentSettings::default(),
         CacheSettings::default(),
-        std::time::Duration::from_secs(60),
+        TEST_INDEX_TRUST_TTL,
     );
     let dir = temp_repo("unrelated_path_recomputes");
 
@@ -664,7 +668,7 @@ async fn fingerprint_change_touching_result_paths_recomputes() {
         probe,
         AgentSettings::default(),
         CacheSettings::default(),
-        std::time::Duration::from_secs(60),
+        TEST_INDEX_TRUST_TTL,
     );
     let dir = temp_repo("result_paths_recomputes");
 
