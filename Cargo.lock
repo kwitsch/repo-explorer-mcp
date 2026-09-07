@@ -1648,9 +1648,11 @@ dependencies = [
 name = "repo-explorer-memory"
 version = "0.8.0"
 dependencies = [
+ "hex",
  "repo-explorer-core",
  "rmcp",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
 ]
