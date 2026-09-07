@@ -159,13 +159,19 @@ fn reject_zero_max_results(max_results: Option<u32>) -> Result<(), String> {
 /// git-fingerprint probe and a query-cache lookup against a bogus root before
 /// failing deep inside `ensure_fresh_index`. Boundary-level check: constructs
 /// no `ExplorationQuery` and does no agent work. Duplicates (does not replace)
-/// the deeper async check as defense-in-depth against TOCTOU.
-fn reject_invalid_repo_path(repo_path: &str) -> Result<(), String> {
+/// the deeper async check as defense-in-depth against TOCTOU. The `is_dir`
+/// syscall runs via `spawn_blocking`, mirroring `canonicalize_repo_root`, so a
+/// slow/network-mounted `repo_path` can't tie up a Tokio worker thread.
+async fn reject_invalid_repo_path(repo_path: &str) -> Result<(), String> {
     let path = std::path::Path::new(repo_path);
     if !path.is_absolute() {
         return Err(format!("repo_path must be an absolute path: {repo_path}"));
     }
-    if !path.is_dir() {
+    let owned = path.to_path_buf();
+    let is_dir = tokio::task::spawn_blocking(move || owned.is_dir())
+        .await
+        .unwrap_or(false);
+    if !is_dir {
         return Err(format!(
             "repo_path is not an existing directory: {repo_path}"
         ));
@@ -177,10 +183,10 @@ fn reject_invalid_repo_path(repo_path: &str) -> Result<(), String> {
 /// new request-shape validation (one per discovered bug so far: F-04, F-09,
 /// F-22) gets added, instead of each check's caller re-pasting its own
 /// log-and-return wrapper.
-fn validate_request(req: &ExploreRepositoryRequest) -> Result<(), String> {
+async fn validate_request(req: &ExploreRepositoryRequest) -> Result<(), String> {
     reject_blank_query(&req.query)?;
     reject_zero_max_results(req.max_results)?;
-    reject_invalid_repo_path(&req.repo_path)?;
+    reject_invalid_repo_path(&req.repo_path).await?;
     Ok(())
 }
 
@@ -248,7 +254,7 @@ impl RepoExplorerServer {
         params: Parameters<ExploreRepositoryRequest>,
     ) -> Result<Json<ExplorationResultDto>, String> {
         let req = params.0;
-        if let Err(e) = validate_request(&req) {
+        if let Err(e) = validate_request(&req).await {
             tracing::warn!(error_class = "validation", message = %e, "exploration rejected");
             return Err(e);
         }
@@ -472,17 +478,21 @@ mod tests {
         assert!(err.is_err());
     }
 
-    #[test]
-    fn reject_invalid_repo_path_accepts_absolute_existing_dir() {
-        assert!(reject_invalid_repo_path(env!("CARGO_MANIFEST_DIR")).is_ok());
+    #[tokio::test]
+    async fn reject_invalid_repo_path_accepts_absolute_existing_dir() {
+        assert!(
+            reject_invalid_repo_path(env!("CARGO_MANIFEST_DIR"))
+                .await
+                .is_ok()
+        );
     }
 
-    #[test]
-    fn reject_invalid_repo_path_rejects_relative_even_if_it_exists() {
+    #[tokio::test]
+    async fn reject_invalid_repo_path_rejects_relative_even_if_it_exists() {
         // "src" exists relative to the crate dir, but the absolute-only guard
         // must still reject it — the long-lived server has only an incidental
         // cwd to resolve against.
-        let err = reject_invalid_repo_path("src").unwrap_err();
+        let err = reject_invalid_repo_path("src").await.unwrap_err();
         assert!(
             err.contains("must be an absolute path"),
             "unexpected message: {err}"
@@ -498,23 +508,27 @@ mod tests {
     #[cfg(not(windows))]
     const NONEXISTENT_ABS_PATH: &str = "/nonexistent/repo/xyz";
 
-    #[test]
-    fn reject_invalid_repo_path_rejects_absolute_nonexistent() {
-        let err = reject_invalid_repo_path(NONEXISTENT_ABS_PATH).unwrap_err();
+    #[tokio::test]
+    async fn reject_invalid_repo_path_rejects_absolute_nonexistent() {
+        let err = reject_invalid_repo_path(NONEXISTENT_ABS_PATH)
+            .await
+            .unwrap_err();
         assert!(
             err.contains("is not an existing directory"),
             "unexpected message: {err}"
         );
     }
 
-    #[test]
-    fn reject_invalid_repo_path_messages_are_pinned() {
+    #[tokio::test]
+    async fn reject_invalid_repo_path_messages_are_pinned() {
         assert_eq!(
-            reject_invalid_repo_path("src").unwrap_err(),
+            reject_invalid_repo_path("src").await.unwrap_err(),
             "repo_path must be an absolute path: src"
         );
         assert_eq!(
-            reject_invalid_repo_path(NONEXISTENT_ABS_PATH).unwrap_err(),
+            reject_invalid_repo_path(NONEXISTENT_ABS_PATH)
+                .await
+                .unwrap_err(),
             format!("repo_path is not an existing directory: {NONEXISTENT_ABS_PATH}")
         );
     }
@@ -585,29 +599,29 @@ mod tests {
         assert_eq!(names, ["bare-symbol", "find-definition", "locate-at-line"]);
     }
 
-    #[test]
-    fn validate_request_runs_all_boundary_checks() {
+    #[tokio::test]
+    async fn validate_request_runs_all_boundary_checks() {
         let dir = env!("CARGO_MANIFEST_DIR");
         let ok: ExploreRepositoryRequest = serde_json::from_str(&format!(
             r#"{{"repo_path":{dir:?},"query":"q","max_results":5}}"#
         ))
         .unwrap();
-        assert!(validate_request(&ok).is_ok());
+        assert!(validate_request(&ok).await.is_ok());
 
         let blank: ExploreRepositoryRequest = serde_json::from_str(&format!(
             r#"{{"repo_path":{dir:?},"query":"  ","max_results":5}}"#
         ))
         .unwrap();
-        assert!(validate_request(&blank).is_err());
+        assert!(validate_request(&blank).await.is_err());
 
         let zero: ExploreRepositoryRequest = serde_json::from_str(&format!(
             r#"{{"repo_path":{dir:?},"query":"q","max_results":0}}"#
         ))
         .unwrap();
-        assert!(validate_request(&zero).is_err());
+        assert!(validate_request(&zero).await.is_err());
 
         let bad_path: ExploreRepositoryRequest =
             serde_json::from_str(r#"{"repo_path":"/nonexistent/xyz","query":"q"}"#).unwrap();
-        assert!(validate_request(&bad_path).is_err());
+        assert!(validate_request(&bad_path).await.is_err());
     }
 }
