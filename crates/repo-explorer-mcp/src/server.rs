@@ -36,6 +36,9 @@ pub type Agent =
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ExploreRepositoryRequest {
+    /// Absolute path to the repository's base directory to explore. Required.
+    /// `scope_hint` is interpreted relative to this path.
+    repo_path: String,
     /// Free-text search request in English only. Include the exact
     /// identifier, symbol, or file path as it appears in the code (e.g. a
     /// snake_case or camelCase name) for the fastest, most precise results.
@@ -111,8 +114,12 @@ impl From<ExplorationResult> for ExplorationResultDto {
 /// internally, plus a per-process monotonically increasing counter — so
 /// every log line for one call (including concurrent calls) can be
 /// correlated by an external harness without fragile timestamp-slicing.
-fn build_req_id(query: &ExplorationQuery, counter: &AtomicU64) -> String {
-    let key = Agent::query_cache_key(query);
+fn build_req_id(
+    repo_path: &std::path::Path,
+    query: &ExplorationQuery,
+    counter: &AtomicU64,
+) -> String {
+    let key = Agent::query_cache_key(repo_path, query);
     let hash = hex::encode(Sha256::digest(key.as_bytes()));
     let n = counter.fetch_add(1, Ordering::Relaxed);
     format!("{}-{n}", &hash[..8])
@@ -143,23 +150,46 @@ fn reject_zero_max_results(max_results: Option<u32>) -> Result<(), String> {
     Ok(())
 }
 
+/// Reject a `repo_path` that is not an absolute path to an existing directory
+/// before it reaches the agent loop (F-22). Absolute-only: a relative path is
+/// rejected outright — the long-lived server has only an incidental cwd, so
+/// resolving relative paths against it is fragile and surprising, and with the
+/// server-level root removed there is no fence-root to resolve against. A
+/// missing/typo'd/relative/file-not-dir path would otherwise burn a
+/// git-fingerprint probe and a query-cache lookup against a bogus root before
+/// failing deep inside `ensure_fresh_index`. Boundary-level check: constructs
+/// no `ExplorationQuery` and does no agent work. Duplicates (does not replace)
+/// the deeper async check as defense-in-depth against TOCTOU.
+fn reject_invalid_repo_path(repo_path: &str) -> Result<(), String> {
+    let path = std::path::Path::new(repo_path);
+    if !path.is_absolute() {
+        return Err(format!("repo_path must be an absolute path: {repo_path}"));
+    }
+    if !path.is_dir() {
+        return Err(format!(
+            "repo_path is not an existing directory: {repo_path}"
+        ));
+    }
+    Ok(())
+}
+
 /// Every `explore_repository` boundary check, in order — the single place
-/// new request-shape validation (one per discovered bug so far: F-04, F-09)
-/// gets added, instead of each check's caller re-pasting its own
+/// new request-shape validation (one per discovered bug so far: F-04, F-09,
+/// F-22) gets added, instead of each check's caller re-pasting its own
 /// log-and-return wrapper.
 fn validate_request(req: &ExploreRepositoryRequest) -> Result<(), String> {
     reject_blank_query(&req.query)?;
     reject_zero_max_results(req.max_results)?;
+    reject_invalid_repo_path(&req.repo_path)?;
     Ok(())
 }
 
-/// The MCP server handler: a shared `Arc<Agent>` plus the repo root to explore.
+/// The MCP server handler: a shared `Arc<Agent>`.
 #[derive(Clone)]
 pub struct RepoExplorerServer {
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
     agent: Arc<Agent>,
-    repo_root: Arc<PathBuf>,
     /// Per-process counter feeding [`build_req_id`]; shared (not per-clone)
     /// so every `RepoExplorerServer` clone contributes to one sequence.
     req_counter: Arc<AtomicU64>,
@@ -188,12 +218,11 @@ struct LocateAtLineArgs {
 #[tool_router]
 #[prompt_router]
 impl RepoExplorerServer {
-    pub fn new(agent: Arc<Agent>, repo_root: PathBuf) -> Self {
+    pub fn new(agent: Arc<Agent>) -> Self {
         Self {
             tool_router: Self::tool_router(),
             prompt_router: Self::prompt_router(),
             agent,
-            repo_root: Arc::new(repo_root),
             req_counter: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -209,8 +238,10 @@ impl RepoExplorerServer {
                        unresolved/symbol-only match, plus optional \
                        snippet/context) plus a summary. Phrase the query with \
                        the exact code identifier, symbol, or file path you are \
-                       looking for. Args: query (required), optional \
-                       scope_hint (path prefix), optional max_results."
+                       looking for. Args: repo_path (required, absolute path to \
+                       the repository base directory), query (required), optional \
+                       scope_hint (path prefix, relative to repo_path), optional \
+                       max_results."
     )]
     async fn explore_repository(
         &self,
@@ -221,18 +252,15 @@ impl RepoExplorerServer {
             tracing::warn!(error_class = "validation", message = %e, "exploration rejected");
             return Err(e);
         }
+        let repo_path = PathBuf::from(&req.repo_path);
         let query = ExplorationQuery {
             text: req.query,
             scope_hint: req.scope_hint.map(PathBuf::from),
             max_results: req.max_results,
         };
-        let req_id = build_req_id(&query, &self.req_counter);
+        let req_id = build_req_id(&repo_path, &query, &self.req_counter);
         let span = tracing::info_span!("explore", req_id = %req_id);
-        let result = self
-            .agent
-            .run(self.repo_root.as_ref(), &query)
-            .instrument(span)
-            .await;
+        let result = self.agent.run(&repo_path, &query).instrument(span).await;
         match result {
             Ok(result) => Ok(Json(ExplorationResultDto::from(result))),
             Err(e) => {
@@ -403,18 +431,24 @@ mod tests {
 
     #[test]
     fn deserializes_minimal_request() {
-        let req: ExploreRepositoryRequest =
-            serde_json::from_str(r#"{"query":"where is main"}"#).expect("minimal request");
+        let json = format!(
+            r#"{{"repo_path":{:?},"query":"where is main"}}"#,
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let req: ExploreRepositoryRequest = serde_json::from_str(&json).expect("minimal request");
         assert_eq!(req.query, "where is main");
+        assert_eq!(req.repo_path, env!("CARGO_MANIFEST_DIR"));
         assert!(req.scope_hint.is_none());
         assert!(req.max_results.is_none());
     }
 
     #[test]
     fn deserializes_full_request() {
-        let req: ExploreRepositoryRequest =
-            serde_json::from_str(r#"{"query":"q","scope_hint":"src","max_results":5}"#)
-                .expect("full request");
+        let json = format!(
+            r#"{{"repo_path":{:?},"query":"q","scope_hint":"src","max_results":5}}"#,
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let req: ExploreRepositoryRequest = serde_json::from_str(&json).expect("full request");
         assert_eq!(req.query, "q");
         assert_eq!(req.scope_hint.as_deref(), Some("src"));
         assert_eq!(req.max_results, Some(5));
@@ -422,8 +456,58 @@ mod tests {
 
     #[test]
     fn rejects_unknown_field() {
-        let err = serde_json::from_str::<ExploreRepositoryRequest>(r#"{"query":"q","bogus":true}"#);
+        let json = format!(
+            r#"{{"repo_path":{:?},"query":"q","bogus":true}}"#,
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let err = serde_json::from_str::<ExploreRepositoryRequest>(&json);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn rejects_request_missing_repo_path() {
+        // repo_path carries no #[serde(default)], so its absence is a
+        // deserialize error (surfaced by rmcp as invalid-params).
+        let err = serde_json::from_str::<ExploreRepositoryRequest>(r#"{"query":"q"}"#);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn reject_invalid_repo_path_accepts_absolute_existing_dir() {
+        assert!(reject_invalid_repo_path(env!("CARGO_MANIFEST_DIR")).is_ok());
+    }
+
+    #[test]
+    fn reject_invalid_repo_path_rejects_relative_even_if_it_exists() {
+        // "src" exists relative to the crate dir, but the absolute-only guard
+        // must still reject it — the long-lived server has only an incidental
+        // cwd to resolve against.
+        let err = reject_invalid_repo_path("src").unwrap_err();
+        assert!(
+            err.contains("must be an absolute path"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_repo_path_rejects_absolute_nonexistent() {
+        let err = reject_invalid_repo_path("/nonexistent/repo/xyz").unwrap_err();
+        assert!(
+            err.contains("is not an existing directory"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_repo_path_messages_are_pinned() {
+        assert_eq!(
+            reject_invalid_repo_path("src").unwrap_err(),
+            "repo_path must be an absolute path: src"
+        );
+        assert_eq!(
+            reject_invalid_repo_path("/nonexistent/repo/xyz").unwrap_err(),
+            "repo_path is not an existing directory: /nonexistent/repo/xyz"
+        );
     }
 
     #[test]
@@ -493,17 +577,28 @@ mod tests {
     }
 
     #[test]
-    fn validate_request_runs_both_boundary_checks() {
-        let ok: ExploreRepositoryRequest =
-            serde_json::from_str(r#"{"query":"q","max_results":5}"#).unwrap();
+    fn validate_request_runs_all_boundary_checks() {
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let ok: ExploreRepositoryRequest = serde_json::from_str(&format!(
+            r#"{{"repo_path":{dir:?},"query":"q","max_results":5}}"#
+        ))
+        .unwrap();
         assert!(validate_request(&ok).is_ok());
 
-        let blank: ExploreRepositoryRequest =
-            serde_json::from_str(r#"{"query":"  ","max_results":5}"#).unwrap();
+        let blank: ExploreRepositoryRequest = serde_json::from_str(&format!(
+            r#"{{"repo_path":{dir:?},"query":"  ","max_results":5}}"#
+        ))
+        .unwrap();
         assert!(validate_request(&blank).is_err());
 
-        let zero: ExploreRepositoryRequest =
-            serde_json::from_str(r#"{"query":"q","max_results":0}"#).unwrap();
+        let zero: ExploreRepositoryRequest = serde_json::from_str(&format!(
+            r#"{{"repo_path":{dir:?},"query":"q","max_results":0}}"#
+        ))
+        .unwrap();
         assert!(validate_request(&zero).is_err());
+
+        let bad_path: ExploreRepositoryRequest =
+            serde_json::from_str(r#"{"repo_path":"/nonexistent/xyz","query":"q"}"#).unwrap();
+        assert!(validate_request(&bad_path).is_err());
     }
 }
