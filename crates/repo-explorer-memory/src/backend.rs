@@ -14,6 +14,7 @@ use repo_explorer_core::memory::{
     GraphQuery, IndexStatus, MemoryBackend, MemoryError, SnippetTarget,
 };
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
@@ -26,27 +27,20 @@ use std::time::{Duration, SystemTime};
 pub struct MemoryClientBackend {
     client: Option<MemoryClient>,
     staleness: Duration,
-    /// Wall-clock time this process last successfully ran `index_repository`,
-    /// used as the `last_indexed_at` fed to `decide_freshness`. The real
-    /// `index_status` response carries no timestamp field at all (verified
-    /// against the live tool), so this in-process record is the only source
-    /// of that value — without it, `last_indexed_at` would always be `None`
-    /// and every `ensure_fresh_index` call would reindex regardless of the
-    /// configured staleness threshold.
-    last_reindexed_at: Mutex<Option<SystemTime>>,
-    /// Cache of the project name resolved from `repo_root`, keyed on the
-    /// `repo_root` it was resolved from. In practice `repo_root` never changes
-    /// across a `MemoryClientBackend`'s lifetime (every query method is called
-    /// with the same value each time), so after the first resolution this
-    /// lets [`Self::cached_project_name`] skip `project_name`'s
-    /// `spawn_blocking` + `fs::canonicalize` round trip on every subsequent
-    /// call — mirrors the `last_reindexed_at` single-field-cache pattern
-    /// above. The key guards that "in practice" is not a compile-time
-    /// guarantee: nothing stops a future caller from driving one instance with
-    /// two different `repo_root` values, and a keyless cache would then
-    /// silently serve the wrong project's cached name instead of
-    /// re-resolving.
-    project_name_cache: Mutex<Option<(PathBuf, String)>>,
+    /// Wall-clock time this process last successfully ran `index_repository`
+    /// for a given repo root, used as the `last_indexed_at` fed to
+    /// `decide_freshness`. Per-repo because one server instance now serves
+    /// many roots per request: a single global timestamp would let repo A's
+    /// reindex be read as repo B's `last_indexed_at`.
+    // ponytail: unbounded per-repo cache; add LRU/TTL eviction if long-lived
+    // multi-repo servers grow this unboundedly.
+    last_reindexed_at: Mutex<HashMap<PathBuf, SystemTime>>,
+    /// Project name resolved per `repo_root`. Per-repo (not single-slot) so one
+    /// server serving many roots caches each repo's name independently instead
+    /// of the two alternating repos thrashing a single slot.
+    // ponytail: unbounded per-repo cache; add LRU/TTL eviction if long-lived
+    // multi-repo servers grow this unboundedly.
+    project_name_cache: Mutex<HashMap<PathBuf, String>>,
 }
 
 impl MemoryClientBackend {
@@ -56,8 +50,8 @@ impl MemoryClientBackend {
         Ok(Self {
             client: Some(client),
             staleness: Duration::from_secs(config.staleness_seconds),
-            last_reindexed_at: Mutex::new(None),
-            project_name_cache: Mutex::new(None),
+            last_reindexed_at: Mutex::new(HashMap::new()),
+            project_name_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -189,18 +183,24 @@ impl MemoryClientBackend {
 
     /// Run `index_repository` against the given, already-canonicalized repo
     /// root. Soft tool failure -> `IndexingFailed`; transport failure -> `Err`.
-    ///
-    /// Takes the canonicalized path directly (rather than re-canonicalizing a
-    /// raw `repo_root`) because `ensure_fresh_index` already resolved it once
-    /// for `project_name_from_abs`; canonicalizing twice per reindex would
-    /// duplicate a blocking filesystem syscall for no benefit.
-    async fn run_index(&self, abs_repo_root: &Path) -> Result<IndexStatus, MemoryError> {
+    /// `repo_root` is the raw path used to key `last_reindexed_at` (matching
+    /// every other per-repo cache lookup); `abs_repo_root` is the canonical
+    /// path sent to the tool (`ensure_fresh_index` already resolved it once).
+    async fn run_index(
+        &self,
+        repo_root: &Path,
+        abs_repo_root: &Path,
+    ) -> Result<IndexStatus, MemoryError> {
         let args = index_repository_args(abs_repo_root);
         match self.client().call("index_repository", args).await {
             Ok(_) => {
-                // Record when *we* just rebuilt it — the only clock available,
-                // since the upstream tool never reports a build timestamp.
-                *self.last_reindexed_at.lock().unwrap() = Some(SystemTime::now());
+                // Record when *we* just rebuilt it, keyed on the raw repo_root
+                // — the only clock available, since the upstream tool never
+                // reports a build timestamp.
+                self.last_reindexed_at
+                    .lock()
+                    .unwrap()
+                    .insert(repo_root.to_path_buf(), SystemTime::now());
                 Ok(IndexStatus::Reindexed)
             }
             Err(MemoryError::ToolFailed { message, .. }) => {
@@ -220,13 +220,16 @@ impl MemoryClientBackend {
             .project_name_cache
             .lock()
             .unwrap()
-            .as_ref()
-            .and_then(|(cached_root, name)| (cached_root == repo_root).then(|| name.clone()))
+            .get(repo_root)
+            .cloned()
         {
             return Ok(name);
         }
         let name = project_name(repo_root).await?;
-        *self.project_name_cache.lock().unwrap() = Some((repo_root.to_path_buf(), name.clone()));
+        self.project_name_cache
+            .lock()
+            .unwrap()
+            .insert(repo_root.to_path_buf(), name.clone());
         Ok(name)
     }
 
@@ -906,11 +909,18 @@ impl MemoryClientBackend {
         // skip the redundant canonicalize + project-name round trip on their
         // first call -- moving `project` by value instead of cloning it, since
         // nothing below needs it anymore.
-        *self.project_name_cache.lock().unwrap() = Some((repo_root.to_path_buf(), project));
+        self.project_name_cache
+            .lock()
+            .unwrap()
+            .insert(repo_root.to_path_buf(), project);
         // Only meaningful once this project has been indexed; irrelevant
         // (and forced to `Reindex` regardless) when `exists` is false.
         let last_indexed_at = if exists {
-            *self.last_reindexed_at.lock().unwrap()
+            self.last_reindexed_at
+                .lock()
+                .unwrap()
+                .get(repo_root)
+                .copied()
         } else {
             None
         };
@@ -921,7 +931,7 @@ impl MemoryClientBackend {
         };
         match decide_freshness(&probe, self.staleness, SystemTime::now()) {
             FreshnessDecision::UpToDate => Ok(IndexStatus::UpToDate),
-            FreshnessDecision::Reindex => self.run_index(&abs).await,
+            FreshnessDecision::Reindex => self.run_index(repo_root, &abs).await,
         }
     }
 }
@@ -1072,6 +1082,32 @@ impl MemoryBackend for MemoryClientBackend {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn project_name_cache_keeps_a_separate_entry_per_repo_root() {
+        // Regression: the cache was a single-slot `Option<(PathBuf, String)>`
+        // that, driven with two different roots, kept only the last writer's
+        // entry — so one server serving repo A then repo B would thrash and
+        // could serve A's project name for B. It must now be a per-repo map
+        // holding BOTH entries at once. Both paths are nonexistent so
+        // `project_name` canonicalizes-with-fallback and never touches the
+        // (absent) client.
+        let backend = MemoryClientBackend {
+            client: None,
+            staleness: Duration::from_secs(1),
+            last_reindexed_at: Mutex::new(HashMap::new()),
+            project_name_cache: Mutex::new(HashMap::new()),
+        };
+        let root_a = Path::new("/nonexistent/alpha-repo");
+        let root_b = Path::new("/nonexistent/beta-repo");
+        let name_a = backend.cached_project_name(root_a).await.unwrap();
+        let name_b = backend.cached_project_name(root_b).await.unwrap();
+        assert_ne!(name_a, name_b, "distinct roots must get distinct names");
+        let cache = backend.project_name_cache.lock().unwrap();
+        assert_eq!(cache.len(), 2, "both repos' names must be cached at once");
+        assert_eq!(cache.get(root_a), Some(&name_a));
+        assert_eq!(cache.get(root_b), Some(&name_b));
+    }
 
     /// Real `search_graph format:"json"` payload shape (columnar).
     #[test]
@@ -1376,8 +1412,8 @@ ensure_fresh_index crates/repo-explorer-core/src/memory.rs \"1\" \"81\" \"81\"\n
         let backend = MemoryClientBackend {
             client: None,
             staleness: Duration::from_secs(1),
-            last_reindexed_at: Mutex::new(None),
-            project_name_cache: Mutex::new(None),
+            last_reindexed_at: Mutex::new(HashMap::new()),
+            project_name_cache: Mutex::new(HashMap::new()),
         };
         let target = SnippetTarget::FileRange {
             file: std::path::PathBuf::from("src/a.rs"),
