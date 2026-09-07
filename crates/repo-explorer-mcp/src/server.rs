@@ -41,7 +41,7 @@ struct ExploreRepositoryRequest {
     /// snake_case or camelCase name) for the fastest, most precise results.
     query: String,
     /// Optional path prefix (relative to the repo root) to restrict the
-    /// search. Requests are handled in English only.
+    /// search.
     #[serde(default)]
     scope_hint: Option<String>,
     /// Optional cap on the number of findings.
