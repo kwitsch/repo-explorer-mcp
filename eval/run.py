@@ -73,6 +73,13 @@ MESSAGE_RES = {
     "fallback_turn": re.compile(r"fallback turn\b"),
     "escalated": re.compile(r"verification escalated to the fallback loop"),
     "exploration_failed": re.compile(r"exploration failed\b"),
+    # PR #47 (v0.8.0): early-exit now disk-verifies each candidate before returning
+    # (agent.rs `result_from_candidates`) — these two lines explain a stage_expected=early-exit
+    # mismatch that isn't F-03 pre-stage nondeterminism.
+    "early_exit_fallthrough": re.compile(
+        r"early-exit produced no filesystem-verified candidate; falling through to verification"
+    ),
+    "early_exit_dropped": re.compile(r"early-exit dropped an unverifiable candidate"),
 }
 RATE_LIMIT_ISERROR_RE = re.compile(r"rate limit|exhausted or cooling down|429|RESOURCE_EXHAUSTED", re.I)
 
@@ -239,7 +246,8 @@ def parse_call_lines(lines: list[str]) -> dict:
     leg_failures) score.py already consumes, and adds every field the observability patch
     introduced: llm_calls, forced_finish, index_status, git_probe_ms, retrieval_patterns,
     leg_timings, candidates_ranked, provider_calls, verify_actions, fallback_turns,
-    exploration_failed."""
+    exploration_failed, early_exit_fallthrough, early_exit_dropped_candidates (the last two
+    from PR #47's early-exit disk verification)."""
     out = {
         "stage": None,
         "tokens": None,
@@ -259,6 +267,8 @@ def parse_call_lines(lines: list[str]) -> dict:
         "verify_actions": [],
         "fallback_turns": [],
         "exploration_failed": None,
+        "early_exit_fallthrough": False,
+        "early_exit_dropped_candidates": [],
     }
     for line in lines:
         kind = line_kind(line)
@@ -336,6 +346,14 @@ def parse_call_lines(lines: list[str]) -> dict:
             m = re.search(r'error_class="?(?P<cls>\w+)"?\s+message=(?P<msg>.*)$', line)
             if m:
                 out["exploration_failed"] = {"error_class": m.group("cls"), "message": m.group("msg")}
+        elif kind == "early_exit_fallthrough":
+            out["early_exit_fallthrough"] = True
+        elif kind == "early_exit_dropped":
+            # `reason=` is an unquoted %Display string (clamp_location's Err) that can contain
+            # spaces, same shape as leg_failed's `error=` above — take to end of line.
+            m = re.search(r"\breason=(?P<reason>.*)$", line)
+            if m:
+                out["early_exit_dropped_candidates"].append(m.group("reason"))
     return out
 
 

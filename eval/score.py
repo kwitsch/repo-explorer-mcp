@@ -527,9 +527,16 @@ def print_report(result: dict) -> None:
     for r in rows:
         if not r["stage_match"]:
             any_mismatch = True
+            # PR #47: an expected=early-exit mismatch may be explained by disk-verification
+            # rejecting every early-exit candidate (agent.rs `result_from_candidates`) rather
+            # than F-03 pre-stage nondeterminism — surface that cause when present.
+            cause = ""
+            if r["stage_expected"] == "early-exit" and r.get("early_exit_fallthrough"):
+                reasons = r.get("early_exit_dropped_candidates") or []
+                cause = f" (early-exit disk-verification rejected all candidates: {reasons[0]!r})" if reasons else " (early-exit disk-verification rejected all candidates)"
             print(
                 f"  {r['repo']}/{r['query_id']} pass{r['pass']}: "
-                f"expected={r['stage_expected']} observed={r['stage']}"
+                f"expected={r['stage_expected']} observed={r['stage']}{cause}"
             )
     if not any_mismatch:
         print("  none (or no stage expectations set)")
