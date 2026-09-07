@@ -33,9 +33,12 @@ pub type Agent =
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ExploreRepositoryRequest {
-    /// Free-text exploration request.
+    /// Free-text search request in English only. Include the exact
+    /// identifier, symbol, or file path as it appears in the code (e.g. a
+    /// snake_case or camelCase name) for the fastest, most precise results.
     query: String,
-    /// Optional path prefix to restrict the search to.
+    /// Optional path prefix (relative to the repo root) to restrict the
+    /// search. Requests are handled in English only.
     #[serde(default)]
     scope_hint: Option<String>,
     /// Optional cap on the number of findings.
@@ -172,12 +175,16 @@ impl RepoExplorerServer {
     /// Explore the repository and return structured findings plus a summary.
     #[tool(
         name = "explore_repository",
-        description = "Explore the repository for the given request and return \
-                       matching file locations (path always present; line \
-                       numbers included when resolvable, omitted entirely for \
-                       an unresolved/symbol-only match, plus optional \
-                       snippet/context) plus a summary. Args: query (required), \
-                       optional scope_hint (path prefix), optional max_results."
+        description = "This server handles English-language requests only; \
+                       send the query in English. Explore the repository for \
+                       the given request and return matching file locations \
+                       (path always present; line numbers included when \
+                       resolvable, omitted entirely for an \
+                       unresolved/symbol-only match, plus optional \
+                       snippet/context) plus a summary. Phrase the query with \
+                       the exact code identifier, symbol, or file path you are \
+                       looking for. Args: query (required), optional \
+                       scope_hint (path prefix), optional max_results."
     )]
     async fn explore_repository(
         &self,
@@ -214,8 +221,11 @@ impl RepoExplorerServer {
 impl ServerHandler for RepoExplorerServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Repository exploration server. Call `explore_repository` with a \
-             free-text query to receive structured findings and a summary.",
+            "Repository exploration server. Handles English-language requests \
+             only — send queries in English. Call `explore_repository` with a \
+             free-text query (best results when it names an exact identifier, \
+             symbol, or file path) to receive structured findings and a \
+             summary. See the listed prompts for example query phrasings.",
         )
     }
 }
