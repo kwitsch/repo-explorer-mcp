@@ -137,10 +137,22 @@ impl ResultCache {
     /// joined with a bare delimiter — differing field boundaries can never
     /// hash-collide regardless of what characters the fields themselves
     /// contain.
-    pub(crate) fn tool_key(fp: &RepoFingerprint, tool: &str, args_json: &str) -> String {
+    pub(crate) fn tool_key(
+        repo_root: &Path,
+        fp: &RepoFingerprint,
+        tool: &str,
+        args_json: &str,
+    ) -> String {
+        let repo = repo_root.to_string_lossy();
         let mut key = String::with_capacity(
-            fp.head_sha.len() + fp.dirty_hash.len() + tool.len() + args_json.len() + 20,
+            repo.len()
+                + fp.head_sha.len()
+                + fp.dirty_hash.len()
+                + tool.len()
+                + args_json.len()
+                + 24,
         );
+        encode_field_into(&mut key, &repo);
         let _ = write!(key, "{}#{}#", fp.head_sha, fp.dirty_hash);
         encode_field_into(&mut key, tool);
         encode_field_into(&mut key, args_json);
@@ -155,8 +167,15 @@ impl ResultCache {
         self.lock().tools.insert(key, value);
     }
 
-    pub(crate) fn leg_key(fp: &RepoFingerprint, leg: &str) -> String {
-        format!("{}#{}#{leg}", fp.head_sha, fp.dirty_hash)
+    pub(crate) fn leg_key(repo_root: &Path, fp: &RepoFingerprint, leg: &str) -> String {
+        let repo = repo_root.to_string_lossy();
+        let mut key = String::with_capacity(
+            repo.len() + fp.head_sha.len() + fp.dirty_hash.len() + leg.len() + 24,
+        );
+        encode_field_into(&mut key, &repo);
+        let _ = write!(key, "{}#{}#", fp.head_sha, fp.dirty_hash);
+        encode_field_into(&mut key, leg);
+        key
     }
 
     pub(crate) fn get_leg(&self, key: &str) -> Option<Vec<Candidate>> {
@@ -170,11 +189,14 @@ impl ResultCache {
     /// Fingerprint-independent query key: invalidation is handled via the
     /// stored fingerprint, not the key. Fields are joined via `encode_field`
     /// so differing field boundaries can never collide.
-    pub(crate) fn query_key(query: &ExplorationQuery) -> String {
+    pub(crate) fn query_key(repo_root: &Path, query: &ExplorationQuery) -> String {
+        let repo = repo_root.to_string_lossy();
         let text = query.text.trim().to_lowercase();
         let scope = scope_display(query.scope_hint.as_deref());
         let max_results = opt_to_string(query.max_results);
-        let mut key = String::with_capacity(text.len() + scope.len() + max_results.len() + 24);
+        let mut key =
+            String::with_capacity(repo.len() + text.len() + scope.len() + max_results.len() + 32);
+        encode_field_into(&mut key, &repo);
         encode_field_into(&mut key, &text);
         encode_field_into(&mut key, &scope);
         encode_field_into(&mut key, &max_results);
@@ -233,7 +255,7 @@ impl ResultCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn fp(sha: &str) -> RepoFingerprint {
         RepoFingerprint {
@@ -322,9 +344,10 @@ mod tests {
 
     #[test]
     fn keys_distinguish_fingerprint_tool_and_args() {
-        let a = ResultCache::tool_key(&fp("s1"), "grep", "{\"p\":1}");
-        let b = ResultCache::tool_key(&fp("s2"), "grep", "{\"p\":1}");
-        let c = ResultCache::tool_key(&fp("s1"), "find", "{\"p\":1}");
+        let r = Path::new("/repo");
+        let a = ResultCache::tool_key(r, &fp("s1"), "grep", "{\"p\":1}");
+        let b = ResultCache::tool_key(r, &fp("s2"), "grep", "{\"p\":1}");
+        let c = ResultCache::tool_key(r, &fp("s1"), "find", "{\"p\":1}");
         assert_ne!(a, b);
         assert_ne!(a, c);
     }
@@ -333,8 +356,9 @@ mod tests {
     fn tool_key_does_not_collide_across_tool_arg_boundary() {
         // "grep" + '{"pattern":"a#b"}' vs 'grep#{"pattern":"a' + 'b"}' — same
         // concatenation, different tool/args split; must not collide.
-        let a = ResultCache::tool_key(&fp("s"), "grep", "{\"pattern\":\"a#b\"}");
-        let b = ResultCache::tool_key(&fp("s"), "grep#{\"pattern\":\"a", "b\"}");
+        let r = Path::new("/repo");
+        let a = ResultCache::tool_key(r, &fp("s"), "grep", "{\"pattern\":\"a#b\"}");
+        let b = ResultCache::tool_key(r, &fp("s"), "grep#{\"pattern\":\"a", "b\"}");
         assert_ne!(a, b);
     }
 
@@ -350,7 +374,11 @@ mod tests {
             scope_hint: None,
             max_results: None,
         };
-        assert_eq!(ResultCache::query_key(&q1), ResultCache::query_key(&q2));
+        let r = Path::new("/repo");
+        assert_eq!(
+            ResultCache::query_key(r, &q1),
+            ResultCache::query_key(r, &q2)
+        );
     }
 
     #[test]
@@ -374,8 +402,37 @@ mod tests {
             scope_hint: Some(PathBuf::from("../../etc")),
             max_results: None,
         };
-        let none_key = ResultCache::query_key(&none);
-        assert_eq!(ResultCache::query_key(&absolute), none_key);
-        assert_eq!(ResultCache::query_key(&parent), none_key);
+        let r = Path::new("/repo");
+        let none_key = ResultCache::query_key(r, &none);
+        assert_eq!(ResultCache::query_key(r, &absolute), none_key);
+        assert_eq!(ResultCache::query_key(r, &parent), none_key);
+    }
+
+    #[test]
+    fn keys_distinguish_repo_root() {
+        // Two different repositories with an identical git fingerprint, tool,
+        // args, leg, and query must produce DISTINCT cache keys, so one
+        // server instance serving both never serves repo B a result computed
+        // for repo A.
+        let a = Path::new("/repo/a");
+        let b = Path::new("/repo/b");
+        let f = fp("s");
+        assert_ne!(
+            ResultCache::tool_key(a, &f, "grep", "{}"),
+            ResultCache::tool_key(b, &f, "grep", "{}"),
+        );
+        assert_ne!(
+            ResultCache::leg_key(a, &f, "grep7:pattern"),
+            ResultCache::leg_key(b, &f, "grep7:pattern"),
+        );
+        let query = ExplorationQuery {
+            text: "where is main".to_string(),
+            scope_hint: None,
+            max_results: None,
+        };
+        assert_ne!(
+            ResultCache::query_key(a, &query),
+            ResultCache::query_key(b, &query),
+        );
     }
 }

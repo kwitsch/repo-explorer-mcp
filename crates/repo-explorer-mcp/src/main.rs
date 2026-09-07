@@ -146,9 +146,6 @@ async fn main() -> ExitCode {
 async fn run(config: repo_explorer_core::config::Config) -> anyhow::Result<()> {
     init_tracing(config.logging.level);
 
-    // The directory the server is launched in = the project root to explore.
-    let repo_root = std::env::current_dir().context("failed to determine current directory")?;
-
     let mut memory_config = config.codebase_memory.clone();
     if memory_config.command.is_some()
         && let Some(running) = wait_for_running_memory_binary().await
@@ -211,7 +208,7 @@ async fn run(config: repo_explorer_core::config::Config) -> anyhow::Result<()> {
     let probe = GitStateProbe::new(config.search.timeout_seconds);
     let agent = AgentLoop::new(memory, search, router, probe, config.agent, config.cache);
 
-    let server = RepoExplorerServer::new(Arc::new(agent), repo_root);
+    let server = RepoExplorerServer::new(Arc::new(agent));
     tracing::info!("repo-explorer-mcp serving on stdio");
     let service = server
         .serve(rmcp::transport::stdio())

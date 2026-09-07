@@ -168,8 +168,8 @@ where
     /// server's `explore` observability span) can derive a short
     /// request-correlation id from the same normalization the query cache
     /// uses internally.
-    pub fn query_cache_key(query: &ExplorationQuery) -> String {
-        ResultCache::query_key(query)
+    pub fn query_cache_key(repo_root: &Path, query: &ExplorationQuery) -> String {
+        ResultCache::query_key(repo_root, query)
     }
 
     pub async fn run(
@@ -184,7 +184,7 @@ where
             None => None,
         };
         let git_probe_ms = git_probe_start.elapsed().as_millis() as u64;
-        let query_key = ResultCache::query_key(query);
+        let query_key = ResultCache::query_key(repo_root, query);
         if let Some(hit) = self
             .query_cache_lookup(repo_root, &query_key, &fingerprint)
             .await
@@ -814,7 +814,7 @@ where
         let key = self.cache_for(fingerprint).map(|(cache, fp)| {
             (
                 cache,
-                ResultCache::tool_key(fp, &call.name, &call.arguments_json),
+                ResultCache::tool_key(repo_root, fp, &call.name, &call.arguments_json),
             )
         });
         if let Some((cache, key)) = &key
@@ -1004,7 +1004,7 @@ mod tests {
     use repo_explorer_core::memory::mock::MockMemoryBackend;
     use repo_explorer_core::search::SearchError;
     use repo_explorer_core::search::mock::MockSearchBackend;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn finish_call() -> ToolCall {
         ToolCall {
@@ -1596,7 +1596,7 @@ mod tests {
         assert!(message.content.contains("failed"));
         assert!(findings.is_empty());
 
-        let key = ResultCache::tool_key(&fp, &call.name, &call.arguments_json);
+        let key = ResultCache::tool_key(Path::new("/repo"), &fp, &call.name, &call.arguments_json);
         let cached = agent
             .cache_for(Some(&fp))
             .and_then(|(cache, _)| cache.get_tool(&key));
