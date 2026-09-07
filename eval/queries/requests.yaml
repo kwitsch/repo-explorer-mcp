@@ -31,8 +31,8 @@
 
 - id: requests-P1-DE-01
   cat: P1-DE
-  lang: de
-  query: "wo ist HTTPBasicAuth definiert"
+  lang: en
+  query: "where is HTTPBasicAuth defined"
   expect:
     primary_mode: all
     primary:
@@ -145,15 +145,15 @@
 
 - id: requests-I3-01
   cat: I3
-  sub: de
-  lang: de
-  query: "wo ist die fehlerbehandlung für zeitüberschreitungen"
+  sub: compound
+  lang: en
+  query: "where is the error handling for connectiontimeout"
   expect:
     primary_mode: any
     primary:
       - { path: src/requests/adapters.py, symbol: send, span: [634, 748] }
     stage: fallback
-  notes: "compound noun 'zeitüberschreitungen' (timeouts) — not a derive_patterns stopword"
+  notes: "flat unspaced compound 'connectiontimeout' mirroring the camelCase ConnectTimeoutError/ReadTimeoutError — no underscore/case transition, so case_fold_variant returns None and it never splits into 'connection'+'timeout'; fallback-stage regression that must still reach adapters.py send() (or the acceptable BaseAdapter.send:132)"
 
 - id: requests-I3-02
   cat: I3

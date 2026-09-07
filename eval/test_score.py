@@ -4,7 +4,7 @@ and snippet_chunks' blank-line handling (F-20).
 
 No test framework, no fixtures, no results/ directory, no external corpus:
 writes a synthetic file to a tempdir and asserts the classifications directly.
-Run with:  python eval/test_score.py   (prints OK; non-zero exit on failure)
+Run with:  uv run --with pyyaml eval/test_score.py   (prints OK; non-zero exit on failure)
 """
 import sys
 import tempfile
@@ -18,6 +18,16 @@ from score import snippet_found_at
 def _write_file(dir_path: Path, name: str, n_lines: int) -> None:
     body = "\n".join(f"SENTINEL_{i:03d}_line_content" for i in range(n_lines))
     (dir_path / name).write_text(body + "\n")
+
+
+def check_queries_ascii() -> None:
+    import yaml
+
+    qdir = Path(__file__).resolve().parent / "queries"
+    for name in ("self.yaml", "requests.yaml"):
+        for item in yaml.safe_load((qdir / name).read_text()):
+            q = item["query"]
+            assert q.isascii(), f"{name}: non-ASCII query in {item['id']}: {q!r}"
 
 
 def main() -> None:
@@ -105,6 +115,11 @@ def main() -> None:
             + "\n"
         )
         assert snippet_found_at(repo, "dup.py", 21, 21, "DUP_line_content") == "ok"
+
+        # English-only invariant: every eval query string is pure ASCII
+        # (scoped to item["query"]; notes/comments keep their non-ASCII
+        # punctuation).
+        check_queries_ascii()
 
     print("OK")
 
