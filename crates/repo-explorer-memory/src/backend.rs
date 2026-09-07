@@ -210,11 +210,12 @@ impl MemoryClientBackend {
         }
     }
 
-    /// [`project_name`], but cached on `repo_root`: every query method calls
-    /// this with the same, never-changing `repo_root` for the lifetime of
-    /// this backend, so only the first call actually canonicalizes and
-    /// derives the name — later calls return the cached value straight off
-    /// the lock, with no `spawn_blocking` round trip.
+    /// [`project_name`], but cached per `repo_root`: one backend instance
+    /// serves requests for many different repo roots over its lifetime, so
+    /// the cache is keyed on `repo_root` — only the first call for a given
+    /// root actually canonicalizes and derives the name; later calls for
+    /// that same root return the cached value straight off the lock, with
+    /// no `spawn_blocking` round trip.
     async fn cached_project_name(&self, repo_root: &Path) -> Result<String, MemoryError> {
         if let Some(name) = self
             .project_name_cache
