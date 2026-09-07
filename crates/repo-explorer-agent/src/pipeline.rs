@@ -99,6 +99,7 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
             .into_iter()
             .map(|token| {
                 memoized(
+                    repo_root,
                     leg_cache,
                     move || leg_key("symbol", token, scope),
                     async move {
@@ -138,6 +139,7 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
             .chain(leg_identifiers(&patterns, semantic_identifier_budget))
             .map(|token| {
                 memoized(
+                    repo_root,
                     leg_cache,
                     move || {
                         let mut key = leg_key("semantic", token, scope);
@@ -168,6 +170,7 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
 
     let grep_legs = join_all(patterns.grep_patterns.iter().map(|pattern| {
         memoized(
+            repo_root,
             leg_cache,
             move || leg_key("grep", pattern, scope),
             async move {
@@ -193,6 +196,7 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
             .take(FILE_LOOKUP_TOKENS)
             .map(|token| {
                 memoized(
+                    repo_root,
                     leg_cache,
                     move || leg_key("file", token, scope),
                     async move {
@@ -256,11 +260,12 @@ fn is_trusted_symbol_match(candidate: &Candidate, patterns: &QueryPatterns) -> b
 /// failure (`None`, see `soft_leg`) must not poison the cache with a
 /// permanent-looking empty result for what was really a transient hiccup.
 async fn memoized(
+    repo_root: &Path,
     leg_cache: LegCache<'_>,
     leg: impl FnOnce() -> String,
     fut: impl Future<Output = Option<Vec<Candidate>>>,
 ) -> Vec<Candidate> {
-    let key = leg_cache.map(|(cache, fp)| (cache, ResultCache::leg_key(fp, &leg())));
+    let key = leg_cache.map(|(cache, fp)| (cache, ResultCache::leg_key(repo_root, fp, &leg())));
     if let Some((cache, key)) = &key
         && let Some(hit) = cache.get_leg(key)
     {
