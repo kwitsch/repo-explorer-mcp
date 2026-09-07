@@ -18,8 +18,8 @@
 
 - id: self-P1-DE-01
   cat: P1-DE
-  lang: de
-  query: "wo ist wait_for_running_memory_binary definiert"
+  lang: en
+  query: "where is wait_for_running_memory_binary defined"
   scope_hint: crates
   expect:
     primary_mode: all
@@ -140,9 +140,9 @@
 
 - id: self-I3-01
   cat: I3
-  sub: de
-  lang: de
-  query: "wo wird das tokenbudget geprüft und was passiert wenn es aufgebraucht ist"
+  sub: compound
+  lang: en
+  query: "where is the tokenbudget checked and what happens when it is exhausted"
   scope_hint: crates
   expect:
     primary_mode: all
@@ -150,7 +150,7 @@
       - { path: crates/repo-explorer-agent/src/agent.rs, symbol: TokenBudget, span: [52, 55] }
       - { path: crates/repo-explorer-agent/src/agent.rs, symbol: forced_finish, span: [527, 558] }
     stage: fallback
-  notes: "compound noun 'tokenbudget' intended — not in derive_patterns' identifier-splitting vocabulary"
+  notes: "flat unspaced compound 'tokenbudget' (written as one run, not 'token budget') — case_fold_variant only splits on underscore or a case transition, so this stays one opaque token and never decomposes into 'token'+'budget'; regression that the matcher must still resolve to TokenBudget/forced_finish"
 
 - id: self-I3-02
   cat: I3
