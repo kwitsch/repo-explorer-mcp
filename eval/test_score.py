@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from score import snippet_found_at
+from score import load_queries, snippet_found_at
 
 
 def _write_file(dir_path: Path, name: str, n_lines: int) -> None:
@@ -21,13 +21,10 @@ def _write_file(dir_path: Path, name: str, n_lines: int) -> None:
 
 
 def check_queries_ascii() -> None:
-    import yaml
-
-    qdir = Path(__file__).resolve().parent / "queries"
-    for name in ("self.yaml", "requests.yaml"):
-        for item in yaml.safe_load((qdir / name).read_text()):
+    for repo_id in ("self", "requests"):
+        for item_id, item in load_queries(repo_id).items():
             q = item["query"]
-            assert q.isascii(), f"{name}: non-ASCII query in {item['id']}: {q!r}"
+            assert q.isascii(), f"{repo_id}: non-ASCII query in {item_id}: {q!r}"
 
 
 def main() -> None:
