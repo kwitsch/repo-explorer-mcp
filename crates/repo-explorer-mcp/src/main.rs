@@ -206,7 +206,15 @@ async fn run(config: repo_explorer_core::config::Config) -> anyhow::Result<()> {
     let router = repo_explorer_llm::build_router(&config.llm)
         .context("failed to build LLM provider router")?;
     let probe = GitStateProbe::new(config.search.timeout_seconds);
-    let agent = AgentLoop::new(memory, search, router, probe, config.agent, config.cache);
+    let agent = AgentLoop::new(
+        memory,
+        search,
+        router,
+        probe,
+        config.agent,
+        config.cache,
+        std::time::Duration::from_secs(config.codebase_memory.staleness_seconds),
+    );
 
     let server = RepoExplorerServer::new(Arc::new(agent));
     tracing::info!("repo-explorer-mcp serving on stdio");

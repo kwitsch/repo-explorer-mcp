@@ -9,6 +9,12 @@ Owns `serde_json` — core stays free of it. Full pipeline design:
 
 - **Retrieval pre-stage** — concurrent symbol/grep/file fanout; exits with
   zero LLM calls when it finds a confident match.
+- **Stage-1 index refresh** — before retrieval, `run` ensures a fresh memory
+  index. Repeat calls for the same `repo_path` skip this upstream round-trip
+  when the local git `RepoFingerprint` is unchanged since the last refresh and
+  still within the trust window (`codebase_memory.staleness_seconds`); any git
+  change (commit, checkout, working-tree edit) or an elapsed window forces the
+  full flow. No fingerprint (not a git repo / probe failure) never skips.
 - **LLM verification stage** — runs over the top-k candidate skeletons the
   pre-stage produced.
 - **Explorative fallback loop** — the hardened path when verification isn't
