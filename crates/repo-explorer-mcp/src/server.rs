@@ -489,9 +489,18 @@ mod tests {
         );
     }
 
+    // Absolute-but-nonexistent, per-platform: a bare "/..." path is not
+    // `Path::is_absolute()` on Windows (no drive prefix), so the two OSes
+    // need different literals to exercise the same "not an existing
+    // directory" branch rather than the "must be absolute" one.
+    #[cfg(windows)]
+    const NONEXISTENT_ABS_PATH: &str = "C:\\nonexistent\\repo\\xyz";
+    #[cfg(not(windows))]
+    const NONEXISTENT_ABS_PATH: &str = "/nonexistent/repo/xyz";
+
     #[test]
     fn reject_invalid_repo_path_rejects_absolute_nonexistent() {
-        let err = reject_invalid_repo_path("/nonexistent/repo/xyz").unwrap_err();
+        let err = reject_invalid_repo_path(NONEXISTENT_ABS_PATH).unwrap_err();
         assert!(
             err.contains("is not an existing directory"),
             "unexpected message: {err}"
@@ -505,8 +514,8 @@ mod tests {
             "repo_path must be an absolute path: src"
         );
         assert_eq!(
-            reject_invalid_repo_path("/nonexistent/repo/xyz").unwrap_err(),
-            "repo_path is not an existing directory: /nonexistent/repo/xyz"
+            reject_invalid_repo_path(NONEXISTENT_ABS_PATH).unwrap_err(),
+            format!("repo_path is not an existing directory: {NONEXISTENT_ABS_PATH}")
         );
     }
 
