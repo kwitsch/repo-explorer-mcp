@@ -729,7 +729,7 @@ def print_qw0_report(agg: dict) -> None:
         unp = ", ".join(f"{m} x{c}" for m, c in sorted(cost["unpriced"].items()))
         print(f"  cost_per_query: n/a - unpriced models served: {unp}")
         if cost["priced_calls"]:
-            partial = cost["usd_total_priced"] / cost["n_rows"] if cost["n_rows"] else 0.0
+            partial = cost["usd_total_priced"] / cost["rows_fully_priced"] if cost["rows_fully_priced"] else 0.0
             print(f"    (priced subset only: ${partial:.5f}/query over {cost['priced_calls']} of "
                   f"{cost['priced_calls'] + sum(cost['unpriced'].values())} provider calls)")
     else:

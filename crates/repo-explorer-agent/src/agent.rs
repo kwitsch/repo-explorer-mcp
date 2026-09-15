@@ -229,10 +229,9 @@ impl QueryMetrics {
 /// Stamp the wall-clock fields and emit the record: the headline fields on
 /// `msg`'s INFO line (what `eval/run.py` parses), and the full record to the
 /// optional `REPO_EXPLORER_METRICS` JSONL file.
-fn emit_metrics(metrics: &mut QueryMetrics, msg: &'static str) {
+async fn emit_metrics(metrics: &mut QueryMetrics, msg: &'static str) {
     metrics.ts_unix_ms = now_unix_ms();
     metrics.total_ms = metrics.started.elapsed().as_millis() as u64;
-    let json = serde_json::to_string(&metrics).unwrap_or_default();
     tracing::info!(
         path = metrics.path,
         tokens = metrics.tokens,
@@ -249,7 +248,8 @@ fn emit_metrics(metrics: &mut QueryMetrics, msg: &'static str) {
         "{}",
         msg
     );
-    append_metrics_line(&json);
+    let json = serde_json::to_string(&metrics).unwrap_or_default();
+    append_metrics_line(json).await;
     #[cfg(test)]
     EMITTED.with(|v| v.borrow_mut().push(metrics.clone()));
 }
@@ -264,13 +264,29 @@ fn now_unix_ms() -> u64 {
 /// Append one JSONL record to `REPO_EXPLORER_METRICS`, when set. Non-fatal:
 /// a sink failure must never fail a query. Never stdout — that is the MCP
 /// JSON-RPC channel.
-// ponytail: sync append on the tokio worker; ~300 bytes/query, move to a
-// channel if it ever shows up in latency.
-fn append_metrics_line(json: &str) {
-    let Some(path) = METRICS_SINK.as_deref() else {
+///
+/// Runs the blocking `open`+`write_all` via `spawn_blocking`, like the
+/// filesystem syscalls in `dispatch.rs` (`canonical_repo_root`,
+/// `read_file_canonical`): a slow or contended sink path must not stall the
+/// tokio worker thread and therefore every other task sharing it, including
+/// unrelated concurrent `explore_repository` calls.
+async fn append_metrics_line(json: String) {
+    let Some(path) = METRICS_SINK.clone() else {
         return;
     };
-    let _ = append_json_line(path, json).inspect_err(
+    let result = tokio::task::spawn_blocking(move || {
+        let result = append_json_line(&path, &json);
+        (path, result)
+    })
+    .await;
+    let (path, result) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "metrics sink write task panicked");
+            return;
+        }
+    };
+    let _ = result.inspect_err(
         |e| tracing::warn!(path = %path.display(), error = %e, "metrics sink write failed"),
     );
 }
@@ -393,7 +409,7 @@ where
             .await
         {
             metrics.record_result("cache", &hit);
-            emit_metrics(&mut metrics, "exploration served from query cache");
+            emit_metrics(&mut metrics, "exploration served from query cache").await;
             return Ok(hit);
         }
 
@@ -529,13 +545,8 @@ where
         {
             Some("confidence")
         } else if self.settings.skip_verify_on_exact_symbol
-            && let Some(index) = outcome.unique_trusted_symbol
+            && outcome.unique_trusted_symbol.is_some()
         {
-            tracing::info!(
-                confidence = outcome.confidence,
-                symbol = outcome.candidates[index].symbol.as_deref().unwrap_or(""),
-                "early-exit: sole trusted exact symbol match, skipping verification"
-            );
             Some("unique-symbol")
         } else {
             None
@@ -563,16 +574,35 @@ where
                 _ => !result.findings.is_empty(),
             };
             if authorized {
+                // Logged only now that verification is actually being
+                // skipped: the "unique-symbol" route above is provisional
+                // until its one authorizing candidate is confirmed to have
+                // survived disk verification / the response caps (just
+                // above) — logging any earlier would over-count runs that
+                // actually fell through to Stage 4 (see `eval/run.py`'s
+                // early-exit log parsing).
+                if route == "unique-symbol" {
+                    let index = outcome
+                        .unique_trusted_symbol
+                        .expect("route == \"unique-symbol\" implies Some(index)");
+                    tracing::info!(
+                        confidence = outcome.confidence,
+                        symbol = outcome.candidates[index].symbol.as_deref().unwrap_or(""),
+                        "early-exit: sole trusted exact symbol match, skipping verification"
+                    );
+                }
                 metrics.early_exit_route = route;
-                return Ok(self.complete_run(
-                    &mut metrics,
-                    "early-exit",
-                    &budget,
-                    false,
-                    &query_key,
-                    fingerprint,
-                    result,
-                ));
+                return Ok(self
+                    .complete_run(
+                        &mut metrics,
+                        "early-exit",
+                        &budget,
+                        false,
+                        &query_key,
+                        fingerprint,
+                        result,
+                    )
+                    .await);
             }
             tracing::info!(
                 "early-exit produced no filesystem-verified candidate; falling through to verification"
@@ -604,16 +634,18 @@ where
             )
             .await
             {
-                return Ok(self.finalize_and_complete(
-                    &mut metrics,
-                    "verify",
-                    result,
-                    query,
-                    &budget,
-                    false,
-                    &query_key,
-                    fingerprint,
-                ));
+                return Ok(self
+                    .finalize_and_complete(
+                        &mut metrics,
+                        "verify",
+                        result,
+                        query,
+                        &budget,
+                        false,
+                        &query_key,
+                        fingerprint,
+                    )
+                    .await);
             }
             tracing::info!("verification escalated to the fallback loop");
         }
@@ -636,20 +668,22 @@ where
             Err(e) => {
                 metrics.path = "error";
                 metrics.record_budget(&budget, false);
-                emit_metrics(&mut metrics, "exploration complete");
+                emit_metrics(&mut metrics, "exploration complete").await;
                 return Err(e);
             }
         };
-        Ok(self.finalize_and_complete(
-            &mut metrics,
-            "fallback",
-            result,
-            query,
-            &budget,
-            forced_finish,
-            &query_key,
-            fingerprint,
-        ))
+        Ok(self
+            .finalize_and_complete(
+                &mut metrics,
+                "fallback",
+                result,
+                query,
+                &budget,
+                forced_finish,
+                &query_key,
+                fingerprint,
+            )
+            .await)
     }
 
     /// The shared dedupe-then-truncate contract: dedupe first so a run of
@@ -712,7 +746,7 @@ where
     /// record, persist to the query cache, and hand back the result for the
     /// caller to wrap in `Ok`.
     #[allow(clippy::too_many_arguments)]
-    fn complete_run(
+    async fn complete_run(
         &self,
         metrics: &mut QueryMetrics,
         path: &'static str,
@@ -724,7 +758,7 @@ where
     ) -> ExplorationResult {
         metrics.record_result(path, &result);
         metrics.record_budget(budget, forced_finish);
-        emit_metrics(metrics, "exploration complete");
+        emit_metrics(metrics, "exploration complete").await;
         self.store_query_cache(query_key, fingerprint, &result);
         result
     }
@@ -732,7 +766,7 @@ where
     /// The shared tail of the verify/fallback branches: finalize the result,
     /// then run it through `complete_run` with the tokens spent so far.
     #[allow(clippy::too_many_arguments)]
-    fn finalize_and_complete(
+    async fn finalize_and_complete(
         &self,
         metrics: &mut QueryMetrics,
         stage: &'static str,
@@ -753,6 +787,7 @@ where
             fingerprint,
             result,
         )
+        .await
     }
 
     /// The cache is usable this call only when caching is enabled and a

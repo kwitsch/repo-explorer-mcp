@@ -197,6 +197,28 @@ def check_all_unpriced_report() -> None:
     assert "priced subset only" not in out, out
 
 
+def check_priced_subset_report() -> None:
+    """A run mixing priced and unpriced rows: the "priced subset only" per-query figure must
+    divide by the rows that actually had priced calls (rows_fully_priced), not by every scored
+    row -- else a run mostly on an unpriced model wildly understates the priced subset's cost."""
+    priced_call = {"model_served": "gemini-3.5-flash-lite", "prompt_tokens": 5_000_000, "completion_tokens": 0}
+    unpriced_call = {"model_served": "mystery-1", "prompt_tokens": 100, "completion_tokens": 10}
+    rows = [
+        _row(query_id="a", provider_calls=[priced_call]),
+        _row(query_id="b", provider_calls=[priced_call]),
+        _row(query_id="c", provider_calls=[unpriced_call]),
+        _row(query_id="d", provider_calls=[unpriced_call]),
+        _row(query_id="e", provider_calls=[unpriced_call]),
+    ]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print_qw0_report(qw0_metrics(rows))
+    out = buf.getvalue()
+    # $0.50 per priced call (5M input tokens @ $0.10/1M) over 2 fully-priced rows -> $0.50/query.
+    # Dividing by all 5 rows (the bug) would print $0.20000/query instead.
+    assert "priced subset only: $0.50000/query over 2 of 5 provider calls" in out, out
+
+
 def check_price_fallback() -> None:
     priced = {"model_served": "gemini-3.5-flash-lite", "prompt_tokens": 1_000_000, "completion_tokens": 1_000_000}
     assert abs(call_cost(priced) - (0.10 + 0.40)) < 1e-9
@@ -379,6 +401,7 @@ def main() -> None:
         check_graceful_degradation()
         check_price_fallback()
         check_all_unpriced_report()
+        check_priced_subset_report()
         check_cache_ratio()
         check_csv_rows()
 

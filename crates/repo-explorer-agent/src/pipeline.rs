@@ -265,14 +265,35 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
 }
 
 /// How many *distinct* trusted exact symbol names the raw (pre-merge) set
-/// carries. Names are compared by last segment, so the same symbol reported
-/// with different qualification by two legs still counts once.
+/// carries. Two spellings of the same symbol still count once (`Foo::new`
+/// reported alongside a bare `new` from another leg), but two qualified names
+/// that merely share a trailing segment (`Foo::new`, `Bar::new`) are
+/// different symbols and count as two — see `same_trusted_symbol`.
 fn distinct_trusted_symbols(raw: &[Candidate], patterns: &QueryPatterns) -> usize {
-    raw.iter()
+    let mut distinct: Vec<&str> = Vec::new();
+    for name in raw
+        .iter()
         .filter(|c| is_trusted_symbol_match(c, patterns))
-        .filter_map(|c| c.symbol.as_deref().map(last_segment))
-        .collect::<HashSet<_>>()
-        .len()
+        .filter_map(|c| c.symbol.as_deref())
+    {
+        if !distinct.iter().any(|seen| same_trusted_symbol(seen, name)) {
+            distinct.push(name);
+        }
+    }
+    distinct.len()
+}
+
+/// Do `a` and `b` name the same trusted symbol? Equal names always do. A
+/// qualified name and a bare re-qualification of it (`Foo::new` vs `new`) do
+/// too, since a bare name carries no qualifier to disagree with. Two
+/// qualified names that only share a trailing segment (`Foo::new` vs
+/// `Bar::new`) do not — they are genuinely different symbols.
+fn same_trusted_symbol(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (a_seg, b_seg) = (last_segment(a), last_segment(b));
+    a_seg == b_seg && (a == a_seg || b == b_seg)
 }
 
 /// Index of the sole trusted exact symbol match — see
@@ -540,6 +561,27 @@ mod tests {
         // verify against the filesystem, so it must not license the skip.
         let unknown = vec![symbol_candidate("a.rs", 0, "m::decide_freshness")];
         assert_eq!(unique_trusted_symbol(&unknown, &patterns), None);
+    }
+
+    #[test]
+    fn distinct_trusted_symbols_counts_different_qualified_names_sharing_a_segment() {
+        // "Foo::new" and "Bar::new" are two different symbols that merely
+        // share a trailing segment: must NOT collapse to one, or the
+        // unique-symbol early exit would silently pick one of the two.
+        let patterns = derive_patterns("new");
+        let raw = vec![
+            symbol_candidate("a.rs", 1, "Foo::new"),
+            symbol_candidate("a.rs", 1, "Bar::new"),
+        ];
+        assert_eq!(distinct_trusted_symbols(&raw, &patterns), 2);
+
+        // A bare re-qualification of the same symbol by another leg still
+        // collapses to one.
+        let same = vec![
+            symbol_candidate("a.rs", 1, "Foo::new"),
+            symbol_candidate("a.rs", 1, "new"),
+        ];
+        assert_eq!(distinct_trusted_symbols(&same, &patterns), 1);
     }
 
     #[test]
