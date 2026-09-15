@@ -601,19 +601,20 @@ def qw0_cost(rows: list[dict]) -> dict:
     unpriced: Counter = Counter()
     rows_priced = 0
     for r in rows:
-        rc = row_cost(r)
-        if rc is not None:
-            rows_priced += 1
+        row_had_unpriced = False
         for pc in r.get("provider_calls") or []:
             c = call_cost(pc)
             if c is None:
                 unpriced[pc.get("model_served") or "<unknown>"] += 1
+                row_had_unpriced = True
             elif c > 0 or pc.get("prompt_tokens") is not None:
                 # Only attempts that actually reported usage count as billed calls; a
                 # zero-usage attempt (see call_cost) costs nothing and would otherwise pad
                 # the denominator of "$X over N provider calls".
                 total += c
                 priced_calls += 1
+        if not row_had_unpriced:
+            rows_priced += 1
     return {
         "usd_total_priced": total,
         "priced_calls": priced_calls,
@@ -807,9 +808,10 @@ def flatten_agg(agg: dict, prefix: str = "") -> list[tuple[str, str]]:
     return pairs
 
 
-def write_qw0_csv(result: dict, path: Path) -> Path:
+def write_qw0_csv(result: dict, path: Path, qw0_agg: dict) -> Path:
     """One row per scored query at `path`, plus a sibling <stem>.aggregate.csv of metric,value
-    pairs. stdlib csv, no pandas — this is 32 rows, not a dataframe."""
+    pairs. stdlib csv, no pandas — this is 32 rows, not a dataframe. `qw0_agg` is
+    `qw0_metrics(result["scored_rows"])`, already computed once by `print_report`."""
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         w.writeheader()
@@ -818,11 +820,13 @@ def write_qw0_csv(result: dict, path: Path) -> Path:
     with open(agg_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["metric", "value"])
-        w.writerows(flatten_agg(qw0_metrics(result["scored_rows"])))
+        w.writerows(flatten_agg(qw0_agg))
     return agg_path
 
 
-def print_report(result: dict) -> None:
+def print_report(result: dict) -> dict:
+    """Prints the full report and returns the QW-0 aggregate dict, so a caller that also
+    wants the CSV (`write_qw0_csv`) doesn't have to redo the whole aggregation pass."""
     rows = result["scored_rows"]
     qs = result["query_summary"]
     pinned_model = result.get("pinned_model")
@@ -974,7 +978,9 @@ def print_report(result: dict) -> None:
         git_probe.sort()
         print(f"  git_probe_ms: median={git_probe[len(git_probe)//2]}  max={max(git_probe)}")
 
-    print_qw0_report(qw0_metrics(rows))
+    agg = qw0_metrics(rows)
+    print_qw0_report(agg)
+    return agg
 
 
 def main() -> None:
@@ -993,7 +999,7 @@ def main() -> None:
         sys.exit(f"no such directory: {out_dir}")
 
     result = score_run(out_dir)
-    print_report(result)
+    qw0_agg = print_report(result)
 
     if args.json_out:
         with open(args.json_out, "w") as f:
@@ -1002,7 +1008,7 @@ def main() -> None:
 
     if args.csv_out:
         csv_path = Path(args.csv_out)
-        agg_path = write_qw0_csv(result, csv_path)
+        agg_path = write_qw0_csv(result, csv_path, qw0_agg)
         print(f"QW-0 per-query CSV written to {csv_path} (aggregates: {agg_path})", file=sys.stderr)
 
 

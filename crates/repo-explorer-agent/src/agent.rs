@@ -248,8 +248,13 @@ async fn emit_metrics(metrics: &mut QueryMetrics, msg: &'static str) {
         "{}",
         msg
     );
-    let json = serde_json::to_string(&metrics).unwrap_or_default();
-    append_metrics_line(json).await;
+    // Skip the serialization entirely when the sink is disabled (the common
+    // case): `append_metrics_line` would otherwise discard the string it
+    // just paid to build on every single query.
+    if METRICS_SINK.is_some() {
+        let json = serde_json::to_string(&metrics).unwrap_or_default();
+        append_metrics_line(json).await;
+    }
     #[cfg(test)]
     EMITTED.with(|v| v.borrow_mut().push(metrics.clone()));
 }
