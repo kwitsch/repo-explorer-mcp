@@ -64,6 +64,7 @@ fn query(text: &str) -> ExplorationQuery {
         text: text.to_string(),
         scope_hint: None,
         max_results: None,
+        detailed_snippets: false,
     }
 }
 
@@ -498,6 +499,7 @@ async fn token_budget_exhaustion_forces_final_finish() {
             usage: Some(TokenUsage {
                 prompt_tokens: 8,
                 completion_tokens: 5,
+                ..Default::default()
             }),
         }),
         // The forced final call yields a finish.

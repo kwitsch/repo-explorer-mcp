@@ -113,10 +113,20 @@ pub enum ProviderResponse {
 pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Prompt tokens served from the provider's prompt cache; `0` when the
+    /// provider reported no cache activity. A *breakdown* of `prompt_tokens`,
+    /// not an extra charge — providers fold cache reads into the prompt total.
+    pub cached_tokens: u64,
+    /// Prompt tokens written into the provider's prompt cache; `0` when the
+    /// provider reported none. Also already folded into `prompt_tokens`.
+    pub cache_creation_tokens: u64,
 }
 
 impl TokenUsage {
     pub fn total(&self) -> u64 {
+        // ponytail: cache-read tokens cost ~0.1x but are charged at full
+        // weight here (they are already folded into `prompt_tokens` by the
+        // provider); discount here if the budget ever gates real spend.
         self.prompt_tokens.saturating_add(self.completion_tokens)
     }
 }

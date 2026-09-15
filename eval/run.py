@@ -68,7 +68,14 @@ MESSAGE_RES = {
     "leg_failed": re.compile(r"retrieval leg failed\b"),
     "candidates": re.compile(r"retrieval candidates\b"),
     "index_status": re.compile(r"index status\b"),
-    "provider_call": re.compile(r"provider call\b"),
+    # The real per-attempt line's message is exactly "provider call" (llm/src/lib.rs). Three
+    # other lines start with the same words and must NOT be counted as provider calls:
+    # core/src/llm.rs's "provider call succeeded" / "provider call failed, no failover" (the
+    # router's own DEBUG/WARN commentary on the same attempt) and verify.rs's "verification
+    # stage provider call failed". Before this lookahead every successful attempt was recorded
+    # twice — once real, once as a fieldless ghost with outcome=None — which doubled
+    # provider-call counts and made every cost/token aggregate over them unusable.
+    "provider_call": re.compile(r"provider call(?!\s+(?:succeeded|failed))"),
     "verify_action": re.compile(r"verify action\b"),
     "fallback_turn": re.compile(r"fallback turn\b"),
     "escalated": re.compile(r"verification escalated to the fallback loop"),
@@ -92,6 +99,15 @@ RATE_LIMIT_ISERROR_RE = re.compile(r"rate limit|exhausted or cooling down|429|RE
 # only breaks if a value itself contains a literal `]`, e.g. inside a path/literal/symbol token —
 # an accepted, rare limitation for a stats harness, not a general-purpose log parser.
 FIELD_RE = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\[.*?\]|\{.*?\}|\S+)')
+
+def take_qw0_fields(out: dict, f: dict) -> None:
+    """QW-0 fields shared by `exploration complete` and the query-cache-hit line. Every one
+    defaults to None (not 0) in `out` so score.py can tell "field absent in this run" — a row
+    from a pre-QW-0 binary — from a real zero. The cache path exits before the retrieval
+    pre-stage, so it emits neither `confidence` nor `candidate_count` and both stay None."""
+    for key in ("candidate_count", "early_exit_route", "cache_read_tokens", "cache_write_tokens", "total_ms"):
+        if f.get(key) is not None:
+            out[key] = f[key]
 
 
 def strip_ansi(s: str) -> str:
@@ -247,7 +263,9 @@ def parse_call_lines(lines: list[str]) -> dict:
     introduced: llm_calls, forced_finish, index_status, git_probe_ms, retrieval_patterns,
     leg_timings, candidates_ranked, provider_calls, verify_actions, fallback_turns,
     exploration_failed, early_exit_fallthrough, early_exit_dropped_candidates (the last two
-    from PR #47's early-exit disk verification)."""
+    from PR #47's early-exit disk verification), plus the QW-0 fields (candidate_count,
+    early_exit_route, cache_read_tokens, cache_write_tokens, total_ms) via
+    take_qw0_fields."""
     out = {
         "stage": None,
         "tokens": None,
@@ -269,6 +287,12 @@ def parse_call_lines(lines: list[str]) -> dict:
         "exploration_failed": None,
         "early_exit_fallthrough": False,
         "early_exit_dropped_candidates": [],
+        # QW-0 (see take_qw0_fields): None means "this binary didn't emit it", not zero.
+        "candidate_count": None,
+        "early_exit_route": None,
+        "cache_read_tokens": None,
+        "cache_write_tokens": None,
+        "total_ms": None,
     }
     for line in lines:
         kind = line_kind(line)
@@ -278,7 +302,9 @@ def parse_call_lines(lines: list[str]) -> dict:
         if kind == "cache":
             out["stage"] = "cache"
             out["tokens"] = f.get("tokens", 0)
+            out["llm_calls"] = f.get("llm_calls")  # 0 by construction, but only if it's logged
             out["git_probe_ms"] = f.get("git_probe_ms")
+            take_qw0_fields(out, f)
         elif kind == "complete":
             out["stage"] = f.get("path")
             out["tokens"] = f.get("tokens")
@@ -286,6 +312,7 @@ def parse_call_lines(lines: list[str]) -> dict:
             out["forced_finish"] = f.get("forced_finish")
             out["index_status"] = f.get("index_status")
             out["git_probe_ms"] = f.get("git_probe_ms")
+            take_qw0_fields(out, f)
         elif kind == "retrieval_complete":
             out["candidates"] = f.get("candidates")
             out["confidence"] = f.get("confidence")
@@ -326,6 +353,9 @@ def parse_call_lines(lines: list[str]) -> dict:
                     "prompt_tokens": f.get("prompt_tokens"),
                     "completion_tokens": f.get("completion_tokens"),
                     "reasoning_tokens": f.get("reasoning_tokens"),
+                    # QW-0: None on a pre-QW-0 binary; 0 means the provider reported no cache hit.
+                    "cached_tokens": f.get("cached_tokens"),
+                    "cache_creation_tokens": f.get("cache_creation_tokens"),
                 }
             )
         elif kind == "verify_action":

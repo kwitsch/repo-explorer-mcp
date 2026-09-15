@@ -300,8 +300,36 @@ async fn expand_content(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::cache_prefix_fingerprint;
     use repo_explorer_core::domain::{CandidateKind, FileLocation};
     use repo_explorer_core::memory::mock::MockMemoryBackend;
+
+    #[test]
+    fn verify_cache_prefix_is_byte_stable() {
+        // Anthropic prompt caching only pays when the cached prefix is
+        // byte-identical across turns AND across queries. These literals pin
+        // that: any edit injecting per-run content (repo path, timestamp,
+        // query text) into the system prompt, any change to an `expand`/
+        // `finish` description or schema — same-length edits included, which
+        // the hash catches and a byte count would not — and any reorder of the
+        // catalog fails here. Updating the numbers is fine — noticing the
+        // change is the point.
+        assert!(
+            !VERIFY_SYSTEM_PROMPT.contains('{'),
+            "VERIFY_SYSTEM_PROMPT must stay a plain const with no format \
+             placeholder — per-run content in the prefix defeats the cache"
+        );
+        let names: Vec<&str> = verify_catalog().iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["expand", "finish"]);
+        // 1627 content bytes (~1.7 KB on the wire) is roughly 430-510 tokens
+        // — BELOW Anthropic's 1024-token minimum cacheable prefix, so the
+        // `cache_control` marker is silently a no-op on this, the hot path.
+        // See crates/repo-explorer-llm/CLAUDE.md.
+        assert_eq!(
+            cache_prefix_fingerprint(VERIFY_SYSTEM_PROMPT, verify_catalog()),
+            (1627, 5381662065911654639)
+        );
+    }
 
     fn candidate(path: &str, start: u32, end: u32) -> Candidate {
         Candidate {

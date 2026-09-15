@@ -125,3 +125,63 @@ with Wilson CIs, hallucinations, confident-wrong cases, stage mismatches, §7.4 
 attribution, candidate recall@top_k, provider call outcomes and model drift, forced-finish rows,
 per-leg latency, and index-status distribution — and can dump the full scored data as JSON with
 `--json-out`.
+
+## QW-0 efficiency metrics (added 2026-09-15)
+
+`score.py` prints a **QW-0 efficiency** block at the end of the report, over the same scored rows
+as every other section (the `-warmup` row is excluded):
+
+- `llm_turns_per_query` — mean and p95 of `llm_calls`. A cache hit counts as 0 turns by
+  construction, even in an older run whose cache line predates the field.
+- `stage_exit` — count and share per stage (`verify` / `early-exit` / `cache` / `fallback` /
+  `error`), with early-exit split by `early_exit_route` (`confidence` / `unique-symbol` / `none`).
+- `tokens_per_query` — mean/p50/p95, reported **both ways**: over all rows, and over
+  LLM-touching rows only. `tokens` is 0 by construction on cache and early-exit rows, so the
+  all-rows mean is a per-query figure and the LLM-rows mean is a per-LLM-query figure; either
+  one alone reads as the other.
+- `cached_ratio` — `cache_read_tokens / prompt_tokens` across the run. Reported as
+  `n/a - provider reports no cache activity` when either side is absent, never as a silent 0%.
+- `cost_per_query` — USD, from the dated `PRICES` table in `score.py`
+  (`cost = Σ prompt × p_in + (completion + reasoning) × p_out`, plan §7.1). A model with no price
+  entry makes the run's cost `n/a` and names the unpriced models; it is never costed at 0. A
+  failed attempt that reports no token usage costs 0 and is not counted as unpriced.
+- `latency_per_query` / `total_ms` — mean and p95.
+
+Every metric degrades to `n/a (field absent in this run)` on a results/ dir written before the
+field existed, so old runs rescore without crashing and without reporting a fabricated zero.
+
+`--csv-out PATH` writes one CSV row per scored query (run id, repo, pass, query_id, cat, stage
+plus the QW-0 columns) and a sibling `PATH.aggregate.csv` of `metric,value` pairs. stdlib `csv`,
+no pandas.
+
+Prices in `score.py`'s `PRICES` are USD per 1M tokens, captured **2026-09-15** from
+<https://ai.google.dev/pricing>, covering the six models in `config/default.toml`'s failover
+chain. They are the published **tier** rates (Flash / Flash-Lite) applied to every model in that
+tier — the individual 3.x per-model rates were not re-verified on the capture date. Treat
+`cost_per_query` as a signal comparable *between runs of this harness*, not as an invoice, and
+re-check the table before quoting a dollar figure anywhere else.
+
+### Known gap: `outer_followup_rate` is not measurable here
+
+The plan's `outer_followup_rate` — how often the *calling* agent has to issue a follow-up
+`explore_repository` call (or fall back to its own Grep/Read) after one answer — cannot be
+produced by this harness at all. `run.py` is a scripted MCP client: it issues exactly one call
+per query and never decides it needs another, so the metric is structurally always 0 here.
+Measuring it needs a real outer-agent arm (Layer B/C of the plan): Claude Code sessions driven
+against the pinned repos with the isolated profile in `claude-profile/`, their transcripts parsed
+for follow-up tool calls, and a judge pass to separate "the answer was incomplete" from "the
+agent asked a genuinely new question". None of that scaffolding exists yet —
+`eval/baseline.py`, `claude_loop.sh` and `judge_prompt.md` are named in the plan but absent from
+this directory. Until that arm is built, treat `outer_followup_rate` as unmeasured, not as zero.
+
+### Fixed while adding the above
+
+`run.py`'s `provider_call` matcher was `provider call\b`, which also matched
+`repo-explorer-core`'s router commentary (`provider call succeeded`, `provider call failed, no
+failover`) and `verify.rs`'s `verification stage provider call failed`. Every successful attempt
+was therefore recorded **twice** — once real, once as a fieldless ghost with `outcome=None` — so
+`Provider calls (N total)` and `provider_events` were roughly double the truth (224 vs 121 in
+`results/20260907T091929`) and no per-call cost or token aggregate over them was usable. The
+matcher now excludes the commentary lines. Rows already stored in `results/` still carry the
+ghosts; `score.py` tolerates them (a call with no reported token usage costs 0 and needs no
+price), but the provider-call counts printed for those older runs stay inflated.

@@ -26,7 +26,7 @@ use repo_explorer_core::llm::{
 };
 use repo_explorer_core::memory::{IndexStatus, MemoryBackend, MemoryError};
 use repo_explorer_core::retrieval::{
-    finding_from_candidate, is_unknown_location, normalize_location,
+    finding_from_candidate, is_unknown_location, normalize_location, normalize_rel_path,
 };
 use repo_explorer_core::search::SearchBackend;
 use std::collections::{HashMap, HashSet};
@@ -58,6 +58,11 @@ pub(crate) struct TokenBudget {
     /// Number of `Completion`s returned to the agent so far this run —
     /// exists purely to be logged on `exploration complete`.
     llm_calls: u32,
+    /// Prompt tokens this run was served from the provider's prompt cache,
+    /// and prompt tokens it wrote into that cache. Telemetry only — both are
+    /// already inside `spent` (see `TokenUsage::total`).
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
     /// This run's `CallOptions::rotation_seed` — one value picked by `run`
     /// per top-level conversation and reused by every raw
     /// `complete_with_tools` call the verification stage and the fallback
@@ -74,6 +79,8 @@ impl TokenBudget {
             limit,
             spent: 0,
             llm_calls: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             rotation_seed,
         }
     }
@@ -86,6 +93,10 @@ impl TokenBudget {
         self.llm_calls += 1;
         if let Some(usage) = usage {
             self.spent = self.spent.saturating_add(usage.total());
+            self.cache_read_tokens = self.cache_read_tokens.saturating_add(usage.cached_tokens);
+            self.cache_write_tokens = self
+                .cache_write_tokens
+                .saturating_add(usage.cache_creation_tokens);
         }
     }
 
@@ -100,12 +111,212 @@ impl TokenBudget {
     pub(crate) fn llm_calls(&self) -> u32 {
         self.llm_calls
     }
+
+    pub(crate) fn cache_read_tokens(&self) -> u64 {
+        self.cache_read_tokens
+    }
+
+    pub(crate) fn cache_write_tokens(&self) -> u64 {
+        self.cache_write_tokens
+    }
 }
 
 /// Consecutive single-call turns rejected before one is executed anyway (the
 /// 2-strike batching rule; the escape hatch keeps weak models from
 /// deadlocking).
 const MAX_SINGLE_CALL_REJECTIONS: u32 = 2;
+
+/// Optional JSONL metrics sink: when `REPO_EXPLORER_METRICS` names a path,
+/// every query appends one `QueryMetrics` line to it. Resolved once per
+/// process, never per query.
+static METRICS_SINK: std::sync::LazyLock<Option<PathBuf>> =
+    std::sync::LazyLock::new(|| sink_path(std::env::var_os));
+
+/// Resolve the sink path from an env accessor. An empty value counts as
+/// unset — in an MCP server's `env` map that is the usual way to disable a
+/// variable, and a `""` path would otherwise WARN on every single query.
+/// Split out from the `LazyLock` so a test can pin the documented variable
+/// name without mutating the process environment.
+fn sink_path(get_env: impl FnOnce(&'static str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    get_env("REPO_EXPLORER_METRICS")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// One per-query telemetry record, emitted from **every** `run` exit path
+/// (cache hit, early exit, verify, fallback, provider error).
+///
+/// Built up as the run progresses, starting at the "nothing ran yet" values,
+/// so an exit taken before a stage executed still yields a complete record.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct QueryMetrics {
+    /// Run start, for `total_ms`. Not part of the record.
+    #[serde(skip)]
+    started: Instant,
+    pub ts_unix_ms: u64,
+    pub repo_path: String,
+    pub query: String,
+    pub scope_hint: Option<String>,
+    pub max_results: Option<u32>,
+    /// Exit path: `early-exit` | `verify` | `fallback` | `cache` | `error`.
+    pub path: &'static str,
+    pub index_status: &'static str,
+    /// `None` until the retrieval pre-stage runs — the cache path exits
+    /// before it, and a fabricated `0` there would read as a real score.
+    pub confidence: Option<u32>,
+    pub candidate_count: Option<usize>,
+    /// Which Stage-3 gate let the run skip the LLM: `confidence` |
+    /// `unique-symbol` | `none`.
+    pub early_exit_route: &'static str,
+    pub tokens: u64,
+    pub llm_calls: u32,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub forced_finish: bool,
+    pub findings_count: usize,
+    pub summary_len: usize,
+    pub git_probe_ms: u64,
+    pub total_ms: u64,
+}
+
+impl QueryMetrics {
+    /// `started` doubles as the run-start instant (it is the same `Instant`
+    /// the git probe is timed from, the first statement of `run`).
+    fn new(repo_root: &Path, query: &ExplorationQuery, started: Instant) -> Self {
+        Self {
+            started,
+            ts_unix_ms: 0,
+            repo_path: repo_root.to_string_lossy().into_owned(),
+            query: query.text.clone(),
+            scope_hint: query
+                .scope_hint
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            max_results: query.max_results,
+            path: "none",
+            // The cache path exits before Stage 1 ever runs.
+            index_status: "NotChecked",
+            confidence: None,
+            candidate_count: None,
+            early_exit_route: "none",
+            tokens: 0,
+            llm_calls: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            forced_finish: false,
+            findings_count: 0,
+            summary_len: 0,
+            git_probe_ms: 0,
+            total_ms: 0,
+        }
+    }
+
+    fn record_result(&mut self, path: &'static str, result: &ExplorationResult) {
+        self.path = path;
+        self.findings_count = result.findings.len();
+        self.summary_len = result.summary.len();
+    }
+
+    fn record_budget(&mut self, budget: &TokenBudget, forced_finish: bool) {
+        self.tokens = budget.spent();
+        self.llm_calls = budget.llm_calls();
+        self.cache_read_tokens = budget.cache_read_tokens();
+        self.cache_write_tokens = budget.cache_write_tokens();
+        self.forced_finish = forced_finish;
+    }
+}
+
+/// Stamp the wall-clock fields and emit the record: the headline fields on
+/// `msg`'s INFO line (what `eval/run.py` parses), and the full record to the
+/// optional `REPO_EXPLORER_METRICS` JSONL file.
+async fn emit_metrics(metrics: &mut QueryMetrics, msg: &'static str) {
+    metrics.ts_unix_ms = now_unix_ms();
+    metrics.total_ms = metrics.started.elapsed().as_millis() as u64;
+    tracing::info!(
+        path = metrics.path,
+        tokens = metrics.tokens,
+        llm_calls = metrics.llm_calls,
+        forced_finish = metrics.forced_finish,
+        index_status = metrics.index_status,
+        git_probe_ms = metrics.git_probe_ms,
+        confidence = metrics.confidence,
+        candidate_count = metrics.candidate_count,
+        early_exit_route = metrics.early_exit_route,
+        cache_read_tokens = metrics.cache_read_tokens,
+        cache_write_tokens = metrics.cache_write_tokens,
+        total_ms = metrics.total_ms,
+        "{}",
+        msg
+    );
+    // Skip the serialization entirely when the sink is disabled (the common
+    // case): `append_metrics_line` would otherwise discard the string it
+    // just paid to build on every single query.
+    if METRICS_SINK.is_some() {
+        let json = serde_json::to_string(&metrics).unwrap_or_default();
+        append_metrics_line(json).await;
+    }
+    #[cfg(test)]
+    EMITTED.with(|v| v.borrow_mut().push(metrics.clone()));
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Append one JSONL record to `REPO_EXPLORER_METRICS`, when set. Non-fatal:
+/// a sink failure must never fail a query. Never stdout — that is the MCP
+/// JSON-RPC channel.
+///
+/// Runs the blocking `open`+`write_all` via `spawn_blocking`, like the
+/// filesystem syscalls in `dispatch.rs` (`canonical_repo_root`,
+/// `read_file_canonical`): a slow or contended sink path must not stall the
+/// tokio worker thread and therefore every other task sharing it, including
+/// unrelated concurrent `explore_repository` calls.
+async fn append_metrics_line(json: String) {
+    let Some(path) = METRICS_SINK.clone() else {
+        return;
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let result = append_json_line(&path, &json);
+        (path, result)
+    })
+    .await;
+    let (path, result) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "metrics sink write task panicked");
+            return;
+        }
+    };
+    let _ = result.inspect_err(
+        |e| tracing::warn!(path = %path.display(), error = %e, "metrics sink write failed"),
+    );
+}
+
+/// Create-or-append one `\n`-terminated line. Never truncates: a restarted
+/// server keeps extending the same JSONL file. Record and newline go out in
+/// ONE `write_all`: `O_APPEND` makes a single write atomic, but not a pair,
+/// so two concurrent queries would otherwise interleave as `{a}{b}\n\n`.
+fn append_json_line(path: &Path, json: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(format!("{json}\n").as_bytes())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only tap on `emit_metrics`, so each exit path can assert the
+    /// record it produced without standing up a tracing subscriber.
+    /// `#[tokio::test]` is single-threaded, so this stays per-test.
+    static EMITTED: std::cell::RefCell<Vec<QueryMetrics>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// The generic exploration orchestrator. Owns `memory`, `search`, the
 /// `router` (which owns its providers), and the repo-state `probe` — static
@@ -191,21 +402,19 @@ where
         repo_root: &Path,
         query: &ExplorationQuery,
     ) -> Result<ExplorationResult, AgentLoopError> {
-        // Stage 0: query cache.
+        // Stage 0: query cache. `git_probe_start` doubles as the run-start
+        // instant for `QueryMetrics::total_ms`.
         let git_probe_start = std::time::Instant::now();
         let fingerprint = self.probe.fingerprint(repo_root).await;
-        let git_probe_ms = git_probe_start.elapsed().as_millis() as u64;
+        let mut metrics = QueryMetrics::new(repo_root, query, git_probe_start);
+        metrics.git_probe_ms = git_probe_start.elapsed().as_millis() as u64;
         let query_key = ResultCache::query_key(repo_root, query);
         if let Some(hit) = self
             .query_cache_lookup(repo_root, &query_key, &fingerprint)
             .await
         {
-            tracing::info!(
-                path = "cache",
-                tokens = 0u64,
-                git_probe_ms,
-                "exploration served from query cache"
-            );
+            metrics.record_result("cache", &hit);
+            emit_metrics(&mut metrics, "exploration served from query cache").await;
             return Ok(hit);
         }
 
@@ -254,7 +463,7 @@ where
         };
         // Distinguish a synthesized skip from a real backend round-trip in the
         // "exploration complete" log line — both otherwise map to "UpToDate".
-        let index_status = if skip {
+        metrics.index_status = if skip {
             "UpToDateSkipped"
         } else {
             index_status_label(&index_result)
@@ -289,6 +498,8 @@ where
             confidence = outcome.confidence,
             "retrieval pre-stage complete"
         );
+        metrics.confidence = Some(outcome.confidence);
+        metrics.candidate_count = Some(outcome.candidates.len());
 
         // If the top-level scope_hint escaped the repo root, `outcome` already
         // dropped it for every leg (`pipeline::retrieve` computes this once);
@@ -320,47 +531,95 @@ where
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut budget = TokenBudget::new(self.settings.token_budget, rotation_seed);
 
-        // Stage 3: early exit — the pre-stage already answered. Guarded by
-        // has_exact_symbol_match: high confidence alone isn't proof the query
-        // named a real code symbol — a coincidental path/prose match must not
-        // early-exit, even though a genuine exact symbol match should, whatever
-        // the matched token's case/shape (F-16).
-        if outcome.confidence >= self.settings.early_exit_confidence
-            && !outcome.candidates.is_empty()
+        // Stage 3: early exit — the pre-stage already answered. Two ways in,
+        // both requiring a trusted exact symbol match: high confidence alone
+        // isn't proof the query named a real code symbol — a coincidental
+        // path/prose match must not early-exit, even though a genuine exact
+        // symbol match should, whatever the matched token's case/shape (F-16).
+        //
+        // - "confidence": confidence clears the threshold and *some* ranked
+        //   candidate is a trusted exact symbol match.
+        // - "unique-symbol" (QW-2): *exactly one* ranked candidate is, at a
+        //   known location. That is unambiguous by construction, so the
+        //   confidence score — which a strong SymbolFuzzy runner-up deflates
+        //   well below the threshold — is not consulted at all.
+        let early_exit_route = if outcome.candidates.is_empty() {
+            None
+        } else if outcome.confidence >= self.settings.early_exit_confidence
+            && outcome.has_exact_symbol_match
         {
-            if outcome.has_exact_symbol_match {
-                let result = self
-                    .result_from_candidates(
-                        &outcome.candidates,
-                        query,
-                        outcome.confidence,
-                        note.as_deref(),
-                        repo_root,
-                    )
-                    .await;
-                if !result.findings.is_empty() {
-                    return Ok(self.complete_run(
+            Some("confidence")
+        } else if self.settings.skip_verify_on_exact_symbol
+            && outcome.unique_trusted_symbol.is_some()
+        {
+            Some("unique-symbol")
+        } else {
+            None
+        };
+        if let Some(route) = early_exit_route {
+            let result = self
+                .result_from_candidates(
+                    &outcome.candidates,
+                    query,
+                    outcome.confidence,
+                    note.as_deref(),
+                    repo_root,
+                )
+                .await;
+            // The unique-symbol route is authorized by ONE specific
+            // candidate. If disk verification or the response caps dropped
+            // exactly that one (stale line past EOF, renamed file,
+            // `max_results` truncation), the survivors are unrelated matches
+            // nothing vetted — so the authorization is void and the run has
+            // to pay for verification after all.
+            let authorized = match outcome.unique_trusted_symbol {
+                Some(index) if route == "unique-symbol" => {
+                    candidate_survived(&result.findings, &outcome.candidates[index])
+                }
+                _ => !result.findings.is_empty(),
+            };
+            if authorized {
+                // Logged only now that verification is actually being
+                // skipped: the "unique-symbol" route above is provisional
+                // until its one authorizing candidate is confirmed to have
+                // survived disk verification / the response caps (just
+                // above) — logging any earlier would over-count runs that
+                // actually fell through to Stage 4 (see `eval/run.py`'s
+                // early-exit log parsing).
+                if route == "unique-symbol" {
+                    let index = outcome
+                        .unique_trusted_symbol
+                        .expect("route == \"unique-symbol\" implies Some(index)");
+                    tracing::info!(
+                        confidence = outcome.confidence,
+                        symbol = outcome.candidates[index].symbol.as_deref().unwrap_or(""),
+                        "early-exit: sole trusted exact symbol match, skipping verification"
+                    );
+                }
+                metrics.early_exit_route = route;
+                return Ok(self
+                    .complete_run(
+                        &mut metrics,
                         "early-exit",
-                        0,
-                        0,
+                        &budget,
                         false,
-                        index_status,
-                        git_probe_ms,
                         &query_key,
                         fingerprint,
                         result,
-                    ));
-                }
-                tracing::info!(
-                    "early-exit produced no filesystem-verified candidate; falling through to verification"
-                );
-                // fall through to Stage 4
-            } else {
-                tracing::info!(
-                    confidence = outcome.confidence,
-                    "early-exit vetoed: no trusted exact symbol match"
-                );
+                    )
+                    .await);
             }
+            tracing::info!(
+                "early-exit produced no filesystem-verified candidate; falling through to verification"
+            );
+            // fall through to Stage 4
+        } else if outcome.confidence >= self.settings.early_exit_confidence
+            && !outcome.candidates.is_empty()
+        {
+            tracing::info!(
+                confidence = outcome.confidence,
+                "early-exit vetoed: no trusted exact symbol match"
+            );
         }
 
         // Stage 4: LLM verification over the candidates.
@@ -380,23 +639,25 @@ where
             )
             .await
             {
-                return Ok(self.finalize_and_complete(
-                    "verify",
-                    result,
-                    query.max_results,
-                    &budget,
-                    false,
-                    index_status,
-                    git_probe_ms,
-                    &query_key,
-                    fingerprint,
-                ));
+                return Ok(self
+                    .finalize_and_complete(
+                        &mut metrics,
+                        "verify",
+                        result,
+                        query,
+                        &budget,
+                        false,
+                        &query_key,
+                        fingerprint,
+                    )
+                    .await);
             }
             tracing::info!("verification escalated to the fallback loop");
         }
 
-        // Stage 5: explorative fallback loop.
-        let (result, forced_finish) = self
+        // Stage 5: explorative fallback loop. The only hard-error exit —
+        // matched rather than `?`d so it emits a metrics record too.
+        let looped = self
             .fallback_loop(
                 repo_root,
                 query,
@@ -406,18 +667,28 @@ where
                 fingerprint.as_ref(),
                 &mut budget,
             )
-            .await?;
-        Ok(self.finalize_and_complete(
-            "fallback",
-            result,
-            query.max_results,
-            &budget,
-            forced_finish,
-            index_status,
-            git_probe_ms,
-            &query_key,
-            fingerprint,
-        ))
+            .await;
+        let (result, forced_finish) = match looped {
+            Ok(v) => v,
+            Err(e) => {
+                metrics.path = "error";
+                metrics.record_budget(&budget, false);
+                emit_metrics(&mut metrics, "exploration complete").await;
+                return Err(e);
+            }
+        };
+        Ok(self
+            .finalize_and_complete(
+                &mut metrics,
+                "fallback",
+                result,
+                query,
+                &budget,
+                forced_finish,
+                &query_key,
+                fingerprint,
+            )
+            .await)
     }
 
     /// The shared dedupe-then-truncate contract: dedupe first so a run of
@@ -428,13 +699,37 @@ where
     fn tidy_and_truncate(
         &self,
         findings: Vec<ExplorationFinding>,
-        max_results: Option<u32>,
+        query: &ExplorationQuery,
     ) -> Vec<ExplorationFinding> {
-        let mut findings = tidy_findings(findings, &self.caps);
-        if let Some(max) = max_results {
+        let mut findings = tidy_findings(findings, &self.response_caps(query));
+        if let Some(max) = query.max_results {
             findings.truncate(max as usize);
         }
         findings
+    }
+
+    /// Caps for the FINAL response only. `self.caps` (the `snippet_max_chars`
+    /// knob) stays the prompt-side cap on every path — a "detailed" request
+    /// must not widen what the LLM is shown, or it would inflate the token
+    /// cost this whole feature exists to cut.
+    ///
+    /// The detailed cap is a FLOOR, never a ceiling: `detailed` must not
+    /// return less than `concise` when `snippet_max_chars` is configured
+    /// above `snippet_max_chars_detailed` (or set to `0`, "no cap").
+    fn response_caps(&self, query: &ExplorationQuery) -> RenderCaps {
+        if !query.detailed_snippets {
+            return self.caps;
+        }
+        let detailed = self.settings.snippet_max_chars_detailed as usize;
+        let snippet_max_chars = if detailed == 0 || self.caps.snippet_max_chars == 0 {
+            0
+        } else {
+            detailed.max(self.caps.snippet_max_chars)
+        };
+        RenderCaps {
+            snippet_max_chars,
+            ..self.caps
+        }
     }
 
     /// Normalize/dedupe/cap the final findings once, whatever stage produced
@@ -446,37 +741,29 @@ where
     fn finalize(
         &self,
         mut result: ExplorationResult,
-        max_results: Option<u32>,
+        query: &ExplorationQuery,
     ) -> ExplorationResult {
-        result.findings = self.tidy_and_truncate(result.findings, max_results);
+        result.findings = self.tidy_and_truncate(result.findings, query);
         result
     }
 
-    /// The shared tail of every `run()` branch: log completion, persist to
-    /// the query cache, and hand back the result for the caller to wrap in
-    /// `Ok`.
+    /// The shared tail of every `run()` branch: emit the run's metrics
+    /// record, persist to the query cache, and hand back the result for the
+    /// caller to wrap in `Ok`.
     #[allow(clippy::too_many_arguments)]
-    fn complete_run(
+    async fn complete_run(
         &self,
+        metrics: &mut QueryMetrics,
         path: &'static str,
-        tokens: u64,
-        llm_calls: u32,
+        budget: &TokenBudget,
         forced_finish: bool,
-        index_status: &'static str,
-        git_probe_ms: u64,
         query_key: &str,
         fingerprint: Option<RepoFingerprint>,
         result: ExplorationResult,
     ) -> ExplorationResult {
-        tracing::info!(
-            path,
-            tokens,
-            llm_calls,
-            forced_finish,
-            index_status,
-            git_probe_ms,
-            "exploration complete"
-        );
+        metrics.record_result(path, &result);
+        metrics.record_budget(budget, forced_finish);
+        emit_metrics(metrics, "exploration complete").await;
         self.store_query_cache(query_key, fingerprint, &result);
         result
     }
@@ -484,30 +771,28 @@ where
     /// The shared tail of the verify/fallback branches: finalize the result,
     /// then run it through `complete_run` with the tokens spent so far.
     #[allow(clippy::too_many_arguments)]
-    fn finalize_and_complete(
+    async fn finalize_and_complete(
         &self,
+        metrics: &mut QueryMetrics,
         stage: &'static str,
         result: ExplorationResult,
-        max_results: Option<u32>,
+        query: &ExplorationQuery,
         budget: &TokenBudget,
         forced_finish: bool,
-        index_status: &'static str,
-        git_probe_ms: u64,
         query_key: &str,
         fingerprint: Option<RepoFingerprint>,
     ) -> ExplorationResult {
-        let result = self.finalize(result, max_results);
+        let result = self.finalize(result, query);
         self.complete_run(
+            metrics,
             stage,
-            budget.spent(),
-            budget.llm_calls(),
+            budget,
             forced_finish,
-            index_status,
-            git_probe_ms,
             query_key,
             fingerprint,
             result,
         )
+        .await
     }
 
     /// The cache is usable this call only when caching is enabled and a
@@ -626,7 +911,7 @@ where
                 }
             }
         }
-        let findings = self.tidy_and_truncate(verified, query.max_results);
+        let findings = self.tidy_and_truncate(verified, query);
         let mut summary = format!(
             "Resolved deterministically by the retrieval pre-stage (confidence {confidence}/100, no LLM involved): {} location(s) matching \"{}\".",
             findings.len(),
@@ -930,6 +1215,19 @@ fn index_status_label(result: &Result<IndexStatus, MemoryError>) -> &'static str
     }
 }
 
+/// Did `candidate` itself survive into the final findings? Path plus
+/// `line_start` identify it: filesystem verification only clamps `line_end`
+/// (a `line_start` past EOF drops the candidate outright) and tidying only
+/// normalizes the path spelling. Used by the unique-symbol early exit, whose
+/// authorization is void if the one candidate that granted it was dropped.
+fn candidate_survived(findings: &[ExplorationFinding], candidate: &Candidate) -> bool {
+    let location = normalize_location(candidate.location.clone());
+    let path = normalize_rel_path(location.path);
+    findings
+        .iter()
+        .any(|f| f.location.path == path && f.location.line_start == location.line_start)
+}
+
 /// One JSON-array line of the ranked candidate list — rank, kind, score,
 /// path, line range, symbol — for the `retrieval candidates` debug log, so a
 /// harness can compute candidate-recall-at-top-k without re-deriving the
@@ -1077,6 +1375,7 @@ fn user_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::cache_prefix_fingerprint;
     use repo_explorer_core::config::AgentSettings;
     use repo_explorer_core::domain::CandidateKind;
     use repo_explorer_core::fingerprint::RepoFingerprint;
@@ -1092,6 +1391,40 @@ mod tests {
     /// Trust-window TTL used across these tests — centralized so a future
     /// default change or edge-case TTL needs editing in one place.
     const TEST_INDEX_TRUST_TTL: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn fallback_cache_prefix_is_byte_stable() {
+        // Sibling of `verify::tests::verify_cache_prefix_is_byte_stable` for
+        // the fallback loop's prefix; same reasoning, see that test.
+        assert!(
+            !FALLBACK_SYSTEM_PROMPT.contains('{'),
+            "FALLBACK_SYSTEM_PROMPT must stay a plain const with no format \
+             placeholder — per-run content in the prefix defeats the cache"
+        );
+        let names: Vec<&str> = tool_catalog().iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "search_code",
+                "search_graph",
+                "query_graph",
+                "trace_path",
+                "get_architecture",
+                "get_code_snippet",
+                "grep",
+                "find",
+                "read_file",
+                "finish",
+            ]
+        );
+        // 5387 content bytes (~5.9 KB on the wire) is roughly 1.5-1.7k tokens
+        // — over Anthropic's 1024-token minimum for Sonnet/Opus, under
+        // Haiku's 2048.
+        assert_eq!(
+            cache_prefix_fingerprint(FALLBACK_SYSTEM_PROMPT, tool_catalog()),
+            (5387, 5612853071500758155)
+        );
+    }
 
     fn finish_call() -> ToolCall {
         ToolCall {
@@ -1122,6 +1455,28 @@ mod tests {
             .map(|i| format!("l{i}"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// One single-line finding — the shape every graph-memory fixture here
+    /// uses. Mirrors `pipeline`'s and `render`'s local `finding` helpers.
+    fn finding(path: &str, line: u32, note: &str) -> ExplorationFinding {
+        ExplorationFinding {
+            location: FileLocation {
+                path: PathBuf::from(path),
+                line_start: line,
+                line_end: line,
+            },
+            snippet: None,
+            note: Some(note.to_string()),
+        }
+    }
+
+    /// A memory backend whose graph leg returns exactly `findings`. The
+    /// summary is never asserted (only `summary_len > 0`), so it is derived.
+    fn graph_memory(findings: Vec<ExplorationFinding>) -> MockMemoryBackend {
+        let summary = format!("{} rows", findings.len());
+        MockMemoryBackend::new()
+            .with_search_graph_result(Ok(ExplorationResult { findings, summary }))
     }
 
     fn tool_calls(
@@ -1163,6 +1518,7 @@ mod tests {
             text: "where is main".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let dir = temp_repo("immediate_finish");
         let got = agent.run(&dir, &query).await.unwrap();
@@ -1190,6 +1546,7 @@ mod tests {
             text: "where is main".to_string(),
             scope_hint: None,
             max_results: Some(1),
+            detailed_snippets: false,
         };
         let dir = temp_repo("fallback_capped");
         let got = agent.run(&dir, &query).await.unwrap();
@@ -1273,6 +1630,7 @@ mod tests {
             text: "x".to_string(),
             scope_hint: None,
             max_results: Some(3),
+            detailed_snippets: false,
         };
         let result = agent
             .result_from_candidates(&candidates, &query, 100, None, &dir)
@@ -1330,6 +1688,7 @@ mod tests {
             text: "x".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let result = agent
             .result_from_candidates(&candidates, &query, 100, None, &dir)
@@ -1366,6 +1725,7 @@ mod tests {
             text: "x".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let result = agent
             .result_from_candidates(&candidates, &query, 100, None, &dir)
@@ -1400,6 +1760,7 @@ mod tests {
             text: "x".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let result = agent
             .result_from_candidates(&candidates, &query, 100, None, &dir)
@@ -1436,6 +1797,7 @@ mod tests {
             text: "x".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let result = agent
             .result_from_candidates(&candidates, &query, 100, None, &dir)
@@ -1455,22 +1817,14 @@ mod tests {
         // index-freshness note — a confident answer served from a stale
         // index (reindex failed, memory backend still answers from the
         // previous index) must still say so.
-        let memory = MockMemoryBackend::new()
-            .with_ensure_fresh_index_result(Ok(IndexStatus::IndexingFailed {
-                reason: "boom".to_string(),
-            }))
-            .with_search_graph_result(Ok(ExplorationResult {
-                findings: vec![ExplorationFinding {
-                    location: FileLocation {
-                        path: PathBuf::from("crates/x/src/freshness.rs"),
-                        line_start: 12,
-                        line_end: 12,
-                    },
-                    snippet: None,
-                    note: Some("decide_freshness".to_string()),
-                }],
-                summary: "1 row".to_string(),
-            }));
+        let memory = graph_memory(vec![finding(
+            "crates/x/src/freshness.rs",
+            12,
+            "decide_freshness",
+        )])
+        .with_ensure_fresh_index_result(Ok(IndexStatus::IndexingFailed {
+            reason: "boom".to_string(),
+        }));
         let router = ProviderRouter::with_clock(
             vec![(
                 "primary".to_string(),
@@ -1492,6 +1846,7 @@ mod tests {
             text: "decide_freshness".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let dir = crate::test_support::temp_repo_with(
             "agent_run",
@@ -1513,18 +1868,11 @@ mod tests {
         // the deterministic early-exit summary must say so — not silently
         // pretend the scope was honored. Same high-confidence SymbolExact setup
         // as the stale-index-note test, but with an escaping scope_hint.
-        let memory = MockMemoryBackend::new().with_search_graph_result(Ok(ExplorationResult {
-            findings: vec![ExplorationFinding {
-                location: FileLocation {
-                    path: PathBuf::from("crates/x/src/freshness.rs"),
-                    line_start: 12,
-                    line_end: 12,
-                },
-                snippet: None,
-                note: Some("decide_freshness".to_string()),
-            }],
-            summary: "1 row".to_string(),
-        }));
+        let memory = graph_memory(vec![finding(
+            "crates/x/src/freshness.rs",
+            12,
+            "decide_freshness",
+        )]);
         let router = ProviderRouter::with_clock(
             vec![(
                 "primary".to_string(),
@@ -1546,6 +1894,7 @@ mod tests {
             text: "decide_freshness".to_string(),
             scope_hint: Some(PathBuf::from("../../etc")),
             max_results: None,
+            detailed_snippets: false,
         };
         let dir = crate::test_support::temp_repo_with(
             "agent_run",
@@ -1571,24 +1920,17 @@ mod tests {
         // that's just a path fragment, so has_exact_symbol_match stays false
         // and the Stage 3 gate is vetoed even though a lone SymbolExact
         // candidate here scores >= early_exit_confidence (90).
-        let memory = MockMemoryBackend::new().with_search_graph_result(Ok(ExplorationResult {
-            findings: vec![ExplorationFinding {
-                location: FileLocation {
-                    path: PathBuf::from("crates/repo-explorer-agent/src/verify.rs"),
-                    line_start: 35,
-                    line_end: 35,
-                },
-                snippet: None,
-                // Last segment "crates" == the query's first symbol-lookup token,
-                // so the symbol leg classifies this as SymbolExact -> confidence
-                // clears early_exit_confidence (90). But "crates" is also a
-                // fragment of the query's own path token
-                // ("crates/repo-explorer-agent/src/verify.rs"), so the guard
-                // (not the confidence check) is what blocks early-exit here.
-                note: Some("crates".to_string()),
-            }],
-            summary: "1 row".to_string(),
-        }));
+        // The note's last segment "crates" == the query's first symbol-lookup
+        // token, so the symbol leg classifies this as SymbolExact ->
+        // confidence clears early_exit_confidence (90). But "crates" is also a
+        // fragment of the query's own path token
+        // ("crates/repo-explorer-agent/src/verify.rs"), so the guard (not the
+        // confidence check) is what blocks early-exit here.
+        let memory = graph_memory(vec![finding(
+            "crates/repo-explorer-agent/src/verify.rs",
+            35,
+            "crates",
+        )]);
         // Prime the LLM to finish so the vetoed run completes via verify; the
         // finish payload points at src/lib.rs, which temp_repo creates.
         let provider = MockLlmProvider::new().with_responses(vec![tool_calls(vec![finish_call()])]);
@@ -1611,6 +1953,7 @@ mod tests {
                 .to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let dir = temp_repo("symbol_free_no_early_exit");
         let got = agent.run(&dir, &query).await.unwrap();
@@ -1641,6 +1984,7 @@ mod tests {
             text: "x".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let got = agent.run(&PathBuf::from("/repo"), &query).await;
         assert!(matches!(got, Err(AgentLoopError::Provider(_))));
@@ -1745,6 +2089,7 @@ mod tests {
         b.add(Some(TokenUsage {
             prompt_tokens: u64::MAX,
             completion_tokens: 1,
+            ..Default::default()
         }));
         assert!(!b.exhausted(), "0 means unlimited");
 
@@ -1755,8 +2100,33 @@ mod tests {
         b.add(Some(TokenUsage {
             prompt_tokens: 7,
             completion_tokens: 3,
+            ..Default::default()
         }));
         assert!(b.exhausted(), "exactly at the limit counts as exhausted");
+    }
+
+    #[test]
+    fn token_budget_accumulates_cache_tokens_without_double_charging() {
+        // Cache read/write are a breakdown of prompt_tokens, so they must sum
+        // into their own counters while `spent` still tracks total() only.
+        let mut b = TokenBudget::new(0, 0);
+        b.add(Some(TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 10,
+            cached_tokens: 60,
+            cache_creation_tokens: 40,
+        }));
+        b.add(Some(TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 10,
+            cached_tokens: 90,
+            cache_creation_tokens: 0,
+        }));
+        b.add(None);
+        assert_eq!(b.spent(), 220, "spent stays prompt+completion");
+        assert_eq!(b.cache_read_tokens(), 150);
+        assert_eq!(b.cache_write_tokens(), 40);
+        assert_eq!(b.llm_calls(), 3);
     }
 
     #[test]
@@ -1768,6 +2138,7 @@ mod tests {
             text: "where is main".to_string(),
             scope_hint: Some(PathBuf::from("../../etc")),
             max_results: None,
+            detailed_snippets: false,
         };
         let preamble = query_preamble(&escaping, true, None);
         assert!(
@@ -1779,6 +2150,7 @@ mod tests {
             text: "where is main".to_string(),
             scope_hint: Some(PathBuf::from("src")),
             max_results: None,
+            detailed_snippets: false,
         };
         let preamble = query_preamble(&valid, false, None);
         assert!(
@@ -1829,6 +2201,7 @@ mod tests {
             text: "where is main".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let dir = temp_repo("rotation_stable_within_conversation");
         let got = agent.run(&dir, &query).await.unwrap();
@@ -1896,6 +2269,7 @@ mod tests {
             text: text.to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         }
     }
 
@@ -2185,5 +2559,642 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir_a).ok();
         std::fs::remove_dir_all(&dir_b).ok();
+    }
+
+    // --- QW-0: every `run` exit path must emit exactly one metrics record ---
+
+    /// The records `emit_metrics` taped on this thread, oldest first. Under
+    /// `--test-threads=1` earlier tests can have left some behind, so callers
+    /// assert on the last one — emission is in call order.
+    fn taped_metrics() -> Vec<QueryMetrics> {
+        EMITTED.with(|v| std::mem::take(&mut *v.borrow_mut()))
+    }
+
+    /// A memory backend whose graph leg returns one exact `decide_freshness`
+    /// symbol hit — enough confidence for Stage 3's early exit.
+    fn high_confidence_memory() -> MockMemoryBackend {
+        graph_memory(vec![finding(
+            "crates/x/src/freshness.rs",
+            12,
+            "decide_freshness",
+        )])
+    }
+
+    #[tokio::test]
+    async fn metrics_emitted_on_cache_path() {
+        let provider = MockLlmProvider::new().with_responses(vec![tool_calls(vec![finish_call()])]);
+        let probe = MockRepoStateProbe::new().with_fingerprint(Some(fp("abc")));
+        let agent = agent_with_probe_and_ttl(
+            MockMemoryBackend::new(),
+            provider,
+            probe,
+            TEST_INDEX_TRUST_TTL,
+        );
+        let dir = temp_repo("metrics_cache");
+        let query = q("where is main");
+        agent.run(&dir, &query).await.unwrap();
+        // Same query, same fingerprint -> served from the query cache, which
+        // returns before Stage 1 and never reaches complete_run.
+        agent.run(&dir, &query).await.unwrap();
+
+        let taped = taped_metrics();
+        let m = taped.last().expect("the cache path must emit a record");
+        assert_eq!(m.path, "cache");
+        assert_eq!(m.query, "where is main");
+        assert_eq!(m.repo_path, dir.to_string_lossy());
+        assert_eq!(m.tokens, 0);
+        assert_eq!(m.llm_calls, 0);
+        assert_eq!(
+            (m.confidence, m.candidate_count),
+            (None, None),
+            "the pre-stage never ran, so neither was measured"
+        );
+        assert_eq!(m.early_exit_route, "none");
+        assert_eq!(m.index_status, "NotChecked", "Stage 1 never ran");
+        assert_eq!(m.findings_count, 1);
+        assert!(m.ts_unix_ms > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn metrics_emitted_on_early_exit_path() {
+        let agent = agent_with_probe_and_ttl(
+            high_confidence_memory(),
+            MockLlmProvider::new(),
+            MockRepoStateProbe::new(),
+            TEST_INDEX_TRUST_TTL,
+        );
+        let dir = crate::test_support::temp_repo_with(
+            "agent_run",
+            "metrics_early_exit",
+            &[("crates/x/src/freshness.rs", &numbered_lines(12))],
+        );
+        agent.run(&dir, &q("decide_freshness")).await.unwrap();
+
+        let taped = taped_metrics();
+        let m = taped
+            .last()
+            .expect("the early-exit path must emit a record");
+        assert_eq!(m.path, "early-exit");
+        assert_eq!(m.early_exit_route, "confidence");
+        assert_eq!(m.llm_calls, 0, "early exit makes no provider call");
+        assert!(m.confidence.unwrap() > 0);
+        assert_eq!(m.candidate_count, Some(1));
+        assert_eq!(m.findings_count, 1);
+        assert!(m.summary_len > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- QW-2: the unique-trusted-symbol Stage-3 route ---
+
+    /// A graph leg returning one exact `decide_freshness` hit plus a
+    /// `SymbolFuzzy` runner-up. The runner-up (400 base vs 700) shrinks the
+    /// margin enough to drop confidence to 88 — below `early_exit_confidence`
+    /// (90) — while the exact match itself stays unambiguous. Exactly the
+    /// case QW-2 exists for.
+    fn lone_exact_with_fuzzy_runner_up() -> MockMemoryBackend {
+        graph_memory(vec![
+            finding("crates/x/src/freshness.rs", 12, "decide_freshness"),
+            finding("crates/x/src/other.rs", 5, "decide_freshness_v2"),
+        ])
+    }
+
+    fn two_file_repo(test: &str) -> PathBuf {
+        crate::test_support::temp_repo_with(
+            "agent_run",
+            test,
+            &[
+                ("crates/x/src/freshness.rs", &numbered_lines(12)),
+                ("crates/x/src/other.rs", &numbered_lines(8)),
+                // The path `finish_call`'s payload names, so a run that does
+                // reach the LLM can finish at Stage 4 instead of escalating.
+                ("src/lib.rs", "a\nb\nc\n"),
+            ],
+        )
+    }
+
+    /// Like `agent_with_probe_and_ttl`, but with caller-chosen `AgentSettings`
+    /// (the QW-2 escape hatch is the only knob any caller varies).
+    fn agent_with_settings(
+        memory: MockMemoryBackend,
+        provider: MockLlmProvider,
+        settings: AgentSettings,
+    ) -> AgentLoop<
+        MockMemoryBackend,
+        MockSearchBackend,
+        MockLlmProvider,
+        MockRepoStateProbe,
+        FakeClock,
+    > {
+        let router = ProviderRouter::with_clock(
+            vec![("primary".to_string(), vec![("m".to_string(), provider)])],
+            60,
+            FakeClock::new(),
+        );
+        AgentLoop::new(
+            memory,
+            MockSearchBackend::new(),
+            router,
+            MockRepoStateProbe::new(),
+            settings,
+            CacheSettings::default(),
+            TEST_INDEX_TRUST_TTL,
+        )
+    }
+
+    #[tokio::test]
+    async fn sub_threshold_unique_symbol_skips_verification() {
+        // The win: one unambiguous exact symbol match, confidence dragged
+        // below early_exit_confidence by a fuzzy runner-up. Before QW-2 this
+        // paid a full verify round-trip. The provider has no responses queued,
+        // so any LLM call would fail the run outright.
+        let agent = agent_with_probe_and_ttl(
+            lone_exact_with_fuzzy_runner_up(),
+            MockLlmProvider::new(),
+            MockRepoStateProbe::new(),
+            TEST_INDEX_TRUST_TTL,
+        );
+        let dir = two_file_repo("qw2_unique_symbol");
+        let got = agent.run(&dir, &q("decide_freshness")).await.unwrap();
+        assert!(
+            got.summary
+                .contains("Resolved deterministically by the retrieval pre-stage"),
+            "expected the pre-stage answer, got: {}",
+            got.summary
+        );
+
+        let m = taped_metrics().pop().expect("a record must be emitted");
+        assert_eq!(m.path, "early-exit");
+        assert_eq!(m.early_exit_route, "unique-symbol");
+        assert_eq!(m.llm_calls, 0, "the whole point: no verification call");
+        assert!(
+            m.confidence.unwrap() < AgentSettings::default().early_exit_confidence,
+            "fixture must stay below the confidence route's threshold, was {:?}",
+            m.confidence
+        );
+        // The route returns the whole ranked list, like the confidence route.
+        assert_eq!(m.candidate_count, Some(2));
+        assert_eq!(m.findings_count, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unique_symbol_route_verifies_when_its_own_candidate_is_dropped() {
+        // The route is authorized by ONE candidate. Here `freshness.rs` was
+        // truncated since it was indexed, so line 12 is past EOF and disk
+        // verification drops exactly that candidate — leaving only the
+        // unrelated `decide_freshness_v2` fuzzy match. Returning that as the
+        // answer would be an unverified wrong answer, so the run must fall
+        // through and pay for verification after all.
+        let provider = MockLlmProvider::new().with_responses(vec![tool_calls(vec![finish_call()])]);
+        let agent = agent_with_probe_and_ttl(
+            lone_exact_with_fuzzy_runner_up(),
+            provider,
+            MockRepoStateProbe::new(),
+            TEST_INDEX_TRUST_TTL,
+        );
+        let dir = crate::test_support::temp_repo_with(
+            "agent_run",
+            "qw2_authorizer_dropped",
+            &[
+                ("crates/x/src/freshness.rs", &numbered_lines(3)),
+                ("crates/x/src/other.rs", &numbered_lines(8)),
+                ("src/lib.rs", "a\nb\nc\n"),
+            ],
+        );
+        agent.run(&dir, &q("decide_freshness")).await.unwrap();
+
+        let m = taped_metrics().pop().expect("a record must be emitted");
+        assert_eq!(
+            m.path, "verify",
+            "the candidate that authorized the early exit did not survive"
+        );
+        assert_eq!(m.early_exit_route, "none");
+        assert_eq!(m.llm_calls, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn two_exact_matches_in_different_files_still_verify() {
+        // Same symbol in two files stays two candidates -> ambiguous -> the
+        // LLM still has to pick.
+        let memory = graph_memory(vec![
+            finding("crates/x/src/freshness.rs", 12, "a::decide_freshness"),
+            finding("crates/x/src/other.rs", 5, "b::decide_freshness"),
+        ]);
+        let provider = MockLlmProvider::new().with_responses(vec![tool_calls(vec![finish_call()])]);
+        let agent = agent_with_probe_and_ttl(
+            memory,
+            provider,
+            MockRepoStateProbe::new(),
+            TEST_INDEX_TRUST_TTL,
+        );
+        let dir = two_file_repo("qw2_two_exact");
+        agent.run(&dir, &q("decide_freshness")).await.unwrap();
+
+        let m = taped_metrics().pop().expect("a record must be emitted");
+        assert_eq!(m.path, "verify");
+        assert_eq!(m.early_exit_route, "none");
+        assert_eq!(m.llm_calls, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn skip_verify_on_exact_symbol_false_restores_verification() {
+        let provider = MockLlmProvider::new().with_responses(vec![tool_calls(vec![finish_call()])]);
+        let agent = agent_with_settings(
+            lone_exact_with_fuzzy_runner_up(),
+            provider,
+            AgentSettings {
+                skip_verify_on_exact_symbol: false,
+                ..AgentSettings::default()
+            },
+        );
+        let dir = two_file_repo("qw2_escape_hatch");
+        agent.run(&dir, &q("decide_freshness")).await.unwrap();
+
+        let m = taped_metrics().pop().expect("a record must be emitted");
+        assert_eq!(m.path, "verify");
+        assert_eq!(m.early_exit_route, "none");
+        assert_eq!(m.llm_calls, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn metrics_emitted_on_verify_path() {
+        // Same shape as `symbol_free_query_is_vetoed_from_early_exit`: high
+        // confidence, but the exact match is only a path fragment, so Stage 3
+        // is vetoed and the LLM's `finish` lands on the verify exit.
+        let memory = graph_memory(vec![finding(
+            "crates/repo-explorer-agent/src/verify.rs",
+            35,
+            "crates",
+        )]);
+        let provider = MockLlmProvider::new().with_responses(vec![tool_calls(vec![finish_call()])]);
+        let agent = agent_with_probe_and_ttl(
+            memory,
+            provider,
+            MockRepoStateProbe::new(),
+            TEST_INDEX_TRUST_TTL,
+        );
+        let dir = temp_repo("metrics_verify");
+        agent
+            .run(
+                &dir,
+                &q("crates/repo-explorer-agent/src/verify.rs:35 what does this constant do"),
+            )
+            .await
+            .unwrap();
+
+        let taped = taped_metrics();
+        let m = taped.last().expect("the verify path must emit a record");
+        assert_eq!(m.path, "verify");
+        assert_eq!(m.early_exit_route, "none", "Stage 3 was vetoed");
+        assert_eq!(m.llm_calls, 1);
+        assert_eq!(m.findings_count, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn metrics_emitted_on_fallback_path() {
+        let provider = MockLlmProvider::new().with_responses(vec![tool_calls(vec![finish_call()])]);
+        let agent = agent_with(provider);
+        let dir = temp_repo("metrics_fallback");
+        agent.run(&dir, &q("where is main")).await.unwrap();
+
+        let taped = taped_metrics();
+        let m = taped.last().expect("the fallback path must emit a record");
+        assert_eq!(m.path, "fallback");
+        assert_eq!(m.early_exit_route, "none");
+        assert_eq!(m.llm_calls, 1);
+        assert!(!m.forced_finish);
+        assert_eq!(m.findings_count, 1);
+        assert_eq!(m.index_status, "UpToDate");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn metrics_emitted_on_provider_error_path() {
+        // Empty provider list -> the fallback loop's first turn is a hard
+        // RouterError, the one `run` exit that returns Err.
+        let router: ProviderRouter<MockLlmProvider, FakeClock> =
+            ProviderRouter::with_clock(vec![], 60, FakeClock::new());
+        let agent = AgentLoop::new(
+            MockMemoryBackend::new(),
+            MockSearchBackend::new(),
+            router,
+            MockRepoStateProbe::new(),
+            AgentSettings::default(),
+            CacheSettings::default(),
+            TEST_INDEX_TRUST_TTL,
+        );
+        let got = agent.run(&PathBuf::from("/repo"), &q("x")).await;
+        assert!(matches!(got, Err(AgentLoopError::Provider(_))));
+
+        let taped = taped_metrics();
+        let m = taped.last().expect("the error path must emit a record");
+        assert_eq!(m.path, "error");
+        assert_eq!(m.findings_count, 0, "no result exists on the error exit");
+        assert_eq!(m.repo_path, "/repo");
+    }
+
+    #[test]
+    fn query_metrics_json_is_one_line_and_complete() {
+        // The record rides a tracing field and a JSONL sink, so it must
+        // serialize to a single line and keep every contract key.
+        let mut m = QueryMetrics::new(
+            Path::new("/repo"),
+            &ExplorationQuery {
+                text: "a\nb".to_string(),
+                scope_hint: Some(PathBuf::from("crates")),
+                max_results: Some(3),
+                detailed_snippets: false,
+            },
+            Instant::now(),
+        );
+        m.record_budget(&TokenBudget::new(0, 0), true);
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(!json.contains('\n'), "must stay a single line: {json}");
+        for key in [
+            "ts_unix_ms",
+            "repo_path",
+            "query",
+            "scope_hint",
+            "max_results",
+            "path",
+            "index_status",
+            "confidence",
+            "candidate_count",
+            "early_exit_route",
+            "tokens",
+            "llm_calls",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "forced_finish",
+            "findings_count",
+            "summary_len",
+            "git_probe_ms",
+            "total_ms",
+        ] {
+            assert!(
+                json.contains(&format!("\"{key}\"")),
+                "missing {key}: {json}"
+            );
+        }
+        assert!(!json.contains("started"), "the Instant must not serialize");
+    }
+
+    #[test]
+    fn metrics_sink_creates_then_appends() {
+        // The JSONL sink must extend the file across writes (and across
+        // server restarts), never truncate it.
+        let dir = crate::test_support::temp_repo_with("agent_run", "metrics_sink", &[]);
+        let path = dir.join("metrics.jsonl");
+        append_json_line(&path, r#"{"n":1}"#).unwrap();
+        append_json_line(&path, r#"{"n":2}"#).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"n\":1}\n{\"n\":2}\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sink_path_reads_the_documented_env_var() {
+        // README.md documents `REPO_EXPLORER_METRICS`; renaming it here is a
+        // silently dead sink, and an empty value (how an MCP `env` map
+        // disables a variable) must read as unset, not as the path "".
+        let set = |k: &str| (k == "REPO_EXPLORER_METRICS").then(|| "/tmp/m.jsonl".into());
+        assert_eq!(sink_path(set), Some(PathBuf::from("/tmp/m.jsonl")));
+        assert_eq!(sink_path(|_| None), None);
+        assert_eq!(sink_path(|_| Some(std::ffi::OsString::new())), None);
+    }
+
+    /// QW-3 settings: a deliberately tiny prompt cap next to a larger
+    /// response-only cap, so the two can never be confused for each other.
+    fn qw3_settings() -> AgentSettings {
+        AgentSettings {
+            snippet_max_chars: 10,
+            snippet_max_chars_detailed: 50,
+            ..AgentSettings::default()
+        }
+    }
+
+    fn detailed_q(text: &str) -> ExplorationQuery {
+        ExplorationQuery {
+            detailed_snippets: true,
+            ..q(text)
+        }
+    }
+
+    /// Number of leading `x`s before the truncation marker — the cap that was
+    /// actually applied.
+    fn kept_chars(snippet: &str) -> usize {
+        snippet.chars().take_while(|c| *c == 'x').count()
+    }
+
+    #[tokio::test]
+    async fn detailed_snippets_raise_the_response_cap_only() {
+        // QW-3: `response_format: "detailed"` widens the FINAL findings'
+        // snippet cap. `self.caps` — the cap handed to verify/dispatch/render
+        // for LLM PROMPT rendering — must stay at `snippet_max_chars` for a
+        // detailed request too, or the feature would inflate exactly the
+        // prompt cost it exists to cut.
+        let dir = crate::test_support::temp_repo_with(
+            "agent_run",
+            "qw3_response_cap",
+            &[("f.rs", &numbered_lines(5))],
+        );
+        let candidates = vec![Candidate {
+            location: FileLocation {
+                path: PathBuf::from("f.rs"),
+                line_start: 2,
+                line_end: 3,
+            },
+            symbol: Some("x".to_string()),
+            kind: CandidateKind::SymbolExact,
+            score: 900,
+            snippet: Some("x".repeat(1000)),
+        }];
+        let agent = agent_with_settings(
+            MockMemoryBackend::new(),
+            MockLlmProvider::new(),
+            qw3_settings(),
+        );
+
+        let concise = agent
+            .result_from_candidates(&candidates, &q("x"), 100, None, &dir)
+            .await;
+        let detailed = agent
+            .result_from_candidates(&candidates, &detailed_q("x"), 100, None, &dir)
+            .await;
+
+        assert_eq!(
+            kept_chars(concise.findings[0].snippet.as_deref().unwrap()),
+            10,
+            "concise must keep today's agent.snippet_max_chars behavior"
+        );
+        assert_eq!(
+            kept_chars(detailed.findings[0].snippet.as_deref().unwrap()),
+            50,
+            "detailed must use agent.snippet_max_chars_detailed"
+        );
+        assert_eq!(
+            agent.caps.snippet_max_chars, 10,
+            "the prompt-side cap must be untouched by a detailed request"
+        );
+        assert_eq!(agent.response_caps(&detailed_q("x")).snippet_max_chars, 50);
+        assert_eq!(agent.response_caps(&q("x")).snippet_max_chars, 10);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detailed_response_cap_is_a_floor_never_a_ceiling() {
+        // `snippet_max_chars_detailed` widens the response cap; it must never
+        // narrow it. A config whose concise cap already exceeds the detailed
+        // one (or disables the cap with 0) would otherwise make "detailed"
+        // truncate harder than "concise", contradicting the tool description.
+        let wider_concise = agent_with_settings(
+            MockMemoryBackend::new(),
+            MockLlmProvider::new(),
+            AgentSettings {
+                snippet_max_chars: 2000,
+                snippet_max_chars_detailed: 1500,
+                ..AgentSettings::default()
+            },
+        );
+        assert_eq!(
+            wider_concise
+                .response_caps(&detailed_q("x"))
+                .snippet_max_chars,
+            2000,
+            "detailed must not return less than concise"
+        );
+        let uncapped = agent_with_settings(
+            MockMemoryBackend::new(),
+            MockLlmProvider::new(),
+            AgentSettings {
+                snippet_max_chars: 0,
+                ..AgentSettings::default()
+            },
+        );
+        assert_eq!(
+            uncapped.response_caps(&detailed_q("x")).snippet_max_chars,
+            0,
+            "0 means uncapped on both knobs"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_tool_findings_stay_at_the_prompt_cap_even_when_detailed() {
+        // Pins the documented limitation on `ExplorationQuery::detailed_snippets`:
+        // tool-dispatch findings are capped at the PROMPT cap the moment they
+        // are dispatched, long before any response cap applies. The fallback
+        // loop's budget-exhausted-without-finish exit returns exactly those,
+        // so `response_format: "detailed"` cannot widen them there.
+        let dir = crate::test_support::temp_repo_with(
+            "agent_run",
+            "qw3_dispatch_cap",
+            &[("f.rs", &numbered_lines(3))],
+        );
+        let search = MockSearchBackend::new().with_search_result(Ok(vec![ExplorationFinding {
+            location: FileLocation {
+                path: PathBuf::from("f.rs"),
+                line_start: 1,
+                line_end: 1,
+            },
+            snippet: Some("x".repeat(1000)),
+            note: None,
+        }]));
+        let router = ProviderRouter::with_clock(
+            vec![(
+                "primary".to_string(),
+                vec![("m".to_string(), MockLlmProvider::new())],
+            )],
+            60,
+            FakeClock::new(),
+        );
+        let agent = AgentLoop::new(
+            MockMemoryBackend::new(),
+            search,
+            router,
+            MockRepoStateProbe::new(),
+            qw3_settings(),
+            CacheSettings::default(),
+            TEST_INDEX_TRUST_TTL,
+        );
+        let call = ToolCall {
+            id: "c1".to_string(),
+            name: "grep".to_string(),
+            arguments_json: r#"{"pattern":"x"}"#.to_string(),
+            thought_signatures: None,
+        };
+        let (_message, findings) = agent.cached_dispatch(&dir, &call, None).await;
+        assert_eq!(
+            kept_chars(findings[0].snippet.as_deref().unwrap()),
+            10,
+            "dispatch caps at snippet_max_chars, whatever the response format"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn detailed_request_is_not_served_the_cached_concise_snippets() {
+        // QW-3 cache hazard: the query cache stores already-capped findings,
+        // so a detailed call landing on a concise entry would silently get
+        // 10-char snippets. `detailed_snippets` is part of the query key.
+        let long = "x".repeat(1000);
+        let memory = graph_memory(vec![
+            ExplorationFinding {
+                snippet: Some(long),
+                ..finding("crates/x/src/freshness.rs", 12, "decide_freshness")
+            },
+            finding("crates/x/src/other.rs", 5, "decide_freshness_v2"),
+        ]);
+        // A stable fingerprint is what makes the query cache live at all —
+        // without it `store_query_cache` is a no-op and this test would pass
+        // even with the format missing from the key. No provider responses
+        // queued: any LLM call would fail the run, so both calls must stay on
+        // the deterministic early-exit path.
+        let router = ProviderRouter::with_clock(
+            vec![(
+                "primary".to_string(),
+                vec![("m".to_string(), MockLlmProvider::new())],
+            )],
+            60,
+            FakeClock::new(),
+        );
+        let agent = AgentLoop::new(
+            memory,
+            MockSearchBackend::new(),
+            router,
+            MockRepoStateProbe::new().with_fingerprint(Some(fp("abc"))),
+            qw3_settings(),
+            CacheSettings::default(),
+            TEST_INDEX_TRUST_TTL,
+        );
+        let dir = two_file_repo("qw3_cache_format");
+
+        let concise = agent.run(&dir, &q("decide_freshness")).await.unwrap();
+        assert_eq!(
+            agent.run(&dir, &q("decide_freshness")).await.unwrap(),
+            concise,
+            "sanity: the repeated concise call must be served from the query cache"
+        );
+        let detailed = agent
+            .run(&dir, &detailed_q("decide_freshness"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            kept_chars(concise.findings[0].snippet.as_deref().unwrap()),
+            10
+        );
+        assert_eq!(
+            kept_chars(detailed.findings[0].snippet.as_deref().unwrap()),
+            50,
+            "the detailed call must not be served the cached concise entry"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

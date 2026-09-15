@@ -147,6 +147,9 @@ top_k = 12                    # candidates handed from retrieval to the LLM
 early_exit_confidence = 90    # >= this (0-100): answer without any LLM call
 fallback_confidence = 30      # < this: skip verification, run the full loop
 snippet_max_chars = 400       # snippet cap in prompts and tool results
+snippet_max_chars_detailed = 1500  # response-only cap for response_format = "detailed"
+                              # (a floor: never narrower than snippet_max_chars)
+skip_verify_on_exact_symbol = true  # one exact symbol hit? answer without the LLM
 
 # In-memory result caching, keyed by git state (HEAD + dirty digest).
 [cache]
@@ -159,6 +162,14 @@ level = "info"            # trace | debug | info | warn | error
 
 The env var named by each `api_key_env` must actually be set in the environment,
 or config loading fails with `MissingEnvVar`.
+
+Setting `REPO_EXPLORER_METRICS=<path>` appends one JSON line of per-query
+metrics (exit path, tokens, cache read/write tokens, confidence, timings) to
+that file; an empty value counts as unset. Without it, the headline fields are
+still logged — on `exploration complete` for a normal run and on `exploration
+served from query cache` for a cache hit, so grepping only the first message
+silently drops every 0-token row. A sink write failure is logged and never
+fails a query.
 
 ## `.mcp.json`
 

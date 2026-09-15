@@ -189,17 +189,23 @@ impl ResultCache {
     /// Fingerprint-independent query key: invalidation is handled via the
     /// stored fingerprint, not the key. Fields are joined via `encode_field`
     /// so differing field boundaries can never collide.
+    ///
+    /// `detailed_snippets` is part of the key because it changes the snippet
+    /// cap applied to the cached findings themselves — without it a detailed
+    /// request would be served a concise entry's already-truncated snippets.
     pub(crate) fn query_key(repo_root: &Path, query: &ExplorationQuery) -> String {
         let repo = repo_root.to_string_lossy();
         let text = query.text.trim().to_lowercase();
         let scope = scope_display(query.scope_hint.as_deref());
         let max_results = opt_to_string(query.max_results);
+        let detail = if query.detailed_snippets { "d" } else { "c" };
         let mut key =
             String::with_capacity(repo.len() + text.len() + scope.len() + max_results.len() + 32);
         encode_field_into(&mut key, &repo);
         encode_field_into(&mut key, &text);
         encode_field_into(&mut key, &scope);
         encode_field_into(&mut key, &max_results);
+        encode_field_into(&mut key, detail);
         key
     }
 
@@ -368,16 +374,39 @@ mod tests {
             text: "  Where Is Main ".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let q2 = ExplorationQuery {
             text: "where is main".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let r = Path::new("/repo");
         assert_eq!(
             ResultCache::query_key(r, &q1),
             ResultCache::query_key(r, &q2)
+        );
+    }
+
+    #[test]
+    fn query_key_separates_detailed_from_concise() {
+        // QW-3: the cached findings are already snippet-capped, so the two
+        // response formats must never share an entry.
+        let concise = ExplorationQuery {
+            text: "where is main".to_string(),
+            scope_hint: None,
+            max_results: None,
+            detailed_snippets: false,
+        };
+        let detailed = ExplorationQuery {
+            detailed_snippets: true,
+            ..concise.clone()
+        };
+        let r = Path::new("/repo");
+        assert_ne!(
+            ResultCache::query_key(r, &concise),
+            ResultCache::query_key(r, &detailed)
         );
     }
 
@@ -391,16 +420,19 @@ mod tests {
             text: "where is main".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let absolute = ExplorationQuery {
             text: "where is main".to_string(),
             scope_hint: Some(PathBuf::from("/etc")),
             max_results: None,
+            detailed_snippets: false,
         };
         let parent = ExplorationQuery {
             text: "where is main".to_string(),
             scope_hint: Some(PathBuf::from("../../etc")),
             max_results: None,
+            detailed_snippets: false,
         };
         let r = Path::new("/repo");
         let none_key = ResultCache::query_key(r, &none);
@@ -429,6 +461,7 @@ mod tests {
             text: "where is main".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         assert_ne!(
             ResultCache::query_key(a, &query),

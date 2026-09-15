@@ -177,6 +177,19 @@ pub struct AgentSettings {
     /// Cap applied to snippets rendered into LLM prompts and tool results.
     #[serde(default = "default_snippet_max_chars")]
     pub snippet_max_chars: u32,
+    /// Cap applied to the *final response* snippets when the MCP request asks
+    /// for `response_format: "detailed"`. A floor, not a ceiling: a value
+    /// below `snippet_max_chars` never narrows the response. Never applies to
+    /// LLM prompts — those always use `snippet_max_chars`. `0` disables the
+    /// cap entirely, same as `snippet_max_chars`.
+    #[serde(default = "default_snippet_max_chars_detailed")]
+    pub snippet_max_chars_detailed: u32,
+    /// Answer without the LLM verification stage when the pre-stage found
+    /// exactly one trusted exact symbol match, whatever the confidence score
+    /// (which a strong fuzzy runner-up deflates). `false` is the escape
+    /// hatch: verification then runs for every sub-threshold query again.
+    #[serde(default = "default_skip_verify_on_exact_symbol")]
+    pub skip_verify_on_exact_symbol: bool,
 }
 
 /// Hand-written for the same reason as `SearchConfig`: `Default` and the serde
@@ -191,6 +204,8 @@ impl Default for AgentSettings {
             early_exit_confidence: default_early_exit_confidence(),
             fallback_confidence: default_fallback_confidence(),
             snippet_max_chars: default_snippet_max_chars(),
+            snippet_max_chars_detailed: default_snippet_max_chars_detailed(),
+            skip_verify_on_exact_symbol: default_skip_verify_on_exact_symbol(),
         }
     }
 }
@@ -280,6 +295,14 @@ fn default_fallback_confidence() -> u32 {
 
 fn default_snippet_max_chars() -> u32 {
     400
+}
+
+fn default_snippet_max_chars_detailed() -> u32 {
+    1500
+}
+
+fn default_skip_verify_on_exact_symbol() -> bool {
+    true
 }
 
 fn default_cache_enabled() -> bool {
@@ -476,6 +499,8 @@ const KNOWN_SECTIONS: &[(&str, &[&str])] = &[
             "early_exit_confidence",
             "fallback_confidence",
             "snippet_max_chars",
+            "snippet_max_chars_detailed",
+            "skip_verify_on_exact_symbol",
         ],
     ),
     ("cache", &["enabled", "max_entries"]),
@@ -1053,6 +1078,31 @@ mod tests {
         assert_eq!(
             from_default.timeout_seconds,
             default_search_timeout_seconds()
+        );
+    }
+
+    #[test]
+    fn agent_snippet_max_chars_detailed_defaults_and_parses() {
+        // The hand-written `Default` and the serde field default must agree
+        // (a derived `Default` would give 0 here, silently disabling the cap),
+        // and the knob must be settable from `[agent]`.
+        let from_default = AgentSettings::default();
+        let from_empty: AgentSettings =
+            toml::from_str("").expect("an empty [agent] section must parse");
+        assert_eq!(from_default.snippet_max_chars_detailed, 1500);
+        assert_eq!(
+            from_empty.snippet_max_chars_detailed,
+            from_default.snippet_max_chars_detailed
+        );
+        let explicit: AgentSettings =
+            toml::from_str("snippet_max_chars_detailed = 0").expect("explicit value must parse");
+        assert_eq!(
+            explicit.snippet_max_chars_detailed, 0,
+            "0 must survive as the explicit \"no cap\" opt-out, not be replaced by the default"
+        );
+        assert_eq!(
+            explicit.snippet_max_chars, from_default.snippet_max_chars,
+            "the detailed knob must not disturb the prompt-side cap"
         );
     }
 

@@ -8,7 +8,17 @@ Owns `serde_json` — core stays free of it. Full pipeline design:
 ## Pipeline stages
 
 - **Retrieval pre-stage** — concurrent symbol/grep/file fanout; exits with
-  zero LLM calls when it finds a confident match.
+  zero LLM calls when it finds a confident match. Two routes into that
+  Stage-3 exit, both requiring a trusted exact symbol match (F-16), reported
+  as `early_exit_route` in `QueryMetrics`: `confidence` (score clears
+  `agent.early_exit_confidence`) and `unique-symbol` (exactly one trusted
+  exact match at a known location — unambiguous by construction, so the
+  score, which a strong `SymbolFuzzy` runner-up deflates, is not consulted;
+  disable with `agent.skip_verify_on_exact_symbol = false`). Uniqueness is
+  counted **pre-merge** (`merge_and_rank` folds two overlapping symbols in one
+  file into one candidate and drops the loser's name), and the exit falls
+  through to verification when that one authorizing candidate does not survive
+  disk verification or the response caps.
 - **Stage-1 index refresh** — before retrieval, `run` ensures a fresh memory
   index. Repeat calls for the same `repo_path` skip this upstream round-trip
   when the local git `RepoFingerprint` is unchanged since the last refresh and
@@ -25,3 +35,14 @@ Owns `serde_json` — core stays free of it. Full pipeline design:
 - **Explorative fallback loop** — the hardened path when verification isn't
   confident: enforces a token budget, batches tool calls, and forces a final
   finish (via the Stage-4 `ProviderRouter`) rather than looping indefinitely.
+
+## Per-query metrics
+
+`QueryMetrics` (agent.rs) is emitted from **all five** `run` exit paths —
+cache hit, early exit, verify, fallback, provider error (`path = "error"`) —
+via `emit_metrics`. Two sinks: the headline fields as flat tracing fields on
+that path's INFO log line (what `eval/run.py` parses), and, when
+`REPO_EXPLORER_METRICS` names a non-empty path, the whole record as one
+appended JSONL line — the only lossless copy (it also carries `repo_path`,
+`query`, `findings_count`, `summary_len`). Never stdout — that is the MCP
+JSON-RPC channel.
