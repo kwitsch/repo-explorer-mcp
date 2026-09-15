@@ -19,12 +19,13 @@ approximation is misleading at n<30).
 """
 
 import argparse
+import csv
 import json
 import math
 import re
 import sys
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -464,7 +465,361 @@ def score_run(out_dir: Path) -> dict:
             }
         )
 
-    return {"scored_rows": all_scored, "query_summary": query_summary, "pinned_model": pinned_model}
+    return {
+        "run_id": out_dir.name,
+        "scored_rows": all_scored,
+        "query_summary": query_summary,
+        "pinned_model": pinned_model,
+    }
+
+
+# ---------------------------------------------------------------------------
+# QW-0 efficiency metrics
+# ---------------------------------------------------------------------------
+
+# Price table for cost_per_query (plan §7.1: cost = Σ prompt × p_in + (completion + reasoning)
+# × p_out). USD per 1M tokens.
+#
+#   Prices as of 2026-09-15. Source: https://ai.google.dev/pricing
+#
+# CAVEAT, read before quoting a dollar figure anywhere outside this report: these are the
+# published *tier* rates (Flash / Flash-Lite) applied to every model in that tier — the
+# individual 3.x per-model rates were not re-verified on the capture date. cost_per_query is a
+# comparable relative signal between runs of this harness, not an invoice. A model that is not
+# in this table is reported as n/a and never priced at 0 — see qw0_cost().
+#
+# Covers the six models in eval/config/default.toml's failover chain. When that chain changes,
+# this table changes with it, or the run reports unpriced calls.
+PRICES_CAPTURED = "2026-09-15"
+PRICES_SOURCE = "https://ai.google.dev/pricing"
+PRICES = {
+    "gemini-3.8-flash": {"usd_per_1M_input": 0.30, "usd_per_1M_output": 2.50, "tier": "flash"},
+    "gemini-3.7-flash": {"usd_per_1M_input": 0.30, "usd_per_1M_output": 2.50, "tier": "flash"},
+    "gemini-3.6-flash": {"usd_per_1M_input": 0.30, "usd_per_1M_output": 2.50, "tier": "flash"},
+    "gemini-3.5-flash": {"usd_per_1M_input": 0.30, "usd_per_1M_output": 2.50, "tier": "flash"},
+    "gemini-3.5-flash-lite": {"usd_per_1M_input": 0.10, "usd_per_1M_output": 0.40, "tier": "flash-lite"},
+    "gemini-3.1-flash-lite": {"usd_per_1M_input": 0.10, "usd_per_1M_output": 0.40, "tier": "flash-lite"},
+}
+
+# Every QW-0 number this block reports, in the order print_qw0_report prints them. A metric whose
+# source field is absent from every row degrades to "n/a (field absent in this run)" — an older
+# results/ dir predates the field, and a silent 0 would read as a real measurement.
+NA_ABSENT = "n/a (field absent in this run)"
+
+
+def qw0_field(row: dict, name: str):
+    """One QW-0 field off a scored row. Every field reported here is emitted as its own flat
+    tracing field on the `exploration complete` / cache-hit line and copied into the row by
+    run.py; None means the run's binary never emitted it."""
+    return row.get(name)
+
+
+def llm_calls_of(row: dict) -> int | None:
+    """LLM turns for one query. A cache hit made zero by construction (the memoized result is
+    returned before any provider is touched), so it counts as 0 even in a results/ dir whose
+    cache line predates the llm_calls field. Every other absence stays absent (None)."""
+    v = qw0_field(row, "llm_calls")
+    if v is None and row.get("stage") == "cache":
+        return 0
+    return v
+
+
+def numeric_field(rows: list[dict], name: str) -> list[float]:
+    """Every non-None numeric value of `name` across rows. Empty list == absent everywhere."""
+    vals = []
+    for r in rows:
+        v = qw0_field(r, name)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            vals.append(v)
+    return vals
+
+
+def percentile(values: list[float], q: float) -> float | None:
+    """Nearest-rank percentile (no interpolation): the smallest value at or above the q-th rank.
+    n=1 -> that value for any q; n=2, q=0.95 -> the max. Deliberate for small n — interpolating
+    a p95 out of two samples invents precision the run doesn't have."""
+    if not values:
+        return None
+    vals = sorted(values)
+    k = max(1, math.ceil(q * len(vals)))
+    return vals[min(k, len(vals)) - 1]
+
+
+def mean(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _dist(values: list[float]) -> dict | None:
+    if not values:
+        return None
+    return {
+        "n": len(values),
+        "mean": mean(values),
+        "p50": percentile(values, 0.50),
+        "p95": percentile(values, 0.95),
+    }
+
+
+def call_cost(pc: dict) -> float | None:
+    """USD for one provider call, or None if its model_served has no price entry.
+
+    A call that reports no token usage at all costs 0.0 and needs no price: that is a failed
+    attempt (rate_limited / quota — llm/src/lib.rs's error branch logs neither model_served nor
+    tokens), or, in a results/ dir written before the provider_call regex was tightened, a ghost
+    row from the router's "provider call succeeded" commentary. Billing it as "unpriced" would
+    turn cost_per_query into n/a for the whole run over calls that spent nothing."""
+    tokens = [pc.get(k) for k in ("prompt_tokens", "completion_tokens", "reasoning_tokens")]
+    if all(t is None for t in tokens):
+        return 0.0
+    price = PRICES.get(pc.get("model_served"))
+    if price is None:
+        return None
+    prompt = pc.get("prompt_tokens") or 0
+    out = (pc.get("completion_tokens") or 0) + (pc.get("reasoning_tokens") or 0)
+    return prompt / 1e6 * price["usd_per_1M_input"] + out / 1e6 * price["usd_per_1M_output"]
+
+
+def row_cost(row: dict) -> float | None:
+    """USD for one query, or None if any of its provider calls is unpriced. A 0-LLM row (cache /
+    early-exit) has no provider calls and costs exactly 0.0 — that is a measurement, not an
+    absence."""
+    total = 0.0
+    for pc in row.get("provider_calls") or []:
+        c = call_cost(pc)
+        if c is None:
+            return None
+        total += c
+    return total
+
+
+def qw0_cost(rows: list[dict]) -> dict:
+    """Run-level cost. `unpriced` counts provider calls whose model has no price entry; when it
+    is non-empty the run total is incomplete and must be reported n/a, never as the partial sum
+    passed off as the whole."""
+    total = 0.0
+    priced_calls = 0
+    unpriced: Counter = Counter()
+    rows_priced = 0
+    for r in rows:
+        rc = row_cost(r)
+        if rc is not None:
+            rows_priced += 1
+        for pc in r.get("provider_calls") or []:
+            c = call_cost(pc)
+            if c is None:
+                unpriced[pc.get("model_served") or "<unknown>"] += 1
+            elif c > 0 or pc.get("prompt_tokens") is not None:
+                # Only attempts that actually reported usage count as billed calls; a
+                # zero-usage attempt (see call_cost) costs nothing and would otherwise pad
+                # the denominator of "$X over N provider calls".
+                total += c
+                priced_calls += 1
+    return {
+        "usd_total_priced": total,
+        "priced_calls": priced_calls,
+        "unpriced": dict(unpriced),
+        "rows_fully_priced": rows_priced,
+        "n_rows": len(rows),
+        "usd_per_query": (total / len(rows)) if rows and not unpriced else None,
+    }
+
+
+def qw0_cache(rows: list[dict]) -> dict:
+    """cache_read_tokens / prompt tokens across the run. Numerator: the per-query
+    cache_read_tokens field, falling back to summing the provider calls' own cached_tokens.
+    Denominator: prompt_tokens over every provider call. Either side absent -> ratio None, so
+    the report says "no cache activity reported" instead of a silent 0%."""
+    read = [v for v in (qw0_field(r, "cache_read_tokens") for r in rows) if v is not None]
+    write = [v for v in (qw0_field(r, "cache_write_tokens") for r in rows) if v is not None]
+    per_call = [pc.get("cached_tokens") for r in rows for pc in (r.get("provider_calls") or [])]
+    per_call = [v for v in per_call if v is not None]
+    if not read and per_call:
+        read = per_call
+    prompt = [pc.get("prompt_tokens") for r in rows for pc in (r.get("provider_calls") or [])]
+    prompt = [v for v in prompt if v is not None]
+    numerator = sum(read) if read else None
+    denominator = sum(prompt) if prompt else None
+    ratio = None
+    if numerator is not None and denominator:
+        ratio = numerator / denominator
+    return {
+        "cache_read_tokens": numerator,
+        "cache_write_tokens": sum(write) if write else None,
+        "prompt_tokens": denominator,
+        "ratio": ratio,
+        "reported": bool(read),
+    }
+
+
+def qw0_metrics(rows: list[dict]) -> dict:
+    """Every QW-0 aggregate over the already-warm-up-filtered scored rows. Pure — print_qw0_report
+    and the --csv-out writer both consume this and neither recomputes anything."""
+    llm_calls = [v for v in (llm_calls_of(r) for r in rows) if v is not None]
+    tokens_all = numeric_field(rows, "tokens")
+    tokens_llm = [
+        t
+        for r, t in ((r, qw0_field(r, "tokens")) for r in rows)
+        if isinstance(t, (int, float)) and (llm_calls_of(r) or 0) > 0
+    ]
+    stage_exit = Counter(r.get("stage") or "<none>" for r in rows)
+    routes = [qw0_field(r, "early_exit_route") for r in rows if r.get("stage") == "early-exit"]
+    routes = [x for x in routes if x is not None]
+    return {
+        "n_rows": len(rows),
+        "llm_calls": _dist(llm_calls),
+        "stage_exit": dict(stage_exit),
+        "early_exit_route": dict(Counter(routes)) if routes else None,
+        "tokens_all": _dist(tokens_all),
+        "tokens_llm_rows": _dist(tokens_llm),
+        "cache": qw0_cache(rows),
+        "cost": qw0_cost(rows),
+        "latency_ms": _dist(numeric_field(rows, "latency_ms")),
+        "total_ms": _dist(numeric_field(rows, "total_ms")),
+    }
+
+
+def _fmt_dist(d: dict | None, unit: str = "", keys=("mean", "p95")) -> str:
+    if d is None:
+        return NA_ABSENT
+    parts = [f"{k}={d[k]:.1f}{unit}" for k in keys if d.get(k) is not None]
+    return f"n={d['n']} " + " ".join(parts)
+
+
+def print_qw0_report(agg: dict) -> None:
+    n = agg["n_rows"]
+    print(f"\n=== QW-0 efficiency (over {n} scored rows; warm-up excluded) ===")
+
+    print(f"  llm_turns_per_query: {_fmt_dist(agg['llm_calls'])}")
+
+    print("  stage_exit:")
+    for stage, count in sorted(agg["stage_exit"].items(), key=lambda kv: -kv[1]):
+        share = count / n if n else 0.0
+        print(f"    {stage:12s} {count:4d}  {share:5.1%}")
+        if stage == "early-exit":
+            routes = agg["early_exit_route"]
+            if routes is None:
+                print(f"      early_exit_route: {NA_ABSENT}")
+            else:
+                for route, rn in sorted(routes.items(), key=lambda kv: -kv[1]):
+                    print(f"      route={route:16s} {rn:4d}  {rn / count:5.1%} of early-exit")
+
+    # tokens=0 by construction on cache and early-exit rows, so the all-rows mean is a
+    # per-query cost figure and the LLM-rows-only mean is a per-LLM-query cost figure. Both,
+    # always — either one alone reads as the other.
+    print(f"  tokens_per_query (all rows):         {_fmt_dist(agg['tokens_all'], keys=('mean', 'p50', 'p95'))}")
+    print(f"  tokens_per_query (LLM-touching only):{_fmt_dist(agg['tokens_llm_rows'], keys=('mean', 'p50', 'p95'))}")
+
+    cache = agg["cache"]
+    if cache["ratio"] is None:
+        why = "provider reports no cache activity" if not cache["reported"] else "no prompt tokens recorded"
+        print(f"  cached_ratio: n/a - {why}")
+    else:
+        note = " (provider reported zero cached tokens on every call)" if cache["ratio"] == 0 else ""
+        print(
+            f"  cached_ratio: {cache['ratio']:.1%}  "
+            f"({cache['cache_read_tokens']} cache-read / {cache['prompt_tokens']} prompt tokens){note}"
+        )
+
+    cost = agg["cost"]
+    if cost["usd_per_query"] is not None:
+        print(f"  cost_per_query: ${cost['usd_per_query']:.5f}  (${cost['usd_total_priced']:.4f} over {n} rows, {cost['priced_calls']} provider calls)")
+    elif cost["unpriced"]:
+        # Before "no priced calls": when EVERY call ran on an unpriced model, priced_calls is 0
+        # too, and naming the models is the useful report — not "no priced provider calls".
+        unp = ", ".join(f"{m} x{c}" for m, c in sorted(cost["unpriced"].items()))
+        print(f"  cost_per_query: n/a - unpriced models served: {unp}")
+        if cost["priced_calls"]:
+            partial = cost["usd_total_priced"] / cost["n_rows"] if cost["n_rows"] else 0.0
+            print(f"    (priced subset only: ${partial:.5f}/query over {cost['priced_calls']} of "
+                  f"{cost['priced_calls'] + sum(cost['unpriced'].values())} provider calls)")
+    else:
+        print("  cost_per_query: n/a - no priced provider calls in this run")
+    print(f"    price table: {PRICES_SOURCE}, captured {PRICES_CAPTURED} (tier rates - see PRICES in score.py)")
+
+    print(f"  latency_per_query:   {_fmt_dist(agg['latency_ms'], unit='ms')}")
+    print(f"  total_ms (server-side): {_fmt_dist(agg['total_ms'], unit='ms')}")
+
+
+CSV_COLUMNS = [
+    "run_id",
+    "repo",
+    "pass",
+    "query_id",
+    "cat",
+    "stage",
+    "early_exit_route",
+    "llm_calls",
+    "tokens",
+    "prompt_tokens",
+    "completion_tokens",
+    "reasoning_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "cost_usd",
+    "latency_ms",
+    "total_ms",
+    "confidence",
+    "candidate_count",
+]
+
+
+def qw0_csv_rows(result: dict) -> list[dict]:
+    run_id = result.get("run_id")
+    out = []
+    for r in result["scored_rows"]:
+        calls = r.get("provider_calls") or []
+        cost = row_cost(r)
+        out.append(
+            {
+                "run_id": run_id,
+                "repo": r.get("repo"),
+                "pass": r.get("pass"),
+                "query_id": r.get("query_id"),
+                "cat": r.get("cat"),
+                "stage": r.get("stage"),
+                "early_exit_route": qw0_field(r, "early_exit_route"),
+                "llm_calls": llm_calls_of(r),
+                "tokens": qw0_field(r, "tokens"),
+                "prompt_tokens": sum(pc.get("prompt_tokens") or 0 for pc in calls),
+                "completion_tokens": sum(pc.get("completion_tokens") or 0 for pc in calls),
+                "reasoning_tokens": sum(pc.get("reasoning_tokens") or 0 for pc in calls),
+                "cache_read_tokens": qw0_field(r, "cache_read_tokens"),
+                "cache_write_tokens": qw0_field(r, "cache_write_tokens"),
+                "cost_usd": f"{cost:.6f}" if cost is not None else "",
+                "latency_ms": r.get("latency_ms"),
+                "total_ms": qw0_field(r, "total_ms"),
+                "confidence": r.get("confidence"),
+                "candidate_count": qw0_field(r, "candidate_count"),
+            }
+        )
+    return out
+
+
+def flatten_agg(agg: dict, prefix: str = "") -> list[tuple[str, str]]:
+    """The aggregate dict as flat metric,value pairs for the sibling aggregate CSV."""
+    pairs = []
+    for key, val in agg.items():
+        name = f"{prefix}{key}"
+        if isinstance(val, dict):
+            pairs.extend(flatten_agg(val, f"{name}."))
+        else:
+            pairs.append((name, "" if val is None else str(val)))
+    return pairs
+
+
+def write_qw0_csv(result: dict, path: Path) -> Path:
+    """One row per scored query at `path`, plus a sibling <stem>.aggregate.csv of metric,value
+    pairs. stdlib csv, no pandas — this is 32 rows, not a dataframe."""
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        w.writeheader()
+        w.writerows(qw0_csv_rows(result))
+    agg_path = path.with_name(path.stem + ".aggregate" + path.suffix)
+    with open(agg_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["metric", "value"])
+        w.writerows(flatten_agg(qw0_metrics(result["scored_rows"])))
+    return agg_path
 
 
 def print_report(result: dict) -> None:
@@ -609,8 +964,9 @@ def print_report(result: dict) -> None:
 
     latencies = [r["latency_ms"] for r in rows]
     if latencies:
-        latencies.sort()
-        p50 = latencies[len(latencies) // 2]
+        # Same definition as the aggregate CSV's latency_ms.p50 — two spellings of "p50"
+        # over one list put two different numbers in one run's artifacts.
+        p50 = percentile(latencies, 0.50)
         print(f"\n=== Latency ===\n  n={len(latencies)}  p50={p50:.0f}ms  max={max(latencies):.0f}ms")
 
     git_probe = [r["git_probe_ms"] for r in rows if r.get("git_probe_ms") is not None]
@@ -618,11 +974,18 @@ def print_report(result: dict) -> None:
         git_probe.sort()
         print(f"  git_probe_ms: median={git_probe[len(git_probe)//2]}  max={max(git_probe)}")
 
+    print_qw0_report(qw0_metrics(rows))
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("run_dir", help="results/<run-id> directory")
     ap.add_argument("--json-out", default=None, help="write the full scored rows as JSON here")
+    ap.add_argument(
+        "--csv-out",
+        default=None,
+        help="write the QW-0 per-query metrics CSV here (plus a sibling <stem>.aggregate.csv)",
+    )
     args = ap.parse_args()
 
     out_dir = Path(args.run_dir)
@@ -636,6 +999,11 @@ def main() -> None:
         with open(args.json_out, "w") as f:
             json.dump(result, f, indent=2, default=str)
         print(f"\nfull scored data written to {args.json_out}", file=sys.stderr)
+
+    if args.csv_out:
+        csv_path = Path(args.csv_out)
+        agg_path = write_qw0_csv(result, csv_path)
+        print(f"QW-0 per-query CSV written to {csv_path} (aggregates: {agg_path})", file=sys.stderr)
 
 
 if __name__ == "__main__":
