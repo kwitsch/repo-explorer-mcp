@@ -268,32 +268,39 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
 /// carries. Two spellings of the same symbol still count once (`Foo::new`
 /// reported alongside a bare `new` from another leg), but two qualified names
 /// that merely share a trailing segment (`Foo::new`, `Bar::new`) are
-/// different symbols and count as two — see `same_trusted_symbol`.
+/// different symbols and count as two.
+///
+/// Counted by grouping on the trailing segment first, then counting the
+/// distinct *qualified* spellings within each group: a group holding only bare
+/// names is one symbol, a group holding `Foo::new` and `Bar::new` is two
+/// whether or not a bare `new` from a third leg also landed in it. Pairwise
+/// folding would instead depend on leg order — seeded with the bare `new`,
+/// both qualified names absorb into it and an ambiguous trio counts as one,
+/// which is exactly the false "unique" that licenses skipping verification.
 fn distinct_trusted_symbols(raw: &[Candidate], patterns: &QueryPatterns) -> usize {
-    let mut distinct: Vec<&str> = Vec::new();
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
     for name in raw
         .iter()
         .filter(|c| is_trusted_symbol_match(c, patterns))
         .filter_map(|c| c.symbol.as_deref())
     {
-        if !distinct.iter().any(|seen| same_trusted_symbol(seen, name)) {
-            distinct.push(name);
+        let segment = last_segment(name);
+        let group = match groups.iter().position(|(seg, _)| *seg == segment) {
+            Some(index) => index,
+            None => {
+                groups.push((segment, Vec::new()));
+                groups.len() - 1
+            }
+        };
+        if name != segment && !groups[group].1.contains(&name) {
+            groups[group].1.push(name);
         }
     }
-    distinct.len()
-}
-
-/// Do `a` and `b` name the same trusted symbol? Equal names always do. A
-/// qualified name and a bare re-qualification of it (`Foo::new` vs `new`) do
-/// too, since a bare name carries no qualifier to disagree with. Two
-/// qualified names that only share a trailing segment (`Foo::new` vs
-/// `Bar::new`) do not — they are genuinely different symbols.
-fn same_trusted_symbol(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-    let (a_seg, b_seg) = (last_segment(a), last_segment(b));
-    a_seg == b_seg && (a == a_seg || b == b_seg)
+    // A group with no qualified spelling is still one symbol.
+    groups
+        .iter()
+        .map(|(_, qualified)| qualified.len().max(1))
+        .sum()
 }
 
 /// Index of the sole trusted exact symbol match — see
@@ -582,6 +589,30 @@ mod tests {
             symbol_candidate("a.rs", 1, "new"),
         ];
         assert_eq!(distinct_trusted_symbols(&same, &patterns), 1);
+
+        // A bare name alongside two qualified ones is still two symbols, and
+        // the count must not depend on which leg reported first: folding
+        // pairwise from the bare `new` would absorb both qualified names and
+        // wrongly report one, licensing the skip on an ambiguous trio.
+        let bare_first = vec![
+            symbol_candidate("a.rs", 1, "new"),
+            symbol_candidate("a.rs", 1, "Foo::new"),
+            symbol_candidate("a.rs", 1, "Bar::new"),
+        ];
+        let bare_last = vec![
+            symbol_candidate("a.rs", 1, "Foo::new"),
+            symbol_candidate("a.rs", 1, "Bar::new"),
+            symbol_candidate("a.rs", 1, "new"),
+        ];
+        assert_eq!(distinct_trusted_symbols(&bare_first, &patterns), 2);
+        assert_eq!(distinct_trusted_symbols(&bare_last, &patterns), 2);
+
+        // Different trailing segments are always different symbols.
+        let two_segments = vec![
+            symbol_candidate("a.rs", 1, "Foo::new"),
+            symbol_candidate("a.rs", 1, "Foo::drop"),
+        ];
+        assert_eq!(distinct_trusted_symbols(&two_segments, &patterns), 2);
     }
 
     #[test]
