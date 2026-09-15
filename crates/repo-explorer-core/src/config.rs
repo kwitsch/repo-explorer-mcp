@@ -190,6 +190,53 @@ pub struct AgentSettings {
     /// hatch: verification then runs for every sub-threshold query again.
     #[serde(default = "default_skip_verify_on_exact_symbol")]
     pub skip_verify_on_exact_symbol: bool,
+    /// Deterministic repo-brief prefetch injected into the explorative
+    /// fallback loop (Stage 5 only). Must stay the LAST field: a nested
+    /// table has to be serialized after every bare `[agent]` scalar.
+    #[serde(default)]
+    pub repo_brief: RepoBriefSettings,
+}
+
+/// Which part of the repository fingerprint the repo-brief cache is keyed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RepoBriefKey {
+    /// HEAD commit only — a dirty working tree keeps reusing the same brief.
+    #[default]
+    Head,
+    /// HEAD plus the dirty-tree digest — every save rebuilds the brief.
+    Full,
+}
+
+/// The Stage-5 repo-brief prefetch: one deterministic `get_architecture` call
+/// rendered into a token-budgeted markdown brief, cached per fingerprint.
+///
+/// ponytail: keys inside a nested `[agent.repo_brief]` table are not
+/// typo-checked — `unknown_key_warnings` does not recurse into sub-tables.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RepoBriefSettings {
+    /// `false` makes Stage 5 behave exactly as before: no prefetch, one
+    /// system message.
+    #[serde(default = "default_repo_brief_enabled")]
+    pub enabled: bool,
+    /// Budget for the rendered brief, enforced locally by dropping the
+    /// smallest modules. `0` is the explicit opt-out (no brief).
+    #[serde(default = "default_repo_brief_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub key: RepoBriefKey,
+}
+
+/// Hand-written for the same reason as `SearchConfig`: `Default` and the serde
+/// field defaults must be the same values.
+impl Default for RepoBriefSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_repo_brief_enabled(),
+            max_tokens: default_repo_brief_max_tokens(),
+            key: RepoBriefKey::default(),
+        }
+    }
 }
 
 /// Hand-written for the same reason as `SearchConfig`: `Default` and the serde
@@ -206,6 +253,7 @@ impl Default for AgentSettings {
             snippet_max_chars: default_snippet_max_chars(),
             snippet_max_chars_detailed: default_snippet_max_chars_detailed(),
             skip_verify_on_exact_symbol: default_skip_verify_on_exact_symbol(),
+            repo_brief: RepoBriefSettings::default(),
         }
     }
 }
@@ -303,6 +351,14 @@ fn default_snippet_max_chars_detailed() -> u32 {
 
 fn default_skip_verify_on_exact_symbol() -> bool {
     true
+}
+
+fn default_repo_brief_enabled() -> bool {
+    true
+}
+
+fn default_repo_brief_max_tokens() -> u32 {
+    3000
 }
 
 fn default_cache_enabled() -> bool {
@@ -501,6 +557,7 @@ const KNOWN_SECTIONS: &[(&str, &[&str])] = &[
             "snippet_max_chars",
             "snippet_max_chars_detailed",
             "skip_verify_on_exact_symbol",
+            "repo_brief",
         ],
     ),
     ("cache", &["enabled", "max_entries"]),
@@ -1104,6 +1161,28 @@ mod tests {
             explicit.snippet_max_chars, from_default.snippet_max_chars,
             "the detailed knob must not disturb the prompt-side cap"
         );
+    }
+
+    #[test]
+    fn repo_brief_defaults_and_parses() {
+        // Hand-written `Default` and serde field defaults must agree (a
+        // derived one would give `enabled: false, max_tokens: 0` — a silently
+        // disabled prefetch), and the nested table must be settable.
+        let from_default = AgentSettings::default();
+        let from_empty: AgentSettings =
+            toml::from_str("").expect("an empty [agent] section must parse");
+        assert_eq!(from_default.repo_brief, RepoBriefSettings::default());
+        assert_eq!(from_empty.repo_brief, from_default.repo_brief);
+        assert!(from_default.repo_brief.enabled);
+        assert_eq!(from_default.repo_brief.max_tokens, 3000);
+        assert_eq!(from_default.repo_brief.key, RepoBriefKey::Head);
+
+        let explicit: AgentSettings =
+            toml::from_str("[repo_brief]\nenabled = false\nmax_tokens = 500\nkey = \"full\"\n")
+                .expect("an explicit [agent.repo_brief] block must parse");
+        assert!(!explicit.repo_brief.enabled);
+        assert_eq!(explicit.repo_brief.max_tokens, 500);
+        assert_eq!(explicit.repo_brief.key, RepoBriefKey::Full);
     }
 
     #[test]

@@ -105,9 +105,10 @@ struct Inner {
     tools: CappedMap<(String, Vec<ExplorationFinding>)>,
     legs: CappedMap<Vec<Candidate>>,
     queries: CappedMap<QueryEntry>,
+    briefs: CappedMap<String>,
 }
 
-/// All three caches behind one lock (entries are small; contention is one
+/// All four caches behind one lock (entries are small; contention is one
 /// exploration at a time per repo in practice).
 pub(crate) struct ResultCache {
     inner: Mutex<Inner>,
@@ -120,6 +121,7 @@ impl ResultCache {
                 tools: CappedMap::new(max_entries),
                 legs: CappedMap::new(max_entries),
                 queries: CappedMap::new(max_entries),
+                briefs: CappedMap::new(max_entries),
             }),
         }
     }
@@ -176,6 +178,30 @@ impl ResultCache {
         let _ = write!(key, "{}#{}#", fp.head_sha, fp.dirty_hash);
         encode_field_into(&mut key, leg);
         key
+    }
+
+    /// Repo-brief key. `head_only` drops the dirty digest so a brief survives
+    /// an unrelated working-tree save (the architecture of a repo does not
+    /// change with every edit); `false` gives the `leg_key` shape.
+    pub(crate) fn brief_key(repo_root: &Path, fp: &RepoFingerprint, head_only: bool) -> String {
+        let repo = repo_root.to_string_lossy();
+        let mut key =
+            String::with_capacity(repo.len() + fp.head_sha.len() + fp.dirty_hash.len() + 24);
+        encode_field_into(&mut key, &repo);
+        let _ = if head_only {
+            write!(key, "{}#", fp.head_sha)
+        } else {
+            write!(key, "{}#{}#", fp.head_sha, fp.dirty_hash)
+        };
+        key
+    }
+
+    pub(crate) fn get_brief(&self, key: &str) -> Option<String> {
+        self.lock().briefs.get(key)
+    }
+
+    pub(crate) fn put_brief(&self, key: String, value: String) {
+        self.lock().briefs.insert(key, value);
     }
 
     pub(crate) fn get_leg(&self, key: &str) -> Option<Vec<Candidate>> {

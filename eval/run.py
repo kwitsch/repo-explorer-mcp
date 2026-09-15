@@ -104,8 +104,21 @@ def take_qw0_fields(out: dict, f: dict) -> None:
     """QW-0 fields shared by `exploration complete` and the query-cache-hit line. Every one
     defaults to None (not 0) in `out` so score.py can tell "field absent in this run" — a row
     from a pre-QW-0 binary — from a real zero. The cache path exits before the retrieval
-    pre-stage, so it emits neither `confidence` nor `candidate_count` and both stay None."""
-    for key in ("candidate_count", "early_exit_route", "cache_read_tokens", "cache_write_tokens", "total_ms"):
+    pre-stage, so it emits neither `confidence` nor `candidate_count` and both stay None.
+
+    `brief_tokens` / `orientation_calls_in_loop` (M-2) are Stage-5-only: the server emits them
+    on the Stage-5 exit paths (`path="fallback"`, and `path="error"` when the provider chain
+    dies mid-loop), so they stay None on every other stage — absent, not a zero that would drag
+    the orientation mean down for free."""
+    for key in (
+        "candidate_count",
+        "early_exit_route",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "total_ms",
+        "brief_tokens",
+        "orientation_calls_in_loop",
+    ):
         if f.get(key) is not None:
             out[key] = f[key]
 
@@ -264,8 +277,8 @@ def parse_call_lines(lines: list[str]) -> dict:
     leg_timings, candidates_ranked, provider_calls, verify_actions, fallback_turns,
     exploration_failed, early_exit_fallthrough, early_exit_dropped_candidates (the last two
     from PR #47's early-exit disk verification), plus the QW-0 fields (candidate_count,
-    early_exit_route, cache_read_tokens, cache_write_tokens, total_ms) via
-    take_qw0_fields."""
+    early_exit_route, cache_read_tokens, cache_write_tokens, total_ms, brief_tokens,
+    orientation_calls_in_loop) via take_qw0_fields."""
     out = {
         "stage": None,
         "tokens": None,
@@ -293,6 +306,11 @@ def parse_call_lines(lines: list[str]) -> dict:
         "cache_read_tokens": None,
         "cache_write_tokens": None,
         "total_ms": None,
+        # M-2 repo brief, Stage 5 only: None also means "this query never reached the
+        # fallback loop", which is why score.py denominates the orientation aggregate on the
+        # rows that carry the field (a Stage-5 provider error reports stage=="error").
+        "brief_tokens": None,
+        "orientation_calls_in_loop": None,
     }
     for line in lines:
         kind = line_kind(line)

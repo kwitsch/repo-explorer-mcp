@@ -15,7 +15,7 @@
 //! messages fed back to the model; only a `RouterError` in the fallback loop
 //! is a hard failure.
 
-use repo_explorer_core::config::{AgentSettings, CacheSettings};
+use repo_explorer_core::config::{AgentSettings, CacheSettings, RepoBriefKey};
 use repo_explorer_core::domain::{
     Candidate, ExplorationFinding, ExplorationQuery, ExplorationResult, FileLocation,
 };
@@ -33,6 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::brief;
 use crate::cache::{CappedMap, QueryEntry, ResultCache};
 use crate::dispatch::{canonical_repo_root, clamp_location, dispatch_inner, read_verified_file};
 use crate::pipeline;
@@ -177,6 +178,13 @@ pub(crate) struct QueryMetrics {
     pub summary_len: usize,
     pub git_probe_ms: u64,
     pub total_ms: u64,
+    /// Estimated size of the repo brief injected into Stage 5. `None` when
+    /// Stage 5 never ran or produced no brief — never a fabricated `0`.
+    pub brief_tokens: Option<u32>,
+    /// In-loop `get_architecture` calls actually executed. Seeded to `Some(0)`
+    /// on Stage-5 entry, so a real zero is distinguishable from "Stage 5
+    /// never ran" (`None`).
+    pub orientation_calls_in_loop: Option<u32>,
 }
 
 impl QueryMetrics {
@@ -208,6 +216,8 @@ impl QueryMetrics {
             summary_len: 0,
             git_probe_ms: 0,
             total_ms: 0,
+            brief_tokens: None,
+            orientation_calls_in_loop: None,
         }
     }
 
@@ -244,6 +254,8 @@ async fn emit_metrics(metrics: &mut QueryMetrics, msg: &'static str) {
         early_exit_route = metrics.early_exit_route,
         cache_read_tokens = metrics.cache_read_tokens,
         cache_write_tokens = metrics.cache_write_tokens,
+        brief_tokens = metrics.brief_tokens,
+        orientation_calls_in_loop = metrics.orientation_calls_in_loop,
         total_ms = metrics.total_ms,
         "{}",
         msg
@@ -666,6 +678,7 @@ where
                 outcome.candidates,
                 fingerprint.as_ref(),
                 &mut budget,
+                &mut metrics,
             )
             .await;
         let (result, forced_finish) = match looped {
@@ -806,6 +819,56 @@ where
         }
     }
 
+    /// The deterministic Stage-5 repo brief: one `get_architecture` round trip
+    /// per cold fingerprint, rendered locally and memoized in the existing
+    /// result cache. Every failure mode (disabled, backend error, unusable
+    /// payload) degrades to `None`, which leaves the loop exactly as it was —
+    /// a prefetch must never fail a query.
+    async fn repo_brief(
+        &self,
+        repo_root: &Path,
+        fingerprint: Option<&RepoFingerprint>,
+    ) -> Option<String> {
+        // `max_tokens == 0` is the documented budget opt-out — honour it here,
+        // before the round trip it is meant to avoid.
+        if !self.settings.repo_brief.enabled || self.settings.repo_brief.max_tokens == 0 {
+            return None;
+        }
+        let cached = self.cache_for(fingerprint).map(|(cache, fp)| {
+            (
+                cache,
+                ResultCache::brief_key(
+                    repo_root,
+                    fp,
+                    self.settings.repo_brief.key == RepoBriefKey::Head,
+                ),
+            )
+        });
+        if let Some((cache, key)) = &cached
+            && let Some(hit) = cache.get_brief(key)
+        {
+            return Some(hit);
+        }
+        let started = Instant::now();
+        let text = match self.memory.get_architecture_text(repo_root).await {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::debug!(error = %e, "repo brief prefetch failed");
+                return None;
+            }
+        };
+        let brief = brief::render_brief(&text, self.settings.repo_brief.max_tokens)?;
+        tracing::debug!(
+            brief_tokens = brief::estimate_tokens(&brief),
+            build_ms = started.elapsed().as_millis() as u64,
+            "repo brief built"
+        );
+        if let Some((cache, key)) = cached {
+            cache.put_brief(key, brief.clone());
+        }
+        Some(brief)
+    }
+
     /// Serve from the query cache when the entry is still valid: same
     /// fingerprint, or a fingerprint change that provably changed nothing at
     /// all. Checking the diff against only the *entry's own* contributing
@@ -941,17 +1004,41 @@ where
         candidates: Vec<Candidate>,
         fingerprint: Option<&RepoFingerprint>,
         budget: &mut TokenBudget,
+        metrics: &mut QueryMetrics,
     ) -> Result<(ExplorationResult, bool), AgentLoopError> {
+        // Stage 5 starts blind otherwise: the first turns go on orientation
+        // (get_architecture) that one deterministic call answers for free.
+        // Stage 4 deliberately gets nothing — it is 75% of runs. Skipped when
+        // no exploratory turn will run (budget already spent upstream, or zero
+        // iterations configured): the prefetch would only bill the
+        // forced-finish call for a brief nothing can act on.
+        let repo_brief = if budget.exhausted() || self.settings.max_fallback_iterations == 0 {
+            None
+        } else {
+            self.repo_brief(repo_root, fingerprint).await
+        };
+        metrics.brief_tokens = repo_brief
+            .as_deref()
+            .map(|b| brief::estimate_tokens(b) as u32);
+        // Seeded here so every exit path of this loop carries a truthful
+        // count, and the paths that never reach Stage 5 leave it absent.
+        metrics.orientation_calls_in_loop = Some(0);
+
         let tools = tool_catalog();
-        let mut messages: Vec<Message> = vec![
-            Message::system(FALLBACK_SYSTEM_PROMPT),
-            Message::user(user_prompt(
-                query,
-                scope_hint_escaped,
-                index_note,
-                &candidates,
-            )),
-        ];
+        // A second system message, not part of the user prompt: every system
+        // message carries its own cache breakpoint, and the brief is stable
+        // per fingerprint — so it is re-read from the provider cache on every
+        // turn instead of re-billed behind the conversation's only breakpoint.
+        let mut messages: Vec<Message> = vec![Message::system(FALLBACK_SYSTEM_PROMPT)];
+        if let Some(b) = &repo_brief {
+            messages.push(Message::system(b));
+        }
+        messages.push(Message::user(user_prompt(
+            query,
+            scope_hint_escaped,
+            index_note,
+            &candidates,
+        )));
 
         let mut findings: Vec<ExplorationFinding> = Vec::new();
         let mut seen: HashSet<(FileLocation, Option<String>)> = HashSet::new();
@@ -1027,6 +1114,14 @@ where
                             if !non_finish.is_empty() {
                                 single_call_rejections = 0;
                             }
+                            // Counted where the calls actually execute, so the
+                            // rejected single-call turn above (which
+                            // `continue`s) is not counted twice.
+                            *metrics.orientation_calls_in_loop.get_or_insert(0) += non_finish
+                                .iter()
+                                .filter(|c| c.name == "get_architecture")
+                                .count()
+                                as u32;
                             tracing::debug!(
                                 turn,
                                 tool_names = %tool_names_joined(&non_finish),
@@ -2849,6 +2944,11 @@ mod tests {
         let taped = taped_metrics();
         let m = taped.last().expect("the verify path must emit a record");
         assert_eq!(m.path, "verify");
+        assert_eq!(
+            (m.brief_tokens, m.orientation_calls_in_loop),
+            (None, None),
+            "Stage 5 never ran, so neither was measured"
+        );
         assert_eq!(m.early_exit_route, "none", "Stage 3 was vetoed");
         assert_eq!(m.llm_calls, 1);
         assert_eq!(m.findings_count, 1);
@@ -2870,6 +2970,54 @@ mod tests {
         assert!(!m.forced_finish);
         assert_eq!(m.findings_count, 1);
         assert_eq!(m.index_status, "UpToDate");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn orientation_calls_and_brief_tokens_are_emitted_on_the_fallback_path() {
+        // Live `get_architecture` payload shape (see the memory crate's
+        // decoder tests).
+        const ARCH: &str = "\
+packages: 1  (cols: name nodes fan_in fan_out)\n  repo-explorer-core 256 0 0\n\
+entry_points: 1  (cols: qn file)\n  repo.src.main.main src/main.rs\n";
+        let provider = MockLlmProvider::new().with_responses(vec![
+            // Batched — a single-call turn is rejected, never executed, so it
+            // must not be counted either.
+            tool_calls(vec![
+                ToolCall {
+                    id: "o1".to_string(),
+                    name: "get_architecture".to_string(),
+                    arguments_json: "{}".to_string(),
+                    thought_signatures: None,
+                },
+                ToolCall {
+                    id: "o2".to_string(),
+                    name: "grep".to_string(),
+                    arguments_json: r#"{"pattern":"main"}"#.to_string(),
+                    thought_signatures: None,
+                },
+            ]),
+            tool_calls(vec![finish_call()]),
+        ]);
+        let memory =
+            MockMemoryBackend::new().with_get_architecture_text_result(Ok(ARCH.to_string()));
+        let agent = agent_with_settings(memory, provider, AgentSettings::default());
+        let dir = temp_repo("metrics_orientation");
+        agent.run(&dir, &q("where is main")).await.unwrap();
+
+        let taped = taped_metrics();
+        let m = taped.last().expect("the fallback path must emit a record");
+        assert_eq!(m.path, "fallback");
+        assert!(
+            m.brief_tokens.is_some_and(|t| t > 0),
+            "an injected brief must be measured: {:?}",
+            m.brief_tokens
+        );
+        assert_eq!(
+            m.orientation_calls_in_loop,
+            Some(1),
+            "the in-loop get_architecture call must be counted"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

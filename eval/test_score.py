@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from score import (
+    NA_ABSENT,
     PRICES,
     call_cost,
     llm_calls_of,
@@ -295,6 +296,55 @@ def check_csv_rows() -> None:
     assert unpriced[0]["cost_usd"] == ""
 
 
+def check_repo_brief_metrics() -> None:
+    """M-2's two Stage-5 fields: parsed off the same `exploration complete` line by run.py, and
+    aggregated over fallback rows ONLY. A row set from a pre-M-2 binary must report them absent,
+    never as a zero that would look like "the loop stopped re-orienting"."""
+    # run.py half: the names must match the server's tracing fields verbatim, or score.py sees
+    # nothing and silently prints n/a forever.
+    parsed = parse_call_lines([
+        "INFO explore{req_id=a-0}: repo_explorer_agent::agent: exploration complete "
+        'path="fallback" tokens=30000 llm_calls=4 brief_tokens=742 orientation_calls_in_loop=0'
+    ])
+    assert parsed["stage"] == "fallback"
+    assert parsed["brief_tokens"] == 742, parsed
+    assert parsed["orientation_calls_in_loop"] == 0, parsed
+    assert parse_call_lines([COMPLETE_LINE])["brief_tokens"] is None  # pre-M-2 line
+
+    # Pre-M-2 rows: absent everywhere -> None (NA_ABSENT in the report), not an n=0/mean=0 dist.
+    old = qw0_metrics([_row(query_id="a", stage="fallback", llm_calls=6, tokens=30000)])
+    assert old["brief_tokens"] is None, old["brief_tokens"]
+    assert old["orientation_calls_in_loop"] is None, old["orientation_calls_in_loop"]
+
+    # Denominator is "the row carries a count", not the stage name: a non-Stage-5 row never
+    # carries one, and a Stage-5 run that died in the provider chain (stage=="error") does.
+    agg = qw0_metrics([
+        _row(query_id="a", stage="fallback", llm_calls=4, tokens=30000,
+             brief_tokens=700, orientation_calls_in_loop=1),
+        _row(query_id="b", stage="error", llm_calls=5, tokens=31000,
+             brief_tokens=900, orientation_calls_in_loop=1),
+        _row(query_id="c", stage="verify", llm_calls=2, tokens=1000),
+    ])
+    assert agg["brief_tokens"]["n"] == 2 and agg["brief_tokens"]["mean"] == 800
+    assert agg["orientation_calls_in_loop"]["n"] == 2
+    assert agg["orientation_calls_in_loop"]["mean"] == 1.0, agg["orientation_calls_in_loop"]
+
+    # A measured zero is a measurement, not an absence — this is the acceptance gate's reading.
+    zeroed = qw0_metrics([_row(query_id="a", stage="fallback", brief_tokens=640,
+                               orientation_calls_in_loop=0)])
+    assert zeroed["orientation_calls_in_loop"]["mean"] == 0.0
+
+    # Report + CSV both carry them.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print_qw0_report(old)
+    assert f"orientation_calls_in_loop (fallback rows): {NA_ABSENT}" in buf.getvalue(), buf.getvalue()
+    csv_row = qw0_csv_rows({"run_id": "x", "scored_rows": [
+        _row(query_id="a", stage="fallback", brief_tokens=640, orientation_calls_in_loop=0)
+    ]})[0]
+    assert csv_row["brief_tokens"] == 640 and csv_row["orientation_calls_in_loop"] == 0
+
+
 def _write_file(dir_path: Path, name: str, n_lines: int) -> None:
     body = "\n".join(f"SENTINEL_{i:03d}_line_content" for i in range(n_lines))
     (dir_path / name).write_text(body + "\n")
@@ -404,6 +454,7 @@ def main() -> None:
         check_priced_subset_report()
         check_cache_ratio()
         check_csv_rows()
+        check_repo_brief_metrics()
 
         # English-only invariant: every eval query string is pure ASCII
         # (scoped to item["query"]; notes/comments keep their non-ASCII

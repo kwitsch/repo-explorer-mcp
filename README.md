@@ -151,6 +151,16 @@ snippet_max_chars_detailed = 1500  # response-only cap for response_format = "de
                               # (a floor: never narrower than snippet_max_chars)
 skip_verify_on_exact_symbol = true  # one exact symbol hit? answer without the LLM
 
+# Deterministic repository brief prefetched once on entry to the explorative fallback
+# loop (Stage 5 only) and injected as its own system message, so the loop does not spend
+# its first turns re-deriving the module layout. A nested table must come AFTER every
+# bare `[agent]` key above — in TOML, everything below a `[agent.repo_brief]` header
+# belongs to that sub-table, not to `[agent]`.
+[agent.repo_brief]
+enabled = true    # false = Stage 5 behaves exactly as before, no prefetch at all
+max_tokens = 3000 # budget for the rendered brief; over budget, the smallest modules are dropped
+key = "head"      # cache key: "head" survives a dirty working tree, "full" re-builds on every save
+
 # In-memory result caching, keyed by git state (HEAD + dirty digest).
 [cache]
 enabled = true

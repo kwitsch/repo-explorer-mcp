@@ -685,3 +685,156 @@ async fn fingerprint_change_touching_result_paths_recomputes() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Live `get_architecture` payload shape (see the memory crate's decoder
+/// tests) — the sections a repo brief is rendered from.
+const ARCH_PAYLOAD: &str = "\
+node_labels: 2  (cols: label count)\n  Function 120\n  Method 136\n\
+packages: 1  (cols: name nodes fan_in fan_out)\n  repo-explorer-core 256 0 0\n\
+entry_points: 1  (cols: qn file)\n  \
+repo.crates.repo-explorer-mcp.src.main.main crates/repo-explorer-mcp/src/main.rs\n";
+
+fn finish_now() -> Result<Completion, ProviderError> {
+    ok_calls(vec![tc(
+        "f1",
+        "finish",
+        r#"{"findings":[],"summary":"done"}"#,
+    )])
+}
+
+#[tokio::test]
+async fn fallback_loop_injects_repo_brief_as_second_system_message() {
+    let provider = MockLlmProvider::new().with_responses(vec![finish_now()]);
+    let provider_probe = provider.clone();
+    let memory =
+        MockMemoryBackend::new().with_get_architecture_text_result(Ok(ARCH_PAYLOAD.to_string()));
+    let mem_probe = memory.clone();
+    let agent = AgentLoop::new(
+        memory,
+        MockSearchBackend::new(),
+        single_router(provider),
+        MockRepoStateProbe::new().with_fingerprint(Some(fp("aaa"))),
+        fallback_only(),
+        CacheSettings::default(),
+        TEST_INDEX_TRUST_TTL,
+    );
+
+    agent
+        .run(&PathBuf::from("/repo"), &query("where is main"))
+        .await
+        .unwrap();
+
+    let calls = provider_probe.calls();
+    let systems: Vec<&str> = calls[0]
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::System)
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(systems.len(), 2, "brief must be its own system message");
+    assert!(
+        systems[0].starts_with("You are a repository exploration agent."),
+        "the cached static prefix must stay first and unmodified: {}",
+        systems[0]
+    );
+    assert!(
+        !systems[0].contains("Do NOT call get_architecture"),
+        "hardening text must not leak into the static prefix"
+    );
+    assert!(systems[1].starts_with("A deterministic repository brief follows."));
+    assert!(systems[1].contains("Do NOT call get_architecture"));
+    assert!(systems[1].contains("repo-explorer-core"));
+    assert!(
+        mem_probe
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, MemCall::GetArchitectureText { .. }))
+            .count()
+            == 1
+    );
+}
+
+#[tokio::test]
+async fn repo_brief_is_reused_across_queries_on_the_same_head() {
+    let provider = MockLlmProvider::new().with_fallback(finish_now());
+    let memory =
+        MockMemoryBackend::new().with_get_architecture_text_result(Ok(ARCH_PAYLOAD.to_string()));
+    let mem_probe = memory.clone();
+    let probe = MockRepoStateProbe::new().with_fingerprint(Some(fp("aaa")));
+    let probe_handle = probe.clone();
+    let agent = AgentLoop::new(
+        memory,
+        MockSearchBackend::new(),
+        single_router(provider),
+        probe,
+        fallback_only(),
+        CacheSettings::default(),
+        TEST_INDEX_TRUST_TTL,
+    );
+
+    agent
+        .run(&PathBuf::from("/repo"), &query("first question"))
+        .await
+        .unwrap();
+    // Same HEAD, dirty working tree — the default `key = "head"` must not
+    // invalidate the brief on every save.
+    probe_handle.set_fingerprint(Some(RepoFingerprint {
+        head_sha: "aaa".to_string(),
+        dirty_hash: "dirty".to_string(),
+    }));
+    agent
+        .run(&PathBuf::from("/repo"), &query("second question"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        mem_probe
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, MemCall::GetArchitectureText { .. }))
+            .count(),
+        1,
+        "the brief must be built once per HEAD, not once per query"
+    );
+}
+
+#[tokio::test]
+async fn repo_brief_disabled_makes_no_backend_call() {
+    let provider = MockLlmProvider::new().with_responses(vec![finish_now()]);
+    let provider_probe = provider.clone();
+    let memory =
+        MockMemoryBackend::new().with_get_architecture_text_result(Ok(ARCH_PAYLOAD.to_string()));
+    let mem_probe = memory.clone();
+    let mut settings = fallback_only();
+    settings.repo_brief.enabled = false;
+    let agent = AgentLoop::new(
+        memory,
+        MockSearchBackend::new(),
+        single_router(provider),
+        MockRepoStateProbe::new().with_fingerprint(Some(fp("aaa"))),
+        settings,
+        CacheSettings::default(),
+        TEST_INDEX_TRUST_TTL,
+    );
+
+    agent
+        .run(&PathBuf::from("/repo"), &query("where is main"))
+        .await
+        .unwrap();
+
+    assert!(
+        !mem_probe
+            .calls()
+            .iter()
+            .any(|c| matches!(c, MemCall::GetArchitectureText { .. }))
+    );
+    assert_eq!(
+        provider_probe.calls()[0]
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::System)
+            .count(),
+        1,
+        "the kill switch must restore the exact pre-M-2 prompt"
+    );
+}

@@ -35,6 +35,19 @@ Owns `serde_json` — core stays free of it. Full pipeline design:
 - **Explorative fallback loop** — the hardened path when verification isn't
   confident: enforces a token budget, batches tool calls, and forces a final
   finish (via the Stage-4 `ProviderRouter`) rather than looping indefinitely.
+  It is also the only stage that gets a **repo brief**: one deterministic
+  `get_architecture_text` call, rendered by `brief.rs` into a token-budgeted
+  markdown block (`[agent.repo_brief] max_tokens`, chars/4 estimate, over
+  budget drops the smallest modules) and injected as a _second_
+  `Message::system` — every system message carries its own provider cache
+  breakpoint, so the static prefix stays byte-stable (see
+  `fallback_cache_prefix_is_byte_stable`) and the "do NOT call
+  get_architecture" hardening line ships inside the brief, never in
+  `FALLBACK_SYSTEM_PROMPT`. Memoized in `cache.rs`'s `briefs` map, keyed on
+  the repo fingerprint's HEAD alone or HEAD+dirty per `[agent.repo_brief]
+key`. Every failure (disabled, backend error, unusable payload) degrades to
+  the pre-M-2 single-system-message prompt. Verification (Stage 4) gets no
+  brief — it is the common path, the brief is for the blind one.
 
 ## Per-query metrics
 
@@ -46,3 +59,10 @@ that path's INFO log line (what `eval/run.py` parses), and, when
 appended JSONL line — the only lossless copy (it also carries `repo_path`,
 `query`, `findings_count`, `summary_len`). Never stdout — that is the MCP
 JSON-RPC channel.
+
+Stage-5-only fields: `brief_tokens` (estimated size of the injected repo
+brief) and `orientation_calls_in_loop` (in-loop `get_architecture` calls
+actually executed). Both are `Option<u32>`, seeded on Stage-5 entry — absent
+means "Stage 5 never ran", never a fabricated `0` (tracing emits nothing for
+`None`, the same `confidence`/`candidate_count` convention `eval/run.py`
+relies on).

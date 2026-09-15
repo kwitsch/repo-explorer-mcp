@@ -146,6 +146,20 @@ as every other section (the `-warmup` row is excluded):
   entry makes the run's cost `n/a` and names the unpriced models; it is never costed at 0. A
   failed attempt that reports no token usage costs 0 and is not counted as unpriced.
 - `latency_per_query` / `total_ms` — mean and p95.
+- `brief_tokens` / `orientation_calls_in_loop` (M-2, added 2026-09-15) — **denominated over the
+  rows that carry `orientation_calls_in_loop`**, the same restriction `early_exit_route` gets.
+  The server emits both exclusively on the Stage-5 path (the deterministic repo brief is
+  prefetched on entry to the explorative fallback loop and nowhere else), so a
+  verify/early-exit/cache row has no value to contribute and must not pad the denominator. That
+  is the field's presence, not `stage == "fallback"`: a Stage-5 run that ends in a provider
+  error reports `stage == "error"` and still carries a truthful orientation count, so filtering
+  on the stage name would silently drop it from the acceptance gate. `brief_tokens` is the server's own
+  chars/4 estimate of the injected brief; `orientation_calls_in_loop` counts the
+  `get_architecture` calls the model still made _inside_ the loop — the M-2 acceptance gate is
+  `< 0.2` per Stage-5 query, which is only readable against a Stage-5 denominator. Note the
+  corpus currently produces very few fallback rows (2 of 64 in the committed baseline, both the
+  same query), so `n` on these two lines is small; read them alongside the per-query CSV
+  filtered on `stage == fallback`, not as run-wide means.
 
 Every metric degrades to `n/a (field absent in this run)` on a results/ dir written before the
 field existed, so old runs rescore without crashing and without reporting a fabricated zero.
@@ -158,12 +172,12 @@ Prices in `score.py`'s `PRICES` are USD per 1M tokens, captured **2026-09-15** f
 <https://ai.google.dev/pricing>, covering the six models in `config/default.toml`'s failover
 chain. They are the published **tier** rates (Flash / Flash-Lite) applied to every model in that
 tier — the individual 3.x per-model rates were not re-verified on the capture date. Treat
-`cost_per_query` as a signal comparable *between runs of this harness*, not as an invoice, and
+`cost_per_query` as a signal comparable _between runs of this harness_, not as an invoice, and
 re-check the table before quoting a dollar figure anywhere else.
 
 ### Known gap: `outer_followup_rate` is not measurable here
 
-The plan's `outer_followup_rate` — how often the *calling* agent has to issue a follow-up
+The plan's `outer_followup_rate` — how often the _calling_ agent has to issue a follow-up
 `explore_repository` call (or fall back to its own Grep/Read) after one answer — cannot be
 produced by this harness at all. `run.py` is a scripted MCP client: it issues exactly one call
 per query and never decides it needs another, so the metric is structurally always 0 here.

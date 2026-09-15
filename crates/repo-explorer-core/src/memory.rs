@@ -125,6 +125,14 @@ pub trait MemoryBackend {
         repo_root: &Path,
         target: &SnippetTarget,
     ) -> Result<ExplorationResult, MemoryError>;
+
+    /// `get_architecture` with the raw multi-section response preserved
+    /// verbatim instead of mapped to findings — the `node_labels:`/
+    /// `edge_types:`/`packages:` sections carry no file column, so the
+    /// finding mapper drops exactly the data the deterministic repo-brief
+    /// prefetch is made of. No default body: an empty one would silently
+    /// yield no brief on a real backend.
+    async fn get_architecture_text(&self, repo_root: &Path) -> Result<String, MemoryError>;
 }
 
 /// In-memory `MemoryBackend` for tests: returns per-method canned results and
@@ -167,6 +175,9 @@ pub mod mock {
             repo_root: PathBuf,
             depth: Option<u32>,
         },
+        GetArchitectureText {
+            repo_root: PathBuf,
+        },
         GetCodeSnippet {
             repo_root: PathBuf,
             target: SnippetTarget,
@@ -190,6 +201,7 @@ pub mod mock {
         query_graph: Result<ExplorationResult, MemoryError>,
         trace_path: Result<ExplorationResult, MemoryError>,
         get_architecture: Result<ExplorationResult, MemoryError>,
+        get_architecture_text: Result<String, MemoryError>,
         get_code_snippet: Result<ExplorationResult, MemoryError>,
         calls: Arc<Mutex<Vec<Call>>>,
     }
@@ -204,6 +216,7 @@ pub mod mock {
                 query_graph: Ok(empty_result()),
                 trace_path: Ok(empty_result()),
                 get_architecture: Ok(empty_result()),
+                get_architecture_text: Ok(String::new()),
                 get_code_snippet: Ok(empty_result()),
                 calls: Arc::new(Mutex::new(Vec::new())),
             }
@@ -256,6 +269,10 @@ pub mod mock {
             r: Result<ExplorationResult, MemoryError>,
         ) -> Self {
             self.get_architecture = r;
+            self
+        }
+        pub fn with_get_architecture_text_result(mut self, r: Result<String, MemoryError>) -> Self {
+            self.get_architecture_text = r;
             self
         }
         pub fn with_get_code_snippet_result(
@@ -358,6 +375,13 @@ pub mod mock {
                 depth,
             });
             self.get_architecture.clone()
+        }
+
+        async fn get_architecture_text(&self, repo_root: &Path) -> Result<String, MemoryError> {
+            self.record(Call::GetArchitectureText {
+                repo_root: repo_root.to_path_buf(),
+            });
+            self.get_architecture_text.clone()
         }
 
         async fn get_code_snippet(
@@ -503,7 +527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mock_records_all_seven_methods() {
+    async fn mock_records_all_eight_methods() {
         let backend = MockMemoryBackend::new();
         let root = PathBuf::from("/repo");
         let q = ExplorationQuery {
@@ -521,8 +545,15 @@ mod tests {
         let _ = backend.trace_path(&root, "a", "b", Some(3)).await;
         let _ = backend.get_architecture(&root, Some(2)).await;
         let _ = backend.get_code_snippet(&root, &target).await;
+        let _ = backend.get_architecture_text(&root).await;
         let calls = backend.calls();
-        assert_eq!(calls.len(), 7);
+        assert_eq!(calls.len(), 8);
+        assert_eq!(
+            calls[7],
+            Call::GetArchitectureText {
+                repo_root: root.clone()
+            }
+        );
         assert_eq!(
             calls[3],
             Call::QueryGraph {

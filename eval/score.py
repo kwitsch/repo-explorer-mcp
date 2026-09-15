@@ -665,6 +665,13 @@ def qw0_metrics(rows: list[dict]) -> dict:
     stage_exit = Counter(r.get("stage") or "<none>" for r in rows)
     routes = [qw0_field(r, "early_exit_route") for r in rows if r.get("stage") == "early-exit"]
     routes = [x for x in routes if x is not None]
+    # M-2: both fields are emitted only on the Stage-5 path, so they are denominated over
+    # Stage-5 rows only — the same restriction early_exit_route gets above. Averaging
+    # orientation_calls_in_loop over all rows would divide a fallback-only numerator by the
+    # whole corpus and report ~0.00 for a loop that never stopped calling get_architecture.
+    # Stage 5 also exits as stage=="error" (provider exhaustion) carrying truthful counts, so
+    # the denominator is "the row has a count", not the clean-exit stage name.
+    fallback_rows = [r for r in rows if r.get("orientation_calls_in_loop") is not None]
     return {
         "n_rows": len(rows),
         "llm_calls": _dist(llm_calls),
@@ -676,6 +683,8 @@ def qw0_metrics(rows: list[dict]) -> dict:
         "cost": qw0_cost(rows),
         "latency_ms": _dist(numeric_field(rows, "latency_ms")),
         "total_ms": _dist(numeric_field(rows, "total_ms")),
+        "brief_tokens": _dist(numeric_field(fallback_rows, "brief_tokens")),
+        "orientation_calls_in_loop": _dist(numeric_field(fallback_rows, "orientation_calls_in_loop")),
     }
 
 
@@ -740,6 +749,12 @@ def print_qw0_report(agg: dict) -> None:
     print(f"  latency_per_query:   {_fmt_dist(agg['latency_ms'], unit='ms')}")
     print(f"  total_ms (server-side): {_fmt_dist(agg['total_ms'], unit='ms')}")
 
+    # M-2 repo brief. Both are Stage-5-only measurements: `n` is the number of fallback rows
+    # that reported the field, NOT the run's row count. A run whose binary predates M-2, or one
+    # with no fallback row at all, prints n/a here — never 0.
+    print(f"  brief_tokens (fallback rows):        {_fmt_dist(agg['brief_tokens'], keys=('mean', 'p50', 'p95'))}")
+    print(f"  orientation_calls_in_loop (fallback rows): {_fmt_dist(agg['orientation_calls_in_loop'])}")
+
 
 CSV_COLUMNS = [
     "run_id",
@@ -761,6 +776,8 @@ CSV_COLUMNS = [
     "total_ms",
     "confidence",
     "candidate_count",
+    "brief_tokens",
+    "orientation_calls_in_loop",
 ]
 
 
@@ -791,6 +808,8 @@ def qw0_csv_rows(result: dict) -> list[dict]:
                 "total_ms": qw0_field(r, "total_ms"),
                 "confidence": r.get("confidence"),
                 "candidate_count": qw0_field(r, "candidate_count"),
+                "brief_tokens": qw0_field(r, "brief_tokens"),
+                "orientation_calls_in_loop": qw0_field(r, "orientation_calls_in_loop"),
             }
         )
     return out

@@ -10,6 +10,7 @@
 //! in `repo-explorer-memory` and `genai` in `repo-explorer-llm`.
 
 mod agent;
+mod brief;
 mod cache;
 mod dispatch;
 mod pipeline;
