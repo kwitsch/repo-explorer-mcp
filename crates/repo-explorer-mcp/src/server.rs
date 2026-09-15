@@ -32,6 +32,23 @@ use tracing::Instrument;
 pub type Agent =
     AgentLoop<MemoryClientBackend, CliSearchBackend, GenaiProvider, GitStateProbe, SystemClock>;
 
+/// How much snippet text the response carries. Affects the *response* only —
+/// LLM prompt rendering always uses `agent.snippet_max_chars`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum ResponseFormat {
+    /// Snippets capped at `agent.snippet_max_chars` (default 400). The
+    /// default, and byte-identical to the pre-`response_format` behavior.
+    #[default]
+    Concise,
+    /// Snippets capped at `agent.snippet_max_chars_detailed` (default 1500),
+    /// or at `agent.snippet_max_chars` when that is larger — never narrower
+    /// than `concise`. Findings gathered by the fallback loop's tool calls
+    /// are already capped at the concise size, so a budget-exhausted
+    /// exploration can return concise-length snippets here.
+    Detailed,
+}
+
 /// Input schema for `explore_repository`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -50,6 +67,11 @@ struct ExploreRepositoryRequest {
     /// Optional cap on the number of findings.
     #[serde(default)]
     max_results: Option<u32>,
+    /// How much snippet text to return: `"concise"` (default) or
+    /// `"detailed"` for longer snippets. Does not change how much the server
+    /// sends to its own LLM.
+    #[serde(default)]
+    response_format: ResponseFormat,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -234,20 +256,28 @@ impl RepoExplorerServer {
     }
 
     /// Explore the repository and return structured findings plus a summary.
+    ///
+    /// `read_only_hint = true` is about the *repository*, which this tool
+    /// never writes. It can still trigger an upstream codebase-memory
+    /// reindex, so it is not side-effect-free in the literal sense — that
+    /// cache refresh is invisible to the caller and idempotent, which is what
+    /// MCP's hint actually means.
     #[tool(
         name = "explore_repository",
-        description = "This server handles English-language requests only; \
-                       send the query in English. Explore the repository for \
-                       the given request and return matching file locations \
-                       (path always present; line numbers included when \
-                       resolvable, omitted entirely for an \
-                       unresolved/symbol-only match, plus optional \
-                       snippet/context) plus a summary. Phrase the query with \
-                       the exact code identifier, symbol, or file path you are \
-                       looking for. Args: repo_path (required, absolute path to \
-                       the repository base directory), query (required), optional \
-                       scope_hint (path prefix, relative to repo_path), optional \
-                       max_results."
+        description = "Answers questions about a git repository. Internally: \
+                       code graph (symbols, callers, architecture) + ripgrep + \
+                       LLM synthesis. Returns file:line locations and code \
+                       snippets. Use ONE call per question; do NOT follow up \
+                       with grep/read for locations already returned. Not \
+                       needed for: reading a known file path (use your file \
+                       tool). English-language queries only; name the exact \
+                       identifier, symbol, or file path you are after. Args: \
+                       repo_path (required, absolute path to the repository \
+                       base directory), query (required), optional scope_hint \
+                       (path prefix relative to repo_path), optional \
+                       max_results, optional response_format \
+                       (\"concise\" (default) | \"detailed\" for longer snippets).",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn explore_repository(
         &self,
@@ -263,6 +293,7 @@ impl RepoExplorerServer {
             text: req.query,
             scope_hint: req.scope_hint.map(PathBuf::from),
             max_results: req.max_results,
+            detailed_snippets: req.response_format == ResponseFormat::Detailed,
         };
         let req_id = build_req_id(&repo_path, &query, &self.req_counter);
         let span = tracing::info_span!("explore", req_id = %req_id);
@@ -339,12 +370,14 @@ impl ServerHandler for RepoExplorerServer {
                 .enable_prompts()
                 .build(),
         )
+        // Deliberately does NOT restate the `explore_repository` usage
+        // guidance — that lives in the tool description, which every client
+        // already sees. This string is sent on every initialize; two copies
+        // of the same advice is pure token waste.
         .with_instructions(
-            "Repository exploration server. Handles English-language requests \
-             only — send queries in English. Call `explore_repository` with a \
-             free-text query (best results when it names an exact identifier, \
-             symbol, or file path) to receive structured findings and a \
-             summary. See the listed prompts for example query phrasings.",
+            "Repository exploration server. See the `explore_repository` tool \
+             description for usage, and the listed prompts for example query \
+             phrasings.",
         )
     }
 }
@@ -446,6 +479,33 @@ mod tests {
         assert_eq!(req.repo_path, env!("CARGO_MANIFEST_DIR"));
         assert!(req.scope_hint.is_none());
         assert!(req.max_results.is_none());
+        assert_eq!(
+            req.response_format,
+            ResponseFormat::Concise,
+            "an omitted response_format must keep today's behavior"
+        );
+    }
+
+    #[test]
+    fn deserializes_response_format() {
+        let base = env!("CARGO_MANIFEST_DIR");
+        let parse = |fmt: &str| {
+            serde_json::from_str::<ExploreRepositoryRequest>(&format!(
+                r#"{{"repo_path":{base:?},"query":"q","response_format":"{fmt}"}}"#
+            ))
+        };
+        assert_eq!(
+            parse("concise").expect("concise").response_format,
+            ResponseFormat::Concise
+        );
+        assert_eq!(
+            parse("detailed").expect("detailed").response_format,
+            ResponseFormat::Detailed
+        );
+        assert!(
+            parse("verbose").is_err(),
+            "an unknown variant must be rejected, not silently defaulted"
+        );
     }
 
     #[test]
@@ -458,6 +518,49 @@ mod tests {
         assert_eq!(req.query, "q");
         assert_eq!(req.scope_hint.as_deref(), Some("src"));
         assert_eq!(req.max_results, Some(5));
+    }
+
+    /// Nothing pinned the advertised tool metadata before QW-3. The
+    /// description is what makes a client spend one call instead of following
+    /// up with grep/read, and the annotations are what let a client cache or
+    /// parallelize the call — both are load-bearing, and both are easy to
+    /// silently drop while editing the `#[tool]` attribute.
+    #[test]
+    fn tool_description_and_annotations_are_advertised() {
+        let tools = RepoExplorerServer::tool_router().list_all();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "explore_repository")
+            .expect("the tool must be registered");
+        let desc = tool.description.as_deref().expect("a description");
+        for expected in [
+            "Answers questions about a git repository.",
+            "code graph (symbols, callers, architecture) + ripgrep + LLM synthesis",
+            "Returns file:line locations and code snippets.",
+            "Use ONE call per question; do NOT follow up with grep/read for locations already returned.",
+            "Not needed for: reading a known file path (use your file tool).",
+            "response_format",
+        ] {
+            assert!(
+                desc.contains(expected),
+                "description lost {expected:?}: {desc}"
+            );
+        }
+
+        let ann = tool
+            .annotations
+            .as_ref()
+            .expect("annotations must be advertised");
+        assert_eq!(ann.read_only_hint, Some(true));
+        assert_eq!(ann.idempotent_hint, Some(true));
+        assert_eq!(ann.open_world_hint, Some(false));
+
+        // rmcp auto-derives this from the `Result<Json<T>, String>` return
+        // type. Hand-building a CallToolResult would silently drop it.
+        assert!(
+            tool.output_schema.is_some(),
+            "the output schema must stay advertised"
+        );
     }
 
     #[test]

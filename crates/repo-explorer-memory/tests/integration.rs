@@ -56,6 +56,7 @@ async fn ensure_fresh_index_then_search_code() {
         text: "MemoryBackend".to_string(),
         scope_hint: None,
         max_results: Some(5),
+        detailed_snippets: false,
     };
     let result = backend
         .search_code(&root, &query)

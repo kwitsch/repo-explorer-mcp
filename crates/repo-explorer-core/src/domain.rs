@@ -38,6 +38,19 @@ pub struct ExplorationQuery {
     pub text: String,
     pub scope_hint: Option<PathBuf>,
     pub max_results: Option<u32>,
+    /// Response-side rendering only: `true` caps the *final* findings'
+    /// snippets at `agent.snippet_max_chars_detailed` instead of the default
+    /// `agent.snippet_max_chars` (as a floor — never narrower than the
+    /// concise cap). LLM *prompt* rendering keeps `agent.snippet_max_chars`
+    /// either way — raising the prompt cap would inflate token cost, the
+    /// opposite of what this flag is for. Part of the query cache key, so a
+    /// detailed call can't be served a concise entry.
+    ///
+    /// Known limit: findings produced by the fallback loop's tool dispatch
+    /// are already capped at `agent.snippet_max_chars` when they are
+    /// dispatched, so on that loop's budget-exhausted-without-finish exit
+    /// this flag cannot widen them.
+    pub detailed_snippets: bool,
 }
 
 /// The outcome of running an [`ExplorationQuery`].
@@ -96,6 +109,7 @@ mod tests {
             text: "where is main".to_string(),
             scope_hint: Some(PathBuf::from("src")),
             max_results: Some(5),
+            detailed_snippets: false,
         };
         let result = ExplorationResult {
             findings: vec![finding.clone()],

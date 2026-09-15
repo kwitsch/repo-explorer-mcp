@@ -340,6 +340,10 @@ fn to_genai_message(
     use genai::chat::{ChatMessage, ContentPart, MessageContent, ToolResponse};
 
     match message.role {
+        // Must stay a `ChatMessage::system` — genai's `ChatRequest::system`
+        // field can never carry cache_control, so refactoring to
+        // `ChatRequest::with_system` would silently kill Anthropic prompt
+        // caching (guarded by `to_genai_messages_marks_only_the_system_message`).
         Role::System => Ok(ChatMessage::system(message.content.clone())),
         Role::User => Ok(ChatMessage::user(message.content.clone())),
         Role::Assistant => {
@@ -498,9 +502,14 @@ fn usage_from(usage: &genai::chat::Usage) -> Option<TokenUsage> {
         return None;
     }
     let clamp = |n: Option<i32>| n.map(|n| n.max(0) as u64).unwrap_or(0);
+    // genai zeroes-to-None, so `prompt_tokens_details` is absent on a cache
+    // MISS. That means "no cache activity" — 0, not "unknown".
+    let details = usage.prompt_tokens_details.as_ref();
     Some(TokenUsage {
         prompt_tokens: clamp(usage.prompt_tokens),
         completion_tokens: clamp(usage.completion_tokens),
+        cached_tokens: clamp(details.and_then(|d| d.cached_tokens)),
+        cache_creation_tokens: clamp(details.and_then(|d| d.cache_creation_tokens)),
     })
 }
 
@@ -571,39 +580,32 @@ impl LlmProvider for GenaiProvider {
             Ok(response) => {
                 let latency_ms = start.elapsed().as_millis() as u64;
                 let usage = usage_from(&response.usage);
+                // One non-branching `info!`: a missing count is logged as 0
+                // rather than dropping the field, so every `provider call`
+                // line carries the same key set for downstream parsers.
                 let reasoning_tokens = response
                     .usage
                     .completion_tokens_details
                     .as_ref()
-                    .and_then(|d| d.reasoning_tokens);
+                    .and_then(|d| d.reasoning_tokens)
+                    .map(|n| n.max(0) as u64)
+                    .unwrap_or(0);
                 let model_served = response.provider_model_iden.model_name.as_str();
-                let prompt_tokens = usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
-                let completion_tokens = usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0);
-                match reasoning_tokens {
-                    Some(reasoning_tokens) => tracing::info!(
-                        provider = %self.name,
-                        model_requested = %self.model,
-                        model_served,
-                        attempt,
-                        outcome = "ok",
-                        latency_ms,
-                        prompt_tokens,
-                        completion_tokens,
-                        reasoning_tokens,
-                        "provider call"
-                    ),
-                    None => tracing::info!(
-                        provider = %self.name,
-                        model_requested = %self.model,
-                        model_served,
-                        attempt,
-                        outcome = "ok",
-                        latency_ms,
-                        prompt_tokens,
-                        completion_tokens,
-                        "provider call"
-                    ),
-                }
+                let counts = usage.unwrap_or_default();
+                tracing::info!(
+                    provider = %self.name,
+                    model_requested = %self.model,
+                    model_served,
+                    attempt,
+                    outcome = "ok",
+                    latency_ms,
+                    prompt_tokens = counts.prompt_tokens,
+                    completion_tokens = counts.completion_tokens,
+                    reasoning_tokens,
+                    cached_tokens = counts.cached_tokens,
+                    cache_creation_tokens = counts.cache_creation_tokens,
+                    "provider call"
+                );
                 let response = from_genai_response(&self.name, response)?;
                 Ok(Completion { response, usage })
             }
@@ -910,6 +912,75 @@ mod tests {
         assert_eq!(responses[0].content, "code results");
         assert_eq!(responses[1].call_id, "toolu_01B");
         assert_eq!(responses[1].content, "graph results");
+    }
+
+    /// The cache-control marker on each mapped message, in order.
+    fn cache_controls(
+        messages: &[Message],
+        cache_system_prompt: bool,
+    ) -> Vec<Option<genai::chat::CacheControl>> {
+        to_genai_messages("p", messages, cache_system_prompt)
+            .expect("mapping succeeds")
+            .into_iter()
+            .map(|m| m.options.and_then(|o| o.cache_control))
+            .collect()
+    }
+
+    fn cacheable_conversation() -> Vec<Message> {
+        vec![
+            Message::system("system"),
+            Message::user("user"),
+            Message::assistant_text("assistant"),
+        ]
+    }
+
+    #[test]
+    fn to_genai_messages_marks_only_the_system_message() {
+        // Anthropic prompt caching rests entirely on this marker: genai turns
+        // it into a `cache_control` breakpoint on the system block which — per
+        // Anthropic's tools -> system -> messages prefix order — also covers
+        // the tool definitions. Nothing else may be marked: Anthropic allows at
+        // most 4 breakpoints, and a breakpoint on per-query content caches
+        // bytes that are never reused. Without this test a regression dropping
+        // the marker (or moving the system prompt to `ChatRequest::system`,
+        // which cannot carry cache_control) would be silent.
+        assert_eq!(
+            cache_controls(&cacheable_conversation(), true),
+            vec![Some(genai::chat::CacheControl::Ephemeral), None, None]
+        );
+    }
+
+    #[test]
+    fn to_genai_messages_marks_nothing_when_caching_is_off() {
+        assert!(
+            cache_controls(&cacheable_conversation(), false)
+                .iter()
+                .all(Option::is_none)
+        );
+    }
+
+    #[test]
+    fn bind_model_enables_prompt_caching_for_anthropic_only() {
+        use genai::adapter::AdapterKind;
+        // genai's Gemini adapter ignores message-level cache_control entirely
+        // and its OpenAI adapter honours only request-level hints, so marking
+        // system messages for either is dead weight on the wire.
+        for (kind, expected) in [
+            (AdapterKind::Anthropic, true),
+            (AdapterKind::OpenAI, false),
+            (AdapterKind::Gemini, false),
+        ] {
+            let shared = SharedProviderParts {
+                name: "p".to_string(),
+                client: genai::Client::builder().with_adapter_kind(kind).build(),
+                adapter_kind: kind,
+            };
+            assert_eq!(
+                GenaiProvider::bind_model(&shared, "model").cache_system_prompt,
+                expected,
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]

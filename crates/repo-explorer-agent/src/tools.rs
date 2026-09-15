@@ -487,6 +487,38 @@ pub(crate) async fn resolve_finish(
     Err(rejections)
 }
 
+/// Size and identity of the provider-side prompt-cache prefix for one LLM
+/// stage: its system prompt plus its serialized tool catalog. Anthropic's
+/// cache breakpoint sits on the system block and its prefix order is
+/// `tools -> system -> messages`, so this is the whole cacheable region (the
+/// per-query user message follows it and is never cached).
+///
+/// Returns `(content bytes, FNV-1a over the same bytes)`: the count says
+/// whether the prefix clears the minimum cacheable size, the hash catches
+/// same-length edits (a typo fix in a prompt or a description) that move
+/// every byte of the cached prefix without moving its length. FNV-1a by hand
+/// rather than `DefaultHasher`, whose output is not stable across Rust
+/// releases and would turn this into a toolchain-upgrade flake.
+#[cfg(test)]
+pub(crate) fn cache_prefix_fingerprint(system_prompt: &str, catalog: &[Tool]) -> (usize, u64) {
+    let mut len = 0usize;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for s in std::iter::once(system_prompt).chain(catalog.iter().flat_map(|t| {
+        [
+            t.name.as_str(),
+            t.description.as_str(),
+            t.parameters_schema_json.as_str(),
+        ]
+    })) {
+        len += s.len();
+        for b in s.as_bytes() {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    (len, hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

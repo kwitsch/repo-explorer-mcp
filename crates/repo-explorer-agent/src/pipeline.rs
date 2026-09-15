@@ -10,7 +10,8 @@ use repo_explorer_core::domain::{
 use repo_explorer_core::fingerprint::RepoFingerprint;
 use repo_explorer_core::memory::{GraphQuery, MemoryBackend};
 use repo_explorer_core::retrieval::{
-    QueryPatterns, confidence, derive_patterns, leg_identifiers, merge_and_rank,
+    QueryPatterns, confidence, derive_patterns, is_unknown_location, leg_identifiers,
+    merge_and_rank,
 };
 use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use std::collections::HashSet;
@@ -48,6 +49,20 @@ pub(crate) struct RetrievalOutcome {
     /// the real `verify` module), which is what produced the original F-16
     /// false early-exit and is still excluded via `is_trusted_symbol_match`.
     pub has_exact_symbol_match: bool,
+    /// Index into `candidates` of the *only* trusted exact symbol match, when
+    /// there is exactly one and its location is known. `None` when there is
+    /// none, when two or more disagree (the same name in two files stays two
+    /// candidates — `merge_and_rank` only merges within one file — and two
+    /// distinct names that *did* get merged are caught pre-merge by
+    /// `distinct_trusted_symbols`), or when the sole match has no real
+    /// location (`line_start == 0`).
+    ///
+    /// Exactly one trusted match is unambiguous *by construction*, which the
+    /// `confidence` score cannot express: it is pure score arithmetic, so a
+    /// strong `SymbolFuzzy` runner-up deflates it (700 vs 400 → 88) and the
+    /// verification round-trip gets paid for a question already answered.
+    /// Gates the Stage-3 unique-symbol route (QW-2).
+    pub unique_trusted_symbol: Option<usize>,
     /// True when the query's top-level `scope_hint` was present but escapes
     /// the repository root (`dispatch::escapes_repo_root`), and was therefore
     /// dropped for every leg above. Computed once here so `agent::run`'s
@@ -155,6 +170,7 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
                             text: token.clone(),
                             scope_hint: scope.map(Path::to_path_buf),
                             max_results: query.max_results,
+                            detailed_snippets: false,
                         };
                         soft_leg(
                             "semantic",
@@ -226,17 +242,54 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
     raw.extend(greps.into_iter().flatten());
     raw.extend(files.into_iter().flatten());
 
+    // Counted BEFORE `merge_and_rank`, which folds two overlapping symbols in
+    // one file into a single candidate and drops the loser's name (a class
+    // and one of its methods, an impl and one of its fns): post-merge, that
+    // genuine ambiguity would look unique.
+    let distinct_trusted = distinct_trusted_symbols(&raw, &patterns);
     let candidates = merge_and_rank(raw, &patterns, top_k);
     let confidence = confidence(&candidates);
     let has_exact_symbol_match = candidates
         .iter()
         .any(|c| is_trusted_symbol_match(c, &patterns));
+    let unique_trusted_symbol = (distinct_trusted <= 1)
+        .then(|| unique_trusted_symbol(&candidates, &patterns))
+        .flatten();
     RetrievalOutcome {
         candidates,
         confidence,
         has_exact_symbol_match,
+        unique_trusted_symbol,
         scope_hint_escaped,
     }
+}
+
+/// How many *distinct* trusted exact symbol names the raw (pre-merge) set
+/// carries. Names are compared by last segment, so the same symbol reported
+/// with different qualification by two legs still counts once.
+fn distinct_trusted_symbols(raw: &[Candidate], patterns: &QueryPatterns) -> usize {
+    raw.iter()
+        .filter(|c| is_trusted_symbol_match(c, patterns))
+        .filter_map(|c| c.symbol.as_deref().map(last_segment))
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// Index of the sole trusted exact symbol match — see
+/// `RetrievalOutcome::unique_trusted_symbol`. Two-step, not a `collect`: take
+/// the first match, require that there is no second, and require that the one
+/// survivor points at a real line (an unknown location can't be verified
+/// against the filesystem, so it must not license skipping verification).
+fn unique_trusted_symbol(candidates: &[Candidate], patterns: &QueryPatterns) -> Option<usize> {
+    let mut trusted = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| is_trusted_symbol_match(c, patterns));
+    trusted
+        .next()
+        .filter(|_| trusted.next().is_none())
+        .filter(|(_, c)| !is_unknown_location(&c.location))
+        .map(|(index, _)| index)
 }
 
 /// A `SymbolExact` candidate is trustworthy for the early-exit gate only when
@@ -443,6 +496,52 @@ mod tests {
         assert_eq!(out[2].kind, CandidateKind::SymbolFuzzy);
     }
 
+    /// A `SymbolExact` candidate at `path`/`line` named `symbol`.
+    fn symbol_candidate(path: &str, line: u32, symbol: &str) -> Candidate {
+        Candidate {
+            location: FileLocation {
+                path: PathBuf::from(path),
+                line_start: line,
+                line_end: line,
+            },
+            symbol: Some(symbol.to_string()),
+            kind: CandidateKind::SymbolExact,
+            score: 700,
+            snippet: None,
+        }
+    }
+
+    #[test]
+    fn unique_trusted_symbol_signals() {
+        // One trusted match -> its index (QW-2's entry condition).
+        let patterns = derive_patterns("decide_freshness");
+        let one = vec![symbol_candidate("a.rs", 12, "m::decide_freshness")];
+        assert_eq!(unique_trusted_symbol(&one, &patterns), Some(0));
+
+        // The same name in two files stays two candidates (merge_and_rank only
+        // merges within one file) -> ambiguous, so Stage 4 must still run.
+        let two = vec![
+            symbol_candidate("a.rs", 12, "m::decide_freshness"),
+            symbol_candidate("b.rs", 3, "other::decide_freshness"),
+        ];
+        assert_eq!(unique_trusted_symbol(&two, &patterns), None);
+
+        // An untrusted SymbolExact (F-16: matched only as a fragment of the
+        // query's own path token) doesn't count against uniqueness.
+        let path_patterns = derive_patterns("crates/x/src/verify.rs:35 decide_freshness");
+        let mixed = vec![
+            symbol_candidate("x.rs", 1, "crates"),
+            symbol_candidate("a.rs", 12, "m::decide_freshness"),
+        ];
+        assert!(!is_trusted_symbol_match(&mixed[0], &path_patterns));
+        assert_eq!(unique_trusted_symbol(&mixed, &path_patterns), Some(1));
+
+        // line_start == 0 is the "location unknown" placeholder: nothing to
+        // verify against the filesystem, so it must not license the skip.
+        let unknown = vec![symbol_candidate("a.rs", 0, "m::decide_freshness")];
+        assert_eq!(unique_trusted_symbol(&unknown, &patterns), None);
+    }
+
     #[test]
     fn file_glob_shapes() {
         assert_eq!(file_glob_for("crates/core/src/llm.rs"), "llm.rs");
@@ -479,10 +578,61 @@ mod tests {
             text: "decide_freshness".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let out = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
         assert_eq!(out.candidates[0].kind, CandidateKind::SymbolExact);
         assert!(out.confidence >= 90, "got {}", out.confidence);
+    }
+
+    #[tokio::test]
+    async fn two_symbols_merged_into_one_candidate_are_not_unique() {
+        // A container symbol and one of its members in the same file: their
+        // ranges overlap, so `merge_and_rank` folds them into ONE candidate
+        // and keeps only the stronger name — post-merge the ambiguity is
+        // invisible and the unique-symbol early exit would answer with the
+        // container, never reporting the member the user also asked about.
+        // Counting trusted names PRE-merge is what keeps the gate shut.
+        let memory = MockMemoryBackend::new().with_search_graph_result(Ok(ExplorationResult {
+            findings: vec![
+                ExplorationFinding {
+                    location: FileLocation {
+                        path: PathBuf::from("cache.py"),
+                        line_start: 10,
+                        line_end: 80,
+                    },
+                    snippet: None,
+                    note: Some("Cache".to_string()),
+                },
+                ExplorationFinding {
+                    location: FileLocation {
+                        path: PathBuf::from("cache.py"),
+                        line_start: 30,
+                        line_end: 35,
+                    },
+                    snippet: None,
+                    note: Some("evict".to_string()),
+                },
+            ],
+            summary: "2 rows".to_string(),
+        }));
+        let search = MockSearchBackend::new().with_search_result(Ok(vec![]));
+        let query = ExplorationQuery {
+            text: "Cache evict".to_string(),
+            scope_hint: None,
+            max_results: None,
+            detailed_snippets: false,
+        };
+        let out = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
+        assert_eq!(
+            out.candidates.len(),
+            1,
+            "fixture must actually exercise the merge"
+        );
+        assert_eq!(
+            out.unique_trusted_symbol, None,
+            "two distinct trusted symbols merged into one candidate are still ambiguous"
+        );
     }
 
     #[tokio::test]
@@ -504,6 +654,7 @@ mod tests {
             text: "explain verify".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let out = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
         assert_eq!(out.candidates[0].kind, CandidateKind::SymbolExact);
@@ -525,6 +676,7 @@ mod tests {
                 .to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let out = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
         assert!(
@@ -554,6 +706,7 @@ mod tests {
                 .to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let out = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
         assert_eq!(out.candidates[0].kind, CandidateKind::SymbolExact);
@@ -579,6 +732,7 @@ mod tests {
             text: "decide_freshness".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let out = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
         assert!(out.candidates.is_empty());
@@ -599,6 +753,7 @@ mod tests {
             text: "decide_freshness".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let _ = retrieve(
             &memory,
@@ -614,6 +769,7 @@ mod tests {
             text: "decide_freshness".to_string(),
             scope_hint: Some(PathBuf::from("crates/api")),
             max_results: None,
+            detailed_snippets: false,
         };
         let _ = retrieve(
             &memory,
@@ -664,6 +820,7 @@ mod tests {
             text: r#"grep for "x#y""#.to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let _ = retrieve(
             &memory,
@@ -684,6 +841,7 @@ mod tests {
             text: r#"grep for "x""#.to_string(),
             scope_hint: Some(PathBuf::from("y#")),
             max_results: None,
+            detailed_snippets: false,
         };
         let out_b = retrieve(
             &memory,
@@ -717,6 +875,7 @@ mod tests {
             text: "\"exact phrase\" plus_token".to_string(),
             scope_hint: Some(PathBuf::from("crates")),
             max_results: None,
+            detailed_snippets: false,
         };
         let _ = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
         let calls = search.calls();
@@ -736,6 +895,7 @@ mod tests {
             text: "main".to_string(),
             scope_hint: Some(PathBuf::from("/etc")),
             max_results: None,
+            detailed_snippets: false,
         };
         let _ = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
         let calls = search.calls();
@@ -758,6 +918,7 @@ mod tests {
             text: "main".to_string(),
             scope_hint: Some(PathBuf::from("../../etc")),
             max_results: None,
+            detailed_snippets: false,
         };
         let _ = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
         let calls = search.calls();
@@ -786,6 +947,7 @@ mod tests {
             text: "hello world foo_bar".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let _ = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
         let calls = memory.calls();

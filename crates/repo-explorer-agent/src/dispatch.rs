@@ -70,6 +70,7 @@ pub(crate) async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
                 text: args.query,
                 scope_hint,
                 max_results: args.max_results,
+                detailed_snippets: false,
             };
             call_and_render("search_code", memory.search_code(repo_root, &query), caps).await
         }
@@ -437,6 +438,7 @@ mod tests {
                     text: "main".to_string(),
                     scope_hint: Some(PathBuf::from("src")),
                     max_results: Some(7),
+                    detailed_snippets: false,
                 },
             }
         );

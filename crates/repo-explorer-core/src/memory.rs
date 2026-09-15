@@ -477,6 +477,7 @@ mod tests {
             text: "x".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let res = backend.search_code(&root, &q).await.unwrap();
         assert!(res.findings.is_empty());
@@ -509,6 +510,7 @@ mod tests {
             text: "t".to_string(),
             scope_hint: None,
             max_results: None,
+            detailed_snippets: false,
         };
         let gq = GraphQuery::default();
         let target = SnippetTarget::QualifiedName("a::b".to_string());
