@@ -345,6 +345,69 @@ def check_repo_brief_metrics() -> None:
     assert csv_row["brief_tokens"] == 640 and csv_row["orientation_calls_in_loop"] == 0
 
 
+def check_cache_hit_metrics() -> None:
+    """M-1's three cache-hit fields: parsed off the query-cache line by run.py, and aggregated
+    with two different denominators — the hit rates over every scored row, the saved counters
+    over the cache rows only. The pre-M-1 case is the one that matters: that run HAS cache rows
+    (stage=="cache") but no cache_layer, so the total rate must stay a real measurement while
+    the l1/l2 split reports absent, never 0%."""
+    parsed = parse_call_lines([
+        "INFO explore{req_id=a-0}: repo_explorer_agent::agent: exploration served from query "
+        'cache path="cache" tokens=0 llm_calls=0 cache_layer="l2" '
+        "turns_saved_by_cache=3 tokens_saved_by_cache=18420"
+    ])
+    assert parsed["stage"] == "cache"
+    assert parsed["cache_layer"] == "l2", parsed
+    assert parsed["turns_saved_by_cache"] == 3, parsed
+    assert parsed["tokens_saved_by_cache"] == 18420, parsed
+    assert parse_call_lines([COMPLETE_LINE])["cache_layer"] is None  # pre-M-1 line
+
+    # Pre-M-1 run: 1 of 4 rows was a cache hit, so 25% is measured — but which layer is not.
+    old = qw0_metrics([
+        _row(query_id="a", stage="cache", llm_calls=0, tokens=0),
+        _row(query_id="b", stage="verify", llm_calls=2, tokens=1000),
+        _row(query_id="c", stage="verify", llm_calls=2, tokens=1000),
+        _row(query_id="d", stage="verify", llm_calls=2, tokens=1000),
+    ])
+    assert old["cache_hits"]["hit_rate"] == 0.25, old["cache_hits"]
+    assert old["cache_hits"]["cache_hit_l1"] is None, old["cache_hits"]
+    assert old["cache_hits"]["cache_hit_l2"] is None, old["cache_hits"]
+    assert old["turns_saved_by_cache"] is None
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print_qw0_report(old)
+    out = buf.getvalue()
+    assert "cache_hit_rate: 25.0%  (1 of 4 scored rows served from cache)" in out, out
+    assert f"cache_hit_l1 / cache_hit_l2: {NA_ABSENT}" in out, out
+    assert f"turns_saved_by_cache (cache rows):   {NA_ABSENT}" in out, out
+
+    # M-1 run: the layer split shares the all-rows denominator; the saved counters do not.
+    agg = qw0_metrics([
+        _row(query_id="a", stage="cache", llm_calls=0, tokens=0, cache_layer="l1",
+             turns_saved_by_cache=2, tokens_saved_by_cache=10000),
+        _row(query_id="b", stage="cache", llm_calls=0, tokens=0, cache_layer="l2",
+             turns_saved_by_cache=4, tokens_saved_by_cache=20000),
+        _row(query_id="c", stage="verify", llm_calls=2, tokens=1000),
+        _row(query_id="d", stage="verify", llm_calls=2, tokens=1000),
+    ])
+    assert agg["cache_hits"]["cache_hit_l1"] == 0.25, agg["cache_hits"]
+    assert agg["cache_hits"]["cache_hit_l2"] == 0.25, agg["cache_hits"]
+    assert agg["turns_saved_by_cache"]["n"] == 2, "denominated over cache rows, not all rows"
+    assert agg["turns_saved_by_cache"]["mean"] == 3.0, agg["turns_saved_by_cache"]
+    assert agg["tokens_saved_by_cache"]["mean"] == 15000.0, agg["tokens_saved_by_cache"]
+
+    # A run with no cache row at all: 0% is a measurement (stage is always emitted), not n/a.
+    none_hit = qw0_metrics([_row(query_id="a", stage="verify", llm_calls=2, tokens=1000)])
+    assert none_hit["cache_hits"]["hit_rate"] == 0.0
+
+    csv_row = qw0_csv_rows({"run_id": "x", "scored_rows": [
+        _row(query_id="a", stage="cache", cache_layer="l2", turns_saved_by_cache=4,
+             tokens_saved_by_cache=20000)
+    ]})[0]
+    assert csv_row["cache_layer"] == "l2"
+    assert csv_row["turns_saved_by_cache"] == 4 and csv_row["tokens_saved_by_cache"] == 20000
+
+
 def _write_file(dir_path: Path, name: str, n_lines: int) -> None:
     body = "\n".join(f"SENTINEL_{i:03d}_line_content" for i in range(n_lines))
     (dir_path / name).write_text(body + "\n")
@@ -455,6 +518,7 @@ def main() -> None:
         check_cache_ratio()
         check_csv_rows()
         check_repo_brief_metrics()
+        check_cache_hit_metrics()
 
         # English-only invariant: every eval query string is pure ASCII
         # (scoped to item["query"]; notes/comments keep their non-ASCII

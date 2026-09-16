@@ -15,7 +15,7 @@
 //! messages fed back to the model; only a `RouterError` in the fallback loop
 //! is a hard failure.
 
-use repo_explorer_core::config::{AgentSettings, CacheSettings, RepoBriefKey};
+use repo_explorer_core::config::{AgentSettings, CacheKeyMode, CacheSettings, RepoBriefKey};
 use repo_explorer_core::domain::{
     Candidate, ExplorationFinding, ExplorationQuery, ExplorationResult, FileLocation,
 };
@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use crate::brief;
 use crate::cache::{CappedMap, QueryEntry, ResultCache};
+use crate::disk_cache::{self, FileDep};
 use crate::dispatch::{canonical_repo_root, clamp_location, dispatch_inner, read_verified_file};
 use crate::pipeline;
 use crate::render::{RenderCaps, dedupe_key, tidy_findings};
@@ -185,6 +186,18 @@ pub(crate) struct QueryMetrics {
     /// on Stage-5 entry, so a real zero is distinguishable from "Stage 5
     /// never ran" (`None`).
     pub orientation_calls_in_loop: Option<u32>,
+    /// Which cache layer served this run: `l1` (in-memory) | `l2` (on-disk).
+    /// `None` on every non-cache path — never a fabricated value. `eval`'s
+    /// scorer derives the `cache_hit_l1` / `cache_hit_l2` rates from it; two
+    /// always-false booleans would ride every non-hit log line instead.
+    pub cache_layer: Option<&'static str>,
+    /// `llm_calls` the cached run spent, i.e. the turns this hit avoided.
+    /// `None` unless served from cache.
+    pub turns_saved_by_cache: Option<u32>,
+    /// Tokens the cached run spent. `None` unless served from cache, and
+    /// deliberately *not* folded into `tokens`, which has to keep meaning
+    /// "spend" or the cost aggregate breaks.
+    pub tokens_saved_by_cache: Option<u64>,
 }
 
 impl QueryMetrics {
@@ -218,6 +231,9 @@ impl QueryMetrics {
             total_ms: 0,
             brief_tokens: None,
             orientation_calls_in_loop: None,
+            cache_layer: None,
+            turns_saved_by_cache: None,
+            tokens_saved_by_cache: None,
         }
     }
 
@@ -256,6 +272,9 @@ async fn emit_metrics(metrics: &mut QueryMetrics, msg: &'static str) {
         cache_write_tokens = metrics.cache_write_tokens,
         brief_tokens = metrics.brief_tokens,
         orientation_calls_in_loop = metrics.orientation_calls_in_loop,
+        cache_layer = metrics.cache_layer,
+        turns_saved_by_cache = metrics.turns_saved_by_cache,
+        tokens_saved_by_cache = metrics.tokens_saved_by_cache,
         total_ms = metrics.total_ms,
         "{}",
         msg
@@ -269,6 +288,49 @@ async fn emit_metrics(metrics: &mut QueryMetrics, msg: &'static str) {
     }
     #[cfg(test)]
     EMITTED.with(|v| v.borrow_mut().push(metrics.clone()));
+}
+
+/// Stamp every distinct file the answer references, for `key_mode = "paths"`.
+/// At most `max_results` `stat` calls, and only after the run has already
+/// produced its result — never on the request path.
+async fn collect_deps(repo_root: &Path, result: &ExplorationResult) -> Vec<FileDep> {
+    let mut paths: Vec<String> = Vec::new();
+    for finding in &result.findings {
+        let path = finding.location.path.to_string_lossy().into_owned();
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let repo_root = repo_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        // All or nothing: a partial stamp set would be indistinguishable from
+        // a complete one at validation time (`entry_still_valid` only tests
+        // for emptiness), so the unstamped files would never be checked again.
+        // Empty falls back to `strict`, which is the safe policy.
+        paths
+            .iter()
+            .map(|p| disk_cache::file_dep(&repo_root, p))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Every stamped file still has its store-time `(len, mtime)`. A file that
+/// vanished or became unreadable counts as changed.
+async fn deps_unchanged(repo_root: &Path, deps: &[FileDep]) -> bool {
+    let repo_root = repo_root.to_path_buf();
+    let deps = deps.to_vec();
+    tokio::task::spawn_blocking(move || {
+        deps.iter()
+            .all(|dep| disk_cache::file_dep(&repo_root, &dep.path).as_ref() == Some(dep))
+    })
+    .await
+    .unwrap_or(false)
 }
 
 fn now_unix_ms() -> u64 {
@@ -361,6 +423,9 @@ where
     /// Trust window for `index_refresh_seen`, sourced from
     /// `codebase_memory.staleness_seconds`.
     index_trust_ttl: Duration,
+    /// How a cached entry is proved still valid once the fingerprint moved.
+    /// One policy, applied identically to both cache layers.
+    cache_key_mode: CacheKeyMode,
 }
 
 impl<M, S, P, R, C> AgentLoop<M, S, P, R, C>
@@ -380,9 +445,23 @@ where
         cache_settings: CacheSettings,
         index_trust_ttl: Duration,
     ) -> Self {
+        // The on-disk L2 is opt-in twice over (`enabled` kills both layers,
+        // `persistent` only the disk one) and degrades to `None` — i.e. exactly
+        // today's L1-only behaviour — whenever the directory is unset or
+        // unusable. `dir` arrives already resolved: XDG lookup is a
+        // binary-boundary concern, so no crate below it touches `dirs`.
+        let disk = (cache_settings.enabled && cache_settings.persistent)
+            .then(|| {
+                disk_cache::DiskCache::open(
+                    &cache_settings.dir,
+                    cache_settings.persistent_max_bytes,
+                )
+            })
+            .flatten()
+            .map(std::sync::Arc::new);
         let cache = cache_settings
             .enabled
-            .then(|| ResultCache::new(cache_settings.max_entries));
+            .then(|| ResultCache::new(cache_settings.max_entries, disk));
         let caps = RenderCaps {
             snippet_max_chars: settings.snippet_max_chars as usize,
             ..RenderCaps::default()
@@ -398,15 +477,34 @@ where
             rotation_seed: std::sync::atomic::AtomicUsize::new(0),
             index_refresh_seen: std::sync::Mutex::new(CappedMap::new(cache_settings.max_entries)),
             index_trust_ttl,
+            cache_key_mode: cache_settings.key_mode,
         }
     }
 
     /// Deterministic per-query cache key, exposed so a caller (the MCP
     /// server's `explore` observability span) can derive a short
     /// request-correlation id from the same normalization the query cache
-    /// uses internally.
+    /// uses internally. Correlation only, so it deliberately omits the
+    /// config-derived suffix [`Self::run_query_key`] adds: a `req_id` must
+    /// stay stable per query, not per cache entry.
     pub fn query_cache_key(repo_root: &Path, query: &ExplorationQuery) -> String {
         ResultCache::query_key(repo_root, query)
+    }
+
+    /// The loop's own key: [`Self::query_cache_key`] plus the snippet cap this
+    /// loop would apply. A stored result is already truncated by
+    /// `tidy_and_truncate`, and an L2 entry outlives the config file that set
+    /// that cap — so without this, raising (or lowering) `snippet_max_chars`
+    /// would be silently ignored for every persisted query, with `cache clear`
+    /// as the only way out. `SCHEMA_VERSION` versions the stored *shape*, not
+    /// the settings that produced the value.
+    fn run_query_key(&self, repo_root: &Path, query: &ExplorationQuery) -> String {
+        let mut key = ResultCache::query_key(repo_root, query);
+        crate::cache::encode_field_into(
+            &mut key,
+            &self.response_caps(query).snippet_max_chars.to_string(),
+        );
+        key
     }
 
     pub async fn run(
@@ -420,14 +518,17 @@ where
         let fingerprint = self.probe.fingerprint(repo_root).await;
         let mut metrics = QueryMetrics::new(repo_root, query, git_probe_start);
         metrics.git_probe_ms = git_probe_start.elapsed().as_millis() as u64;
-        let query_key = ResultCache::query_key(repo_root, query);
-        if let Some(hit) = self
+        let query_key = self.run_query_key(repo_root, query);
+        if let Some((hit, layer)) = self
             .query_cache_lookup(repo_root, &query_key, &fingerprint)
             .await
         {
-            metrics.record_result("cache", &hit);
+            metrics.record_result("cache", &hit.result);
+            metrics.cache_layer = Some(layer);
+            metrics.turns_saved_by_cache = Some(hit.llm_turns);
+            metrics.tokens_saved_by_cache = Some(hit.tokens);
             emit_metrics(&mut metrics, "exploration served from query cache").await;
-            return Ok(hit);
+            return Ok(hit.result);
         }
 
         // Stage 1: ensure a fresh index (once). Failures are non-fatal notes.
@@ -611,6 +712,7 @@ where
                 metrics.early_exit_route = route;
                 return Ok(self
                     .complete_run(
+                        repo_root,
                         &mut metrics,
                         "early-exit",
                         &budget,
@@ -653,6 +755,7 @@ where
             {
                 return Ok(self
                     .finalize_and_complete(
+                        repo_root,
                         &mut metrics,
                         "verify",
                         result,
@@ -692,6 +795,7 @@ where
         };
         Ok(self
             .finalize_and_complete(
+                repo_root,
                 &mut metrics,
                 "fallback",
                 result,
@@ -766,6 +870,7 @@ where
     #[allow(clippy::too_many_arguments)]
     async fn complete_run(
         &self,
+        repo_root: &Path,
         metrics: &mut QueryMetrics,
         path: &'static str,
         budget: &TokenBudget,
@@ -777,7 +882,19 @@ where
         metrics.record_result(path, &result);
         metrics.record_budget(budget, forced_finish);
         emit_metrics(metrics, "exploration complete").await;
-        self.store_query_cache(query_key, fingerprint, &result);
+        // Awaited, not detached: deterministic for tests, and no task racing
+        // process exit. Sub-millisecond, except on the one run per process
+        // that also carries `DiskCache`'s eviction sweep (see its comment) —
+        // never on a cache hit, which returns long before here.
+        self.store_query_cache(
+            repo_root,
+            query_key,
+            fingerprint,
+            &result,
+            budget.llm_calls(),
+            budget.spent(),
+        )
+        .await;
         result
     }
 
@@ -786,6 +903,7 @@ where
     #[allow(clippy::too_many_arguments)]
     async fn finalize_and_complete(
         &self,
+        repo_root: &Path,
         metrics: &mut QueryMetrics,
         stage: &'static str,
         result: ExplorationResult,
@@ -797,6 +915,7 @@ where
     ) -> ExplorationResult {
         let result = self.finalize(result, query);
         self.complete_run(
+            repo_root,
             metrics,
             stage,
             budget,
@@ -869,56 +988,110 @@ where
         Some(brief)
     }
 
-    /// Serve from the query cache when the entry is still valid: same
-    /// fingerprint, or a fingerprint change that provably changed nothing at
-    /// all. Checking the diff against only the *entry's own* contributing
-    /// paths is unsound — retrieval scans the whole repo, so a path outside
-    /// those paths (not least a newly added file) can still turn into a
-    /// better match that the stale entry never saw — so any actual diff
-    /// invalidates the entry.
+    /// The one validity policy, shared by both cache layers so they can never
+    /// diverge.
+    ///
+    /// `strict` (the default) serves only what is provably unchanged: the same
+    /// fingerprint, or a fingerprint change with a provably empty diff.
+    /// Checking the diff against only the *entry's own* contributing paths is
+    /// unsound in general — retrieval scans the whole repo, so a path outside
+    /// those paths (not least a newly added file) can still turn into a better
+    /// match that the stale entry never saw — so under `strict` any actual
+    /// diff invalidates.
+    ///
+    /// `paths` accepts that recall ceiling knowingly, in exchange for surviving
+    /// an unrelated working-tree edit: the answer is served when every file it
+    /// references still has its store-time `(len, mtime)`. A newly added file
+    /// that would have been the better match is missed — which is why it is
+    /// opt-in, not the default. An entry with no stamps (stored under `strict`,
+    /// or an answer with no findings) falls back to `strict`, so a
+    /// summary-only entry can never be served forever.
+    ///
+    /// A `head`-only mode is deliberately absent: it is the one policy that
+    /// serves snippets an uncommitted edit already invalidated.
+    async fn entry_still_valid(
+        &self,
+        repo_root: &Path,
+        entry: &QueryEntry,
+        fp: &RepoFingerprint,
+    ) -> bool {
+        if entry.fingerprint == *fp {
+            return true;
+        }
+        if self.cache_key_mode == CacheKeyMode::Paths && !entry.deps.is_empty() {
+            return deps_unchanged(repo_root, &entry.deps).await;
+        }
+        matches!(
+            self.probe
+                .changed_paths(repo_root, &entry.fingerprint, fp)
+                .await,
+            Some(changed) if changed.is_empty()
+        )
+    }
+
+    /// Serve from the query cache, L1 first and the on-disk L2 behind it.
+    /// Returns the whole entry (so the caller can report the turns/tokens the
+    /// hit saved) plus which layer served it.
     async fn query_cache_lookup(
         &self,
         repo_root: &Path,
         query_key: &str,
         fingerprint: &Option<RepoFingerprint>,
-    ) -> Option<ExplorationResult> {
+    ) -> Option<(QueryEntry, &'static str)> {
         let (cache, fp) = self.cache_for(fingerprint.as_ref())?;
-        let entry = cache.get_query(query_key)?;
-        if entry.fingerprint == *fp {
-            return Some(entry.result);
-        }
-        match self
-            .probe
-            .changed_paths(repo_root, &entry.fingerprint, fp)
-            .await
-        {
-            Some(changed) if changed.is_empty() => {
+        if let Some(entry) = cache.get_query(query_key) {
+            if entry.fingerprint == *fp {
+                return Some((entry, "l1"));
+            }
+            if self.entry_still_valid(repo_root, &entry, fp).await {
                 cache.refresh_query_fingerprint(query_key, &entry.fingerprint, fp.clone());
-                Some(entry.result)
+                return Some((entry, "l1"));
             }
-            _ => {
-                cache.remove_query(query_key, &entry.fingerprint);
-                None
-            }
+            cache.remove_query(query_key, &entry.fingerprint);
         }
+        let entry = cache.get_query_l2(query_key).await?;
+        if !self.entry_still_valid(repo_root, &entry, fp).await {
+            return None;
+        }
+        // Promote into L1, relabelled to the current fingerprint (validation
+        // just proved the answer holds for it). The dep stamps are left alone:
+        // they are store-time truth about the files the answer references.
+        cache.put_query(
+            query_key.to_string(),
+            QueryEntry {
+                fingerprint: fp.clone(),
+                ..entry.clone()
+            },
+        );
+        Some((entry, "l2"))
     }
 
-    fn store_query_cache(
+    async fn store_query_cache(
         &self,
+        repo_root: &Path,
         query_key: &str,
         fingerprint: Option<RepoFingerprint>,
         result: &ExplorationResult,
+        llm_turns: u32,
+        tokens: u64,
     ) {
         let (Some(cache), Some(fingerprint)) = (&self.cache, fingerprint) else {
             return;
         };
-        cache.put_query(
-            query_key.to_string(),
-            QueryEntry {
-                fingerprint,
-                result: result.clone(),
-            },
-        );
+        let deps = if self.cache_key_mode == CacheKeyMode::Paths {
+            collect_deps(repo_root, result).await
+        } else {
+            Vec::new()
+        };
+        let entry = QueryEntry {
+            fingerprint,
+            result: result.clone(),
+            llm_turns,
+            tokens,
+            deps,
+        };
+        cache.put_query(query_key.to_string(), entry.clone());
+        cache.put_query_l2(query_key, &entry).await;
     }
 
     /// Build the early-exit result from the ranked candidates, verifying each
@@ -2634,6 +2807,7 @@ mod tests {
         let cache_settings = CacheSettings {
             enabled: true,
             max_entries: 1,
+            ..CacheSettings::default()
         };
         let agent = agent_with_probe_ttl_and_cache(
             memory,
@@ -3344,5 +3518,239 @@ entry_points: 1  (cols: qn file)\n  repo.src.main.main src/main.rs\n";
             "the detailed call must not be served the cached concise entry"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- M-1: the on-disk L2 and the two validation modes ---
+
+    /// A fresh cache directory, following the crate's no-`tempfile` convention
+    /// (`test_support::temp_repo_with`).
+    fn temp_cache_dir(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("agent_l2_{test}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn cache_at(dir: &Path, key_mode: CacheKeyMode) -> CacheSettings {
+        CacheSettings {
+            dir: dir.display().to_string(),
+            key_mode,
+            ..CacheSettings::default()
+        }
+    }
+
+    /// A `finish` with a summary but no findings — the summary-only entry that
+    /// has no dependency stamps to validate.
+    fn finish_call_empty() -> ToolCall {
+        ToolCall {
+            id: "c1".to_string(),
+            name: "finish".to_string(),
+            arguments_json: r#"{"findings":[],"summary":"nothing found"}"#.to_string(),
+            thought_signatures: None,
+        }
+    }
+
+    fn last_metrics() -> QueryMetrics {
+        taped_metrics()
+            .pop()
+            .expect("every run exit emits a metrics record")
+    }
+
+    /// Build a loop that behaves like a fresh process over `cache_dir`: its own
+    /// empty L1, the same store on disk.
+    fn l2_agent(
+        cache_dir: &Path,
+        key_mode: CacheKeyMode,
+        probe: MockRepoStateProbe,
+    ) -> AgentLoop<
+        MockMemoryBackend,
+        MockSearchBackend,
+        MockLlmProvider,
+        MockRepoStateProbe,
+        FakeClock,
+    > {
+        agent_with_probe_ttl_and_cache(
+            MockMemoryBackend::new(),
+            MockLlmProvider::new().with_responses(vec![
+                tool_calls(vec![finish_call()]),
+                tool_calls(vec![finish_call()]),
+            ]),
+            probe,
+            TEST_INDEX_TRUST_TTL,
+            cache_at(cache_dir, key_mode),
+        )
+    }
+
+    #[tokio::test]
+    async fn l2_hit_promotes_into_l1_and_reports_the_layer() {
+        // The cross-session acceptance criterion: a new process on an unchanged
+        // repo must be served from disk, and must report what that hit saved.
+        let cache_dir = temp_cache_dir("promote");
+        let repo = temp_repo("l2_promote");
+        let query = q("where is main");
+        let probe = || MockRepoStateProbe::new().with_fingerprint(Some(fp("abc")));
+
+        let first = l2_agent(&cache_dir, CacheKeyMode::Strict, probe());
+        let produced = first.run(&repo, &query).await.unwrap();
+        let cold = last_metrics();
+        assert_eq!(cold.cache_layer, None, "the producing run is not a hit");
+        assert!(cold.llm_calls > 0);
+        drop(first);
+
+        let second = l2_agent(&cache_dir, CacheKeyMode::Strict, probe());
+        let served = second.run(&repo, &query).await.unwrap();
+        assert_eq!(produced, served);
+        let hit = last_metrics();
+        assert_eq!(hit.cache_layer, Some("l2"));
+        assert_eq!(hit.turns_saved_by_cache, Some(cold.llm_calls));
+        assert_eq!(hit.tokens_saved_by_cache, Some(cold.tokens));
+        assert_eq!(hit.tokens, 0, "`tokens` keeps meaning spend");
+
+        // The promote put it in this loop's L1, so the next run never touches
+        // the disk again.
+        second.run(&repo, &query).await.unwrap();
+        assert_eq!(last_metrics().cache_layer, Some("l1"));
+
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn disk_cache_is_off_when_dir_is_empty() {
+        // The default `CacheSettings` (dir = "") must behave exactly as before
+        // M-1: L1 only, so a new loop starts cold.
+        let repo = temp_repo("l2_no_dir");
+        let query = q("where is main");
+        let probe = || MockRepoStateProbe::new().with_fingerprint(Some(fp("abc")));
+        let make = || {
+            agent_with_probe_ttl_and_cache(
+                MockMemoryBackend::new(),
+                MockLlmProvider::new().with_responses(vec![tool_calls(vec![finish_call()])]),
+                probe(),
+                TEST_INDEX_TRUST_TTL,
+                CacheSettings::default(),
+            )
+        };
+        make().run(&repo, &query).await.unwrap();
+        let _ = taped_metrics();
+        make().run(&repo, &query).await.unwrap();
+        assert_eq!(
+            last_metrics().cache_layer,
+            None,
+            "without a cache dir there is no layer behind L1"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[tokio::test]
+    async fn a_disk_write_failure_never_fails_a_query() {
+        // `dir` names a regular file, so the store can never be opened. The
+        // query must still succeed, on L1 alone.
+        let repo = temp_repo("l2_unwritable");
+        let holder = temp_cache_dir("unwritable");
+        let file = holder.join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let agent = l2_agent(
+            &file,
+            CacheKeyMode::Strict,
+            MockRepoStateProbe::new().with_fingerprint(Some(fp("abc"))),
+        );
+        let query = q("where is main");
+        let result = agent.run(&repo, &query).await.unwrap();
+        assert_eq!(result.findings.len(), 1);
+        // And L1 still works.
+        agent.run(&repo, &query).await.unwrap();
+        assert_eq!(last_metrics().cache_layer, Some("l1"));
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&holder).ok();
+    }
+
+    #[tokio::test]
+    async fn paths_mode_recomputes_when_a_referenced_file_changed() {
+        // MANDATORY staleness guard: the answer names `src/lib.rs`, so a
+        // rewrite of that file must miss, whatever the mode's tolerance for
+        // unrelated edits.
+        let repo = temp_repo("paths_referenced");
+        let probe = MockRepoStateProbe::new()
+            .with_fingerprint(Some(fp("aaa")))
+            .with_changed_paths(None);
+        let handle = probe.clone();
+        let agent = l2_agent(
+            &temp_cache_dir("paths_referenced"),
+            CacheKeyMode::Paths,
+            probe,
+        );
+        let query = q("where is main");
+        agent.run(&repo, &query).await.unwrap();
+        let _ = taped_metrics();
+
+        std::fs::write(repo.join("src/lib.rs"), "a\nb\nc\nd\ne\n").unwrap();
+        handle.set_fingerprint(Some(fp("bbb")));
+        agent.run(&repo, &query).await.unwrap();
+        assert_eq!(
+            last_metrics().cache_layer,
+            None,
+            "a changed referenced file must recompute"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[tokio::test]
+    async fn paths_mode_serves_when_only_an_unreferenced_file_changed() {
+        // The hit the mode exists for: `src/other.rs` is not in the answer.
+        // `changed_paths: None` means strict would have invalidated.
+        let repo = temp_repo("paths_unreferenced");
+        let probe = MockRepoStateProbe::new()
+            .with_fingerprint(Some(fp("aaa")))
+            .with_changed_paths(None);
+        let handle = probe.clone();
+        let agent = l2_agent(
+            &temp_cache_dir("paths_unreferenced"),
+            CacheKeyMode::Paths,
+            probe,
+        );
+        let query = q("where is main");
+        let first = agent.run(&repo, &query).await.unwrap();
+        let _ = taped_metrics();
+
+        std::fs::write(repo.join("src/other.rs"), "d\ne\nf\ng\n").unwrap();
+        handle.set_fingerprint(Some(fp("bbb")));
+        let second = agent.run(&repo, &query).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(last_metrics().cache_layer, Some("l1"));
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[tokio::test]
+    async fn paths_mode_falls_back_to_strict_for_an_entry_with_no_deps() {
+        // A summary-only answer stamps no files, so `paths` has nothing to
+        // check — without the fallback it would be served forever.
+        let repo = temp_repo("paths_no_deps");
+        let probe = MockRepoStateProbe::new()
+            .with_fingerprint(Some(fp("aaa")))
+            .with_changed_paths(None);
+        let handle = probe.clone();
+        let agent = agent_with_probe_ttl_and_cache(
+            MockMemoryBackend::new(),
+            MockLlmProvider::new().with_responses(vec![
+                tool_calls(vec![finish_call_empty()]),
+                tool_calls(vec![finish_call_empty()]),
+            ]),
+            probe,
+            TEST_INDEX_TRUST_TTL,
+            cache_at(&temp_cache_dir("paths_no_deps"), CacheKeyMode::Paths),
+        );
+        let query = q("where is main");
+        agent.run(&repo, &query).await.unwrap();
+        let _ = taped_metrics();
+
+        handle.set_fingerprint(Some(fp("bbb")));
+        agent.run(&repo, &query).await.unwrap();
+        assert_eq!(
+            last_metrics().cache_layer,
+            None,
+            "a dep-less entry must fall back to strict validation"
+        );
+        std::fs::remove_dir_all(&repo).ok();
     }
 }

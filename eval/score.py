@@ -672,6 +672,14 @@ def qw0_metrics(rows: list[dict]) -> dict:
     # Stage 5 also exits as stage=="error" (provider exhaustion) carrying truthful counts, so
     # the denominator is "the row has a count", not the clean-exit stage name.
     fallback_rows = [r for r in rows if r.get("orientation_calls_in_loop") is not None]
+    # M-1: the hit rate's denominator is every scored row, because every scored row is a row
+    # that could have hit — the corpus repeats each query once per pass and each pass runs a
+    # fresh server process, which is exactly the cross-session repetition M-1 exists for.
+    # The layer split gets its own presence test rather than riding that denominator: a
+    # pre-M-1 binary emits stage=="cache" with no cache_layer, so the total rate stays a real
+    # measurement while l1/l2 report absent instead of a fabricated 0%.
+    cache_rows = [r for r in rows if r.get("stage") == "cache"]
+    layers = [x for x in (qw0_field(r, "cache_layer") for r in cache_rows) if x is not None]
     return {
         "n_rows": len(rows),
         "llm_calls": _dist(llm_calls),
@@ -685,6 +693,19 @@ def qw0_metrics(rows: list[dict]) -> dict:
         "total_ms": _dist(numeric_field(rows, "total_ms")),
         "brief_tokens": _dist(numeric_field(fallback_rows, "brief_tokens")),
         "orientation_calls_in_loop": _dist(numeric_field(fallback_rows, "orientation_calls_in_loop")),
+        "cache_hits": {
+            "n_rows": len(rows),
+            "hit_rows": len(cache_rows),
+            "hit_rate": len(cache_rows) / len(rows) if rows else None,
+            "cache_hit_l1": layers.count("l1") / len(rows) if layers and rows else None,
+            "cache_hit_l2": layers.count("l2") / len(rows) if layers and rows else None,
+            "layer_reported": bool(layers),
+        },
+        # Denominated over the cache rows alone (numeric_field drops the None every non-cache
+        # row carries): these measure what a hit avoided, so a non-hit has nothing to add and
+        # must not pad the denominator toward zero.
+        "turns_saved_by_cache": _dist(numeric_field(rows, "turns_saved_by_cache")),
+        "tokens_saved_by_cache": _dist(numeric_field(rows, "tokens_saved_by_cache")),
     }
 
 
@@ -755,6 +776,28 @@ def print_qw0_report(agg: dict) -> None:
     print(f"  brief_tokens (fallback rows):        {_fmt_dist(agg['brief_tokens'], keys=('mean', 'p50', 'p95'))}")
     print(f"  orientation_calls_in_loop (fallback rows): {_fmt_dist(agg['orientation_calls_in_loop'])}")
 
+    # M-1 persistent result cache. All three rates share one denominator — every scored row —
+    # and the line says so, because a hit rate is only readable against the set of rows that
+    # could have hit. The two saved distributions are denominated over the cache rows instead:
+    # they answer "what did a hit avoid", which a non-hit row cannot contribute to.
+    ch = agg["cache_hits"]
+    if ch["hit_rate"] is None:
+        print(f"  cache_hit_rate: {NA_ABSENT}")
+    else:
+        print(
+            f"  cache_hit_rate: {ch['hit_rate']:.1%}  "
+            f"({ch['hit_rows']} of {ch['n_rows']} scored rows served from cache)"
+        )
+        if ch["layer_reported"]:
+            print(
+                f"    cache_hit_l1: {ch['cache_hit_l1']:.1%}   cache_hit_l2: {ch['cache_hit_l2']:.1%}"
+                f"   (share of the same {ch['n_rows']} rows)"
+            )
+        else:
+            print(f"    cache_hit_l1 / cache_hit_l2: {NA_ABSENT}")
+    print(f"  turns_saved_by_cache (cache rows):   {_fmt_dist(agg['turns_saved_by_cache'])}")
+    print(f"  tokens_saved_by_cache (cache rows):  {_fmt_dist(agg['tokens_saved_by_cache'], keys=('mean', 'p50', 'p95'))}")
+
 
 CSV_COLUMNS = [
     "run_id",
@@ -778,6 +821,9 @@ CSV_COLUMNS = [
     "candidate_count",
     "brief_tokens",
     "orientation_calls_in_loop",
+    "cache_layer",
+    "turns_saved_by_cache",
+    "tokens_saved_by_cache",
 ]
 
 
@@ -810,6 +856,9 @@ def qw0_csv_rows(result: dict) -> list[dict]:
                 "candidate_count": qw0_field(r, "candidate_count"),
                 "brief_tokens": qw0_field(r, "brief_tokens"),
                 "orientation_calls_in_loop": qw0_field(r, "orientation_calls_in_loop"),
+                "cache_layer": qw0_field(r, "cache_layer"),
+                "turns_saved_by_cache": qw0_field(r, "turns_saved_by_cache"),
+                "tokens_saved_by_cache": qw0_field(r, "tokens_saved_by_cache"),
             }
         )
     return out

@@ -66,3 +66,53 @@ actually executed). Both are `Option<u32>`, seeded on Stage-5 entry — absent
 means "Stage 5 never ran", never a fabricated `0` (tracing emits nothing for
 `None`, the same `confidence`/`candidate_count` convention `eval/run.py`
 relies on).
+
+## Result cache: L1 in memory, L2 on disk
+
+`cache.rs` holds the four in-memory maps (tools, legs, queries, briefs). Only
+the **query** map has a second layer: `disk_cache.rs`, one JSON file per
+result under `<[cache] dir>/results/v<SCHEMA_VERSION>/<fnv1a64(key)>.json`
+(unix 0700/0600; on Windows the per-user `%LOCALAPPDATA%` ACL). Reached solely
+through `ResultCache::{get_query_l2, put_query_l2}`, which do their I/O in
+`spawn_blocking` and never hold the mutex across it.
+
+- **No database, no locking.** Every entry is independent, idempotent and
+  recomputable, so concurrent MCP processes need only an atomic replace
+  (temp file + `fs::rename`). Two writers racing on one key both write a
+  correct answer for it. Upgrade to sqlite only if `cache stats` ever has to
+  report cross-session aggregates the metrics stream cannot derive.
+- **`disk_cache::SCHEMA_VERSION` is the single versioning point** for the
+  stored shape — directory segment *and* `v` field — so a bump makes every old
+  entry unreachable and the sweep deletes strictly *older* version directories
+  (never a newer one: a mixed-version window would otherwise leave both
+  binaries permanently cold). Bump it (and nothing else) when the stored value
+  changes. The shape spans two crates — the envelope in `disk_cache.rs`, the
+  payload in core's `ExplorationResult` — so `stored_shape_is_pinned_to_the_
+  schema_version` pins the serialized JSON as a literal: any move on either
+  side fails that test instead of silently changing the on-disk format.
+- **The key is the query key plus the response cap.** L2 reuses
+  `ResultCache::query_key` and `AgentLoop::run_query_key` appends the
+  `snippet_max_chars` this loop would apply — a persisted entry is already
+  truncated and outlives the config file that set the cap. `query_cache_key`
+  (the MCP server's `req_id` source) stays on the bare query key: it is a
+  correlation id, not a cache lookup. No fingerprint in the key either:
+  invalidation stays in the *value*, which is what keeps the empty-diff
+  relabel working.
+- **One validity policy, `AgentLoop::entry_still_valid`, shared by both
+  layers.** `[cache] key_mode = "strict"` (default) is the pre-M-1 behaviour:
+  identical fingerprint, or a fingerprint change with a provably empty diff.
+  `"paths"` additionally serves after an unrelated edit, by re-`stat`ing the
+  `(len, mtime)` stamps of the files the answer references; an entry without
+  stamps falls back to strict. A `"head"` mode is deliberately absent — it is
+  the one policy that serves snippets an uncommitted edit already invalidated.
+- **Every failure degrades to L1-only, never to a failed query**: an unusable
+  directory makes `DiskCache::open` return `None`, the first write error
+  logs and is dropped (never latched off — the next completed exploration
+  retries, so a transient ENOSPC or sharing violation is recoverable), and a
+  corrupt entry file is a miss and is deleted.
+- **No L2 for tools/legs/briefs.** They are keyed on the full fingerprint, so
+  they die on every working-tree save — near-zero cross-session value for a
+  fraction of a run's cost.
+- Cache-hit runs report `cache_layer` (`l1`/`l2`), `turns_saved_by_cache` and
+  `tokens_saved_by_cache` in `QueryMetrics`; all three are `Option`, absent on
+  every non-cache path.

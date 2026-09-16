@@ -1,8 +1,13 @@
 //! Pure domain value types describing exploration queries and results.
 //!
-//! These types carry no serde derives and perform no I/O — only
-//! `Debug + Clone + PartialEq + Eq`. Serialization is added later, at an MCP
-//! boundary, if and when it is actually needed (YAGNI).
+//! Only the three result-shaped types — [`FileLocation`],
+//! [`ExplorationFinding`] and [`ExplorationResult`] — carry serde derives, and
+//! only because the agent crate's persistent result cache writes them to disk:
+//! the "if and when it is actually needed" condition the original YAGNI note
+//! named is met by that cache, not by an MCP boundary. The on-disk shape is
+//! versioned in exactly one place, `repo_explorer_agent::disk_cache::
+//! SCHEMA_VERSION`. No other domain type gains derives (the query itself is
+//! covered by the cache key), and core still performs no I/O.
 
 use std::path::PathBuf;
 
@@ -17,7 +22,7 @@ pub fn saturate_u32(n: u64) -> u32 {
 }
 
 /// A span of lines within a single file.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FileLocation {
     pub path: PathBuf,
     pub line_start: u32,
@@ -25,7 +30,7 @@ pub struct FileLocation {
 }
 
 /// A single finding produced while exploring a repository.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExplorationFinding {
     pub location: FileLocation,
     pub snippet: Option<String>,
@@ -54,7 +59,7 @@ pub struct ExplorationQuery {
 }
 
 /// The outcome of running an [`ExplorationQuery`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExplorationResult {
     pub findings: Vec<ExplorationFinding>,
     pub summary: String,

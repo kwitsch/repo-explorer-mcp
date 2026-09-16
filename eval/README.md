@@ -160,6 +160,37 @@ as every other section (the `-warmup` row is excluded):
   corpus currently produces very few fallback rows (2 of 64 in the committed baseline, both the
   same query), so `n` on these two lines is small; read them alongside the per-query CSV
   filtered on `stage == fallback`, not as run-wide means.
+- `cache_hit_rate` / `cache_hit_l1` / `cache_hit_l2` (M-1, added 2026-09-16) — **denominated
+  over every scored row**, and the report line says so, because a hit rate only means anything
+  against the set of rows that could have hit. Here that is all of them: each query is issued
+  once per pass, and every pass runs a fresh server process, so a pass-2 row repeating a pass-1
+  query is exactly the cross-session repeat the persistent L2 cache exists for. (The warm-up
+  call is excluded from the denominator as everywhere else — it is also what seeds L1 for
+  `queries[0]`, so the in-pass L1 hits in an older run are a harness artifact, not caller
+  behaviour.) **A default run reports `cache_hit_l2` as ~0 on purpose**: `config/default.toml`
+  pins `[cache] persistent = false`, because an L2 that survives the process would turn every
+  pass >= 2 into a replay of pass 1 and collapse `llm_calls`, `tokens`, `cost_usd`,
+  `confidence`, `candidate_count` and the pass-to-pass variance into one sample copied N times.
+  Measure the cross-session rate deliberately instead:
+
+  ```bash
+  uv run --with mcp --with pyyaml eval/run.py --repos self --passes 1 --cache-dir /tmp/rex-eval-l2
+  uv run --with mcp --with pyyaml eval/run.py --repos self --passes 1 --cache-dir /tmp/rex-eval-l2
+  ```
+
+  The second run is the measurement (the first only fills the store); `run.py` writes the
+  derived config into that run's `out_dir` as `config.cache.toml` and records the directory in
+  `manifest.json`. Start from an empty `--cache-dir` — a store carried over from an earlier run
+  makes even the first invocation warm, and the acceptance number unreproducible. The layer split gets its own presence test rather than riding that denominator: a
+  pre-M-1 binary emits `stage == "cache"` rows with no `cache_layer` field, so the total rate
+  stays a real measurement while `cache_hit_l1` / `cache_hit_l2` report absent. A run with no
+  cache row at all reports a real `0.0%` — `stage` is always emitted, so that is a measurement,
+  not an absence.
+- `turns_saved_by_cache` / `tokens_saved_by_cache` (M-1) — **denominated over the cache rows
+  only**, like the M-2 pair above. They are what the *producing* run spent, i.e. what the hit
+  avoided; a non-hit row has nothing to contribute and would only drag the mean toward zero.
+  They are deliberately not folded into `tokens`, which keeps meaning spend — `tokens` stays 0
+  on a cache row, so the cost aggregate is unaffected.
 
 Every metric degrades to `n/a (field absent in this run)` on a results/ dir written before the
 field existed, so old runs rescore without crashing and without reporting a fabricated zero.

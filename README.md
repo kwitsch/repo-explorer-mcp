@@ -161,10 +161,16 @@ enabled = true    # false = Stage 5 behaves exactly as before, no prefetch at al
 max_tokens = 3000 # budget for the rendered brief; over budget, the smallest modules are dropped
 key = "head"      # cache key: "head" survives a dirty working tree, "full" re-builds on every save
 
-# In-memory result caching, keyed by git state (HEAD + dirty digest).
+# Result caching, keyed by git state (HEAD + dirty digest). The in-memory maps
+# are the L1; `persistent` adds a per-user on-disk L2 for the query->result
+# cache, so a repeated query in a new process does not pay the full loop again.
 [cache]
-enabled = true
-max_entries = 256
+enabled = true                       # false disables both layers
+max_entries = 256                    # entry cap per in-memory map (L1 only)
+persistent = true                    # false = in-memory only (the privacy opt-out)
+persistent_max_bytes = 268435456     # 256 MiB budget for the on-disk layer; 0 disables it
+key_mode = "strict"                  # strict | paths (see below)
+dir = ""                             # "" = the per-user cache dir, resolved by the binary
 
 [logging]
 level = "info"            # trace | debug | info | warn | error
@@ -173,8 +179,54 @@ level = "info"            # trace | debug | info | warn | error
 The env var named by each `api_key_env` must actually be set in the environment,
 or config loading fails with `MissingEnvVar`.
 
+### On-disk result cache
+
+With `persistent = true` a completed exploration is written to disk so a later
+process (a new Claude Code session, a second editor) can serve it without
+re-running the loop. `dir = ""` resolves to the per-user cache directory —
+`$XDG_CACHE_HOME/repo-explorer` (falling back to `~/.cache/repo-explorer`) on
+Linux, `%LOCALAPPDATA%\repo-explorer` on Windows; a non-empty value overrides
+it verbatim. If no directory resolves at all, the on-disk layer is simply off
+and caching stays in memory.
+
+A stored entry contains **verbatim source snippets and absolute repository
+paths**. On Unix the cache directory is created `0700` and its files `0600`; on
+Windows it relies on the per-user ACL `%LOCALAPPDATA%` already carries. Set
+`persistent = false` (or `persistent_max_bytes = 0`) to keep everything in
+memory, and use `repo-explorer-mcp cache clear` to delete what is already
+there (that command reads `[cache]` alone, so it works without the LLM
+section validating). The store is swept back under `persistent_max_bytes` once
+per process, on the tail of the first exploration that writes to it, evicting
+least-recently-used entries first.
+
+`key_mode` decides when a cached answer may still be served after the
+repository fingerprint moved:
+
+- `strict` (default) — serve only for a repo state proven unchanged: an
+  identical fingerprint, or a fingerprint change with a provably empty diff.
+  This is the pre-existing behavior.
+- `paths` — additionally serve after an *unrelated* edit, by re-stat'ing only
+  the files the cached answer references. Much higher hit rate while you are
+  editing, with a known ceiling: a newly added file that would have been the
+  better match is missed. Entries with no referenced files fall back to
+  `strict`.
+
+There is deliberately no `head` mode. Keying on HEAD alone would serve snippets
+an uncommitted edit has already invalidated — the one failure this cache must
+never produce.
+
+Cache inspection, both printing a JSON report to stdout and exiting non-zero on
+failure (neither starts the server, connects to anything, or prompts):
+
+```bash
+repo-explorer-mcp cache stats   # dir, schema_version, entries, bytes, max_bytes, oldest/newest
+repo-explorer-mcp cache clear   # delete every persisted result; reports what was removed
+```
+
 Setting `REPO_EXPLORER_METRICS=<path>` appends one JSON line of per-query
-metrics (exit path, tokens, cache read/write tokens, confidence, timings) to
+metrics (exit path, tokens, cache read/write tokens, `cache_layer` —
+`l1`/`l2` on a cache hit — plus `turns_saved_by_cache`/`tokens_saved_by_cache`,
+confidence, timings) to
 that file; an empty value counts as unset. Without it, the headline fields are
 still logged — on `exploration complete` for a normal run and on `exploration
 served from query cache` for a cache hit, so grepping only the first message

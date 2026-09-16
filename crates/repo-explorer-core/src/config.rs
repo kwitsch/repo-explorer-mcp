@@ -258,8 +258,27 @@ impl Default for AgentSettings {
     }
 }
 
-/// In-memory result caching (tool-result memoization and query→result cache),
-/// keyed by the repository's git state.
+/// How a cached query result is proved still valid after the repository
+/// fingerprint moved. Deliberately two variants: a HEAD-only mode would serve
+/// snippets that an uncommitted edit already invalidated, which is exactly the
+/// fabricated-snippet class the eval guards against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheKeyMode {
+    /// Serve only for a repo state proven unchanged: identical fingerprint, or
+    /// a fingerprint change with a provably empty diff.
+    #[default]
+    Strict,
+    /// Also serve after an unrelated edit, by re-stat'ing only the files the
+    /// cached answer references. Higher hit rate; known ceiling — a newly
+    /// added file that would have been the better match is missed.
+    Paths,
+}
+
+/// Result caching (tool-result memoization and query→result cache), keyed by
+/// the repository's git state. The in-memory maps are the L1; `persistent`
+/// adds a per-user on-disk L2 for the query→result cache so a new process does
+/// not start cold.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CacheSettings {
     #[serde(default = "default_cache_enabled")]
@@ -267,6 +286,26 @@ pub struct CacheSettings {
     /// Entry cap per cache map (oldest evicted first).
     #[serde(default = "default_cache_max_entries")]
     pub max_entries: usize,
+    /// Write completed results to disk so they survive the process. `false`
+    /// keeps everything in memory — the privacy opt-out, since a stored entry
+    /// contains verbatim source snippets and absolute repository paths.
+    #[serde(default = "default_cache_persistent")]
+    pub persistent: bool,
+    /// Byte budget for the on-disk layer. `0` disables it outright (the same
+    /// opt-out convention as `agent.repo_brief.max_tokens = 0`).
+    #[serde(default = "default_cache_persistent_max_bytes")]
+    pub persistent_max_bytes: u64,
+    /// Which validation policy serves a cached answer after the fingerprint
+    /// moved. Applies identically to the in-memory and the on-disk layer.
+    #[serde(default)]
+    pub key_mode: CacheKeyMode,
+    /// Where the on-disk layer lives. `""` (the default) means "the per-user
+    /// cache directory", resolved by the binary (`dirs::cache_dir()`), since
+    /// XDG path resolution is a binary-boundary concern; a non-empty value
+    /// overrides it verbatim. An unresolvable directory simply leaves the
+    /// on-disk layer off.
+    #[serde(default)]
+    pub dir: String,
 }
 
 /// Hand-written for the same reason as `SearchConfig`: `Default` and the serde
@@ -276,6 +315,10 @@ impl Default for CacheSettings {
         Self {
             enabled: default_cache_enabled(),
             max_entries: default_cache_max_entries(),
+            persistent: default_cache_persistent(),
+            persistent_max_bytes: default_cache_persistent_max_bytes(),
+            key_mode: CacheKeyMode::default(),
+            dir: String::new(),
         }
     }
 }
@@ -367,6 +410,15 @@ fn default_cache_enabled() -> bool {
 
 fn default_cache_max_entries() -> usize {
     256
+}
+
+fn default_cache_persistent() -> bool {
+    true
+}
+
+/// 256 MiB.
+fn default_cache_persistent_max_bytes() -> u64 {
+    268_435_456
 }
 
 /// Canonical `(kind, default api-key env var)` table. `KNOWN_PROVIDER_KINDS`
@@ -531,6 +583,30 @@ pub fn load(path: &Path) -> Result<(Config, Vec<String>), ConfigError> {
     Ok((config, warnings))
 }
 
+/// Read `[cache]` alone, skipping [`Config::validate`] and every other
+/// section. The cache subcommands are run by a human from a shell, where the
+/// provider's `api_key_env` — exported for whatever launches the MCP server,
+/// not necessarily interactively — makes [`load`] fail with `MissingEnvVar`.
+/// Falling back to the defaults there would silently retarget `cache clear`
+/// from the configured `dir` to the per-user one, i.e. report success after
+/// deleting nothing. A file with no `[cache]` section (or none at all, which
+/// is an `Err` the caller reports) is the defaults, as at runtime.
+pub fn cache_settings(path: &Path) -> Result<CacheSettings, ConfigError> {
+    let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let parse = |source: toml::de::Error| ConfigError::Parse {
+        location: source.span().map(|span| line_col(&contents, span.start)),
+        source,
+    };
+    let root: toml::Table = toml::from_str(&contents).map_err(parse)?;
+    match root.get("cache") {
+        None => Ok(CacheSettings::default()),
+        Some(section) => section.clone().try_into().map_err(parse),
+    }
+}
+
 /// (top-level section name, known field names within it) — hand-maintained
 /// alongside `Config`'s nested structs. A key present in the raw TOML but
 /// absent here is reported by [`unknown_key_warnings`] instead of going
@@ -560,7 +636,17 @@ const KNOWN_SECTIONS: &[(&str, &[&str])] = &[
             "repo_brief",
         ],
     ),
-    ("cache", &["enabled", "max_entries"]),
+    (
+        "cache",
+        &[
+            "enabled",
+            "max_entries",
+            "persistent",
+            "persistent_max_bytes",
+            "key_mode",
+            "dir",
+        ],
+    ),
     ("logging", &["level"]),
 ];
 
@@ -1136,6 +1222,77 @@ mod tests {
             from_default.timeout_seconds,
             default_search_timeout_seconds()
         );
+    }
+
+    #[test]
+    fn cache_default_matches_serde_defaults() {
+        // A derived `Default` would give `false`/`0` here, silently disabling
+        // the persistent layer for every caller that builds `CacheSettings`
+        // in code rather than from a file.
+        let from_default = CacheSettings::default();
+        let from_empty_section: CacheSettings =
+            toml::from_str("").expect("an empty [cache] section must parse");
+        assert_eq!(from_default, from_empty_section);
+        assert!(from_default.persistent);
+        assert_eq!(from_default.persistent_max_bytes, 268_435_456);
+        assert_eq!(from_default.key_mode, CacheKeyMode::Strict);
+        assert_eq!(from_default.dir, "");
+    }
+
+    #[test]
+    fn cache_section_keys_are_known_and_parse() {
+        let toml_src = "\
+[cache]\n\
+enabled = false\n\
+max_entries = 8\n\
+persistent = false\n\
+persistent_max_bytes = 1024\n\
+key_mode = \"paths\"\n\
+dir = \"/tmp/rex\"\n";
+        // Parsed as the section alone: a whole `Config` would additionally
+        // demand `[llm]`, which is not what this test is about.
+        let table: toml::Table = toml::from_str(toml_src).expect("the fixture must be valid toml");
+        let parsed: CacheSettings = table["cache"]
+            .clone()
+            .try_into()
+            .expect("every [cache] key must parse");
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.max_entries, 8);
+        assert!(!parsed.persistent);
+        assert_eq!(parsed.persistent_max_bytes, 1024);
+        assert_eq!(parsed.key_mode, CacheKeyMode::Paths);
+        assert_eq!(parsed.dir, "/tmp/rex");
+        // KNOWN_SECTIONS must have kept up, or every user setting a new key
+        // gets a spurious "unrecognized key" warning.
+        assert_eq!(unknown_key_warnings(toml_src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn cache_settings_survives_a_config_that_does_not_validate() {
+        // `cache stats|clear` runs from a human's shell, where the provider's
+        // api_key_env is typically not exported: if that made the read fall
+        // back to the defaults, `cache clear` would wipe the per-user dir and
+        // report success while the configured one kept every entry.
+        let path =
+            std::env::temp_dir().join(format!("rex_cache_settings_{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "[llm]\n\
+             [[llm.providers]]\n\
+             name = \"p\"\n\
+             kind = \"openai\"\n\
+             api_key_env = \"REX_DEFINITELY_NOT_SET_ENV\"\n\
+             models = [\"m\"]\n\
+             [cache]\n\
+             dir = \"/srv/rex-cache\"\n",
+        )
+        .unwrap();
+        assert!(load(&path).is_err(), "the fixture must fail validation");
+        assert_eq!(cache_settings(&path).unwrap().dir, "/srv/rex-cache");
+        std::fs::remove_file(&path).ok();
+        // A file that does not exist at all is an error the caller reports,
+        // not a silent default.
+        assert!(cache_settings(&path).is_err());
     }
 
     #[test]

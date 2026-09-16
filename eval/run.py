@@ -7,7 +7,10 @@ Spawns the INSTALLED repo-explorer-mcp binary (~/.local/bin/repo-explorer-mcp), 
 pinned checkout via cwd, with REPO_EXPLORER_CONFIG set to an eval config variant. Speaks MCP
 over stdio (Python `mcp` SDK). Each repo x pass gets a fresh server process — an identical query
 repeated within one process is a cache hit (§2 Stage 0), so independent attempts require
-independent processes, never a repeated call on the same session.
+independent processes, never a repeated call on the same session. A fresh process is only
+enough while the server's on-disk L2 cache is off, which is what `config/default.toml` pins
+(`[cache] persistent = false`); `--cache-dir` turns it back on, in a directory of your own, for
+the deliberate cross-session measurement.
 
 Mode A (§3.1): the installed binary is 0.5.3, which carries the observability patch, so this
 script runs in full Mode A. Every call is wrapped server-side in a `tracing::info_span!("explore",
@@ -109,7 +112,13 @@ def take_qw0_fields(out: dict, f: dict) -> None:
     `brief_tokens` / `orientation_calls_in_loop` (M-2) are Stage-5-only: the server emits them
     on the Stage-5 exit paths (`path="fallback"`, and `path="error"` when the provider chain
     dies mid-loop), so they stay None on every other stage — absent, not a zero that would drag
-    the orientation mean down for free."""
+    the orientation mean down for free.
+
+    `cache_layer` / `turns_saved_by_cache` / `tokens_saved_by_cache` (M-1) are the mirror case:
+    cache-hit-only, emitted on the query-cache line and nowhere else. `cache_layer` is `"l1"`
+    (in-memory) or `"l2"` (on disk); the two saved counters are what the *producing* run spent,
+    i.e. what this hit avoided, and are deliberately not folded into `tokens`, which keeps
+    meaning spend."""
     for key in (
         "candidate_count",
         "early_exit_route",
@@ -118,6 +127,9 @@ def take_qw0_fields(out: dict, f: dict) -> None:
         "total_ms",
         "brief_tokens",
         "orientation_calls_in_loop",
+        "cache_layer",
+        "turns_saved_by_cache",
+        "tokens_saved_by_cache",
     ):
         if f.get(key) is not None:
             out[key] = f[key]
@@ -278,7 +290,8 @@ def parse_call_lines(lines: list[str]) -> dict:
     exploration_failed, early_exit_fallthrough, early_exit_dropped_candidates (the last two
     from PR #47's early-exit disk verification), plus the QW-0 fields (candidate_count,
     early_exit_route, cache_read_tokens, cache_write_tokens, total_ms, brief_tokens,
-    orientation_calls_in_loop) via take_qw0_fields."""
+    orientation_calls_in_loop, cache_layer, turns_saved_by_cache, tokens_saved_by_cache) via
+    take_qw0_fields."""
     out = {
         "stage": None,
         "tokens": None,
@@ -311,6 +324,13 @@ def parse_call_lines(lines: list[str]) -> dict:
         # rows that carry the field (a Stage-5 provider error reports stage=="error").
         "brief_tokens": None,
         "orientation_calls_in_loop": None,
+        # M-1 persistent result cache, cache hits only: None means "this row was not served
+        # from cache" *or* "this binary predates M-1". score.py separates the two on the
+        # stage name (a cache row with no cache_layer is a pre-M-1 binary), so neither ever
+        # degrades to a fabricated 0% hit rate or a 0-turns-saved measurement.
+        "cache_layer": None,
+        "turns_saved_by_cache": None,
+        "tokens_saved_by_cache": None,
     }
     for line in lines:
         kind = line_kind(line)
@@ -538,12 +558,44 @@ async def run_one_repo_pass(repo: dict, queries: list[QuerySpec], config: Path, 
     return rows
 
 
+def resolve_config(config: Path, cache_dir: str | None, out_dir: Path) -> Path:
+    """The config the servers get, with the on-disk L2 cache resolved.
+
+    Default: the committed config verbatim, which pins `[cache] persistent = false`. The
+    harness's whole methodology is that a pass is an independent sample — a store that
+    outlives the process would replay pass 1 into every later pass and every later run.
+
+    `--cache-dir PATH`: the same config with the L2 switched on and pointed at PATH, written
+    into the run's out_dir so the run records exactly what it used. That is how the
+    cross-session hit rate is measured deliberately: run twice against the same pin with the
+    same --cache-dir and read cache_hit_l2 off the second run. Never the per-user default dir,
+    which is the interactive server's production store.
+    """
+    if not cache_dir:
+        return config
+    marker = "persistent = false"
+    text = config.read_text()
+    if marker not in text:
+        sys.exit(f"--cache-dir: no `[cache] {marker}` line to override in {config}")
+    override = f'persistent = true\ndir = {json.dumps(str(Path(cache_dir).resolve()))}'
+    derived = out_dir / "config.cache.toml"
+    derived.write_text(text.replace(marker, override, 1))
+    return derived
+
+
 async def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repos", nargs="*", default=None, help="repo ids to run (default: all in repos.toml)")
     ap.add_argument("--passes", type=int, default=2, help="number of passes (Phase 1 default: 2)")
     ap.add_argument("--config", default=str(EVAL_DIR / "config" / "default.toml"))
     ap.add_argument("--out", default=None, help="results directory (default: results/<run-id>)")
+    ap.add_argument(
+        "--cache-dir",
+        default=None,
+        help="enable the on-disk result cache in this directory (default: off, so passes stay "
+        "independent samples). For the cross-session hit-rate measurement only: run twice "
+        "against the same pin with the same directory.",
+    )
     args = ap.parse_args()
 
     if not BINARY.exists():
@@ -552,6 +604,8 @@ async def main() -> None:
     run_id = time.strftime("%Y%m%dT%H%M%S")
     out_dir = Path(args.out) if args.out else REPO_ROOT / "results" / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    config = resolve_config(Path(args.config), args.cache_dir, out_dir)
 
     repos = load_repos()
     if args.repos:
@@ -563,7 +617,8 @@ async def main() -> None:
         "run_id": run_id,
         "binary": str(BINARY),
         "binary_version": subprocess.run([str(BINARY), "--version"], capture_output=True, text=True).stdout.strip(),
-        "config": args.config,
+        "config": str(config),
+        "cache_dir": args.cache_dir,
         "passes": args.passes,
         "repos": [r["id"] for r in repos],
         "rtk_version": subprocess.run(["rtk", "--version"], capture_output=True, text=True).stdout.strip(),
@@ -577,7 +632,7 @@ async def main() -> None:
     for repo in repos:
         queries = load_queries(repo["id"])
         for pass_n in range(1, args.passes + 1):
-            await run_one_repo_pass(repo, queries, Path(args.config), pass_n, out_dir)
+            await run_one_repo_pass(repo, queries, config, pass_n, out_dir)
 
     print(f"done: {out_dir}", file=sys.stderr)
 
