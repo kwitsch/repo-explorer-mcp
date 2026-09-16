@@ -28,6 +28,8 @@ Usage:
   repo-explorer-mcp [--config <path>]   Serve on stdio (default)
   repo-explorer-mcp setup               Run the interactive first-run wizard
   repo-explorer-mcp config test         Validate the resolved config only
+  repo-explorer-mcp cache stats         Report the on-disk result cache (JSON)
+  repo-explorer-mcp cache clear         Delete every persisted result
   repo-explorer-mcp --update            Check for and install updates
   repo-explorer-mcp --install           Register with Claude Code (user MCP server + explore agent)
   repo-explorer-mcp --uninstall         Reverse --install
@@ -80,6 +82,9 @@ async fn main() -> ExitCode {
     );
     if wants_config_test(&subcommand_args) {
         return run_config_test(&config_path);
+    }
+    if let Some(command) = wants_cache_command(&subcommand_args) {
+        return run_cache_command(command, &config_path);
     }
     if setup::wants_setup(&subcommand_args) {
         return setup::run_setup(&config_path);
@@ -143,8 +148,20 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(config: repo_explorer_core::config::Config) -> anyhow::Result<()> {
+async fn run(mut config: repo_explorer_core::config::Config) -> anyhow::Result<()> {
     init_tracing(config.logging.level);
+
+    // XDG resolution is a binary-boundary concern: the agent crate receives an
+    // already-resolved (or deliberately empty) directory and never asks where
+    // the user's cache lives. Empty after this = no on-disk layer, L1 only.
+    config.cache.dir = resolve_cache_dir(&config.cache.dir, xdg_default_cache_dir())
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+    if config.cache.enabled && config.cache.persistent && !config.cache.dir.is_empty() {
+        tracing::info!("on-disk result cache at {}", config.cache.dir);
+    } else {
+        tracing::info!("on-disk result cache disabled");
+    }
 
     let mut memory_config = config.codebase_memory.clone();
     if memory_config.command.is_some()
@@ -435,6 +452,24 @@ fn xdg_default_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("repo-explorer").join("repo-explorer.toml"))
 }
 
+/// `<cache dir>/repo-explorer`, or `None` when no cache dir can be determined
+/// (e.g. no HOME). On Linux the cache dir honors `XDG_CACHE_HOME` (falling
+/// back to `~/.cache`); on Windows it is `%LOCALAPPDATA%`.
+fn xdg_default_cache_dir() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("repo-explorer"))
+}
+
+/// Directory the on-disk result cache lives in: `[cache] dir` verbatim when
+/// set, else the per-user cache dir. `None` means nothing resolved, which the
+/// agent crate reads as "no on-disk layer" rather than as an error.
+fn resolve_cache_dir(configured: &str, xdg_default: Option<PathBuf>) -> Option<PathBuf> {
+    if configured.is_empty() {
+        xdg_default
+    } else {
+        Some(PathBuf::from(configured))
+    }
+}
+
 /// True for `--config-test`, or the two-token subcommand `config test`
 /// (adjacent tokens). Callers pass [`args_without_config_value`] output, so a
 /// `--config <path>` value can never supply either token.
@@ -443,6 +478,119 @@ fn wants_config_test(args: &[String]) -> bool {
         return true;
     }
     args.windows(2).any(|w| w[0] == "config" && w[1] == "test")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheCommand {
+    Stats,
+    Clear,
+}
+
+/// The two-token subcommand `cache stats` / `cache clear` (adjacent tokens).
+/// Callers pass [`args_without_config_value`] output, so a `--config <path>`
+/// value can never supply either token.
+fn wants_cache_command(args: &[String]) -> Option<CacheCommand> {
+    args.windows(2)
+        .find_map(|w| match (w[0].as_str(), w[1].as_str()) {
+            ("cache", "stats") => Some(CacheCommand::Stats),
+            ("cache", "clear") => Some(CacheCommand::Clear),
+            _ => None,
+        })
+}
+
+#[derive(serde::Serialize)]
+struct CacheStatsReport {
+    status: &'static str,
+    #[serde(flatten)]
+    stats: repo_explorer_agent::disk_cache::CacheStats,
+    /// `[cache] persistent_max_bytes` — the budget `bytes` is swept against.
+    max_bytes: u64,
+}
+
+#[derive(serde::Serialize)]
+struct CacheClearReport {
+    status: &'static str,
+    #[serde(flatten)]
+    cleared: repo_explorer_agent::disk_cache::CacheCleared,
+}
+
+#[derive(serde::Serialize)]
+struct CacheErrorReport {
+    status: &'static str,
+    dir: Option<String>,
+    error: String,
+}
+
+/// Report or wipe the on-disk result cache, printing a structured JSON report
+/// to stdout like `config test`/`--update`. Only `[cache]` is read, and
+/// *without* validating the rest of the config (`config::cache_settings`):
+/// validation fails whenever the provider's `api_key_env` is not exported in
+/// the calling shell, and falling back to the defaults there would retarget
+/// `cache clear` from the configured `dir` to the per-user one — reporting
+/// `ok` after deleting nothing. A missing or unparseable file still falls back
+/// to the defaults, which is what a config-less install runs with; `config
+/// test` is where a broken config gets reported. Exits non-zero when no
+/// directory resolves or the filesystem call fails.
+fn run_cache_command(command: CacheCommand, config_path: &Path) -> ExitCode {
+    let kind = match command {
+        CacheCommand::Stats => "cache-stats",
+        CacheCommand::Clear => "cache-clear",
+    };
+    let cache = match repo_explorer_core::config::cache_settings(config_path) {
+        Ok(cache) => cache,
+        Err(e) => {
+            // stderr, not the report: stdout carries the JSON. Silence here
+            // would be a trap — a broken config that sets `[cache] dir` would
+            // make `cache clear` wipe the *default* directory instead.
+            eprintln!(
+                "repo-explorer-mcp: could not read [cache] from {} ({e}); using defaults",
+                config_path.display()
+            );
+            repo_explorer_core::config::CacheSettings::default()
+        }
+    };
+    let Some(dir) = resolve_cache_dir(&cache.dir, xdg_default_cache_dir()) else {
+        print_report(
+            &CacheErrorReport {
+                status: "unavailable",
+                dir: None,
+                error: "no cache directory resolved: [cache] dir is empty and no per-user \
+                        cache directory could be determined"
+                    .to_string(),
+            },
+            kind,
+        );
+        return ExitCode::FAILURE;
+    };
+    let outcome = match command {
+        CacheCommand::Stats => repo_explorer_agent::disk_cache::stats(&dir)
+            .map(|stats| CacheStatsReport {
+                status: "ok",
+                stats,
+                max_bytes: cache.persistent_max_bytes,
+            })
+            .map(|r| print_report(&r, kind)),
+        CacheCommand::Clear => repo_explorer_agent::disk_cache::clear(&dir)
+            .map(|cleared| CacheClearReport {
+                status: "ok",
+                cleared,
+            })
+            .map(|r| print_report(&r, kind)),
+    };
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            print_report(
+                &CacheErrorReport {
+                    status: "error",
+                    dir: Some(dir.display().to_string()),
+                    error: e.to_string(),
+                },
+                kind,
+            );
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -744,6 +892,45 @@ mod tests {
             "test".to_string(),
             "config".to_string()
         ]));
+    }
+
+    #[test]
+    fn wants_cache_command_matches_adjacent_tokens_only() {
+        assert_eq!(
+            wants_cache_command(&args(&["cache", "stats"])),
+            Some(CacheCommand::Stats)
+        );
+        assert_eq!(
+            wants_cache_command(&args(&["cache", "clear"])),
+            Some(CacheCommand::Clear)
+        );
+        assert_eq!(wants_cache_command(&args(&["cache"])), None);
+        assert_eq!(wants_cache_command(&args(&["stats"])), None);
+        assert_eq!(wants_cache_command(&args(&["stats", "cache"])), None);
+        assert_eq!(wants_cache_command(&args(&["cache", "purge"])), None);
+        assert_eq!(wants_cache_command(&[]), None);
+    }
+
+    #[test]
+    fn wants_cache_command_ignores_a_config_value() {
+        // `--config cache stats` names a file `cache`, not the subcommand.
+        let stripped = args_without_config_value(&args(&["--config", "cache", "stats"]));
+        assert_eq!(wants_cache_command(&stripped), None);
+        // A real subcommand still survives the strip.
+        let stripped = args_without_config_value(&args(&["--config", "c.toml", "cache", "stats"]));
+        assert_eq!(wants_cache_command(&stripped), Some(CacheCommand::Stats));
+    }
+
+    #[test]
+    fn cache_dir_prefers_the_configured_value_over_the_xdg_default() {
+        let xdg = Some(PathBuf::from("/home/u/.cache/repo-explorer"));
+        assert_eq!(
+            resolve_cache_dir("/srv/cache", xdg.clone()),
+            Some(PathBuf::from("/srv/cache"))
+        );
+        assert_eq!(resolve_cache_dir("", xdg.clone()), xdg);
+        // Neither resolves: the on-disk layer is simply off, not an error.
+        assert_eq!(resolve_cache_dir("", None), None);
     }
 
     #[test]

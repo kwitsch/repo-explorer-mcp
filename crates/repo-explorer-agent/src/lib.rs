@@ -5,12 +5,19 @@
 //! generic over its collaborators.
 //!
 //! This crate owns `serde_json` (tool-schema literals, argument parsing, result
-//! rendering); `repo-explorer-core`'s domain/llm types stay serde-free —
+//! rendering, and the persistent result cache's on-disk entries); of
+//! `repo-explorer-core`'s types only the three result-shaped domain structs
+//! carry serde derives (for that cache), and core itself still does no I/O —
 //! continuing the one-impure-dependency-per-crate convention that keeps `rmcp`
 //! in `repo-explorer-memory` and `genai` in `repo-explorer-llm`.
 
 mod agent;
+mod brief;
 mod cache;
+/// The on-disk L2 behind the in-memory query cache. Public so the binary's
+/// `cache stats` / `cache clear` subcommands can report on and empty the store
+/// without constructing an `AgentLoop`.
+pub mod disk_cache;
 mod dispatch;
 mod pipeline;
 mod render;

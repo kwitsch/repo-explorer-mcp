@@ -2,9 +2,17 @@
 //! tool-result memoization, retrieval-leg memoization, and the query→result
 //! cache with path-level invalidation. Interior-mutable (`Mutex`) because the
 //! agent is shared behind an `Arc` and every entry point takes `&self`.
+//!
+//! The query→result cache alone has a second layer: an optional on-disk store
+//! (`disk_cache`) behind the in-memory map, so a new process does not start
+//! cold. It is reached only through the two `*_l2` async wrappers below, which
+//! do their I/O on a blocking thread and never hold the mutex across it. The
+//! tool/leg/brief maps stay L1-only on purpose — they are keyed on the full
+//! fingerprint, so they die on every working-tree save and would have a
+//! near-zero cross-session hit rate for a fraction of a run's cost.
 
 use repo_explorer_core::domain::{
-    Candidate, ExplorationFinding, ExplorationQuery, ExplorationResult,
+    Candidate, ExplorationFinding, ExplorationOutcome, ExplorationQuery,
 };
 use repo_explorer_core::fingerprint::RepoFingerprint;
 use std::collections::hash_map::Entry;
@@ -13,6 +21,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::disk_cache::{DiskCache, FileDep, StoredEntry};
 use crate::dispatch::escapes_repo_root;
 
 /// A capped `String`-keyed map with FIFO eviction (oldest inserted first out).
@@ -94,33 +103,48 @@ pub(crate) fn opt_to_string<T: ToString>(v: Option<T>) -> String {
     v.map(|x| x.to_string()).unwrap_or_default()
 }
 
-/// One cached query result plus what it depends on.
+/// One cached query result plus what it depends on. Identical in both layers,
+/// so an L1 and an L2 hit report the same savings.
 #[derive(Debug, Clone)]
 pub(crate) struct QueryEntry {
     pub fingerprint: RepoFingerprint,
-    pub result: ExplorationResult,
+    pub result: ExplorationOutcome,
+    /// What the run that produced this entry spent, i.e. what a hit saves.
+    pub llm_turns: u32,
+    pub tokens: u64,
+    /// Store-time `(len, mtime)` stamps of the files this answer references.
+    /// Empty under `key_mode = "strict"`, and for an answer with no findings —
+    /// both fall back to strict validation.
+    pub deps: Vec<FileDep>,
 }
 
 struct Inner {
     tools: CappedMap<(String, Vec<ExplorationFinding>)>,
     legs: CappedMap<Vec<Candidate>>,
     queries: CappedMap<QueryEntry>,
+    briefs: CappedMap<String>,
 }
 
-/// All three caches behind one lock (entries are small; contention is one
+/// All four caches behind one lock (entries are small; contention is one
 /// exploration at a time per repo in practice).
 pub(crate) struct ResultCache {
     inner: Mutex<Inner>,
+    /// The query cache's L2. `Arc` because every access hands it to
+    /// `spawn_blocking`, which needs `'static`.
+    disk: Option<std::sync::Arc<DiskCache>>,
 }
 
 impl ResultCache {
-    pub(crate) fn new(max_entries: usize) -> Self {
+    /// `disk` is the optional L2; `None` is L1-only.
+    pub(crate) fn new(max_entries: usize, disk: Option<std::sync::Arc<DiskCache>>) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 tools: CappedMap::new(max_entries),
                 legs: CappedMap::new(max_entries),
                 queries: CappedMap::new(max_entries),
+                briefs: CappedMap::new(max_entries),
             }),
+            disk,
         }
     }
 
@@ -178,6 +202,30 @@ impl ResultCache {
         key
     }
 
+    /// Repo-brief key. `head_only` drops the dirty digest so a brief survives
+    /// an unrelated working-tree save (the architecture of a repo does not
+    /// change with every edit); `false` gives the `leg_key` shape.
+    pub(crate) fn brief_key(repo_root: &Path, fp: &RepoFingerprint, head_only: bool) -> String {
+        let repo = repo_root.to_string_lossy();
+        let mut key =
+            String::with_capacity(repo.len() + fp.head_sha.len() + fp.dirty_hash.len() + 24);
+        encode_field_into(&mut key, &repo);
+        let _ = if head_only {
+            write!(key, "{}#", fp.head_sha)
+        } else {
+            write!(key, "{}#{}#", fp.head_sha, fp.dirty_hash)
+        };
+        key
+    }
+
+    pub(crate) fn get_brief(&self, key: &str) -> Option<String> {
+        self.lock().briefs.get(key)
+    }
+
+    pub(crate) fn put_brief(&self, key: String, value: String) {
+        self.lock().briefs.insert(key, value);
+    }
+
     pub(crate) fn get_leg(&self, key: &str) -> Option<Vec<Candidate>> {
         self.lock().legs.get(key)
     }
@@ -215,6 +263,29 @@ impl ResultCache {
 
     pub(crate) fn put_query(&self, key: String, entry: QueryEntry) {
         self.lock().queries.insert(key, entry);
+    }
+
+    /// L2 read. The caller still has to validate the entry against the current
+    /// repository state — the layers share one policy
+    /// (`AgentLoop::entry_still_valid`) so they can never diverge.
+    pub(crate) async fn get_query_l2(&self, key: &str) -> Option<QueryEntry> {
+        let disk = self.disk.clone()?;
+        let key = key.to_string();
+        let stored = tokio::task::spawn_blocking(move || disk.get(&key))
+            .await
+            .ok()??;
+        Some(stored.into_entry())
+    }
+
+    /// L2 write-through. Every failure inside is swallowed by `DiskCache`: a
+    /// cache must never fail a query.
+    pub(crate) async fn put_query_l2(&self, key: &str, entry: &QueryEntry) {
+        let Some(disk) = self.disk.clone() else {
+            return;
+        };
+        let stored = StoredEntry::from_entry(key, entry);
+        let key = key.to_string();
+        let _ = tokio::task::spawn_blocking(move || disk.put(&key, &stored)).await;
     }
 
     /// Keep a still-valid entry current after the repo moved without any
@@ -261,6 +332,7 @@ impl ResultCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use repo_explorer_core::domain::{ExplorationResult, StageExit};
     use std::path::{Path, PathBuf};
 
     fn fp(sha: &str) -> RepoFingerprint {
@@ -273,16 +345,24 @@ mod tests {
     fn entry(sha: &str) -> QueryEntry {
         QueryEntry {
             fingerprint: fp(sha),
-            result: ExplorationResult {
-                findings: vec![],
-                summary: format!("from {sha}"),
+            result: ExplorationOutcome {
+                result: ExplorationResult {
+                    findings: vec![],
+                    summary: format!("from {sha}"),
+                },
+                retrieval_confidence: 0,
+                stage_exit: StageExit::Verify,
+                symbols: Vec::new(),
             },
+            llm_turns: 0,
+            tokens: 0,
+            deps: Vec::new(),
         }
     }
 
     #[test]
     fn fifo_eviction_drops_oldest() {
-        let cache = ResultCache::new(2);
+        let cache = ResultCache::new(2, None);
         cache.put_tool("k1".into(), ("v1".into(), vec![]));
         cache.put_tool("k2".into(), ("v2".into(), vec![]));
         cache.put_tool("k3".into(), ("v3".into(), vec![]));
@@ -293,14 +373,14 @@ mod tests {
 
     #[test]
     fn zero_cap_stores_nothing() {
-        let cache = ResultCache::new(0);
+        let cache = ResultCache::new(0, None);
         cache.put_tool("k".into(), ("v".into(), vec![]));
         assert!(cache.get_tool("k").is_none());
     }
 
     #[test]
     fn reinsert_same_key_replaces_without_growth() {
-        let cache = ResultCache::new(2);
+        let cache = ResultCache::new(2, None);
         cache.put_tool("k".into(), ("v1".into(), vec![]));
         cache.put_tool("k".into(), ("v2".into(), vec![]));
         cache.put_tool("k2".into(), ("x".into(), vec![]));
@@ -310,7 +390,7 @@ mod tests {
 
     #[test]
     fn query_refresh_and_remove() {
-        let cache = ResultCache::new(4);
+        let cache = ResultCache::new(4, None);
         cache.put_query("q".into(), entry("a"));
         cache.refresh_query_fingerprint("q", &fp("a"), fp("b"));
         assert_eq!(cache.get_query("q").unwrap().fingerprint, fp("b"));
@@ -325,13 +405,13 @@ mod tests {
         // replaced the entry (fingerprint "c") before this stale removal
         // (based on stale expectation "a") lands — it must not delete "c"'s
         // freshly-stored result.
-        let cache = ResultCache::new(4);
+        let cache = ResultCache::new(4, None);
         cache.put_query("q".into(), entry("a"));
         cache.put_query("q".into(), entry("c"));
         cache.remove_query("q", &fp("a"));
         let got = cache.get_query("q").unwrap();
         assert_eq!(got.fingerprint, fp("c"), "stale removal must not apply");
-        assert_eq!(got.result.summary, "from c");
+        assert_eq!(got.result.result.summary, "from c");
     }
 
     #[test]
@@ -339,13 +419,13 @@ mod tests {
         // Simulates the race: a concurrent full recompute already replaced
         // the entry (fingerprint "c") before this stale refresh (based on
         // stale expectation "a") lands — it must not clobber "c"'s result.
-        let cache = ResultCache::new(4);
+        let cache = ResultCache::new(4, None);
         cache.put_query("q".into(), entry("a"));
         cache.put_query("q".into(), entry("c"));
         cache.refresh_query_fingerprint("q", &fp("a"), fp("b"));
         let got = cache.get_query("q").unwrap();
         assert_eq!(got.fingerprint, fp("c"), "stale refresh must not apply");
-        assert_eq!(got.result.summary, "from c");
+        assert_eq!(got.result.result.summary, "from c");
     }
 
     #[test]

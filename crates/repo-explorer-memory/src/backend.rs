@@ -886,6 +886,21 @@ fn findings_and_summary(tool: &'static str, json: &Value, repo_root: &Path) -> E
     result_with_finding_count(tool, columnar_findings(json).unwrap_or_default())
 }
 
+/// Keep the response as text instead of mapping it to findings: the sections
+/// [`text_table_findings`] drops (every section whose `(cols: ...)` list has
+/// no `file`/`path` column — `node_labels:`, `edge_types:`, `packages:`) are
+/// exactly what the deterministic repo brief is built from. Findings stay
+/// empty; only `summary` carries the payload.
+fn raw_text_summary(_tool: &'static str, json: &Value, _repo_root: &Path) -> ExplorationResult {
+    ExplorationResult {
+        findings: Vec::new(),
+        summary: match json {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        },
+    }
+}
+
 impl MemoryClientBackend {
     /// The actual freshness-check/reindex sequence, unwrapped so the trait
     /// method below can time and log it uniformly across every early-return
@@ -1082,6 +1097,19 @@ impl MemoryBackend for MemoryClientBackend {
         )
         .await
     }
+
+    async fn get_architecture_text(&self, repo_root: &Path) -> Result<String, MemoryError> {
+        // Same wire call as `get_architecture` (`{project}` only) — the sole
+        // difference is the mapper: `raw_text_summary` keeps the multi-section
+        // payload the finding mapper discards. Deliberately a separate method:
+        // `get_architecture` is also the in-loop LLM tool, where the full
+        // architecture text as a tool result would cost more tokens than it
+        // saves.
+        Ok(self
+            .call_memory_tool_with("get_architecture", repo_root, |_args| {}, raw_text_summary)
+            .await?
+            .summary)
+    }
 }
 
 #[cfg(test)]
@@ -1212,6 +1240,27 @@ repo.crates.repo-explorer-core.src.lib.run crates/repo-explorer-core/src/lib.rs\
                 .iter()
                 .all(|f| f.location.path != std::path::Path::new("Function"))
         );
+    }
+
+    /// The repo-brief prefetch reads the same payload through
+    /// [`raw_text_summary`]: every section the finding mapper above throws
+    /// away must survive verbatim.
+    #[test]
+    fn raw_text_summary_preserves_every_section() {
+        let text = "\
+node_labels: 2  (cols: label count)\n  Function 120\n  Method 136\n\
+packages: 1  (cols: name nodes fan_in fan_out)\n  repo-explorer-core 256 0 0\n\
+entry_points: 1  (cols: qn file)\n  \
+repo.crates.repo-explorer-mcp.src.main.main crates/repo-explorer-mcp/src/main.rs\n";
+        let res = raw_text_summary(
+            "get_architecture",
+            &Value::String(text.to_string()),
+            Path::new("/repo"),
+        );
+        assert!(res.findings.is_empty());
+        assert!(res.summary.contains("node_labels:"));
+        assert!(res.summary.contains("packages:"));
+        assert!(res.summary.contains("repo-explorer-core 256 0 0"));
     }
 
     /// Live-verified `trace_path` payload shape: no `(cols: ...)` marker and

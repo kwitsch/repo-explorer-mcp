@@ -40,3 +40,15 @@ prefer_rtk = true
 
 [logging]
 level = "debug"
+
+[cache]
+# The on-disk L2 is OFF for the harness. The methodology rests on passes being
+# independent samples — run.py spawns a fresh server process per pass precisely so an
+# identical query is recomputed, not replayed (§8.1) — and a store that survives the
+# process breaks exactly that: every pass >= 2, and every re-run against the same pin,
+# would exit at stage == "cache" with pass 1's bytes, collapsing llm_calls, tokens,
+# cost_usd, confidence, candidate_count and the pass-to-pass variance to one sample
+# copied N times. It would also write eval answers into the user's production cache dir.
+# Measure the cross-session hit rate deliberately instead: run.py --cache-dir <path>,
+# twice against the same pin (see eval/README.md).
+persistent = false

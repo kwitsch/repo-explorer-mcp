@@ -250,6 +250,36 @@ def score_finding(finding: dict, repo_path: Path) -> dict:
     }
 
 
+# The four values M-3's `stage_exit` may take, spelled exactly as the server's tracing `path`
+# field and as `StageExit::as_str` (core/src/domain.rs) — so a response can be cross-checked
+# against the same run's log for free (`stage_exit_log_agreement`).
+STAGE_EXIT_VALUES = ("early-exit", "verify", "fallback", "cache")
+
+
+def m3_fields(parsed: dict) -> tuple:
+    """M-3's two new top-level response keys, spelled exactly as `ExplorationResultDto`
+    serializes them. Pinned by a test against a literal response, because a typo here is
+    invisible in the report — every M-3 rate would simply read n/a forever, which is also what
+    a legitimately pre-M-3 run looks like."""
+    return parsed.get("stage_exit"), parsed.get("retrieval_confidence")
+
+
+def schema_valid_of(stage_exit, retrieval_confidence) -> bool | None:
+    """Is one answer's M-3 payload schema-valid? None means the answer carried neither new key
+    — a pre-M-3 binary, or an error row with no structured payload at all — so it is excluded
+    from the rate's denominator rather than counted as a violation. The report prints that
+    denominator next to the rate, so a run where only *some* answers carry the keys is visible
+    instead of silently rounding to 100%."""
+    if stage_exit is None and retrieval_confidence is None:
+        return None
+    return (
+        stage_exit in STAGE_EXIT_VALUES
+        and isinstance(retrieval_confidence, int)
+        and not isinstance(retrieval_confidence, bool)
+        and 0 <= retrieval_confidence <= 100
+    )
+
+
 def ranges_overlap(a_start, a_end, b_start, b_end) -> bool:
     return a_start <= b_end and b_start <= a_end
 
@@ -409,10 +439,16 @@ def score_run(out_dir: Path) -> dict:
                     findings = []
                     hallucinations = []
                     path_valid_all = True
+                    # M-3: the same object gained two top-level keys. A binary that predates
+                    # M-3 emits neither, and both stay None so every rate over them degrades
+                    # to NA_ABSENT instead of a fabricated 0% — see schema_valid_of.
+                    resp_stage_exit = None
+                    resp_confidence = None
                     if row.get("response") and not row.get("is_error"):
                         try:
                             parsed = json.loads(row["response"])
                             findings = parsed.get("findings", [])
+                            resp_stage_exit, resp_confidence = m3_fields(parsed)
                         except (json.JSONDecodeError, TypeError):
                             pass
                     for fnd in findings:
@@ -432,8 +468,18 @@ def score_run(out_dir: Path) -> dict:
                         "cat": qspec.get("cat"),
                         "sub": qspec.get("sub"),
                         "path_valid_all": path_valid_all,
+                        "n_findings": len(findings),
                         "hallucinated": len(hallucinations) > 0,
                         "hallucination_detail": hallucinations,
+                        # M-3 response shape. None on an error row and on a pre-M-3 run: the
+                        # answer carried no structured payload to judge, which is not the same
+                        # as an invalid one.
+                        "response_stage_exit": resp_stage_exit,
+                        "response_retrieval_confidence": resp_confidence,
+                        "schema_valid": schema_valid_of(resp_stage_exit, resp_confidence),
+                        "stage_exit_matches_log": (
+                            None if resp_stage_exit is None else resp_stage_exit == row.get("stage")
+                        ),
                         "stage_expected": expected_stage,
                         "stage_match": stage_match,
                         "confident_wrong": (row.get("stage") == "early-exit" and not match["file_hit_any"]),
@@ -652,6 +698,48 @@ def qw0_cache(rows: list[dict]) -> dict:
     }
 
 
+# The two hallucination subtypes a registry-sourced location can actually fix, and therefore the
+# proxy M-3 is read on. `fabricated_path` is reported alongside them for completeness only: every
+# finish location and every early-exit location goes through `verify_location`'s on-disk check, so
+# it reads 0 before AND after M-3 and must not be quoted as an M-3 improvement — the one path that
+# can make it non-zero is the budget/turn-limit synthesis, which returns index candidates with no
+# on-disk check, i.e. a stale-index regression alarm rather than a scorer artifact.
+LOCATION_SUBTYPES = ("range_outside_file", "misaligned_snippet")
+
+
+def qw0_m3(rows: list[dict]) -> dict:
+    """M-3 response-shape aggregates, same degradation rule as the rest of this block: a run
+    whose binary predates the new keys reports them absent, never 0.
+
+    `hallucinated_path_rate` is per *finding* — a returned path that does not exist in the repo
+    under test, over every returned finding — and is computable on any run, old or new, because
+    it reads the filesystem and not a server field. `location_subtypes` splits the two
+    range/alignment subtypes by the stage that produced them; that split, not
+    `outer_followup_rate` (which has no harness arm — see eval/README.md), is what M-3 moves."""
+    judged = [r for r in rows if r.get("schema_valid") is not None]
+    agreed = [r for r in rows if r.get("stage_exit_matches_log") is not None]
+    n_findings = sum(r.get("n_findings") or 0 for r in rows)
+    details = [h for r in rows for h in (r.get("hallucination_detail") or [])]
+    fabricated = sum(1 for h in details if h["hallucination"] == "fabricated_path")
+    by_stage = defaultdict(Counter)
+    for r in rows:
+        for h in r.get("hallucination_detail") or []:
+            if h["hallucination"] in LOCATION_SUBTYPES:
+                by_stage[r.get("stage") or "<none>"][h["hallucination"]] += 1
+    return {
+        "n_rows": len(rows),
+        "schema_judged": len(judged),
+        "schema_valid_rate": (sum(1 for r in judged if r["schema_valid"]) / len(judged)) if judged else None,
+        "stage_exit_log_agreement": (
+            (sum(1 for r in agreed if r["stage_exit_matches_log"]) / len(agreed)) if agreed else None
+        ),
+        "n_findings": n_findings,
+        "fabricated_paths": fabricated,
+        "hallucinated_path_rate": (fabricated / n_findings) if n_findings else None,
+        "location_subtypes": {stage: dict(c) for stage, c in sorted(by_stage.items())},
+    }
+
+
 def qw0_metrics(rows: list[dict]) -> dict:
     """Every QW-0 aggregate over the already-warm-up-filtered scored rows. Pure — print_qw0_report
     and the --csv-out writer both consume this and neither recomputes anything."""
@@ -665,6 +753,21 @@ def qw0_metrics(rows: list[dict]) -> dict:
     stage_exit = Counter(r.get("stage") or "<none>" for r in rows)
     routes = [qw0_field(r, "early_exit_route") for r in rows if r.get("stage") == "early-exit"]
     routes = [x for x in routes if x is not None]
+    # M-2: both fields are emitted only on the Stage-5 path, so they are denominated over
+    # Stage-5 rows only — the same restriction early_exit_route gets above. Averaging
+    # orientation_calls_in_loop over all rows would divide a fallback-only numerator by the
+    # whole corpus and report ~0.00 for a loop that never stopped calling get_architecture.
+    # Stage 5 also exits as stage=="error" (provider exhaustion) carrying truthful counts, so
+    # the denominator is "the row has a count", not the clean-exit stage name.
+    fallback_rows = [r for r in rows if r.get("orientation_calls_in_loop") is not None]
+    # M-1: the hit rate's denominator is every scored row, because every scored row is a row
+    # that could have hit — the corpus repeats each query once per pass and each pass runs a
+    # fresh server process, which is exactly the cross-session repetition M-1 exists for.
+    # The layer split gets its own presence test rather than riding that denominator: a
+    # pre-M-1 binary emits stage=="cache" with no cache_layer, so the total rate stays a real
+    # measurement while l1/l2 report absent instead of a fabricated 0%.
+    cache_rows = [r for r in rows if r.get("stage") == "cache"]
+    layers = [x for x in (qw0_field(r, "cache_layer") for r in cache_rows) if x is not None]
     return {
         "n_rows": len(rows),
         "llm_calls": _dist(llm_calls),
@@ -676,6 +779,25 @@ def qw0_metrics(rows: list[dict]) -> dict:
         "cost": qw0_cost(rows),
         "latency_ms": _dist(numeric_field(rows, "latency_ms")),
         "total_ms": _dist(numeric_field(rows, "total_ms")),
+        "brief_tokens": _dist(numeric_field(fallback_rows, "brief_tokens")),
+        # M-3: finish-only, so denominated on the rows that carry it (numeric_field skips
+        # None), never on the corpus — see the run.py note on absent vs zero.
+        "cited_candidate_ids": _dist(numeric_field(rows, "cited_candidate_ids")),
+        "orientation_calls_in_loop": _dist(numeric_field(fallback_rows, "orientation_calls_in_loop")),
+        "cache_hits": {
+            "n_rows": len(rows),
+            "hit_rows": len(cache_rows),
+            "hit_rate": len(cache_rows) / len(rows) if rows else None,
+            "cache_hit_l1": layers.count("l1") / len(rows) if layers and rows else None,
+            "cache_hit_l2": layers.count("l2") / len(rows) if layers and rows else None,
+            "layer_reported": bool(layers),
+        },
+        # Denominated over the cache rows alone (numeric_field drops the None every non-cache
+        # row carries): these measure what a hit avoided, so a non-hit has nothing to add and
+        # must not pad the denominator toward zero.
+        "turns_saved_by_cache": _dist(numeric_field(rows, "turns_saved_by_cache")),
+        "tokens_saved_by_cache": _dist(numeric_field(rows, "tokens_saved_by_cache")),
+        "m3": qw0_m3(rows),
     }
 
 
@@ -740,6 +862,68 @@ def print_qw0_report(agg: dict) -> None:
     print(f"  latency_per_query:   {_fmt_dist(agg['latency_ms'], unit='ms')}")
     print(f"  total_ms (server-side): {_fmt_dist(agg['total_ms'], unit='ms')}")
 
+    # M-2 repo brief. Both are Stage-5-only measurements: `n` is the number of fallback rows
+    # that reported the field, NOT the run's row count. A run whose binary predates M-2, or one
+    # with no fallback row at all, prints n/a here — never 0.
+    print(f"  brief_tokens (fallback rows):        {_fmt_dist(agg['brief_tokens'], keys=('mean', 'p50', 'p95'))}")
+    print(f"  orientation_calls_in_loop (fallback rows): {_fmt_dist(agg['orientation_calls_in_loop'])}")
+
+    # M-3 `finish` citations: `n` is the number of rows whose run actually made a finish call.
+    # A mean of 0 across a run says the models ignore `candidate_id` and it should be reverted;
+    # n/a says nothing reported it (old binary, or no finish-backed row).
+    print(f"  cited_candidate_ids (finish rows):    {_fmt_dist(agg['cited_candidate_ids'])}")
+
+    # M-1 persistent result cache. All three rates share one denominator — every scored row —
+    # and the line says so, because a hit rate is only readable against the set of rows that
+    # could have hit. The two saved distributions are denominated over the cache rows instead:
+    # they answer "what did a hit avoid", which a non-hit row cannot contribute to.
+    ch = agg["cache_hits"]
+    if ch["hit_rate"] is None:
+        print(f"  cache_hit_rate: {NA_ABSENT}")
+    else:
+        print(
+            f"  cache_hit_rate: {ch['hit_rate']:.1%}  "
+            f"({ch['hit_rows']} of {ch['n_rows']} scored rows served from cache)"
+        )
+        if ch["layer_reported"]:
+            print(
+                f"    cache_hit_l1: {ch['cache_hit_l1']:.1%}   cache_hit_l2: {ch['cache_hit_l2']:.1%}"
+                f"   (share of the same {ch['n_rows']} rows)"
+            )
+        else:
+            print(f"    cache_hit_l1 / cache_hit_l2: {NA_ABSENT}")
+    print(f"  turns_saved_by_cache (cache rows):   {_fmt_dist(agg['turns_saved_by_cache'])}")
+    print(f"  tokens_saved_by_cache (cache rows):  {_fmt_dist(agg['tokens_saved_by_cache'], keys=('mean', 'p50', 'p95'))}")
+
+    # M-3 structured response. The two schema lines are n/a on any run whose binary predates the
+    # keys; hallucinated_path_rate and the subtype split read on every run, old or new.
+    m3 = agg["m3"]
+    if m3["schema_valid_rate"] is None:
+        print(f"  schema_valid_rate: {NA_ABSENT}")
+    else:
+        print(
+            f"  schema_valid_rate: {m3['schema_valid_rate']:.1%}  "
+            f"({m3['schema_judged']} of {m3['n_rows']} answers carried the M-3 keys)"
+        )
+    if m3["stage_exit_log_agreement"] is None:
+        print(f"  stage_exit_log_agreement: {NA_ABSENT}")
+    else:
+        print(f"  stage_exit_log_agreement: {m3['stage_exit_log_agreement']:.1%}  (response stage_exit vs. the run's own log)")
+    if m3["hallucinated_path_rate"] is None:
+        print("  hallucinated_path_rate: n/a - no findings returned in this run")
+    else:
+        print(
+            f"  hallucinated_path_rate: {m3['hallucinated_path_rate']:.2%}  "
+            f"({m3['fabricated_paths']} of {m3['n_findings']} returned findings name a path that "
+            f"does not exist)"
+        )
+    if m3["location_subtypes"]:
+        print("  location hallucinations by stage (the M-3 proxy):")
+        for stage, counts in m3["location_subtypes"].items():
+            print(f"    {stage:12s} " + " ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    else:
+        print("  location hallucinations by stage (the M-3 proxy): none on any stage")
+
 
 CSV_COLUMNS = [
     "run_id",
@@ -761,6 +945,12 @@ CSV_COLUMNS = [
     "total_ms",
     "confidence",
     "candidate_count",
+    "brief_tokens",
+    "orientation_calls_in_loop",
+    "cache_layer",
+    "turns_saved_by_cache",
+    "tokens_saved_by_cache",
+    "cited_candidate_ids",
 ]
 
 
@@ -791,6 +981,12 @@ def qw0_csv_rows(result: dict) -> list[dict]:
                 "total_ms": qw0_field(r, "total_ms"),
                 "confidence": r.get("confidence"),
                 "candidate_count": qw0_field(r, "candidate_count"),
+                "brief_tokens": qw0_field(r, "brief_tokens"),
+                "orientation_calls_in_loop": qw0_field(r, "orientation_calls_in_loop"),
+                "cache_layer": qw0_field(r, "cache_layer"),
+                "turns_saved_by_cache": qw0_field(r, "turns_saved_by_cache"),
+                "tokens_saved_by_cache": qw0_field(r, "tokens_saved_by_cache"),
+                "cited_candidate_ids": qw0_field(r, "cited_candidate_ids"),
             }
         )
     return out

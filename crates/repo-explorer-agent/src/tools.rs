@@ -2,9 +2,12 @@
 //! `finish` validation. `repo_root` is never a tool parameter — the dispatcher
 //! supplies it from loop state.
 
-use crate::dispatch::{canonical_repo_root, slice_lines, verify_location};
-use repo_explorer_core::domain::{ExplorationFinding, ExplorationResult, FileLocation};
+use crate::dispatch::{canonical_repo_root, clamp_location, slice_lines, verify_location};
+use repo_explorer_core::domain::{
+    Candidate, ExplorationFinding, ExplorationResult, FileLocation, saturate_u32,
+};
 use repo_explorer_core::llm::{Message, Tool, ToolCall};
+use repo_explorer_core::retrieval::is_unknown_location;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -199,7 +202,7 @@ fn build_catalog() -> Vec<Tool> {
 fn finish_tool() -> Tool {
     tool(
         "finish",
-        "REQUIRED to conclude: report the located findings and a summary. Call this once you have gathered enough information.",
+        "REQUIRED to conclude: report the located findings and a summary. Call this once you have gathered enough information. Each finding may carry candidate_id: the [n] id of the numbered candidate/starting point it came from, when it came from one.",
         json!({
             "type": "object",
             "properties": {
@@ -219,7 +222,8 @@ fn finish_tool() -> Tool {
                                 "additionalProperties": false
                             },
                             "snippet": {"type": "string"},
-                            "note": {"type": "string"}
+                            "note": {"type": "string"},
+                            "candidate_id": {"type": "integer"}
                         },
                         "required": ["location"],
                         "additionalProperties": false
@@ -331,6 +335,48 @@ pub(crate) struct FinishFinding {
     pub snippet: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
+    /// Optional 1-based id into the numbered candidate list the model was
+    /// shown (verify's `candidates_block`, the fallback loop's starting
+    /// points). Never required and never a rejection reason — see
+    /// [`validate_finding`].
+    #[serde(default)]
+    pub candidate_id: Option<u32>,
+}
+
+/// Resolve a 1-based `candidate_id` into the registry. `None` for an absent,
+/// zero or out-of-range id — all three are "the model did not cite a
+/// candidate", which is legitimate (a genuine grep/read_file find has no id).
+fn candidate_for(id: Option<u32>, candidates: &[Candidate]) -> Option<&Candidate> {
+    candidates.get((id? as usize).checked_sub(1)?)
+}
+
+/// Does the cited candidate's range describe the *same place* the model
+/// reported, i.e. is the model's range a bad transcription of it rather than a
+/// different location that merely came from the same starting point? Only then
+/// may the registry range replace the model's (already disk-verified) one.
+///
+/// * the model gave no range at all (`(0, 0)` sentinel) — the registry range is
+///   the only range there is, so take it;
+/// * the ranges overlap — a drifted/short transcription of the candidate;
+/// * EXCEPT when the model's range sits strictly inside the candidate's: that
+///   is a narrower site the model found *within* a wide indexed span (several
+///   call sites inside one impl block), not a mis-transcription. Substituting
+///   there both widens a precise find and makes every finding citing that id
+///   identical, so `tidy_findings` would dedupe all but the first away.
+/// * a disjoint range is a different place in the same file (the definition
+///   cited as the starting point for a caller found 100 lines down) — keeping
+///   the model's verified range is the whole point of `verify_location`.
+fn snaps_to_candidate(model: &FileLocation, candidate: &FileLocation) -> bool {
+    if is_unknown_location(model) {
+        return true;
+    }
+    let overlaps = candidate.line_start <= model.line_end && model.line_start <= candidate.line_end;
+    // Equal ranges are not "strictly inside" — the substitution is a no-op
+    // there and must still count as a citation.
+    let strictly_inside = candidate.line_start <= model.line_start
+        && model.line_end <= candidate.line_end
+        && (candidate.line_start, candidate.line_end) != (model.line_start, model.line_end);
+    overlaps && !strictly_inside
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -353,7 +399,8 @@ async fn validate_finding(
     f: FinishFinding,
     repo_root: &Path,
     canonical_root: &Path,
-) -> Result<ExplorationFinding, String> {
+    candidates: &[Candidate],
+) -> Result<(ExplorationFinding, bool), String> {
     if f.location.path.trim().is_empty() {
         return Err("finding location.path must be non-empty".to_string());
     }
@@ -365,6 +412,52 @@ async fn validate_finding(
     let (location, content) = verify_location(raw, repo_root, canonical_root)
         .await
         .map_err(|reason| format!("finding {reason}"))?;
+    // M-3: an optional `candidate_id` lets the model point at the numbered
+    // candidate it copied from, so the RANGE comes from the registry instead of
+    // the model's transcription of it (the residual hallucination subtype —
+    // a real path with a wrong span). Deliberately narrow:
+    //   * same file only — the snippet below is sliced from the content
+    //     `verify_location` already read for *this* path;
+    //   * the registry range goes through the same EOF clamp, because Stage
+    //     4/5 candidates come straight from the backends and are NOT
+    //     disk-verified (only the early-exit path verifies them);
+    //   * an unknown-location `(0, 0)` candidate is skipped — it carries no
+    //     range to prefer;
+    //   * and only when the model's own range is a transcription of the
+    //     candidate's rather than a different place in the same file — see
+    //     [`snaps_to_candidate`].
+    // A bad id is NEVER an error: the finding keeps its verified location, so
+    // the loop can never become less able to report a genuine find.
+    let mut cited = false;
+    let location = match candidate_for(f.candidate_id, candidates) {
+        Some(c)
+            if c.location.path == location.path
+                && !is_unknown_location(&c.location)
+                && snaps_to_candidate(&location, &c.location) =>
+        {
+            let line_count = saturate_u32(content.lines().count() as u64);
+            match clamp_location(c.location.clone(), line_count) {
+                Ok(from_registry) => {
+                    cited = true;
+                    from_registry
+                }
+                Err(reason) => {
+                    tracing::debug!(reason = %reason, "candidate_id range does not fit the file; keeping the model location");
+                    location
+                }
+            }
+        }
+        resolved => {
+            if f.candidate_id.is_some() {
+                tracing::debug!(
+                    candidate_id = f.candidate_id,
+                    in_range = resolved.is_some(),
+                    "finish candidate_id unusable; keeping the model location"
+                );
+            }
+            location
+        }
+    };
     // F-18: don't trust the model's own snippet text (paraphrased signatures,
     // invented bodies at an otherwise-correct path+range) — derive it from the
     // file verify_location already read. Only a location with NOTHING
@@ -376,18 +469,23 @@ async fn validate_finding(
     // EOF-clamps `line_end` down to 0 for a real-but-empty file, and reading the
     // clamped value here would misread a real `(0, N)` finding as the sentinel,
     // letting the model's fabricated snippet back in.
-    let nothing_to_slice = f.location.line_start == 0 && f.location.line_end == 0;
+    // `cited` implies a real, registry-sourced range, so there IS something to
+    // slice even when the model's own bounds were the sentinel.
+    let nothing_to_slice = !cited && f.location.line_start == 0 && f.location.line_end == 0;
     let snippet = if nothing_to_slice {
         f.snippet
     } else {
         let real = slice_lines(content, Some(location.line_start), Some(location.line_end));
         if real.is_empty() { None } else { Some(real) }
     };
-    Ok(ExplorationFinding {
-        location,
-        snippet,
-        note: f.note,
-    })
+    Ok((
+        ExplorationFinding {
+            location,
+            snippet,
+            note: f.note,
+        },
+        cited,
+    ))
 }
 
 /// Deserialize and hand-validate `finish` arguments into an `ExplorationResult`.
@@ -400,7 +498,8 @@ async fn validate_finding(
 pub(crate) async fn parse_finish(
     arguments_json: &str,
     repo_root: &Path,
-) -> Result<ExplorationResult, String> {
+    candidates: &[Candidate],
+) -> Result<(ExplorationResult, u32), String> {
     let args: FinishArgs = serde_json::from_str(arguments_json)
         .map_err(|e| format!("could not parse finish arguments: {e}"))?;
     // Resolve the canonical repo root once, and only when there is at least
@@ -411,16 +510,23 @@ pub(crate) async fn parse_finish(
         Some(canonical_repo_root(repo_root).await?)
     };
     let mut findings = Vec::with_capacity(args.findings.len());
+    let mut cited = 0u32;
     for f in args.findings {
         let canonical_root = canonical_root
             .as_ref()
             .expect("canonical_root is Some when findings are non-empty");
-        findings.push(validate_finding(f, repo_root, canonical_root).await?);
+        let (finding, from_candidate) =
+            validate_finding(f, repo_root, canonical_root, candidates).await?;
+        cited += u32::from(from_candidate);
+        findings.push(finding);
     }
-    Ok(ExplorationResult {
-        findings,
-        summary: args.summary,
-    })
+    Ok((
+        ExplorationResult {
+            findings,
+            summary: args.summary,
+        },
+        cited,
+    ))
 }
 
 /// Lenient counterpart to [`parse_finish`] for `forced_finish`, whose one-shot
@@ -434,7 +540,8 @@ pub(crate) async fn parse_finish(
 pub(crate) async fn parse_finish_lenient(
     arguments_json: &str,
     repo_root: &Path,
-) -> Result<ExplorationResult, String> {
+    candidates: &[Candidate],
+) -> Result<(ExplorationResult, u32), String> {
     let args: FinishArgs = serde_json::from_str(arguments_json)
         .map_err(|e| format!("could not parse finish arguments: {e}"))?;
     let had_findings = !args.findings.is_empty();
@@ -444,12 +551,16 @@ pub(crate) async fn parse_finish_lenient(
         Some(canonical_repo_root(repo_root).await?)
     };
     let mut findings = Vec::with_capacity(args.findings.len());
+    let mut cited = 0u32;
     for f in args.findings {
         let canonical_root = canonical_root
             .as_ref()
             .expect("canonical_root is Some when findings are non-empty");
-        match validate_finding(f, repo_root, canonical_root).await {
-            Ok(finding) => findings.push(finding),
+        match validate_finding(f, repo_root, canonical_root, candidates).await {
+            Ok((finding, from_candidate)) => {
+                cited += u32::from(from_candidate);
+                findings.push(finding);
+            }
             Err(reason) => {
                 tracing::debug!(reason = %reason, "forced finish dropped an invalid finding")
             }
@@ -458,10 +569,13 @@ pub(crate) async fn parse_finish_lenient(
     if had_findings && findings.is_empty() {
         return Err("no finding in the finish call had a valid path".to_string());
     }
-    Ok(ExplorationResult {
-        findings,
-        summary: args.summary,
-    })
+    Ok((
+        ExplorationResult {
+            findings,
+            summary: args.summary,
+        },
+        cited,
+    ))
 }
 
 /// Resolve the `finish` calls of one model turn: the first one that parses
@@ -473,10 +587,11 @@ pub(crate) async fn parse_finish_lenient(
 pub(crate) async fn resolve_finish(
     calls: &[ToolCall],
     repo_root: &Path,
-) -> Result<ExplorationResult, Vec<Message>> {
+    candidates: &[Candidate],
+) -> Result<(ExplorationResult, u32), Vec<Message>> {
     let mut rejections = Vec::new();
     for c in calls.iter().filter(|c| c.name == "finish") {
-        match parse_finish(&c.arguments_json, repo_root).await {
+        match parse_finish(&c.arguments_json, repo_root, candidates).await {
             Ok(result) => return Ok(result),
             Err(reason) => rejections.push(Message::tool(
                 &c.id,
@@ -522,6 +637,35 @@ pub(crate) fn cache_prefix_fingerprint(system_prompt: &str, catalog: &[Tool]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test shims. M-3 gave the three `finish` entry points a candidate
+    /// registry and a cited-id count; every pre-existing test exercises the
+    /// registry-free path, so these restore the old shape (empty registry,
+    /// count dropped) and let those tests stay byte-identical. Tests that
+    /// care about the registry call the real `super::` functions.
+    async fn parse_finish(json: &str, repo_root: &Path) -> Result<ExplorationResult, String> {
+        super::parse_finish(json, repo_root, &[])
+            .await
+            .map(|(r, _)| r)
+    }
+
+    async fn parse_finish_lenient(
+        json: &str,
+        repo_root: &Path,
+    ) -> Result<ExplorationResult, String> {
+        super::parse_finish_lenient(json, repo_root, &[])
+            .await
+            .map(|(r, _)| r)
+    }
+
+    async fn resolve_finish(
+        calls: &[ToolCall],
+        repo_root: &Path,
+    ) -> Result<ExplorationResult, Vec<Message>> {
+        super::resolve_finish(calls, repo_root, &[])
+            .await
+            .map(|(r, _)| r)
+    }
 
     /// Temp repo containing `src/main.rs` with `n_lines` numbered lines, via
     /// the crate's shared `test_support::temp_repo_with` fixture. Caller
@@ -787,6 +931,140 @@ mod tests {
         let result = parse_finish(json, &dir).await.unwrap();
         assert_eq!(result.findings[0].location.line_start, 2);
         assert_eq!(result.findings[0].location.line_end, 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn registry_candidate(path: &str, start: u32, end: u32) -> Candidate {
+        Candidate {
+            location: FileLocation {
+                path: PathBuf::from(path),
+                line_start: start,
+                line_end: end,
+            },
+            symbol: Some("main".to_string()),
+            kind: repo_explorer_core::domain::CandidateKind::SymbolExact,
+            score: 700,
+            snippet: None,
+        }
+    }
+
+    /// The M-3 point: the registry's range wins over the model's transcription
+    /// of it, so a cited finding cannot drift off the candidate it came from.
+    /// The model's range has to overlap the candidate's to count as a
+    /// transcription of it (see `snaps_to_candidate`).
+    #[tokio::test]
+    async fn parse_finish_prefers_the_cited_candidates_range() {
+        let dir = temp_repo_main("candidate_id_wins", 5);
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":1,"line_end":3},"candidate_id":1}],"summary":"s"}"#;
+        let candidates = [registry_candidate("src/main.rs", 2, 4)];
+        let (result, cited) = super::parse_finish(json, &dir, &candidates).await.unwrap();
+        assert_eq!(result.findings[0].location.line_start, 2);
+        assert_eq!(result.findings[0].location.line_end, 4);
+        assert_eq!(
+            result.findings[0].snippet.as_deref(),
+            Some("l2\nl3\nl4"),
+            "the snippet is re-derived for the registry range"
+        );
+        assert_eq!(cited, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A candidate in the same file is not automatically the same place: the
+    /// definition cited as the starting point must not relocate a caller found
+    /// further down the file.
+    #[tokio::test]
+    async fn parse_finish_keeps_a_disjoint_finding_off_the_cited_candidate() {
+        let dir = temp_repo_main("candidate_id_disjoint", 5);
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":4,"line_end":5},"candidate_id":1}],"summary":"s"}"#;
+        let candidates = [registry_candidate("src/main.rs", 1, 2)];
+        let (result, cited) = super::parse_finish(json, &dir, &candidates).await.unwrap();
+        assert_eq!(result.findings[0].location.line_start, 4);
+        assert_eq!(result.findings[0].location.line_end, 5);
+        assert_eq!(result.findings[0].snippet.as_deref(), Some("l4\nl5"));
+        assert_eq!(cited, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Distinct sites inside ONE wide candidate (call sites in an impl block)
+    /// keep their own ranges — substituting the candidate's span would make
+    /// them byte-identical and `tidy_findings` would drop all but the first.
+    #[tokio::test]
+    async fn parse_finish_keeps_distinct_sites_inside_one_cited_candidate() {
+        let dir = temp_repo_main("candidate_id_nested", 6);
+        let json = r#"{"findings":[
+            {"location":{"path":"src/main.rs","line_start":2,"line_end":2},"candidate_id":1,"note":"insert"},
+            {"location":{"path":"src/main.rs","line_start":4,"line_end":4},"candidate_id":1,"note":"evict"}
+        ],"summary":"s"}"#;
+        let candidates = [registry_candidate("src/main.rs", 1, 6)];
+        let (result, cited) = super::parse_finish(json, &dir, &candidates).await.unwrap();
+        let ranges: Vec<(u32, u32)> = result
+            .findings
+            .iter()
+            .map(|f| (f.location.line_start, f.location.line_end))
+            .collect();
+        assert_eq!(ranges, vec![(2, 2), (4, 4)]);
+        assert_eq!(cited, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The regression that matters: a bad id must never drop a genuine find.
+    #[tokio::test]
+    async fn parse_finish_keeps_the_finding_for_an_out_of_range_candidate_id() {
+        let dir = temp_repo_main("candidate_id_out_of_range", 5);
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":1,"line_end":2},"candidate_id":9}],"summary":"s"}"#;
+        let candidates = [registry_candidate("src/main.rs", 2, 4)];
+        let (result, cited) = super::parse_finish(json, &dir, &candidates).await.unwrap();
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].location.line_start, 1);
+        assert_eq!(result.findings[0].location.line_end, 2);
+        assert_eq!(cited, 0);
+        // A zero id is "no citation", not candidate 0.
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":1,"line_end":2},"candidate_id":0}],"summary":"s"}"#;
+        let (result, cited) = super::parse_finish(json, &dir, &candidates).await.unwrap();
+        assert_eq!(result.findings[0].location.line_end, 2);
+        assert_eq!(cited, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn parse_finish_keeps_the_model_location_for_an_unusable_candidate() {
+        let dir = temp_repo_main("candidate_id_unusable", 5);
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":1,"line_end":2},"candidate_id":1}],"summary":"s"}"#;
+        // A `(0, 0)` unknown-location candidate carries no range to prefer.
+        let (result, cited) =
+            super::parse_finish(json, &dir, &[registry_candidate("src/main.rs", 0, 0)])
+                .await
+                .unwrap();
+        assert_eq!(result.findings[0].location.line_start, 1);
+        assert_eq!(result.findings[0].location.line_end, 2);
+        assert_eq!(cited, 0);
+        // A candidate in a different file must not relocate the finding.
+        let (result, cited) =
+            super::parse_finish(json, &dir, &[registry_candidate("src/other.rs", 3, 4)])
+                .await
+                .unwrap();
+        assert_eq!(
+            result.findings[0].location.path,
+            PathBuf::from("src/main.rs")
+        );
+        assert_eq!(result.findings[0].location.line_end, 2);
+        assert_eq!(cited, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A stale registry range past EOF must not reintroduce the very
+    /// `range_outside_file` error the field exists to remove.
+    #[tokio::test]
+    async fn parse_finish_ignores_a_candidate_range_past_eof() {
+        let dir = temp_repo_main("candidate_id_past_eof", 3);
+        let json = r#"{"findings":[{"location":{"path":"src/main.rs","line_start":1,"line_end":2},"candidate_id":1}],"summary":"s"}"#;
+        let (result, cited) =
+            super::parse_finish(json, &dir, &[registry_candidate("src/main.rs", 40, 50)])
+                .await
+                .unwrap();
+        assert_eq!(result.findings[0].location.line_start, 1);
+        assert_eq!(result.findings[0].location.line_end, 2);
+        assert_eq!(cited, 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

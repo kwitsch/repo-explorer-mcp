@@ -10,6 +10,7 @@ Run with:  uv run --with pyyaml eval/test_score.py   (prints OK; non-zero exit o
 """
 import contextlib
 import io
+import json
 import sys
 import tempfile
 import types
@@ -18,6 +19,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from score import (
+    NA_ABSENT,
+    m3_fields,
+    qw0_m3,
+    schema_valid_of,
     PRICES,
     call_cost,
     llm_calls_of,
@@ -295,6 +300,207 @@ def check_csv_rows() -> None:
     assert unpriced[0]["cost_usd"] == ""
 
 
+def check_repo_brief_metrics() -> None:
+    """M-2's two Stage-5 fields: parsed off the same `exploration complete` line by run.py, and
+    aggregated over fallback rows ONLY. A row set from a pre-M-2 binary must report them absent,
+    never as a zero that would look like "the loop stopped re-orienting"."""
+    # run.py half: the names must match the server's tracing fields verbatim, or score.py sees
+    # nothing and silently prints n/a forever.
+    parsed = parse_call_lines([
+        "INFO explore{req_id=a-0}: repo_explorer_agent::agent: exploration complete "
+        'path="fallback" tokens=30000 llm_calls=4 brief_tokens=742 orientation_calls_in_loop=0'
+    ])
+    assert parsed["stage"] == "fallback"
+    assert parsed["brief_tokens"] == 742, parsed
+    assert parsed["orientation_calls_in_loop"] == 0, parsed
+    assert parse_call_lines([COMPLETE_LINE])["brief_tokens"] is None  # pre-M-2 line
+
+    # Pre-M-2 rows: absent everywhere -> None (NA_ABSENT in the report), not an n=0/mean=0 dist.
+    old = qw0_metrics([_row(query_id="a", stage="fallback", llm_calls=6, tokens=30000)])
+    assert old["brief_tokens"] is None, old["brief_tokens"]
+    assert old["orientation_calls_in_loop"] is None, old["orientation_calls_in_loop"]
+
+    # Denominator is "the row carries a count", not the stage name: a non-Stage-5 row never
+    # carries one, and a Stage-5 run that died in the provider chain (stage=="error") does.
+    agg = qw0_metrics([
+        _row(query_id="a", stage="fallback", llm_calls=4, tokens=30000,
+             brief_tokens=700, orientation_calls_in_loop=1),
+        _row(query_id="b", stage="error", llm_calls=5, tokens=31000,
+             brief_tokens=900, orientation_calls_in_loop=1),
+        _row(query_id="c", stage="verify", llm_calls=2, tokens=1000),
+    ])
+    assert agg["brief_tokens"]["n"] == 2 and agg["brief_tokens"]["mean"] == 800
+    assert agg["orientation_calls_in_loop"]["n"] == 2
+    assert agg["orientation_calls_in_loop"]["mean"] == 1.0, agg["orientation_calls_in_loop"]
+
+    # A measured zero is a measurement, not an absence — this is the acceptance gate's reading.
+    zeroed = qw0_metrics([_row(query_id="a", stage="fallback", brief_tokens=640,
+                               orientation_calls_in_loop=0)])
+    assert zeroed["orientation_calls_in_loop"]["mean"] == 0.0
+
+    # Report + CSV both carry them.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print_qw0_report(old)
+    assert f"orientation_calls_in_loop (fallback rows): {NA_ABSENT}" in buf.getvalue(), buf.getvalue()
+    csv_row = qw0_csv_rows({"run_id": "x", "scored_rows": [
+        _row(query_id="a", stage="fallback", brief_tokens=640, orientation_calls_in_loop=0)
+    ]})[0]
+    assert csv_row["brief_tokens"] == 640 and csv_row["orientation_calls_in_loop"] == 0
+
+
+
+def check_m3_metrics() -> None:
+    """M-3's response-shape aggregates. The case that matters is the pre-M-3 run: it returns
+    real findings (so hallucinated_path_rate is a real measurement) while carrying neither new
+    key (so both schema lines must read absent, never 0% or 100%)."""
+    # The key names are the whole contract on the response side: get them wrong and every M-3
+    # rate silently reads n/a forever, which is indistinguishable from a pre-M-3 run. Pinned
+    # against a literal response body, the way run.py's log-field names are.
+    body = (
+        '{"findings":[{"location":{"path":"a.rs","line_start":1,"line_end":2},"snippet":"x",'
+        '"note":"n","symbol":"a::b"}],"summary":"s","retrieval_confidence":92,'
+        '"stage_exit":"early-exit"}'
+    )
+    assert m3_fields(json.loads(body)) == ("early-exit", 92)
+    assert m3_fields(json.loads('{"findings":[],"summary":"s"}')) == (None, None)  # pre-M-3
+
+    # Per-answer validity. An error row / a pre-M-3 answer carries neither key -> None.
+    assert schema_valid_of(None, None) is None
+    assert schema_valid_of("verify", 72) is True
+    assert schema_valid_of("early-exit", 0) is True
+    assert schema_valid_of("early_exit", 72) is False, "underscore spelling is not the wire value"
+    assert schema_valid_of("error", 72) is False, "error is unreachable in a returned struct"
+    assert schema_valid_of("verify", None) is False, "half a payload is not valid"
+    assert schema_valid_of("verify", 101) is False
+    assert schema_valid_of("verify", True) is False, "a bool is not a 0-100 confidence"
+
+    # Pre-M-3 run: two rows, one fabricated path out of five findings.
+    old = qw0_m3([
+        _row(query_id="a", stage="verify", n_findings=3,
+             hallucination_detail=[{"hallucination": "fabricated_path", "path": "nope.rs"}]),
+        _row(query_id="b", stage="fallback", n_findings=2, hallucination_detail=[]),
+    ])
+    assert old["schema_valid_rate"] is None, old
+    assert old["stage_exit_log_agreement"] is None, old
+    assert old["hallucinated_path_rate"] == 0.2, old
+    assert old["location_subtypes"] == {}, old
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print_qw0_report(qw0_metrics([
+            _row(query_id="a", stage="verify", n_findings=3,
+                 hallucination_detail=[{"hallucination": "fabricated_path", "path": "nope.rs"}]),
+            _row(query_id="b", stage="fallback", n_findings=2, hallucination_detail=[]),
+        ]))
+    out = buf.getvalue()
+    assert f"schema_valid_rate: {NA_ABSENT}" in out, out
+    assert f"stage_exit_log_agreement: {NA_ABSENT}" in out, out
+    assert "hallucinated_path_rate: 20.00%" in out, out
+
+    # M-3 run: one valid answer, one that disagrees with the log, one invalid, one error row
+    # (no payload at all -> excluded from both denominators, not counted as a violation).
+    agg = qw0_m3([
+        _row(query_id="a", stage="verify", n_findings=2, hallucination_detail=[],
+             schema_valid=True, stage_exit_matches_log=True),
+        _row(query_id="b", stage="fallback", n_findings=1, schema_valid=True,
+             stage_exit_matches_log=False,
+             hallucination_detail=[{"hallucination": "range_outside_file", "path": "a.rs"},
+                                   {"hallucination": "misaligned_snippet", "path": "b.rs"}]),
+        _row(query_id="c", stage="verify", n_findings=1, hallucination_detail=[],
+             schema_valid=False, stage_exit_matches_log=True),
+        _row(query_id="d", stage="error", n_findings=0, hallucination_detail=[]),
+    ])
+    assert agg["schema_judged"] == 3 and agg["n_rows"] == 4, agg
+    assert abs(agg["schema_valid_rate"] - 2 / 3) < 1e-9, agg
+    assert abs(agg["stage_exit_log_agreement"] - 2 / 3) < 1e-9, agg
+    assert agg["hallucinated_path_rate"] == 0.0, "a real path with a wrong range is not a fabricated path"
+    assert agg["location_subtypes"] == {
+        "fallback": {"range_outside_file": 1, "misaligned_snippet": 1}
+    }, agg["location_subtypes"]
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print_qw0_report(qw0_metrics([
+            _row(query_id="a", stage="verify", n_findings=2, hallucination_detail=[],
+                 schema_valid=True, stage_exit_matches_log=True),
+            _row(query_id="c", stage="verify", n_findings=1, hallucination_detail=[],
+                 schema_valid=False, stage_exit_matches_log=True),
+        ]))
+    out = buf.getvalue()
+    assert "schema_valid_rate: 50.0%  (2 of 2 answers carried the M-3 keys)" in out, out
+    assert "stage_exit_log_agreement: 100.0%" in out, out
+    assert "location hallucinations by stage (the M-3 proxy): none on any stage" in out, out
+
+    # A run that returned nothing at all: no denominator, so n/a — not a flattering 0%.
+    empty = qw0_m3([_row(query_id="a", stage="error", n_findings=0, hallucination_detail=[])])
+    assert empty["hallucinated_path_rate"] is None, empty
+    assert qw0_m3([])["hallucinated_path_rate"] is None
+
+
+def check_cache_hit_metrics() -> None:
+    """M-1's three cache-hit fields: parsed off the query-cache line by run.py, and aggregated
+    with two different denominators — the hit rates over every scored row, the saved counters
+    over the cache rows only. The pre-M-1 case is the one that matters: that run HAS cache rows
+    (stage=="cache") but no cache_layer, so the total rate must stay a real measurement while
+    the l1/l2 split reports absent, never 0%."""
+    parsed = parse_call_lines([
+        "INFO explore{req_id=a-0}: repo_explorer_agent::agent: exploration served from query "
+        'cache path="cache" tokens=0 llm_calls=0 cache_layer="l2" '
+        "turns_saved_by_cache=3 tokens_saved_by_cache=18420"
+    ])
+    assert parsed["stage"] == "cache"
+    assert parsed["cache_layer"] == "l2", parsed
+    assert parsed["turns_saved_by_cache"] == 3, parsed
+    assert parsed["tokens_saved_by_cache"] == 18420, parsed
+    assert parse_call_lines([COMPLETE_LINE])["cache_layer"] is None  # pre-M-1 line
+
+    # Pre-M-1 run: 1 of 4 rows was a cache hit, so 25% is measured — but which layer is not.
+    old = qw0_metrics([
+        _row(query_id="a", stage="cache", llm_calls=0, tokens=0),
+        _row(query_id="b", stage="verify", llm_calls=2, tokens=1000),
+        _row(query_id="c", stage="verify", llm_calls=2, tokens=1000),
+        _row(query_id="d", stage="verify", llm_calls=2, tokens=1000),
+    ])
+    assert old["cache_hits"]["hit_rate"] == 0.25, old["cache_hits"]
+    assert old["cache_hits"]["cache_hit_l1"] is None, old["cache_hits"]
+    assert old["cache_hits"]["cache_hit_l2"] is None, old["cache_hits"]
+    assert old["turns_saved_by_cache"] is None
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print_qw0_report(old)
+    out = buf.getvalue()
+    assert "cache_hit_rate: 25.0%  (1 of 4 scored rows served from cache)" in out, out
+    assert f"cache_hit_l1 / cache_hit_l2: {NA_ABSENT}" in out, out
+    assert f"turns_saved_by_cache (cache rows):   {NA_ABSENT}" in out, out
+
+    # M-1 run: the layer split shares the all-rows denominator; the saved counters do not.
+    agg = qw0_metrics([
+        _row(query_id="a", stage="cache", llm_calls=0, tokens=0, cache_layer="l1",
+             turns_saved_by_cache=2, tokens_saved_by_cache=10000),
+        _row(query_id="b", stage="cache", llm_calls=0, tokens=0, cache_layer="l2",
+             turns_saved_by_cache=4, tokens_saved_by_cache=20000),
+        _row(query_id="c", stage="verify", llm_calls=2, tokens=1000),
+        _row(query_id="d", stage="verify", llm_calls=2, tokens=1000),
+    ])
+    assert agg["cache_hits"]["cache_hit_l1"] == 0.25, agg["cache_hits"]
+    assert agg["cache_hits"]["cache_hit_l2"] == 0.25, agg["cache_hits"]
+    assert agg["turns_saved_by_cache"]["n"] == 2, "denominated over cache rows, not all rows"
+    assert agg["turns_saved_by_cache"]["mean"] == 3.0, agg["turns_saved_by_cache"]
+    assert agg["tokens_saved_by_cache"]["mean"] == 15000.0, agg["tokens_saved_by_cache"]
+
+    # A run with no cache row at all: 0% is a measurement (stage is always emitted), not n/a.
+    none_hit = qw0_metrics([_row(query_id="a", stage="verify", llm_calls=2, tokens=1000)])
+    assert none_hit["cache_hits"]["hit_rate"] == 0.0
+
+    csv_row = qw0_csv_rows({"run_id": "x", "scored_rows": [
+        _row(query_id="a", stage="cache", cache_layer="l2", turns_saved_by_cache=4,
+             tokens_saved_by_cache=20000)
+    ]})[0]
+    assert csv_row["cache_layer"] == "l2"
+    assert csv_row["turns_saved_by_cache"] == 4 and csv_row["tokens_saved_by_cache"] == 20000
+
+
 def _write_file(dir_path: Path, name: str, n_lines: int) -> None:
     body = "\n".join(f"SENTINEL_{i:03d}_line_content" for i in range(n_lines))
     (dir_path / name).write_text(body + "\n")
@@ -404,6 +610,9 @@ def main() -> None:
         check_priced_subset_report()
         check_cache_ratio()
         check_csv_rows()
+        check_repo_brief_metrics()
+        check_cache_hit_metrics()
+        check_m3_metrics()
 
         # English-only invariant: every eval query string is pure ASCII
         # (scoped to item["query"]; notes/comments keep their non-ASCII

@@ -4,7 +4,7 @@
 //! core) preserves the one-impure-dependency-per-crate convention.
 
 use repo_explorer_agent::AgentLoop;
-use repo_explorer_core::domain::{ExplorationQuery, ExplorationResult};
+use repo_explorer_core::domain::{ExplorationOutcome, ExplorationQuery, FileLocation};
 use repo_explorer_core::llm::SystemClock;
 use repo_explorer_core::retrieval::is_unknown_location;
 use repo_explorer_llm::GenaiProvider;
@@ -92,22 +92,46 @@ struct ExplorationFindingDto {
     snippet: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    /// Qualified symbol name for this location. Present only when exactly
+    /// one ranked retrieval candidate overlapped the finding's path+range
+    /// (one shared line is enough) and knew a symbol; omitted (never null)
+    /// otherwise, so its absence means "not known", never "no symbol here".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol: Option<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct ExplorationResultDto {
     findings: Vec<ExplorationFindingDto>,
     summary: String,
+    /// How strong the deterministic pre-stage's *candidate set* was, 0-100.
+    /// It scores retrieval, not the answer: a low value means the answer took
+    /// the explorative fallback loop, not that it is wrong.
+    retrieval_confidence: u32,
+    /// Which stage produced this answer: `"early-exit"`, `"verify"`,
+    /// `"fallback"` or `"cache"`. Identical to the `path` field of the
+    /// server's own log line for the call.
+    stage_exit: String,
 }
 
-impl From<ExplorationResult> for ExplorationResultDto {
-    fn from(result: ExplorationResult) -> Self {
+impl From<ExplorationOutcome> for ExplorationResultDto {
+    fn from(outcome: ExplorationOutcome) -> Self {
+        // One pass over the sparse symbol list, then a lookup per finding —
+        // the join is by location because `ExplorationFinding` carries no
+        // symbol on any backend leg.
+        let symbols: std::collections::HashMap<&FileLocation, &str> = outcome
+            .symbols
+            .iter()
+            .map(|(loc, sym)| (loc, sym.as_str()))
+            .collect();
         Self {
-            findings: result
+            findings: outcome
+                .result
                 .findings
                 .into_iter()
                 .map(|f| {
                     let known = !is_unknown_location(&f.location);
+                    let symbol = symbols.get(&f.location).map(|s| (*s).to_string());
                     ExplorationFindingDto {
                         location: FileLocationDto {
                             // Reuses the existing buffer for valid UTF-8 paths; only
@@ -123,10 +147,13 @@ impl From<ExplorationResult> for ExplorationResultDto {
                         },
                         snippet: f.snippet,
                         note: f.note,
+                        symbol,
                     }
                 })
                 .collect(),
-            summary: result.summary,
+            summary: outcome.result.summary,
+            retrieval_confidence: outcome.retrieval_confidence,
+            stage_exit: outcome.stage_exit.as_str().to_string(),
         }
     }
 }
@@ -276,7 +303,9 @@ impl RepoExplorerServer {
                        base directory), query (required), optional scope_hint \
                        (path prefix relative to repo_path), optional \
                        max_results, optional response_format \
-                       (\"concise\" (default) | \"detailed\" for longer snippets).",
+                       (\"concise\" (default) | \"detailed\" for longer snippets). \
+                       Each answer also carries stage_exit and \
+                       retrieval_confidence (0-100).",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn explore_repository(
@@ -299,7 +328,7 @@ impl RepoExplorerServer {
         let span = tracing::info_span!("explore", req_id = %req_id);
         let result = self.agent.run(&repo_path, &query).instrument(span).await;
         match result {
-            Ok(result) => Ok(Json(ExplorationResultDto::from(result))),
+            Ok(outcome) => Ok(Json(ExplorationResultDto::from(outcome))),
             Err(e) => {
                 tracing::warn!(error_class = "provider", message = %e, "exploration failed");
                 Err(e.to_string())
@@ -385,7 +414,20 @@ impl ServerHandler for RepoExplorerServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use repo_explorer_core::domain::{ExplorationFinding, FileLocation};
+    use repo_explorer_core::domain::{
+        ExplorationFinding, ExplorationResult, FileLocation, StageExit,
+    };
+
+    /// The pre-M-3 shape: an outcome with no symbols, so a test that only
+    /// cares about the finding mapping stays as short as it was.
+    fn outcome(result: ExplorationResult) -> ExplorationOutcome {
+        ExplorationOutcome {
+            result,
+            retrieval_confidence: 92,
+            stage_exit: StageExit::EarlyExit,
+            symbols: Vec::new(),
+        }
+    }
 
     #[test]
     fn maps_result_to_dto_json_shape() {
@@ -413,7 +455,7 @@ mod tests {
             summary: "two findings".to_string(),
         };
 
-        let dto = ExplorationResultDto::from(result);
+        let dto = ExplorationResultDto::from(outcome(result));
         let value = serde_json::to_value(&dto).expect("serialize dto");
 
         assert_eq!(value["summary"], "two findings");
@@ -434,6 +476,63 @@ mod tests {
         // snippet/note omitted when None.
         assert!(findings[1].get("snippet").is_none());
         assert!(findings[1].get("note").is_none());
+
+        // M-3 additions. `symbol` is absent (not null) when no ranked
+        // candidate covered the finding — the outcome here carries none.
+        assert!(findings[0].get("symbol").is_none());
+        assert_eq!(value["retrieval_confidence"], 92);
+        assert_eq!(value["stage_exit"], "early-exit");
+    }
+
+    /// The compat contract: the three M-3 keys are purely additive and a
+    /// symbol only appears where the join actually produced one.
+    #[test]
+    fn symbol_is_joined_per_location_and_the_old_keys_are_untouched() {
+        let hit = FileLocation {
+            path: PathBuf::from("src/lib.rs"),
+            line_start: 10,
+            line_end: 20,
+        };
+        let miss = FileLocation {
+            path: PathBuf::from("src/other.rs"),
+            line_start: 1,
+            line_end: 4,
+        };
+        let dto = ExplorationResultDto::from(ExplorationOutcome {
+            result: ExplorationResult {
+                findings: vec![
+                    ExplorationFinding {
+                        location: hit.clone(),
+                        snippet: Some("fn main() {}".to_string()),
+                        note: Some("entry".to_string()),
+                    },
+                    ExplorationFinding {
+                        location: miss,
+                        snippet: None,
+                        note: None,
+                    },
+                ],
+                summary: "two findings".to_string(),
+            },
+            retrieval_confidence: 41,
+            stage_exit: StageExit::Fallback,
+            symbols: vec![(hit, "crate::main".to_string())],
+        });
+        let value = serde_json::to_value(&dto).expect("serialize dto");
+
+        assert_eq!(value["findings"][0]["symbol"], "crate::main");
+        assert!(
+            value["findings"][1].get("symbol").is_none(),
+            "an unmatched finding must omit `symbol`, not serialize a null"
+        );
+        // Every pre-M-3 key, in place and unchanged.
+        assert_eq!(value["summary"], "two findings");
+        assert_eq!(value["findings"][0]["location"]["line_start"], 10);
+        assert_eq!(value["findings"][0]["location"]["line_end"], 20);
+        assert_eq!(value["findings"][0]["snippet"], "fn main() {}");
+        assert_eq!(value["findings"][0]["note"], "entry");
+        assert_eq!(value["stage_exit"], "fallback");
+        assert_eq!(value["retrieval_confidence"], 41);
     }
 
     #[test]
@@ -454,7 +553,7 @@ mod tests {
             summary: "one finding".to_string(),
         };
 
-        let dto = ExplorationResultDto::from(result);
+        let dto = ExplorationResultDto::from(outcome(result));
         let value = serde_json::to_value(&dto).expect("serialize dto");
 
         let location = &value["findings"][0]["location"];
@@ -540,6 +639,7 @@ mod tests {
             "Use ONE call per question; do NOT follow up with grep/read for locations already returned.",
             "Not needed for: reading a known file path (use your file tool).",
             "response_format",
+            "stage_exit and retrieval_confidence (0-100)",
         ] {
             assert!(
                 desc.contains(expected),
@@ -557,10 +657,20 @@ mod tests {
 
         // rmcp auto-derives this from the `Result<Json<T>, String>` return
         // type. Hand-building a CallToolResult would silently drop it.
-        assert!(
-            tool.output_schema.is_some(),
-            "the output schema must stay advertised"
-        );
+        let schema = tool
+            .output_schema
+            .as_ref()
+            .expect("the output schema must stay advertised");
+        let props = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("the derived schema must describe properties");
+        for key in ["findings", "summary", "retrieval_confidence", "stage_exit"] {
+            assert!(
+                props.contains_key(key),
+                "the derived output schema lost {key:?}: {schema:?}"
+            );
+        }
     }
 
     #[test]

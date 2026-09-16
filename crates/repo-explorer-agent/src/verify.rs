@@ -25,7 +25,9 @@ const EXPAND_CONTEXT_BEFORE: u32 = 10;
 const EXPAND_CONTEXT_AFTER: u32 = 20;
 
 pub(crate) enum VerifyOutcome {
-    Finished(ExplorationResult),
+    /// The result plus how many of its findings carried a `candidate_id` that
+    /// resolved into the numbered registry (`QueryMetrics::cited_candidate_ids`).
+    Finished(ExplorationResult, u32),
     /// Verification could not conclude — run the explorative fallback loop.
     Escalate,
 }
@@ -37,8 +39,8 @@ A deterministic retrieval stage has already searched the repository and produced
 numbered list of candidate locations for the user's query. Your only job is to select the \
 candidates that actually answer the query. If a candidate's outline/snippet is not enough to \
 judge it, call the expand tool ONCE, batching every id you need in a single call. \
-Then conclude by calling finish: copy the selected candidates' locations verbatim, add a short \
-note per finding, and write a one-paragraph summary. Do not attempt broad exploration; if the \
+Then conclude by calling finish: copy the selected candidates' locations verbatim and set each \
+finding's candidate_id to the [n] you selected, add a short note per finding, and write a one-paragraph summary. Do not attempt broad exploration; if the \
 candidates cannot answer the query, call finish with an empty findings list and say so in the \
 summary.";
 
@@ -92,14 +94,15 @@ where
                     ProviderResponse::ToolCalls(calls) if !calls.is_empty() => {
                         // Check for a successful finish before cloning anything: the
                         // common case (finish on the first turn) returns right here.
-                        let mut responses = match resolve_finish(&calls, repo_root).await {
-                            Ok(result) => {
-                                let action = if last { "forced_finish" } else { "finish" };
-                                tracing::debug!(turn, action, "verify action");
-                                return VerifyOutcome::Finished(result);
-                            }
-                            Err(rejections) => rejections,
-                        };
+                        let mut responses =
+                            match resolve_finish(&calls, repo_root, candidates).await {
+                                Ok((result, cited)) => {
+                                    let action = if last { "forced_finish" } else { "finish" };
+                                    tracing::debug!(turn, action, "verify action");
+                                    return VerifyOutcome::Finished(result, cited);
+                                }
+                                Err(rejections) => rejections,
+                            };
                         tracing::debug!(turn, action = "expand", "verify action");
                         for call in calls.iter().filter(|c| c.name != "finish") {
                             let content = match call.name.as_str() {
@@ -321,13 +324,13 @@ mod tests {
         );
         let names: Vec<&str> = verify_catalog().iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["expand", "finish"]);
-        // 1627 content bytes (~1.7 KB on the wire) is roughly 430-510 tokens
+        // 1847 content bytes (~1.8 KB on the wire) is roughly 460-580 tokens
         // — BELOW Anthropic's 1024-token minimum cacheable prefix, so the
         // `cache_control` marker is silently a no-op on this, the hot path.
         // See crates/repo-explorer-llm/CLAUDE.md.
         assert_eq!(
             cache_prefix_fingerprint(VERIFY_SYSTEM_PROMPT, verify_catalog()),
-            (1627, 5381662065911654639)
+            (1847, 1815932435607646823)
         );
     }
 

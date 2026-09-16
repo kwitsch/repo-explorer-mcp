@@ -4,6 +4,14 @@ The MCP boundary: hosts the `explore_repository` tool, owns the `rmcp` server
 dependency plus the serde/schemars DTOs, and uses `anyhow` here (core's typed
 errors are consumed via `?`/`.context(...)`).
 
+## Response DTO (`src/server.rs`)
+
+- `ExplorationResultDto` maps from `repo_explorer_core::domain::ExplorationOutcome` (not `ExplorationResult`): `findings` + `summary` come from `outcome.result`, plus `retrieval_confidence: u32` and `stage_exit: String` (`StageExit::as_str()` — the same four literals `QueryMetrics::path` logs).
+- `ExplorationFindingDto.symbol` is filled by joining `outcome.symbols` (a sparse `Vec<(FileLocation, String)>`) on the finding's location, in one `HashMap` pass per response. It is `skip_serializing_if = "Option::is_none"`, like `line_start`/`line_end`/`snippet`/`note` — an absent key means "unknown", never "none exists".
+- The three fields above are the only client-visible additions; every pre-existing key, its order and its omit-when-`None` behavior are unchanged.
+- The output schema is **derived by rmcp** from the tool's `Result<Json<ExplorationResultDto>, String>` return type, and `content[0].text` is rmcp's compact JSON of the same value. Do not hand-build a `CallToolResult`: that drops the derived schema (pinned by `tool_description_and_annotations_are_advertised`) and would break `eval/score.py`, which `json.loads` the text block.
+- Doc comments on the DTO fields are the schema's descriptions — schemars picks them up, so they are client-facing text.
+
 ## Setup wizard (`src/setup.rs`)
 
 - All interactive IO, the env-var scan, the free-tier model catalog, and TOML file writing live here at the binary boundary.
@@ -20,6 +28,7 @@ errors are consumed via `?`/`.context(...)`).
 - The XDG default is `$XDG_CONFIG_HOME/repo-explorer/repo-explorer.toml` on Linux, `%APPDATA%\repo-explorer\repo-explorer.toml` on Windows.
 - The two `exists` gates are load-bearing: the XDG default resolves on essentially every machine, so returning it unconditionally would make the `./repo-explorer.toml` fallback dead code and silently ignore an in-repo config.
 - This crate owns the `dirs` dependency used for XDG resolution; core and the other crates stay free of it.
+- The on-disk result cache follows the same rule: `xdg_default_cache_dir()` (`dirs::cache_dir()/repo-explorer`; `$XDG_CACHE_HOME` on Linux, `%LOCALAPPDATA%` on Windows) and `resolve_cache_dir` — `[cache] dir` verbatim when set, else the XDG default, `None` when neither resolves. `run()` writes the result back into `config.cache.dir` before `AgentLoop::new`, so the agent crate receives an already-resolved (or deliberately empty = no on-disk layer) string and never touches XDG. `cache stats`/`cache clear` reuse the same two functions.
 - `codebase-memory-mcp` managed copy: lives in the shared bin dir (`~/.local/bin` on Linux via `dirs::executable_dir()`, `%LOCALAPPDATA%\repo-explorer-mcp` on Windows via `dirs::data_local_dir().join("repo-explorer-mcp")` — the same dir the npx installer uses for the main binary); provisioned/updated only by `--update` and launched by absolute path — never resolved via PATH/`which`.
 - Search uses `rg` instead: a system `rg` on PATH is preferred, and the managed `rg` copy (also in that shared bin dir) is only a fallback.
 - `setup` writes the absolute `codebase-memory-mcp` path into `[codebase_memory] command` but pins no `[search]` path.
@@ -33,6 +42,9 @@ errors are consumed via `?`/`.context(...)`).
 
 - `config test` (or `--config-test`) validates the resolved config only — parse + semantic checks, no server/memory/LLM/search connections.
 - It prints a structured JSON report to stdout and exits non-zero on failure.
+- `cache stats` / `cache clear` report or wipe the on-disk result cache (the agent crate's L2), printing the same style of JSON report to stdout and exiting non-zero on an io error or when no cache directory resolves.
+- They read `[cache]` through `config::cache_settings`, **not** `config::load`: validation is skipped, because it fails whenever the provider's `api_key_env` is not exported in the calling shell — and a fallback there would retarget `cache clear` from the configured `dir` to the per-user one while still reporting `ok`. A missing or unparseable file still falls back to `CacheSettings::default()` (reporting a broken config is `config test`'s job), announced on **stderr** so stdout stays pure JSON.
+- Numbers come from `repo_explorer_agent::disk_cache::{stats, clear}`; the binary only adds `status` and `max_bytes` and never re-derives them.
 - `setup` (mirroring `config test`) runs the interactive wizard.
 - The wizard also auto-runs when the resolved config is missing, but **only if stdin is a TTY**.
 - A non-interactive launch with no config prints guidance to stderr naming the `setup` subcommand, then exits non-zero — never blocking, never writing to stdout.
@@ -49,6 +61,7 @@ errors are consumed via `?`/`.context(...)`).
 - Both print a per-step (`mcp-server`, `agent-file`) JSON report to stdout and exit non-zero only when a step errors, mirroring `--update`.
 - Both are dispatched before config resolution, so neither loads or creates `repo-explorer.toml`.
 - Dispatch precedence: `--update` (checked first) takes precedence over both; when `--install`/`--uninstall` are both passed without `--update`, `--install` wins (checked first).
+- Full dispatch order in `main()`: `--version` -> `--help` -> `--update` -> `--install` -> `--uninstall` -> `resolve_config_path` -> `config test` -> `cache stats|clear` -> `setup` -> load config -> `run()`. Everything from `config test` down needs the resolved config path; everything above it must not create or read a config.
 
 ## Self-update (`src/update.rs`)
 

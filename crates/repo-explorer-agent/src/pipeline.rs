@@ -816,7 +816,7 @@ mod tests {
     async fn leg_cache_does_not_cross_scopes() {
         let search = MockSearchBackend::new().with_search_result(Ok(vec![]));
         let memory = MockMemoryBackend::new();
-        let cache = ResultCache::new(16);
+        let cache = ResultCache::new(16, None);
         let fp = RepoFingerprint {
             head_sha: "sha".to_string(),
             dirty_hash: "clean".to_string(),
@@ -877,7 +877,7 @@ mod tests {
         // Regression: a bare `#`-joined leg key let pattern `x#y` (unscoped)
         // and pattern `x` (scope `y#`) hash to the identical key
         // `"grep#x#y#"`. Query B must not be served query A's cached rows.
-        let cache = ResultCache::new(16);
+        let cache = ResultCache::new(16, None);
         let fp = RepoFingerprint {
             head_sha: "sha".to_string(),
             dirty_hash: "clean".to_string(),

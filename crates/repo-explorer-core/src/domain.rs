@@ -1,8 +1,14 @@
 //! Pure domain value types describing exploration queries and results.
 //!
-//! These types carry no serde derives and perform no I/O — only
-//! `Debug + Clone + PartialEq + Eq`. Serialization is added later, at an MCP
-//! boundary, if and when it is actually needed (YAGNI).
+//! Only the result-shaped types — [`FileLocation`], [`ExplorationFinding`],
+//! [`ExplorationResult`] and the [`ExplorationOutcome`]/[`StageExit`] wrapper
+//! around them — carry serde derives, and only because the agent crate's
+//! persistent result cache writes them to disk:
+//! the "if and when it is actually needed" condition the original YAGNI note
+//! named is met by that cache, not by an MCP boundary. The on-disk shape is
+//! versioned in exactly one place, `repo_explorer_agent::disk_cache::
+//! SCHEMA_VERSION`. No other domain type gains derives (the query itself is
+//! covered by the cache key), and core still performs no I/O.
 
 use std::path::PathBuf;
 
@@ -17,7 +23,7 @@ pub fn saturate_u32(n: u64) -> u32 {
 }
 
 /// A span of lines within a single file.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FileLocation {
     pub path: PathBuf,
     pub line_start: u32,
@@ -25,7 +31,7 @@ pub struct FileLocation {
 }
 
 /// A single finding produced while exploring a repository.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExplorationFinding {
     pub location: FileLocation,
     pub snippet: Option<String>,
@@ -54,10 +60,55 @@ pub struct ExplorationQuery {
 }
 
 /// The outcome of running an [`ExplorationQuery`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExplorationResult {
     pub findings: Vec<ExplorationFinding>,
     pub summary: String,
+}
+
+/// Which stage of the pipeline produced an answer. The wire spellings are the
+/// exact literals `QueryMetrics::path` already logs, so a response can be
+/// cross-checked against the run's own log line for free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StageExit {
+    EarlyExit,
+    Verify,
+    Fallback,
+    Cache,
+}
+
+impl StageExit {
+    /// The same string serde writes — `&'static str` so metrics (which want
+    /// exactly that) need no allocation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StageExit::EarlyExit => "early-exit",
+            StageExit::Verify => "verify",
+            StageExit::Fallback => "fallback",
+            StageExit::Cache => "cache",
+        }
+    }
+}
+
+/// An [`ExplorationResult`] plus the provenance the MCP boundary reports next
+/// to it. Built exactly once, at the end of `AgentLoop::run` — every backend
+/// leg and every intermediate stage keeps passing the bare
+/// [`ExplorationResult`], for which this data is meaningless.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExplorationOutcome {
+    pub result: ExplorationResult,
+    /// The deterministic pre-stage's score (0-100) for its CANDIDATE SET —
+    /// deliberately not named `confidence`: it does not score the answer. A
+    /// fallback run has a low one by definition (that is what sent it to the
+    /// fallback loop) even when the answer is good.
+    pub retrieval_confidence: u32,
+    pub stage_exit: StageExit,
+    /// Qualified symbol per finding location, for the findings where exactly
+    /// one ranked candidate covered the location and knew a symbol. Sparse and
+    /// keyed by location rather than a field on [`ExplorationFinding`], which
+    /// has no symbol on any backend leg.
+    pub symbols: Vec<(FileLocation, String)>,
 }
 
 /// How a retrieval candidate was found, ordered by intrinsic strength

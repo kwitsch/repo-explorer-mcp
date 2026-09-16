@@ -6,7 +6,7 @@
 use repo_explorer_agent::AgentLoop;
 use repo_explorer_core::config::{AgentSettings, CacheSettings};
 use repo_explorer_core::domain::{
-    ExplorationFinding, ExplorationQuery, ExplorationResult, FileLocation,
+    ExplorationFinding, ExplorationQuery, ExplorationResult, FileLocation, StageExit,
 };
 use repo_explorer_core::fingerprint::RepoFingerprint;
 use repo_explorer_core::fingerprint::mock::MockRepoStateProbe;
@@ -153,9 +153,9 @@ async fn fake_provider_dispatch_and_assembly() {
     // Returned result equals the finish payload, except the snippet: a real
     // location always gets its snippet derived from the file on disk (F-18),
     // not left as whatever the model's finish call did or didn't supply.
-    assert_eq!(result.summary, "found main");
+    assert_eq!(result.result.summary, "found main");
     assert_eq!(
-        result.findings,
+        result.result.findings,
         vec![ExplorationFinding {
             location: FileLocation {
                 path: PathBuf::from("src/main.rs"),
@@ -241,8 +241,8 @@ async fn iteration_limit_degrades_gracefully() {
         .await
         .unwrap();
 
-    assert!(result.summary.contains("iteration limit"));
-    assert_eq!(result.findings, vec![finding("src/x.rs")]);
+    assert!(result.result.summary.contains("iteration limit"));
+    assert_eq!(result.result.findings, vec![finding("src/x.rs")]);
     // 2 rejected turns + 1 executed turn = one real search.
     assert_eq!(search_probe.calls().len(), 1);
     // 3 loop turns + 1 forced-finish attempt.
@@ -290,7 +290,7 @@ async fn mid_exploration_failover_across_providers() {
         .await
         .unwrap();
 
-    assert_eq!(result.summary, "done via secondary");
+    assert_eq!(result.result.summary, "done via secondary");
     // Turn 1: primary (single call -> rejected). Turn 2: primary rate-limited
     // -> secondary (single call -> rejected). Turn 3: primary cooling (clock
     // not advanced) -> secondary finish.
@@ -325,9 +325,9 @@ async fn exact_symbol_early_exit_makes_zero_llm_calls() {
     let result = agent.run(&dir, &query("decide_freshness")).await.unwrap();
 
     assert!(provider_probe.calls().is_empty(), "no LLM call may happen");
-    assert!(result.summary.contains("Resolved deterministically"));
+    assert!(result.result.summary.contains("Resolved deterministically"));
     assert_eq!(
-        result.findings[0].location.path,
+        result.result.findings[0].location.path,
         PathBuf::from("crates/x/src/freshness.rs")
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -365,7 +365,7 @@ async fn medium_confidence_verifies_in_one_turn() {
     let dir = temp_repo("medium");
     let result = agent.run(&dir, &query("decide_freshness")).await.unwrap();
 
-    assert_eq!(result.summary, "verified");
+    assert_eq!(result.result.summary, "verified");
     let calls = provider_probe.calls();
     assert_eq!(calls.len(), 1, "exactly one verification turn");
     // Verification catalog: expand + finish only.
@@ -404,9 +404,9 @@ async fn verify_finish_is_capped_by_max_results() {
     let dir = temp_repo("verify_capped");
     let result = agent.run(&dir, &q).await.unwrap();
 
-    assert_eq!(result.findings.len(), 1, "capped to max_results");
+    assert_eq!(result.result.findings.len(), 1, "capped to max_results");
     assert_eq!(
-        result.findings[0].location.path,
+        result.result.findings[0].location.path,
         PathBuf::from("src/fresh_a.rs")
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -437,7 +437,7 @@ async fn verify_expand_turn_then_forced_finish() {
         .await
         .unwrap();
 
-    assert_eq!(result.summary, "after expand");
+    assert_eq!(result.result.summary, "after expand");
     let calls = provider_probe.calls();
     assert_eq!(calls.len(), 2);
     // Turn 1 free choice, turn 2 (the last verify turn) forces finish.
@@ -480,7 +480,7 @@ async fn failed_verification_escalates_to_fallback_loop() {
         .await
         .unwrap();
 
-    assert_eq!(result.summary, "via fallback");
+    assert_eq!(result.result.summary, "via fallback");
     let calls = provider_probe.calls();
     assert_eq!(calls.len(), 3);
     // The fallback turn offers the full 10-tool catalog and seeds candidates.
@@ -527,7 +527,7 @@ async fn token_budget_exhaustion_forces_final_finish() {
         .await
         .unwrap();
 
-    assert_eq!(result.summary, "budget done");
+    assert_eq!(result.result.summary, "budget done");
     let calls = provider_probe.calls();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[1].options.force_tool.as_deref(), Some("finish"));
@@ -570,7 +570,10 @@ async fn repeated_query_is_served_from_cache() {
     let calls_after_first = mem_probe.calls().len();
 
     let second = agent.run(&dir, &query("decide_freshness")).await.unwrap();
-    assert_eq!(first, second);
+    // A cache hit replays the stored answer and rewrites only `stage_exit`.
+    assert_eq!(first.result, second.result);
+    assert_eq!(first.retrieval_confidence, second.retrieval_confidence);
+    assert_eq!(second.stage_exit, StageExit::Cache);
     assert_eq!(
         mem_probe.calls().len(),
         calls_after_first,
@@ -609,7 +612,10 @@ async fn fingerprint_change_with_no_diff_keeps_cache_entry() {
 
     probe_handle.set_fingerprint(Some(fp("bbb")));
     let second = agent.run(&dir, &query("decide_freshness")).await.unwrap();
-    assert_eq!(first, second);
+    // A cache hit replays the stored answer and rewrites only `stage_exit`.
+    assert_eq!(first.result, second.result);
+    assert_eq!(first.retrieval_confidence, second.retrieval_confidence);
+    assert_eq!(second.stage_exit, StageExit::Cache);
     assert_eq!(mem_probe.calls().len(), calls_after_first);
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -684,4 +690,157 @@ async fn fingerprint_change_touching_result_paths_recomputes() {
         "a change to a contributing path must recompute"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Live `get_architecture` payload shape (see the memory crate's decoder
+/// tests) — the sections a repo brief is rendered from.
+const ARCH_PAYLOAD: &str = "\
+node_labels: 2  (cols: label count)\n  Function 120\n  Method 136\n\
+packages: 1  (cols: name nodes fan_in fan_out)\n  repo-explorer-core 256 0 0\n\
+entry_points: 1  (cols: qn file)\n  \
+repo.crates.repo-explorer-mcp.src.main.main crates/repo-explorer-mcp/src/main.rs\n";
+
+fn finish_now() -> Result<Completion, ProviderError> {
+    ok_calls(vec![tc(
+        "f1",
+        "finish",
+        r#"{"findings":[],"summary":"done"}"#,
+    )])
+}
+
+#[tokio::test]
+async fn fallback_loop_injects_repo_brief_as_second_system_message() {
+    let provider = MockLlmProvider::new().with_responses(vec![finish_now()]);
+    let provider_probe = provider.clone();
+    let memory =
+        MockMemoryBackend::new().with_get_architecture_text_result(Ok(ARCH_PAYLOAD.to_string()));
+    let mem_probe = memory.clone();
+    let agent = AgentLoop::new(
+        memory,
+        MockSearchBackend::new(),
+        single_router(provider),
+        MockRepoStateProbe::new().with_fingerprint(Some(fp("aaa"))),
+        fallback_only(),
+        CacheSettings::default(),
+        TEST_INDEX_TRUST_TTL,
+    );
+
+    agent
+        .run(&PathBuf::from("/repo"), &query("where is main"))
+        .await
+        .unwrap();
+
+    let calls = provider_probe.calls();
+    let systems: Vec<&str> = calls[0]
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::System)
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(systems.len(), 2, "brief must be its own system message");
+    assert!(
+        systems[0].starts_with("You are a repository exploration agent."),
+        "the cached static prefix must stay first and unmodified: {}",
+        systems[0]
+    );
+    assert!(
+        !systems[0].contains("Do NOT call get_architecture"),
+        "hardening text must not leak into the static prefix"
+    );
+    assert!(systems[1].starts_with("A deterministic repository brief follows."));
+    assert!(systems[1].contains("Do NOT call get_architecture"));
+    assert!(systems[1].contains("repo-explorer-core"));
+    assert!(
+        mem_probe
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, MemCall::GetArchitectureText { .. }))
+            .count()
+            == 1
+    );
+}
+
+#[tokio::test]
+async fn repo_brief_is_reused_across_queries_on_the_same_head() {
+    let provider = MockLlmProvider::new().with_fallback(finish_now());
+    let memory =
+        MockMemoryBackend::new().with_get_architecture_text_result(Ok(ARCH_PAYLOAD.to_string()));
+    let mem_probe = memory.clone();
+    let probe = MockRepoStateProbe::new().with_fingerprint(Some(fp("aaa")));
+    let probe_handle = probe.clone();
+    let agent = AgentLoop::new(
+        memory,
+        MockSearchBackend::new(),
+        single_router(provider),
+        probe,
+        fallback_only(),
+        CacheSettings::default(),
+        TEST_INDEX_TRUST_TTL,
+    );
+
+    agent
+        .run(&PathBuf::from("/repo"), &query("first question"))
+        .await
+        .unwrap();
+    // Same HEAD, dirty working tree — the default `key = "head"` must not
+    // invalidate the brief on every save.
+    probe_handle.set_fingerprint(Some(RepoFingerprint {
+        head_sha: "aaa".to_string(),
+        dirty_hash: "dirty".to_string(),
+    }));
+    agent
+        .run(&PathBuf::from("/repo"), &query("second question"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        mem_probe
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, MemCall::GetArchitectureText { .. }))
+            .count(),
+        1,
+        "the brief must be built once per HEAD, not once per query"
+    );
+}
+
+#[tokio::test]
+async fn repo_brief_disabled_makes_no_backend_call() {
+    let provider = MockLlmProvider::new().with_responses(vec![finish_now()]);
+    let provider_probe = provider.clone();
+    let memory =
+        MockMemoryBackend::new().with_get_architecture_text_result(Ok(ARCH_PAYLOAD.to_string()));
+    let mem_probe = memory.clone();
+    let mut settings = fallback_only();
+    settings.repo_brief.enabled = false;
+    let agent = AgentLoop::new(
+        memory,
+        MockSearchBackend::new(),
+        single_router(provider),
+        MockRepoStateProbe::new().with_fingerprint(Some(fp("aaa"))),
+        settings,
+        CacheSettings::default(),
+        TEST_INDEX_TRUST_TTL,
+    );
+
+    agent
+        .run(&PathBuf::from("/repo"), &query("where is main"))
+        .await
+        .unwrap();
+
+    assert!(
+        !mem_probe
+            .calls()
+            .iter()
+            .any(|c| matches!(c, MemCall::GetArchitectureText { .. }))
+    );
+    assert_eq!(
+        provider_probe.calls()[0]
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::System)
+            .count(),
+        1,
+        "the kill switch must restore the exact pre-M-2 prompt"
+    );
 }
