@@ -547,6 +547,7 @@ fn outcome_label(err: &ProviderError) -> &'static str {
     match err {
         ProviderError::RateLimited { .. } => "rate_limited",
         ProviderError::QuotaExceeded { .. } => "quota",
+        ProviderError::DailyQuotaExceeded { .. } => "daily_quota",
         ProviderError::ModelUnavailable { .. } => "model_unavailable",
         ProviderError::Authentication { .. } => "auth",
         ProviderError::InvalidRequest { .. } => "invalid",
@@ -659,6 +660,15 @@ pub fn build_router(cfg: &LlmConfig) -> Result<ProviderRouter<GenaiProvider>, Pr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daily_quota_outcome_label_is_distinct() {
+        let dq = ProviderError::DailyQuotaExceeded {
+            provider: "p".to_string(),
+            message: "per day".to_string(),
+        };
+        assert_eq!(outcome_label(&dq), "daily_quota");
+    }
 
     #[test]
     fn adapter_kind_for_matches_known_provider_kinds() {

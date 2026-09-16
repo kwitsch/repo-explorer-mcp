@@ -178,6 +178,13 @@ pub enum ProviderError {
     RateLimited { provider: String, message: String },
     #[error("provider `{provider}` quota exceeded: {message}")]
     QuotaExceeded { provider: String, message: String },
+    /// A *daily-scope* quota exhaustion (e.g. Gemini "requests per day").
+    /// Distinct from `QuotaExceeded`: it warrants a lockout until the next UTC
+    /// midnight, not the flat cooldown, because the model will keep 429ing
+    /// until the day rolls over. Still a failover trigger — the router moves to
+    /// the next model.
+    #[error("provider `{provider}` daily quota exceeded: {message}")]
+    DailyQuotaExceeded { provider: String, message: String },
     /// The requested model id doesn't exist or was retired (HTTP 404 on the
     /// completion endpoint) — unlike `InvalidRequest`, this is specific to
     /// the one model slot, not the request shape, so it's a failover
@@ -204,7 +211,10 @@ impl ProviderError {
     pub fn is_failover_trigger(&self) -> bool {
         matches!(
             self,
-            Self::RateLimited { .. } | Self::QuotaExceeded { .. } | Self::ModelUnavailable { .. }
+            Self::RateLimited { .. }
+                | Self::QuotaExceeded { .. }
+                | Self::DailyQuotaExceeded { .. }
+                | Self::ModelUnavailable { .. }
         )
     }
 
@@ -213,6 +223,7 @@ impl ProviderError {
         match self {
             Self::RateLimited { provider, .. }
             | Self::QuotaExceeded { provider, .. }
+            | Self::DailyQuotaExceeded { provider, .. }
             | Self::ModelUnavailable { provider, .. }
             | Self::Authentication { provider, .. }
             | Self::InvalidRequest { provider, .. }
@@ -714,6 +725,21 @@ mod tests {
             "provider `p7` configuration error: unknown kind"
         );
         assert_ne!(rl, qe);
+    }
+
+    #[test]
+    fn daily_quota_display_provider_and_failover() {
+        let dq = ProviderError::DailyQuotaExceeded {
+            provider: "gemini".to_string(),
+            message: "requests per day".to_string(),
+        };
+        assert_eq!(dq, dq.clone());
+        assert_eq!(
+            dq.to_string(),
+            "provider `gemini` daily quota exceeded: requests per day"
+        );
+        assert_eq!(dq.provider(), "gemini");
+        assert!(dq.is_failover_trigger());
     }
 
     #[test]
