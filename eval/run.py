@@ -476,7 +476,7 @@ async def run_one_repo_pass(repo: dict, queries: list[QuerySpec], config: Path, 
                 async def call(q: QuerySpec, warm_up: bool, timeout: float) -> dict:
                     nonlocal seq
                     seq += 1
-                    args = {"query": q.query}
+                    args = {"repo_path": str(clone_path(repo).resolve()), "query": q.query}
                     if q.scope_hint:
                         args["scope_hint"] = q.scope_hint
                     if q.max_results is not None:
