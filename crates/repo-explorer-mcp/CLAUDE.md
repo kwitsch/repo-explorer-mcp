@@ -4,6 +4,14 @@ The MCP boundary: hosts the `explore_repository` tool, owns the `rmcp` server
 dependency plus the serde/schemars DTOs, and uses `anyhow` here (core's typed
 errors are consumed via `?`/`.context(...)`).
 
+## Response DTO (`src/server.rs`)
+
+- `ExplorationResultDto` maps from `repo_explorer_core::domain::ExplorationOutcome` (not `ExplorationResult`): `findings` + `summary` come from `outcome.result`, plus `retrieval_confidence: u32` and `stage_exit: String` (`StageExit::as_str()` — the same four literals `QueryMetrics::path` logs).
+- `ExplorationFindingDto.symbol` is filled by joining `outcome.symbols` (a sparse `Vec<(FileLocation, String)>`) on the finding's location, in one `HashMap` pass per response. It is `skip_serializing_if = "Option::is_none"`, like `line_start`/`line_end`/`snippet`/`note` — an absent key means "unknown", never "none exists".
+- The three fields above are the only client-visible additions; every pre-existing key, its order and its omit-when-`None` behavior are unchanged.
+- The output schema is **derived by rmcp** from the tool's `Result<Json<ExplorationResultDto>, String>` return type, and `content[0].text` is rmcp's compact JSON of the same value. Do not hand-build a `CallToolResult`: that drops the derived schema (pinned by `tool_description_and_annotations_are_advertised`) and would break `eval/score.py`, which `json.loads` the text block.
+- Doc comments on the DTO fields are the schema's descriptions — schemars picks them up, so they are client-facing text.
+
 ## Setup wizard (`src/setup.rs`)
 
 - All interactive IO, the env-var scan, the free-tier model catalog, and TOML file writing live here at the binary boundary.

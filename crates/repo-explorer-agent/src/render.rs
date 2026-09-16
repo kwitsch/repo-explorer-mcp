@@ -3,7 +3,7 @@
 //! stable per-file ordering. Every byte rendered here is a prompt token — the
 //! caps are the token-diet half of the retrieval-pipeline design.
 
-use repo_explorer_core::domain::{ExplorationFinding, ExplorationResult, FileLocation};
+use repo_explorer_core::domain::{Candidate, ExplorationFinding, ExplorationResult, FileLocation};
 use repo_explorer_core::retrieval::{is_unknown_location, normalize_rel_path};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -106,6 +106,43 @@ pub(crate) fn tidy_findings(
     out
 }
 
+/// Post-hoc join of the final findings against the ranked candidate list, so
+/// the response can carry a qualified symbol without threading one through
+/// `parse_finish`/`verify`/`dispatch` (where it would be `None` on most legs
+/// anyway).
+///
+/// A pair is emitted only when EXACTLY ONE candidate OVERLAPS the finding's
+/// path and line range (one shared line is enough — the model's reported range
+/// is routinely wider than the indexed symbol span) and that candidate knows a
+/// symbol — two overlapping
+/// candidates in the same file are ambiguous, and guessing between them is
+/// exactly the hallucination this change exists to avoid. Both sides are
+/// already path-normalized (`retrieval::merge_and_rank` for candidates,
+/// `tidy_findings` for findings), so paths compare directly.
+pub(crate) fn symbols_for(
+    findings: &[ExplorationFinding],
+    candidates: &[Candidate],
+) -> Vec<(FileLocation, String)> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for f in findings {
+        let mut covering = candidates.iter().filter(|c| {
+            c.location.path == f.location.path
+                && c.location.line_start <= f.location.line_end
+                && f.location.line_start <= c.location.line_end
+        });
+        let (Some(only), None) = (covering.next(), covering.next()) else {
+            continue;
+        };
+        if let Some(symbol) = &only.symbol {
+            out.push((f.location.clone(), symbol.clone()));
+        }
+    }
+    out
+}
+
 /// [`tidy_findings`], then ordered by (path, line) so per-file findings render
 /// adjacently — for tool results fed back to the model, where grouping beats
 /// arrival order.
@@ -190,8 +227,75 @@ pub(crate) fn render_findings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use repo_explorer_core::domain::FileLocation;
+    use repo_explorer_core::domain::{CandidateKind, FileLocation};
     use std::path::PathBuf;
+
+    fn cand(path: &str, start: u32, end: u32, symbol: Option<&str>) -> Candidate {
+        Candidate {
+            location: FileLocation {
+                path: PathBuf::from(path),
+                line_start: start,
+                line_end: end,
+            },
+            symbol: symbol.map(str::to_string),
+            kind: CandidateKind::SymbolExact,
+            score: 700,
+            snippet: None,
+        }
+    }
+
+    fn at(path: &str, start: u32, end: u32) -> ExplorationFinding {
+        ExplorationFinding {
+            location: FileLocation {
+                path: PathBuf::from(path),
+                line_start: start,
+                line_end: end,
+            },
+            snippet: None,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn symbols_for_fills_on_a_unique_overlapping_candidate() {
+        let findings = [at("src/a.rs", 10, 20)];
+        let candidates = [
+            cand("src/a.rs", 8, 14, Some("a::Foo")),
+            cand("src/b.rs", 1, 5, Some("b::Bar")),
+        ];
+        assert_eq!(
+            symbols_for(&findings, &candidates),
+            vec![(findings[0].location.clone(), "a::Foo".to_string())]
+        );
+    }
+
+    #[test]
+    fn symbols_for_never_guesses_between_two_overlapping_candidates() {
+        let findings = [at("src/a.rs", 10, 20)];
+        let candidates = [
+            cand("src/a.rs", 8, 14, Some("a::Foo")),
+            cand("src/a.rs", 15, 30, Some("a::Bar")),
+        ];
+        assert!(symbols_for(&findings, &candidates).is_empty());
+        // A same-file candidate that does NOT overlap leaves the unique one usable.
+        let candidates = [
+            cand("src/a.rs", 8, 14, Some("a::Foo")),
+            cand("src/a.rs", 40, 50, Some("a::Bar")),
+        ];
+        assert_eq!(symbols_for(&findings, &candidates).len(), 1);
+    }
+
+    #[test]
+    fn symbols_for_skips_a_candidate_without_a_symbol() {
+        let findings = [at("src/a.rs", 10, 20)];
+        assert!(symbols_for(&findings, &[cand("src/a.rs", 8, 14, None)]).is_empty());
+    }
+
+    #[test]
+    fn symbols_for_is_empty_without_candidates() {
+        assert!(symbols_for(&[at("src/a.rs", 1, 2)], &[]).is_empty());
+        assert!(symbols_for(&[], &[cand("src/a.rs", 1, 2, Some("x"))]).is_empty());
+    }
 
     fn finding(path: &str, line: u32, snippet: Option<&str>) -> ExplorationFinding {
         ExplorationFinding {

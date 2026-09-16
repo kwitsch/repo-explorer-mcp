@@ -2,7 +2,18 @@
 
 `AgentLoop` drives `explore_repository`'s search, plus the tool
 catalog/dispatch, compressed rendering, and fingerprint-keyed result caches.
-Owns `serde_json` — core stays free of it. Full pipeline design:
+Owns `serde_json` — core stays free of it.
+
+`AgentLoop::run` returns core's `ExplorationOutcome`: the `ExplorationResult`
+plus `retrieval_confidence` (the pre-stage's 0-100 candidate-set score, *not*
+an answer confidence), `stage_exit` (`early-exit`/`verify`/`fallback`/`cache`,
+the same four literals `QueryMetrics::path` logs) and a sparse
+`symbols: Vec<(FileLocation, String)>`. It is built in exactly one place,
+`complete_run`, and the symbols come from `render::symbols_for` — a pure
+post-hoc join against the ranked candidates that emits a pair only when
+**exactly one** candidate overlaps a finding's range (one shared line is
+enough), so an ambiguous file yields nothing rather than a guess. A cache hit returns the stored outcome
+with `stage_exit` rewritten to `cache` and everything else replayed. Full pipeline design:
 `docs/project-plan/8-retrieval_pipeline.md`.
 
 ## Pipeline stages
@@ -32,6 +43,25 @@ Owns `serde_json` — core stays free of it. Full pipeline design:
   by `cache_settings.max_entries`, like the sibling caches in `cache.rs`.
 - **LLM verification stage** — runs over the top-k candidate skeletons the
   pre-stage produced.
+- **`finish` takes an optional `candidate_id`** — the 1-based `[n]` of the
+  numbered candidate a finding came from. Both stages number their lists the
+  same way and resolve ids against exactly the list they numbered
+  (`verify::candidates_block` gets the whole ranked slice; Stage 5 numbers and
+  resolves the `SEED_CANDIDATES` prefix, so an id past it can never resolve).
+  When it resolves to a candidate **in the same file** with a known range that
+  the finding's own range overlaps without sitting strictly inside it
+  (`tools::snaps_to_candidate` — a mis-transcription of the candidate, not a
+  different site that merely came from it), that range (re-clamped against the
+  file, since Stage-4/5 candidates are not disk-verified) replaces the model's,
+  and the snippet is re-derived for it. It is never a rejection reason: an
+  absent, zero, out-of-range, other-file, unknown-location, disjoint, nested or
+  past-EOF id simply leaves the finding's own verified location in place, so
+  the loop can never become less able to report a genuine grep/`read_file`
+  find. `QueryMetrics::cited_candidate_ids` counts the findings where it
+  actually applied, at parse time (before the dedupe and `max_results` cap, so
+  it can exceed `findings_count`) and only on the two legs where a `finish`
+  call parsed — a run of zeroes across an eval means the field is dead weight
+  and should be reverted.
 - **Explorative fallback loop** — the hardened path when verification isn't
   confident: enforces a token budget, batches tool calls, and forces a final
   finish (via the Stage-4 `ProviderRouter`) rather than looping indefinitely.
@@ -81,13 +111,15 @@ through `ResultCache::{get_query_l2, put_query_l2}`, which do their I/O in
   (temp file + `fs::rename`). Two writers racing on one key both write a
   correct answer for it. Upgrade to sqlite only if `cache stats` ever has to
   report cross-session aggregates the metrics stream cannot derive.
-- **`disk_cache::SCHEMA_VERSION` is the single versioning point** for the
+- **`disk_cache::SCHEMA_VERSION` is `2`** (M-3 moved the stored payload from
+  `ExplorationResult` to `ExplorationOutcome`). It is the single versioning
+  point for the
   stored shape — directory segment *and* `v` field — so a bump makes every old
   entry unreachable and the sweep deletes strictly *older* version directories
   (never a newer one: a mixed-version window would otherwise leave both
   binaries permanently cold). Bump it (and nothing else) when the stored value
   changes. The shape spans two crates — the envelope in `disk_cache.rs`, the
-  payload in core's `ExplorationResult` — so `stored_shape_is_pinned_to_the_
+  payload in core's `ExplorationOutcome` — so `stored_shape_is_pinned_to_the_
   schema_version` pins the serialized JSON as a literal: any move on either
   side fails that test instead of silently changing the on-disk format.
 - **The key is the query key plus the response cap.** L2 reuses

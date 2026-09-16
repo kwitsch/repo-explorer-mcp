@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use repo_explorer_core::domain::ExplorationResult;
+use repo_explorer_core::domain::ExplorationOutcome;
 use repo_explorer_core::fingerprint::RepoFingerprint;
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +30,7 @@ use crate::cache::QueryEntry;
 /// Version of the on-disk entry shape. Bump this — and nothing else — when the
 /// stored value changes; every entry under an older version becomes
 /// unreachable by construction and is deleted by the next sweep.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// FNV-1a over the cache key, rendered as 16 hex chars, purely to get a legal
 /// file name out of a key that contains a repository path and free-text query.
@@ -111,7 +111,7 @@ pub(crate) struct StoredEntry {
     pub llm_turns: u32,
     pub tokens: u64,
     pub deps: Vec<FileDep>,
-    pub result: ExplorationResult,
+    pub result: ExplorationOutcome,
 }
 
 impl StoredEntry {
@@ -446,12 +446,29 @@ pub fn clear(dir: &Path) -> io::Result<CacheCleared> {
 mod tests {
     use super::*;
     use repo_explorer_core::domain::{ExplorationFinding, FileLocation};
+    use repo_explorer_core::domain::{ExplorationResult, StageExit};
 
     fn temp_dir(test: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("disk_cache_{test}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn outcome(path: &str) -> ExplorationOutcome {
+        ExplorationOutcome {
+            result: result(path),
+            retrieval_confidence: 92,
+            stage_exit: StageExit::Verify,
+            symbols: vec![(
+                FileLocation {
+                    path: PathBuf::from(path),
+                    line_start: 1,
+                    line_end: 4,
+                },
+                "a::main".to_string(),
+            )],
+        }
     }
 
     fn result(path: &str) -> ExplorationResult {
@@ -477,7 +494,7 @@ mod tests {
                     head_sha: "aaa".to_string(),
                     dirty_hash: "ddd".to_string(),
                 },
-                result: result("src/a.rs"),
+                result: outcome("src/a.rs"),
                 llm_turns: 3,
                 tokens: 18_420,
                 deps: vec![FileDep {
@@ -495,7 +512,7 @@ mod tests {
         let cache = DiskCache::open(&dir.display().to_string(), 1 << 20).unwrap();
         cache.put("k", &entry("k"));
         let got = cache.get("k").expect("entry must come back");
-        assert_eq!(got.result, result("src/a.rs"));
+        assert_eq!(got.result, outcome("src/a.rs"));
         assert_eq!(got.head_sha, "aaa");
         assert_eq!(got.dirty_hash, "ddd");
         assert_eq!(got.llm_turns, 3);
@@ -586,6 +603,31 @@ mod tests {
     }
 
     #[test]
+    fn stage_exit_wire_strings_are_pinned() {
+        // These four literals are the contract in three places at once: the
+        // persisted entry above, the MCP response's `stage_exit`, and the
+        // `path=` field `eval`'s log parser reads. `as_str` must not drift
+        // from what serde writes. Core cannot host this test — it has no
+        // `serde_json` and must not gain one.
+        for (stage, wire) in [
+            (StageExit::EarlyExit, "early-exit"),
+            (StageExit::Verify, "verify"),
+            (StageExit::Fallback, "fallback"),
+            (StageExit::Cache, "cache"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&stage).unwrap(),
+                format!("\"{wire}\"")
+            );
+            assert_eq!(stage.as_str(), wire);
+            assert_eq!(
+                serde_json::from_str::<StageExit>(&format!("\"{wire}\"")).unwrap(),
+                stage
+            );
+        }
+    }
+
+    #[test]
     fn stored_shape_is_pinned_to_the_schema_version() {
         // The stored shape is defined across two crates: the envelope here and
         // `ExplorationResult` in core. A literal makes any move on either side
@@ -605,11 +647,11 @@ mod tests {
                 len: 12,
                 mtime_ns: 7,
             }],
-            result: result("src/a.rs"),
+            result: outcome("src/a.rs"),
         };
         assert_eq!(
             serde_json::to_string(&stored).unwrap(),
-            r#"{"v":1,"key":"k","head_sha":"aaa","dirty_hash":"ddd","created_at":1700000000,"llm_turns":3,"tokens":18420,"deps":[{"path":"src/a.rs","len":12,"mtime_ns":7}],"result":{"findings":[{"location":{"path":"src/a.rs","line_start":1,"line_end":4},"snippet":"fn main() {}","note":null}],"summary":"a summary"}}"#
+            r#"{"v":2,"key":"k","head_sha":"aaa","dirty_hash":"ddd","created_at":1700000000,"llm_turns":3,"tokens":18420,"deps":[{"path":"src/a.rs","len":12,"mtime_ns":7}],"result":{"result":{"findings":[{"location":{"path":"src/a.rs","line_start":1,"line_end":4},"snippet":"fn main() {}","note":null}],"summary":"a summary"},"retrieval_confidence":92,"stage_exit":"verify","symbols":[[{"path":"src/a.rs","line_start":1,"line_end":4},"a::main"]]}}"#
         );
     }
 

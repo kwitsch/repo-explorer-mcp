@@ -160,6 +160,14 @@ as every other section (the `-warmup` row is excluded):
   corpus currently produces very few fallback rows (2 of 64 in the committed baseline, both the
   same query), so `n` on these two lines is small; read them alongside the per-query CSV
   filtered on `stage == fallback`, not as run-wide means.
+- `cited_candidate_ids` (M-3, added 2026-09-16) — **denominated over the rows that carry the
+  field**, i.e. the runs whose `finish` call actually parsed (verify and fallback; the cache,
+  early-exit and no-finish-synthesis legs emit nothing and must not pad the denominator with
+  zeroes). It counts the findings whose location came from the numbered candidate registry
+  instead of the model's own transcription, counted at parse time and therefore before the
+  dedupe and `max_results` cap — it can exceed that row's finding count, and is a
+  "do the models use the field at all" signal, not a rate. A run of zeroes means
+  `candidate_id` is dead weight and should be reverted.
 - `cache_hit_rate` / `cache_hit_l1` / `cache_hit_l2` (M-1, added 2026-09-16) — **denominated
   over every scored row**, and the report line says so, because a hit rate only means anything
   against the set of rows that could have hit. Here that is all of them: each query is issued
@@ -186,11 +194,39 @@ as every other section (the `-warmup` row is excluded):
   stays a real measurement while `cache_hit_l1` / `cache_hit_l2` report absent. A run with no
   cache row at all reports a real `0.0%` — `stage` is always emitted, so that is a measurement,
   not an absence.
+
 - `turns_saved_by_cache` / `tokens_saved_by_cache` (M-1) — **denominated over the cache rows
-  only**, like the M-2 pair above. They are what the *producing* run spent, i.e. what the hit
+  only**, like the M-2 pair above. They are what the _producing_ run spent, i.e. what the hit
   avoided; a non-hit row has nothing to contribute and would only drag the mean toward zero.
   They are deliberately not folded into `tokens`, which keeps meaning spend — `tokens` stays 0
   on a cache row, so the cost aggregate is unaffected.
+- `schema_valid_rate` / `stage_exit_log_agreement` (M-3, added 2026-09-16) — read out of the
+  answer itself, not the log. The server returns `Json<ExplorationResultDto>` and rmcp fills
+  both `structuredContent` and a text block holding the compact JSON of that same object, so
+  `run.py` needs no new field: `score.py` parses `stage_exit` and `retrieval_confidence` out of
+  the `row["response"]` it already loads. An answer is schema-valid when `stage_exit` is one of
+  `early-exit` / `verify` / `fallback` / `cache` and `retrieval_confidence` is an integer in
+  0-100. **Denominated over the answers that carried either key**, and the line prints that
+  denominator (`N of M answers carried the M-3 keys`) so a run where only some answers have
+  them is visible rather than rounding to 100%. An error row carries no structured payload and
+  is excluded, not counted as a violation; a pre-M-3 run reports both lines as absent.
+  `stage_exit_log_agreement` cross-checks the response's `stage_exit` against the same run's
+  log-parsed `stage` — the two are the same four literals by construction
+  (`StageExit::as_str`), so anything below 100% is a real defect on one side or the other.
+- `hallucinated_path_rate` (M-3) — fabricated-path findings over **every returned finding**: a
+  path in the answer that does not exist in the repo under test. It reads the filesystem, not a
+  server field, so it is computable on old and new runs alike, and reports `n/a` only when the
+  run returned no findings at all. Read it as a regression alarm, not as an M-3 win: every
+  `finish` location and every early-exit location goes through an on-disk check
+  (`verify_location`), so it normally reads 0 — but the budget/turn-limit synthesis
+  (`agent.rs`, no `finish` call parsed) returns ranked candidates straight from the index
+  without one, so a non-zero reading there is real (a stale index naming a renamed/deleted
+  file), not a scorer artifact. The committed baseline reads `0.00% (0 of 191)`.
+- `location hallucinations by stage` (M-3) — the `range_outside_file` and `misaligned_snippet`
+  counts split by the stage that produced them. This is the one accuracy number M-3 can
+  actually move: a real path with a wrong _range_ is the residual error that citing an
+  inspected candidate id fixes. See the `outer_followup_rate` gap below for why this proxy, and
+  not the plan's original acceptance metric.
 
 Every metric degrades to `n/a (field absent in this run)` on a results/ dir written before the
 field existed, so old runs rescore without crashing and without reporting a fabricated zero.
@@ -218,6 +254,21 @@ for follow-up tool calls, and a judge pass to separate "the answer was incomplet
 agent asked a genuinely new question". None of that scaffolding exists yet —
 `eval/baseline.py`, `claude_loop.sh` and `judge_prompt.md` are named in the plan but absent from
 this directory. Until that arm is built, treat `outer_followup_rate` as unmeasured, not as zero.
+
+This is still true after M-3, and M-3's acceptance criterion "`outer_followup_rate` -50% vs
+Stufe 1" therefore cannot be evaluated in this repo. It was struck rather than faked. What M-3
+is read on here instead, all printed in the QW-0 block:
+
+- `schema_valid_rate` — the acceptance gate that _is_ measurable (target 100%), plus
+  `stage_exit_log_agreement` as its free cross-check against the run's own log.
+- the `range_outside_file` + `misaligned_snippet` counts split by stage — the only accuracy
+  failure class a registry-sourced location can fix, and so the honest proxy for "the outer
+  agent had to go re-read the file itself".
+- `hallucinated_path_rate` — reported for completeness and as a regression alarm. It is
+  expected to read 0.00% **before and after** M-3, because a nonexistent path is already
+  impossible by construction, and must not be quoted as an M-3 improvement.
+
+Everything else M-3 changes is a response-shape change, which no retrieval metric can move.
 
 ### Fixed while adding the above
 

@@ -17,7 +17,8 @@
 
 use repo_explorer_core::config::{AgentSettings, CacheKeyMode, CacheSettings, RepoBriefKey};
 use repo_explorer_core::domain::{
-    Candidate, ExplorationFinding, ExplorationQuery, ExplorationResult, FileLocation,
+    Candidate, ExplorationFinding, ExplorationOutcome, ExplorationQuery, ExplorationResult,
+    FileLocation, StageExit,
 };
 use repo_explorer_core::fingerprint::{RepoFingerprint, RepoStateProbe};
 use repo_explorer_core::llm::{
@@ -38,7 +39,7 @@ use crate::cache::{CappedMap, QueryEntry, ResultCache};
 use crate::disk_cache::{self, FileDep};
 use crate::dispatch::{canonical_repo_root, clamp_location, dispatch_inner, read_verified_file};
 use crate::pipeline;
-use crate::render::{RenderCaps, dedupe_key, tidy_findings};
+use crate::render::{RenderCaps, dedupe_key, symbols_for, tidy_findings};
 use crate::tools::{finish_only_catalog, parse_finish_lenient, resolve_finish, tool_catalog};
 use crate::verify::{VerifyOutcome, verify};
 
@@ -198,6 +199,14 @@ pub(crate) struct QueryMetrics {
     /// deliberately *not* folded into `tokens`, which has to keep meaning
     /// "spend" or the cost aggregate breaks.
     pub tokens_saved_by_cache: Option<u64>,
+    /// How many findings of the accepted `finish` call carried a
+    /// `candidate_id` that resolved into the numbered registry AND supplied
+    /// the location — counted at parse time, i.e. BEFORE `finalize`'s dedupe
+    /// and `max_results` cap, so it can exceed `findings_count`. `None` on
+    /// every path where no `finish` call ran (cache, early exit, the
+    /// no-finish synthesis). A run of zeroes across an eval says the models
+    /// ignore the field and it should be reverted.
+    pub cited_candidate_ids: Option<u32>,
 }
 
 impl QueryMetrics {
@@ -234,6 +243,7 @@ impl QueryMetrics {
             cache_layer: None,
             turns_saved_by_cache: None,
             tokens_saved_by_cache: None,
+            cited_candidate_ids: None,
         }
     }
 
@@ -275,6 +285,7 @@ async fn emit_metrics(metrics: &mut QueryMetrics, msg: &'static str) {
         cache_layer = metrics.cache_layer,
         turns_saved_by_cache = metrics.turns_saved_by_cache,
         tokens_saved_by_cache = metrics.tokens_saved_by_cache,
+        cited_candidate_ids = metrics.cited_candidate_ids,
         total_ms = metrics.total_ms,
         "{}",
         msg
@@ -511,7 +522,7 @@ where
         &self,
         repo_root: &Path,
         query: &ExplorationQuery,
-    ) -> Result<ExplorationResult, AgentLoopError> {
+    ) -> Result<ExplorationOutcome, AgentLoopError> {
         // Stage 0: query cache. `git_probe_start` doubles as the run-start
         // instant for `QueryMetrics::total_ms`.
         let git_probe_start = std::time::Instant::now();
@@ -523,12 +534,18 @@ where
             .query_cache_lookup(repo_root, &query_key, &fingerprint)
             .await
         {
-            metrics.record_result("cache", &hit.result);
+            metrics.record_result("cache", &hit.result.result);
             metrics.cache_layer = Some(layer);
             metrics.turns_saved_by_cache = Some(hit.llm_turns);
             metrics.tokens_saved_by_cache = Some(hit.tokens);
             emit_metrics(&mut metrics, "exploration served from query cache").await;
-            return Ok(hit.result);
+            // Only the exit path is rewritten: `retrieval_confidence` and
+            // `symbols` are the stored run's, which is exactly what a hit
+            // replays.
+            return Ok(ExplorationOutcome {
+                stage_exit: StageExit::Cache,
+                ..hit.result
+            });
         }
 
         // Stage 1: ensure a fresh index (once). Failures are non-fatal notes.
@@ -714,12 +731,13 @@ where
                     .complete_run(
                         repo_root,
                         &mut metrics,
-                        "early-exit",
+                        StageExit::EarlyExit,
                         &budget,
                         false,
                         &query_key,
                         fingerprint,
                         result,
+                        &outcome.candidates,
                     )
                     .await);
             }
@@ -739,7 +757,7 @@ where
         // Stage 4: LLM verification over the candidates.
         if outcome.confidence >= self.settings.fallback_confidence && !outcome.candidates.is_empty()
         {
-            if let VerifyOutcome::Finished(result) = verify(
+            if let VerifyOutcome::Finished(result, cited) = verify(
                 &self.memory,
                 &self.router,
                 repo_root,
@@ -753,17 +771,19 @@ where
             )
             .await
             {
+                metrics.cited_candidate_ids = Some(cited);
                 return Ok(self
                     .finalize_and_complete(
                         repo_root,
                         &mut metrics,
-                        "verify",
+                        StageExit::Verify,
                         result,
                         query,
                         &budget,
                         false,
                         &query_key,
                         fingerprint,
+                        &outcome.candidates,
                     )
                     .await);
             }
@@ -778,13 +798,13 @@ where
                 query,
                 outcome.scope_hint_escaped,
                 note.as_deref(),
-                outcome.candidates,
+                &outcome.candidates,
                 fingerprint.as_ref(),
                 &mut budget,
                 &mut metrics,
             )
             .await;
-        let (result, forced_finish) = match looped {
+        let (result, forced_finish, cited) = match looped {
             Ok(v) => v,
             Err(e) => {
                 metrics.path = "error";
@@ -793,17 +813,19 @@ where
                 return Err(e);
             }
         };
+        metrics.cited_candidate_ids = cited;
         Ok(self
             .finalize_and_complete(
                 repo_root,
                 &mut metrics,
-                "fallback",
+                StageExit::Fallback,
                 result,
                 query,
                 &budget,
                 forced_finish,
                 &query_key,
                 fingerprint,
+                &outcome.candidates,
             )
             .await)
     }
@@ -872,16 +894,27 @@ where
         &self,
         repo_root: &Path,
         metrics: &mut QueryMetrics,
-        path: &'static str,
+        stage: StageExit,
         budget: &TokenBudget,
         forced_finish: bool,
         query_key: &str,
         fingerprint: Option<RepoFingerprint>,
         result: ExplorationResult,
-    ) -> ExplorationResult {
-        metrics.record_result(path, &result);
+        candidates: &[Candidate],
+    ) -> ExplorationOutcome {
+        metrics.record_result(stage.as_str(), &result);
         metrics.record_budget(budget, forced_finish);
         emit_metrics(metrics, "exploration complete").await;
+        // The one place an `ExplorationOutcome` is built. `retrieval_confidence`
+        // is the pre-stage score already recorded in `metrics.confidence` — the
+        // only path where that is `None` is the cache hit, which returns long
+        // before here.
+        let outcome = ExplorationOutcome {
+            retrieval_confidence: metrics.confidence.unwrap_or(0),
+            stage_exit: stage,
+            symbols: symbols_for(&result.findings, candidates),
+            result,
+        };
         // Awaited, not detached: deterministic for tests, and no task racing
         // process exit. Sub-millisecond, except on the one run per process
         // that also carries `DiskCache`'s eviction sweep (see its comment) —
@@ -890,12 +923,12 @@ where
             repo_root,
             query_key,
             fingerprint,
-            &result,
+            &outcome,
             budget.llm_calls(),
             budget.spent(),
         )
         .await;
-        result
+        outcome
     }
 
     /// The shared tail of the verify/fallback branches: finalize the result,
@@ -905,14 +938,15 @@ where
         &self,
         repo_root: &Path,
         metrics: &mut QueryMetrics,
-        stage: &'static str,
+        stage: StageExit,
         result: ExplorationResult,
         query: &ExplorationQuery,
         budget: &TokenBudget,
         forced_finish: bool,
         query_key: &str,
         fingerprint: Option<RepoFingerprint>,
-    ) -> ExplorationResult {
+        candidates: &[Candidate],
+    ) -> ExplorationOutcome {
         let result = self.finalize(result, query);
         self.complete_run(
             repo_root,
@@ -923,6 +957,7 @@ where
             query_key,
             fingerprint,
             result,
+            candidates,
         )
         .await
     }
@@ -1071,7 +1106,7 @@ where
         repo_root: &Path,
         query_key: &str,
         fingerprint: Option<RepoFingerprint>,
-        result: &ExplorationResult,
+        outcome: &ExplorationOutcome,
         llm_turns: u32,
         tokens: u64,
     ) {
@@ -1079,13 +1114,13 @@ where
             return;
         };
         let deps = if self.cache_key_mode == CacheKeyMode::Paths {
-            collect_deps(repo_root, result).await
+            collect_deps(repo_root, &outcome.result).await
         } else {
             Vec::new()
         };
         let entry = QueryEntry {
             fingerprint,
-            result: result.clone(),
+            result: outcome.clone(),
             llm_turns,
             tokens,
             deps,
@@ -1174,11 +1209,11 @@ where
         query: &ExplorationQuery,
         scope_hint_escaped: bool,
         index_note: Option<&str>,
-        candidates: Vec<Candidate>,
+        candidates: &[Candidate],
         fingerprint: Option<&RepoFingerprint>,
         budget: &mut TokenBudget,
         metrics: &mut QueryMetrics,
-    ) -> Result<(ExplorationResult, bool), AgentLoopError> {
+    ) -> Result<(ExplorationResult, bool, Option<u32>), AgentLoopError> {
         // Stage 5 starts blind otherwise: the first turns go on orientation
         // (get_architecture) that one deterministic call answers for free.
         // Stage 4 deliberately gets nothing — it is 75% of runs. Skipped when
@@ -1198,6 +1233,11 @@ where
         metrics.orientation_calls_in_loop = Some(0);
 
         let tools = tool_catalog();
+        // The registry `finish`'s `candidate_id` resolves against is exactly
+        // the list the prompt numbers — ids past it were never shown to the
+        // model, so resolving them would substitute a range nobody inspected.
+        // The full slice is still used below for the deterministic synthesis.
+        let seeds = &candidates[..SEED_CANDIDATES.min(candidates.len())];
         // A second system message, not part of the user prompt: every system
         // message carries its own cache breakpoint, and the brief is stable
         // per fingerprint — so it is re-read from the provider cache on every
@@ -1210,7 +1250,7 @@ where
             query,
             scope_hint_escaped,
             index_note,
-            &candidates,
+            seeds,
         )));
 
         let mut findings: Vec<ExplorationFinding> = Vec::new();
@@ -1257,8 +1297,10 @@ where
                             // common immediate-finish path we return before any of that
                             // is needed, skipping the allocation entirely.
                             let mut turn_messages: Vec<Message> =
-                                match resolve_finish(&calls, repo_root).await {
-                                    Ok(result) => return Ok((result, false)),
+                                match resolve_finish(&calls, repo_root, seeds).await {
+                                    Ok((result, cited)) => {
+                                        return Ok((result, false, Some(cited)));
+                                    }
                                     Err(rejections) => rejections,
                                 };
                             let non_finish: Vec<&ToolCall> =
@@ -1342,11 +1384,18 @@ where
 
         // Budget exhausted without finish: one forced final answer, then a
         // deterministic synthesis from everything gathered so far.
-        if let Some(result) = self.forced_finish(&mut messages, budget, repo_root).await {
-            return Ok((result, true));
+        if let Some((result, cited)) = self
+            .forced_finish(&mut messages, budget, repo_root, seeds)
+            .await
+        {
+            return Ok((result, true, Some(cited)));
         }
         for candidate in candidates {
-            accumulate(&mut findings, &mut seen, finding_from_candidate(candidate));
+            accumulate(
+                &mut findings,
+                &mut seen,
+                finding_from_candidate(candidate.clone()),
+            );
         }
         let cause = if turn_limit_hit {
             format!(
@@ -1364,6 +1413,10 @@ where
                 ),
             },
             true,
+            // No `finish` call parsed on this path, so there is nothing to
+            // count — `Some(0)` would read as "the model cited nothing" and
+            // pad the eval's citation aggregate with zeroes.
+            None,
         ))
     }
 
@@ -1373,7 +1426,8 @@ where
         messages: &mut Vec<Message>,
         budget: &mut TokenBudget,
         repo_root: &Path,
-    ) -> Option<ExplorationResult> {
+        candidates: &[Candidate],
+    ) -> Option<(ExplorationResult, u32)> {
         messages.push(Message::user(
             "The exploration budget is exhausted. Call finish NOW with the best findings gathered so far.",
         ));
@@ -1397,7 +1451,9 @@ where
                         // rejection back to the model, so keep whatever findings
                         // validate instead of discarding all of them over one bad
                         // path (see F-05 escalation on parse_finish's strictness).
-                        match parse_finish_lenient(&call.arguments_json, repo_root).await {
+                        match parse_finish_lenient(&call.arguments_json, repo_root, candidates)
+                            .await
+                        {
                             Ok(result) => return Some(result),
                             Err(reason) => {
                                 tracing::debug!(reason = %reason, "forced finish call failed to parse")
@@ -1551,10 +1607,12 @@ const FALLBACK_SYSTEM_PROMPT: &str = "You are a repository exploration agent. Us
 The memory tools (search_code, search_graph, query_graph, trace_path, get_architecture, get_code_snippet) are primary and authoritative — prefer them first. \
 The grep, find, and read_file tools are a supplement/fallback, to be used only when the memory tools are insufficient. \
 Batch ALL independent tool calls of a turn into ONE response with multiple tool calls — they execute concurrently, and single-call turns are rejected. \
-When you have gathered enough information, you MUST conclude by calling the finish tool with your findings and a summary.";
+When you have gathered enough information, you MUST conclude by calling the finish tool with your findings and a summary. \
+When a finding comes from one of the numbered starting points, pass its number as that finding's candidate_id.";
 
 /// How many retrieval candidates are listed as starting points in the
-/// fallback prompt.
+/// fallback prompt — and therefore the exact registry `finish`'s
+/// `candidate_id` resolves against on that leg (see `fallback_loop`).
 const SEED_CANDIDATES: usize = 8;
 
 /// Push an assistant turn followed by the user-facing nudge asking it to
@@ -1616,7 +1674,11 @@ fn user_prompt(
         s.push_str(
             "\nStarting points found by the deterministic retrieval pre-stage (ranked, may be incomplete):",
         );
-        for c in candidates.iter().take(SEED_CANDIDATES) {
+        // Numbered exactly like `verify::candidates_block`, so `finish`'s
+        // `candidate_id` means the same `[n]` in both stages. The caller
+        // passes the `SEED_CANDIDATES` prefix it also resolves ids against —
+        // truncating here instead would number fewer than it resolves.
+        for (idx, c) in candidates.iter().enumerate() {
             let symbol = c
                 .symbol
                 .as_deref()
@@ -1624,12 +1686,14 @@ fn user_prompt(
                 .unwrap_or_default();
             if is_unknown_location(&c.location) {
                 s.push_str(&format!(
-                    "\n- {} (location unknown){symbol}",
+                    "\n[{}] {} (location unknown){symbol}",
+                    idx + 1,
                     c.location.path.display(),
                 ));
             } else {
                 s.push_str(&format!(
-                    "\n- {}:{}-{}{symbol}",
+                    "\n[{}] {}:{}-{}{symbol}",
+                    idx + 1,
                     c.location.path.display(),
                     c.location.line_start,
                     c.location.line_end
@@ -1690,7 +1754,7 @@ mod tests {
         // Haiku's 2048.
         assert_eq!(
             cache_prefix_fingerprint(FALLBACK_SYSTEM_PROMPT, tool_catalog()),
-            (5387, 5612853071500758155)
+            (5658, 2865739095911421978)
         );
     }
 
@@ -1790,9 +1854,9 @@ mod tests {
         };
         let dir = temp_repo("immediate_finish");
         let got = agent.run(&dir, &query).await.unwrap();
-        assert_eq!(got.summary, "done");
-        assert_eq!(got.findings.len(), 1);
-        assert_eq!(got.findings[0].location.line_start, 1);
+        assert_eq!(got.result.summary, "done");
+        assert_eq!(got.result.findings.len(), 1);
+        assert_eq!(got.result.findings[0].location.line_start, 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1818,8 +1882,11 @@ mod tests {
         };
         let dir = temp_repo("fallback_capped");
         let got = agent.run(&dir, &query).await.unwrap();
-        assert_eq!(got.findings.len(), 1, "capped to max_results");
-        assert_eq!(got.findings[0].location.path, PathBuf::from("src/lib.rs"));
+        assert_eq!(got.result.findings.len(), 1, "capped to max_results");
+        assert_eq!(
+            got.result.findings[0].location.path,
+            PathBuf::from("src/lib.rs")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2123,9 +2190,11 @@ mod tests {
         );
         let got = agent.run(&dir, &query).await.unwrap();
         assert!(
-            got.summary.contains("memory index could not be refreshed"),
+            got.result
+                .summary
+                .contains("memory index could not be refreshed"),
             "early-exit summary must surface the index-freshness note: {}",
-            got.summary
+            got.result.summary
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2171,9 +2240,9 @@ mod tests {
         );
         let got = agent.run(&dir, &query).await.unwrap();
         assert!(
-            got.summary.contains("escapes the repository root"),
+            got.result.summary.contains("escapes the repository root"),
             "early-exit summary must surface the ignored-scope note: {}",
-            got.summary
+            got.result.summary
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2226,10 +2295,11 @@ mod tests {
         let dir = temp_repo("symbol_free_no_early_exit");
         let got = agent.run(&dir, &query).await.unwrap();
         assert!(
-            !got.summary
+            !got.result
+                .summary
                 .contains("Resolved deterministically by the retrieval pre-stage"),
             "symbol-free query must not early-exit: {}",
-            got.summary
+            got.result.summary
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2473,7 +2543,7 @@ mod tests {
         };
         let dir = temp_repo("rotation_stable_within_conversation");
         let got = agent.run(&dir, &query).await.unwrap();
-        assert_eq!(got.summary, "done");
+        assert_eq!(got.result.summary, "done");
         assert_eq!(
             a.calls().len(),
             2,
@@ -2898,13 +2968,21 @@ mod tests {
             "metrics_early_exit",
             &[("crates/x/src/freshness.rs", &numbered_lines(12))],
         );
-        agent.run(&dir, &q("decide_freshness")).await.unwrap();
+        let got = agent.run(&dir, &q("decide_freshness")).await.unwrap();
 
         let taped = taped_metrics();
         let m = taped
             .last()
             .expect("the early-exit path must emit a record");
         assert_eq!(m.path, "early-exit");
+        assert_eq!(got.stage_exit, StageExit::EarlyExit);
+        assert_eq!(
+            got.stage_exit.as_str(),
+            m.path,
+            "the response agrees with the log"
+        );
+        assert_eq!(Some(got.retrieval_confidence), m.confidence);
+        assert_eq!(m.cited_candidate_ids, None, "no finish call ran");
         assert_eq!(m.early_exit_route, "confidence");
         assert_eq!(m.llm_calls, 0, "early exit makes no provider call");
         assert!(m.confidence.unwrap() > 0);
@@ -2986,11 +3064,19 @@ mod tests {
         let dir = two_file_repo("qw2_unique_symbol");
         let got = agent.run(&dir, &q("decide_freshness")).await.unwrap();
         assert!(
-            got.summary
+            got.result
+                .summary
                 .contains("Resolved deterministically by the retrieval pre-stage"),
             "expected the pre-stage answer, got: {}",
-            got.summary
+            got.result.summary
         );
+        // The only end-to-end check that `symbols_for`'s join actually fires
+        // against the REAL candidate and finding pipelines (its unit tests
+        // build both sides by hand, so they cannot catch a normalization
+        // mismatch that empties the field on every run).
+        let mut symbols: Vec<&str> = got.symbols.iter().map(|(_, s)| s.as_str()).collect();
+        symbols.sort_unstable();
+        assert_eq!(symbols, vec!["decide_freshness", "decide_freshness_v2"]);
 
         let m = taped_metrics().pop().expect("a record must be emitted");
         assert_eq!(m.path, "early-exit");
@@ -3107,7 +3193,7 @@ mod tests {
             TEST_INDEX_TRUST_TTL,
         );
         let dir = temp_repo("metrics_verify");
-        agent
+        let got = agent
             .run(
                 &dir,
                 &q("crates/repo-explorer-agent/src/verify.rs:35 what does this constant do"),
@@ -3118,6 +3204,14 @@ mod tests {
         let taped = taped_metrics();
         let m = taped.last().expect("the verify path must emit a record");
         assert_eq!(m.path, "verify");
+        assert_eq!(got.stage_exit, StageExit::Verify);
+        assert_eq!(got.stage_exit.as_str(), m.path);
+        assert_eq!(Some(got.retrieval_confidence), m.confidence);
+        assert_eq!(
+            m.cited_candidate_ids,
+            Some(0),
+            "the mock finish cites no candidate_id"
+        );
         assert_eq!(
             (m.brief_tokens, m.orientation_calls_in_loop),
             (None, None),
@@ -3134,11 +3228,15 @@ mod tests {
         let provider = MockLlmProvider::new().with_responses(vec![tool_calls(vec![finish_call()])]);
         let agent = agent_with(provider);
         let dir = temp_repo("metrics_fallback");
-        agent.run(&dir, &q("where is main")).await.unwrap();
+        let got = agent.run(&dir, &q("where is main")).await.unwrap();
 
         let taped = taped_metrics();
         let m = taped.last().expect("the fallback path must emit a record");
         assert_eq!(m.path, "fallback");
+        assert_eq!(got.stage_exit, StageExit::Fallback);
+        assert_eq!(got.stage_exit.as_str(), m.path);
+        assert_eq!(Some(got.retrieval_confidence), m.confidence);
+        assert_eq!(m.cited_candidate_ids, Some(0));
         assert_eq!(m.early_exit_route, "none");
         assert_eq!(m.llm_calls, 1);
         assert!(!m.forced_finish);
@@ -3498,22 +3596,28 @@ entry_points: 1  (cols: qn file)\n  repo.src.main.main src/main.rs\n";
         let dir = two_file_repo("qw3_cache_format");
 
         let concise = agent.run(&dir, &q("decide_freshness")).await.unwrap();
+        let replay = agent.run(&dir, &q("decide_freshness")).await.unwrap();
         assert_eq!(
-            agent.run(&dir, &q("decide_freshness")).await.unwrap(),
-            concise,
+            replay.result, concise.result,
             "sanity: the repeated concise call must be served from the query cache"
         );
+        // A hit replays the stored run's confidence/symbols and rewrites only
+        // the exit path.
+        assert_eq!(replay.stage_exit, StageExit::Cache);
+        assert_eq!(concise.stage_exit, StageExit::EarlyExit);
+        assert_eq!(replay.retrieval_confidence, concise.retrieval_confidence);
+        assert_eq!(replay.symbols, concise.symbols);
         let detailed = agent
             .run(&dir, &detailed_q("decide_freshness"))
             .await
             .unwrap();
 
         assert_eq!(
-            kept_chars(concise.findings[0].snippet.as_deref().unwrap()),
+            kept_chars(concise.result.findings[0].snippet.as_deref().unwrap()),
             10
         );
         assert_eq!(
-            kept_chars(detailed.findings[0].snippet.as_deref().unwrap()),
+            kept_chars(detailed.result.findings[0].snippet.as_deref().unwrap()),
             50,
             "the detailed call must not be served the cached concise entry"
         );
@@ -3599,7 +3703,9 @@ entry_points: 1  (cols: qn file)\n  repo.src.main.main src/main.rs\n";
 
         let second = l2_agent(&cache_dir, CacheKeyMode::Strict, probe());
         let served = second.run(&repo, &query).await.unwrap();
-        assert_eq!(produced, served);
+        assert_eq!(served.result, produced.result);
+        assert_eq!(served.retrieval_confidence, produced.retrieval_confidence);
+        assert_eq!(served.stage_exit, StageExit::Cache);
         let hit = last_metrics();
         assert_eq!(hit.cache_layer, Some("l2"));
         assert_eq!(hit.turns_saved_by_cache, Some(cold.llm_calls));
@@ -3657,7 +3763,7 @@ entry_points: 1  (cols: qn file)\n  repo.src.main.main src/main.rs\n";
         );
         let query = q("where is main");
         let result = agent.run(&repo, &query).await.unwrap();
-        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.result.findings.len(), 1);
         // And L1 still works.
         agent.run(&repo, &query).await.unwrap();
         assert_eq!(last_metrics().cache_layer, Some("l1"));
@@ -3716,7 +3822,8 @@ entry_points: 1  (cols: qn file)\n  repo.src.main.main src/main.rs\n";
         std::fs::write(repo.join("src/other.rs"), "d\ne\nf\ng\n").unwrap();
         handle.set_fingerprint(Some(fp("bbb")));
         let second = agent.run(&repo, &query).await.unwrap();
-        assert_eq!(first, second);
+        assert_eq!(second.result, first.result);
+        assert_eq!(second.stage_exit, StageExit::Cache);
         assert_eq!(last_metrics().cache_layer, Some("l1"));
         std::fs::remove_dir_all(&repo).ok();
     }

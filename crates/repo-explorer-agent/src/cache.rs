@@ -12,7 +12,7 @@
 //! near-zero cross-session hit rate for a fraction of a run's cost.
 
 use repo_explorer_core::domain::{
-    Candidate, ExplorationFinding, ExplorationQuery, ExplorationResult,
+    Candidate, ExplorationFinding, ExplorationOutcome, ExplorationQuery,
 };
 use repo_explorer_core::fingerprint::RepoFingerprint;
 use std::collections::hash_map::Entry;
@@ -108,7 +108,7 @@ pub(crate) fn opt_to_string<T: ToString>(v: Option<T>) -> String {
 #[derive(Debug, Clone)]
 pub(crate) struct QueryEntry {
     pub fingerprint: RepoFingerprint,
-    pub result: ExplorationResult,
+    pub result: ExplorationOutcome,
     /// What the run that produced this entry spent, i.e. what a hit saves.
     pub llm_turns: u32,
     pub tokens: u64,
@@ -332,6 +332,7 @@ impl ResultCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use repo_explorer_core::domain::{ExplorationResult, StageExit};
     use std::path::{Path, PathBuf};
 
     fn fp(sha: &str) -> RepoFingerprint {
@@ -344,9 +345,14 @@ mod tests {
     fn entry(sha: &str) -> QueryEntry {
         QueryEntry {
             fingerprint: fp(sha),
-            result: ExplorationResult {
-                findings: vec![],
-                summary: format!("from {sha}"),
+            result: ExplorationOutcome {
+                result: ExplorationResult {
+                    findings: vec![],
+                    summary: format!("from {sha}"),
+                },
+                retrieval_confidence: 0,
+                stage_exit: StageExit::Verify,
+                symbols: Vec::new(),
             },
             llm_turns: 0,
             tokens: 0,
@@ -405,7 +411,7 @@ mod tests {
         cache.remove_query("q", &fp("a"));
         let got = cache.get_query("q").unwrap();
         assert_eq!(got.fingerprint, fp("c"), "stale removal must not apply");
-        assert_eq!(got.result.summary, "from c");
+        assert_eq!(got.result.result.summary, "from c");
     }
 
     #[test]
@@ -419,7 +425,7 @@ mod tests {
         cache.refresh_query_fingerprint("q", &fp("a"), fp("b"));
         let got = cache.get_query("q").unwrap();
         assert_eq!(got.fingerprint, fp("c"), "stale refresh must not apply");
-        assert_eq!(got.result.summary, "from c");
+        assert_eq!(got.result.result.summary, "from c");
     }
 
     #[test]

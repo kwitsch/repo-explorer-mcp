@@ -130,6 +130,7 @@ def take_qw0_fields(out: dict, f: dict) -> None:
         "cache_layer",
         "turns_saved_by_cache",
         "tokens_saved_by_cache",
+        "cited_candidate_ids",
     ):
         if f.get(key) is not None:
             out[key] = f[key]
@@ -331,6 +332,12 @@ def parse_call_lines(lines: list[str]) -> dict:
         "cache_layer": None,
         "turns_saved_by_cache": None,
         "tokens_saved_by_cache": None,
+        # M-3 `finish` citations, emitted only on the two legs where a finish call parsed
+        # (verify, fallback): None means "no finish call ran on this row" *or* "this binary
+        # predates M-3", so the aggregate is denominated on the rows that carry the field —
+        # counting the absent ones as 0 would report the field as dead weight and get it
+        # reverted.
+        "cited_candidate_ids": None,
     }
     for line in lines:
         kind = line_kind(line)
@@ -486,6 +493,15 @@ async def run_one_repo_pass(repo: dict, queries: list[QuerySpec], config: Path, 
                         # Python even though the wire field is `isError` — verified against
                         # types.CallToolResult.model_fields during Phase-0 harness validation.
                         is_error = bool(getattr(result, "is_error", False))
+                        # The server returns `Json<ExplorationResultDto>`, and rmcp's
+                        # `CallToolResult::structured` fills BOTH `structuredContent` and a
+                        # single text block holding the compact JSON of that same object. So
+                        # this one field already carries every structured key, M-3's
+                        # `stage_exit` / `retrieval_confidence` included, and score.py reads
+                        # them straight out of `json.loads(row["response"])` — no second
+                        # transport, no second row field to keep in sync. A server that emits
+                        # neither key (a pre-M-3 binary) simply parses without them, and
+                        # score.py reports those metrics as absent rather than as zero.
                         response_text = "".join(
                             c.text for c in result.content if getattr(c, "type", None) == "text"
                         )
