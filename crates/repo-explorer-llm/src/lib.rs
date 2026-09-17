@@ -35,6 +35,18 @@ fn message_indicates_quota(message: &str) -> bool {
         || m.contains("billing")
 }
 
+/// Substrings marking a *daily-scope* quota exhaustion (as opposed to a
+/// per-minute rate limit). Gemini's flattened quota error names the offending
+/// metric, e.g. "...requests per day..." / "...PerDay...". Matched (lowercased)
+/// against the same flattened message.
+// ponytail: marker set is best-effort against Gemini's known quota-error
+// wording; confirm/extend against a captured real daily-quota Display string.
+// Mis-detection self-corrects (under-fire -> flat cooldown re-hits).
+fn message_indicates_daily_quota(message: &str) -> bool {
+    let m = message.to_lowercase();
+    m.contains("per day") || m.contains("perday")
+}
+
 /// Pure classification of error facts into a `ProviderError`. Best-effort:
 /// both `RateLimited` and `QuotaExceeded` are failover triggers, so the finer
 /// split need not be exact for correctness.
@@ -49,6 +61,12 @@ pub(crate) fn classify_error_facts(provider: &str, facts: GenaiErrorFacts) -> Pr
         // status at all is a connection/transport failure. All of them report
         // QuotaExceeded instead when the message clearly names a quota/billing
         // condition.
+        // A daily-scope quota (Gemini "per day") warrants a until-UTC-midnight
+        // lockout, not the flat cooldown; checked before the general quota arm
+        // because a daily message also contains "quota".
+        Some(429) | Some(503) | Some(529) | None if message_indicates_daily_quota(&message) => {
+            ProviderError::DailyQuotaExceeded { provider, message }
+        }
         Some(429) | Some(503) | Some(529) | None if message_indicates_quota(&message) => {
             ProviderError::QuotaExceeded { provider, message }
         }
@@ -547,6 +565,7 @@ fn outcome_label(err: &ProviderError) -> &'static str {
     match err {
         ProviderError::RateLimited { .. } => "rate_limited",
         ProviderError::QuotaExceeded { .. } => "quota",
+        ProviderError::DailyQuotaExceeded { .. } => "daily_quota",
         ProviderError::ModelUnavailable { .. } => "model_unavailable",
         ProviderError::Authentication { .. } => "auth",
         ProviderError::InvalidRequest { .. } => "invalid",
@@ -659,6 +678,15 @@ pub fn build_router(cfg: &LlmConfig) -> Result<ProviderRouter<GenaiProvider>, Pr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daily_quota_outcome_label_is_distinct() {
+        let dq = ProviderError::DailyQuotaExceeded {
+            provider: "p".to_string(),
+            message: "per day".to_string(),
+        };
+        assert_eq!(outcome_label(&dq), "daily_quota");
+    }
 
     #[test]
     fn adapter_kind_for_matches_known_provider_kinds() {
@@ -821,6 +849,55 @@ mod tests {
             ProviderError::QuotaExceeded {
                 provider: "p".to_string(),
                 message: "credit balance is too low".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn gemini_daily_quota_classifies_as_daily_quota_exceeded() {
+        // Representative Gemini daily-quota Display text — pins the marker set.
+        // Replace with a captured real Display string once available.
+        let msg = "Quota exceeded for quota metric 'GenerateContentRequests' \
+                   and limit 'GenerateContentRequestsPerDayPerProjectPerModel'";
+        let e = classify_error_facts("gemini", facts(Some(429), msg));
+        assert_eq!(
+            e,
+            ProviderError::DailyQuotaExceeded {
+                provider: "gemini".to_string(),
+                message: msg.to_string(),
+            }
+        );
+        assert!(e.is_failover_trigger());
+    }
+
+    #[test]
+    fn gemini_per_minute_limit_is_not_day_locked() {
+        // Guards over-fire: a per-minute limit must NOT day-lock the model.
+        // The message still contains the general "quota exceeded" phrasing
+        // (Gemini's flattened text for every quota metric, daily or not), so
+        // it classifies via the pre-existing quota arm, not RateLimited —
+        // the invariant under test is only that it is not DailyQuotaExceeded.
+        let msg = "Quota exceeded for quota metric 'GenerateContentRequests' \
+                   and limit 'GenerateContentRequestsPerMinutePerProjectPerModel'";
+        let e = classify_error_facts("gemini", facts(Some(429), msg));
+        assert_eq!(
+            e,
+            ProviderError::QuotaExceeded {
+                provider: "gemini".to_string(),
+                message: msg.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn openai_insufficient_quota_stays_plain_quota_not_daily() {
+        // Guards that non-day quota is untouched by the new arm.
+        let e = classify_error_facts("p", facts(Some(429), "insufficient_quota: no credit"));
+        assert_eq!(
+            e,
+            ProviderError::QuotaExceeded {
+                provider: "p".to_string(),
+                message: "insufficient_quota: no credit".to_string(),
             }
         );
     }

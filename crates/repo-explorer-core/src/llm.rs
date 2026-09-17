@@ -178,6 +178,13 @@ pub enum ProviderError {
     RateLimited { provider: String, message: String },
     #[error("provider `{provider}` quota exceeded: {message}")]
     QuotaExceeded { provider: String, message: String },
+    /// A *daily-scope* quota exhaustion (e.g. Gemini "requests per day").
+    /// Distinct from `QuotaExceeded`: it warrants a lockout until the next UTC
+    /// midnight, not the flat cooldown, because the model will keep 429ing
+    /// until the day rolls over. Still a failover trigger — the router moves to
+    /// the next model.
+    #[error("provider `{provider}` daily quota exceeded: {message}")]
+    DailyQuotaExceeded { provider: String, message: String },
     /// The requested model id doesn't exist or was retired (HTTP 404 on the
     /// completion endpoint) — unlike `InvalidRequest`, this is specific to
     /// the one model slot, not the request shape, so it's a failover
@@ -204,7 +211,10 @@ impl ProviderError {
     pub fn is_failover_trigger(&self) -> bool {
         matches!(
             self,
-            Self::RateLimited { .. } | Self::QuotaExceeded { .. } | Self::ModelUnavailable { .. }
+            Self::RateLimited { .. }
+                | Self::QuotaExceeded { .. }
+                | Self::DailyQuotaExceeded { .. }
+                | Self::ModelUnavailable { .. }
         )
     }
 
@@ -213,6 +223,7 @@ impl ProviderError {
         match self {
             Self::RateLimited { provider, .. }
             | Self::QuotaExceeded { provider, .. }
+            | Self::DailyQuotaExceeded { provider, .. }
             | Self::ModelUnavailable { provider, .. }
             | Self::Authentication { provider, .. }
             | Self::InvalidRequest { provider, .. }
@@ -256,6 +267,10 @@ pub trait LlmProvider {
 /// sleeps. Production uses `SystemClock`; tests use `mock::FakeClock`.
 pub trait Clock {
     fn now(&self) -> std::time::Instant;
+    /// Wall-clock reading, for calendar-boundary cooldowns. Distinct from
+    /// `now()`: `Instant` is monotonic and carries no date; UTC-day math needs
+    /// a `SystemTime`.
+    fn now_wall(&self) -> std::time::SystemTime;
 }
 
 /// Real monotonic clock.
@@ -265,6 +280,9 @@ pub struct SystemClock;
 impl Clock for SystemClock {
     fn now(&self) -> std::time::Instant {
         std::time::Instant::now()
+    }
+    fn now_wall(&self) -> std::time::SystemTime {
+        std::time::SystemTime::now()
     }
 }
 
@@ -453,15 +471,23 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
                         return Ok(resp);
                     }
                     Err(e) if e.is_failover_trigger() => {
+                        let cooldown = if matches!(e, ProviderError::DailyQuotaExceeded { .. }) {
+                            // Daily quota (Gemini "per day"): lock this model
+                            // out for the rest of the UTC day; it will keep
+                            // 429ing until the day rolls over.
+                            duration_until_utc_midnight(self.clock.now_wall())
+                        } else {
+                            self.cooldown
+                        };
                         tracing::warn!(
                             provider = %entry.name,
                             model = %slot.model,
                             error = %e,
-                            cooldown_s = self.cooldown.as_secs(),
+                            cooldown_s = cooldown.as_secs(),
                             "provider limited, entering cooldown"
                         );
                         let mut guard = slot.lock_cooling();
-                        *guard = Some(self.clock.now() + self.cooldown);
+                        *guard = Some(self.clock.now() + cooldown);
                         limited.push(format!("{}/{}", entry.name, slot.model));
                         continue;
                     }
@@ -491,6 +517,19 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
     }
 }
 
+/// Seconds from `now` until the next UTC midnight, as a `Duration`. Unix epoch
+/// is UTC-aligned, so this is pure integer math — no timezone/date crate. Leap
+/// seconds are ignored (same precision the rest of the cooldown math tolerates).
+/// At exactly UTC midnight (`secs % 86_400 == 0`) this returns a full day, the
+/// correct floor for "rest of the day" when the error lands on the boundary.
+fn duration_until_utc_midnight(now: std::time::SystemTime) -> std::time::Duration {
+    let secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    std::time::Duration::from_secs(86_400 - (secs % 86_400))
+}
+
 /// Test harness: a scripted, call-recording `LlmProvider` and a controllable
 /// `Clock`. Gated so it compiles for core's own tests and for downstream crates
 /// that enable `features = ["test-support"]`.
@@ -499,7 +538,7 @@ pub mod mock {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     /// One recorded `complete_with_tools` invocation.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -581,18 +620,22 @@ pub mod mock {
         }
     }
 
-    /// A `Clock` whose `now()` only moves when `advance` is called. Starts at
-    /// `Instant::now()`; `Instant + Duration` avoids constructing arbitrary
-    /// instants.
+    /// A `Clock` whose `now()`/`now_wall()` only move when `advance`/`set_wall`
+    /// are called. `now` starts at `Instant::now()`; `wall` defaults to
+    /// `UNIX_EPOCH` (deterministic — `duration_until_utc_midnight` is then a
+    /// full day). Both share `Arc<Mutex<_>>`, so a `set_wall` on one clone is
+    /// seen by the clone handed to a router.
     #[derive(Clone)]
     pub struct FakeClock {
         now: Arc<Mutex<Instant>>,
+        wall: Arc<Mutex<SystemTime>>,
     }
 
     impl Default for FakeClock {
         fn default() -> Self {
             Self {
                 now: Arc::new(Mutex::new(Instant::now())),
+                wall: Arc::new(Mutex::new(UNIX_EPOCH)),
             }
         }
     }
@@ -602,16 +645,25 @@ pub mod mock {
             Self::default()
         }
 
-        /// Move the clock forward by `d`.
+        /// Move the clock forward by `d` (instant and wall in lockstep).
         pub fn advance(&self, d: Duration) {
-            let mut guard = self.now.lock().expect("fake clock poisoned");
-            *guard += d;
+            *self.now.lock().expect("fake clock poisoned") += d;
+            *self.wall.lock().expect("fake clock poisoned") += d;
+        }
+
+        /// Seed the wall clock (e.g. near a UTC-midnight boundary). Shared over
+        /// the `Arc<Mutex<_>>`, so a clone handed to a router sees it.
+        pub fn set_wall(&self, t: SystemTime) {
+            *self.wall.lock().expect("fake clock poisoned") = t;
         }
     }
 
     impl Clock for FakeClock {
         fn now(&self) -> Instant {
             *self.now.lock().expect("fake clock poisoned")
+        }
+        fn now_wall(&self) -> SystemTime {
+            *self.wall.lock().expect("fake clock poisoned")
         }
     }
 }
@@ -717,6 +769,21 @@ mod tests {
     }
 
     #[test]
+    fn daily_quota_display_provider_and_failover() {
+        let dq = ProviderError::DailyQuotaExceeded {
+            provider: "gemini".to_string(),
+            message: "requests per day".to_string(),
+        };
+        assert_eq!(dq, dq.clone());
+        assert_eq!(
+            dq.to_string(),
+            "provider `gemini` daily quota exceeded: requests per day"
+        );
+        assert_eq!(dq.provider(), "gemini");
+        assert!(dq.is_failover_trigger());
+    }
+
+    #[test]
     fn only_rate_quota_and_model_unavailable_are_failover_triggers() {
         let p = "x".to_string();
         assert!(
@@ -797,7 +864,7 @@ mod tests {
     }
 
     use mock::{FakeClock, MockCall, MockLlmProvider};
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn text(s: &str) -> Completion {
         Completion::from(ProviderResponse::Text(s.to_string()))
@@ -807,6 +874,149 @@ mod tests {
             provider: p.to_string(),
             message: "429".to_string(),
         }
+    }
+    fn daily_quota(p: &str) -> ProviderError {
+        ProviderError::DailyQuotaExceeded {
+            provider: p.to_string(),
+            message: "requests per day".to_string(),
+        }
+    }
+
+    #[test]
+    fn duration_until_utc_midnight_boundaries() {
+        assert_eq!(
+            duration_until_utc_midnight(UNIX_EPOCH),
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(
+            duration_until_utc_midnight(UNIX_EPOCH + Duration::from_secs(82_800)),
+            Duration::from_secs(3_600)
+        );
+        assert_eq!(
+            duration_until_utc_midnight(UNIX_EPOCH + Duration::from_secs(86_399)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            duration_until_utc_midnight(UNIX_EPOCH + Duration::from_secs(86_400)),
+            Duration::from_secs(86_400)
+        );
+    }
+
+    #[tokio::test]
+    async fn daily_quota_locks_model_past_flat_cooldown() {
+        let p = MockLlmProvider::new().with_fallback(Err(daily_quota("gemini")));
+        let clock = FakeClock::new(); // wall = UNIX_EPOCH -> lock 86_400s
+        let router = ProviderRouter::with_clock(
+            vec![("gemini".to_string(), vec![("m1".to_string(), p.clone())])],
+            60,
+            clock.clone(),
+        );
+
+        let first = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
+        assert!(matches!(first, Err(RouterError::AllExhausted(_))));
+        assert_eq!(p.calls().len(), 1);
+
+        // Past the flat 60s window but far short of a UTC day: still locked.
+        clock.advance(Duration::from_secs(120));
+        let second = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
+        assert!(matches!(second, Err(RouterError::AllExhausted(_))));
+        assert_eq!(
+            p.calls().len(),
+            1,
+            "model stays day-locked past flat cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn daily_quota_recovers_after_utc_midnight() {
+        let p = MockLlmProvider::new()
+            .with_responses(vec![Err(daily_quota("gemini")), Ok(text("recovered"))]);
+        let clock = FakeClock::new();
+        clock.set_wall(UNIX_EPOCH + Duration::from_secs(82_800)); // 23:00 -> lock 3_600s
+        let router = ProviderRouter::with_clock(
+            vec![("gemini".to_string(), vec![("m1".to_string(), p.clone())])],
+            60,
+            clock.clone(),
+        );
+
+        let first = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
+        assert!(matches!(first, Err(RouterError::AllExhausted(_))));
+        assert_eq!(p.calls().len(), 1);
+
+        // Past the UTC-midnight deadline (instant + wall advance in lockstep).
+        clock.advance(Duration::from_secs(3_601));
+        let second = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
+        assert_eq!(second, Ok(text("recovered")));
+        assert_eq!(p.calls().len(), 2, "model retried after UTC midnight");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_still_uses_flat_cooldown() {
+        let p = MockLlmProvider::new()
+            .with_responses(vec![Err(rate_limited("gemini")), Ok(text("recovered"))]);
+        let clock = FakeClock::new();
+        let router = ProviderRouter::with_clock(
+            vec![("gemini".to_string(), vec![("m1".to_string(), p.clone())])],
+            60,
+            clock.clone(),
+        );
+
+        let first = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
+        assert!(matches!(first, Err(RouterError::AllExhausted(_))));
+
+        clock.advance(Duration::from_secs(61));
+        let second = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
+        assert_eq!(second, Ok(text("recovered")));
+        assert_eq!(
+            p.calls().len(),
+            2,
+            "rate limit recovers after flat cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_quota_uses_flat_cooldown() {
+        let p = MockLlmProvider::new().with_responses(vec![
+            Err(ProviderError::QuotaExceeded {
+                provider: "p".to_string(),
+                message: "no credit".to_string(),
+            }),
+            Ok(text("recovered")),
+        ]);
+        let clock = FakeClock::new();
+        let router = ProviderRouter::with_clock(
+            vec![("p".to_string(), vec![("m1".to_string(), p.clone())])],
+            60,
+            clock.clone(),
+        );
+
+        let first = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
+        assert!(matches!(first, Err(RouterError::AllExhausted(_))));
+
+        clock.advance(Duration::from_secs(61));
+        let second = router
+            .complete_with_tools(&[], &[], &CallOptions::default())
+            .await;
+        assert_eq!(second, Ok(text("recovered")));
+        assert_eq!(
+            p.calls().len(),
+            2,
+            "plain quota recovers after flat cooldown"
+        );
     }
 
     #[tokio::test]
