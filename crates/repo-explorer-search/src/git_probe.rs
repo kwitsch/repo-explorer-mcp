@@ -22,6 +22,25 @@ impl GitStateProbe {
     }
 }
 
+/// The owner-executable bit of a regular tracked file, folded into its
+/// dirty-hash entry alongside its content oid. `Oid::hash_file` only covers
+/// content, so a `chmod +x`/`-x` with no byte change would otherwise leave
+/// `dirty_hash` unchanged even though `git status`/`git diff` report it.
+/// Windows has no such bit in git's own tracking model here, so this is
+/// always `0` there.
+#[cfg(unix)]
+fn exec_bit(full: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(full)
+        .map(|m| m.permissions().mode() & 0o100)
+        .unwrap_or(0)
+}
+
+#[cfg(not(unix))]
+fn exec_bit(_full: &Path) -> u32 {
+    0
+}
+
 fn sha256_hex(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
     for part in parts {
@@ -72,13 +91,55 @@ fn fingerprint_blocking(repo_root: &Path) -> Option<RepoFingerprint> {
             && !full.exists()
         {
             parts.push(format!("{path}:{bits}:gone"));
+        } else if std::fs::symlink_metadata(&full)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            // A tracked symlink's own blob content is its target-path text,
+            // not the pointee's bytes — Oid::hash_file opens (and so
+            // follows) the link and would hash the wrong content. Hash the
+            // link text itself, exactly what git stores for a symlink blob.
+            // Checked before the directory branch below: a symlink to a
+            // directory must still be hashed as a symlink, not recursed
+            // into as if it were a submodule.
+            let part = match std::fs::read_link(&full).ok().and_then(|target| {
+                Oid::hash_object(ObjectType::Blob, target.as_os_str().as_encoded_bytes()).ok()
+            }) {
+                Some(oid) => format!("{path}:{bits}:{oid}"),
+                None => match std::fs::symlink_metadata(&full) {
+                    Ok(meta) => {
+                        format!("{path}:{bits}:{}:{:?}", meta.len(), meta.modified().ok())
+                    }
+                    Err(_) => format!("{path}:{bits}:missing"),
+                },
+            };
+            parts.push(part);
+        } else if full.is_dir() {
+            // A submodule (gitlink) or a typechange to a plain directory:
+            // Oid::hash_file cannot read a directory, and the directory's
+            // own mtime does not change either when a file nested inside it
+            // is edited or when it is checked out to a different commit.
+            // Recurse as its own repo so both transitions are visible; if
+            // it isn't actually a git repo (or has no commits yet), fall
+            // back to the stat string like every other hash failure.
+            let part = match fingerprint_blocking(&full) {
+                Some(fp) => format!("{path}:{bits}:sub:{}:{}", fp.head_sha, fp.dirty_hash),
+                None => match std::fs::symlink_metadata(&full) {
+                    Ok(meta) => {
+                        format!("{path}:{bits}:{}:{:?}", meta.len(), meta.modified().ok())
+                    }
+                    Err(_) => format!("{path}:{bits}:missing"),
+                },
+            };
+            parts.push(part);
         } else {
             // Tracked-changed (modified/added/typechange/renamed, staged or
-            // unstaged). Content-sensitive blob oid; on error (e.g. a
-            // typechange to a directory) fall back to a stat string so the
-            // entry still varies.
+            // unstaged). Content-sensitive blob oid plus the owner-exec bit
+            // (so a mode-only `chmod +x`/`-x` with no content change still
+            // varies the fingerprint, matching git's own mode tracking); on
+            // error fall back to a stat string so the entry still varies.
             let part = match Oid::hash_file(ObjectType::Blob, &full) {
-                Ok(oid) => format!("{path}:{bits}:{oid}"),
+                Ok(oid) => format!("{path}:{bits}:{}:{oid}", exec_bit(&full)),
                 Err(_) => match std::fs::symlink_metadata(&full) {
                     Ok(meta) => {
                         format!("{path}:{bits}:{}:{:?}", meta.len(), meta.modified().ok())
@@ -334,6 +395,63 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A tracked symlink retargeted to a different existing file must change
+    /// the fingerprint: the blob content is the link's target-path text, not
+    /// the pointee's bytes, so `Oid::hash_file` (which follows the link) must
+    /// not be used for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tracked_symlink_retarget_changes_the_fingerprint() {
+        let dir = temp_dir("tracked_symlink");
+        let repo = init_repo(&dir);
+        std::fs::write(dir.join("target-a"), "same length\n").unwrap();
+        std::fs::write(dir.join("target-b"), "same length\n").unwrap();
+        std::os::unix::fs::symlink("target-a", dir.join("link")).unwrap();
+        write_commit(&repo, "c1");
+
+        let probe = GitStateProbe::new(30);
+        let clean = probe.fingerprint(&dir).await.expect("fingerprint");
+
+        std::fs::remove_file(dir.join("link")).unwrap();
+        std::os::unix::fs::symlink("target-b", dir.join("link")).unwrap();
+        let retargeted = probe.fingerprint(&dir).await.expect("fingerprint");
+        assert_ne!(
+            clean.dirty_hash, retargeted.dirty_hash,
+            "retargeting a tracked symlink to a different (same-content) file must be visible"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Toggling a tracked file's executable bit with no content change must
+    /// still change the fingerprint (git tracks the mode as part of the
+    /// tree entry, independent of blob content).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tracked_file_chmod_exec_changes_the_fingerprint() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("chmod_exec");
+        let repo = init_repo(&dir);
+        std::fs::write(dir.join("script.sh"), "echo hi\n").unwrap();
+        write_commit(&repo, "c1");
+
+        let probe = GitStateProbe::new(30);
+        let clean = probe.fingerprint(&dir).await.expect("fingerprint");
+
+        let path = dir.join("script.sh");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(perms.mode() | 0o100);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let chmodded = probe.fingerprint(&dir).await.expect("fingerprint");
+        assert_ne!(
+            clean.dirty_hash, chmodded.dirty_hash,
+            "chmod +x with no content change must be visible"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// New regression (F-07 + workdir-vs-repo_root): all status paths must be
     /// joined against workdir(), never repo_root. Probe a SUBDIRECTORY of the
     /// repo while an untracked file lives at the git TOP LEVEL; its content
@@ -361,6 +479,83 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F-08: a submodule (gitlink) shows the same `WT_MODIFIED` status bits
+    /// both when a file nested inside it is edited and when it is checked
+    /// out to a different commit — the fingerprint must still change for
+    /// both transitions, not just stat the submodule's own top-level
+    /// directory (whose mtime is stable across either).
+    #[tokio::test]
+    async fn submodule_dirty_content_and_head_change_the_fingerprint() {
+        let outer_dir = temp_dir("submodule_outer");
+        let inner_dir = outer_dir.join("sub");
+
+        let inner_repo = init_repo(&inner_dir);
+        std::fs::write(inner_dir.join("f.txt"), "one\n").unwrap();
+        write_commit(&inner_repo, "inner c1");
+        let inner_c1 = inner_repo.head().unwrap().peel_to_commit().unwrap().id();
+        std::fs::write(inner_dir.join("f.txt"), "two\n").unwrap();
+        write_commit(&inner_repo, "inner c2");
+        let inner_c2 = inner_repo.head().unwrap().peel_to_commit().unwrap().id();
+
+        let outer_repo = init_repo(&outer_dir);
+        std::fs::write(outer_dir.join("top.txt"), "top\n").unwrap();
+        // Manually stage a gitlink entry for "sub" (mode 160000) pointing at
+        // the inner repo's current HEAD — the same tree shape `git submodule
+        // add` produces, without needing a network/file transport.
+        {
+            let mut index = outer_repo.index().unwrap();
+            index
+                .add_all(["top.txt"].iter(), IndexAddOption::DEFAULT, None)
+                .unwrap();
+            index
+                .add(&git2::IndexEntry {
+                    ctime: git2::IndexTime::new(0, 0),
+                    mtime: git2::IndexTime::new(0, 0),
+                    dev: 0,
+                    ino: 0,
+                    mode: 0o160000,
+                    uid: 0,
+                    gid: 0,
+                    file_size: 0,
+                    id: inner_c2,
+                    flags: 0,
+                    flags_extended: 0,
+                    path: b"sub".to_vec(),
+                })
+                .unwrap();
+            index.write().unwrap();
+        }
+        commit_index(&outer_repo, "add submodule");
+
+        let probe = GitStateProbe::new(30);
+        let clean = probe.fingerprint(&outer_dir).await.expect("fingerprint");
+
+        // Edit a file INSIDE the submodule's own working tree — no outer
+        // commit, so the outer gitlink entry shows the same WT_MODIFIED bits
+        // before and after.
+        std::fs::write(inner_dir.join("f.txt"), "two\nthree\n").unwrap();
+        let dirty_content = probe.fingerprint(&outer_dir).await.expect("fingerprint");
+        assert_ne!(
+            clean.dirty_hash, dirty_content.dirty_hash,
+            "editing a file nested inside a submodule must be visible"
+        );
+
+        // Revert the in-submodule edit, then check the submodule's own repo
+        // out to a different (still fully clean) commit.
+        std::fs::write(inner_dir.join("f.txt"), "two\n").unwrap();
+        inner_repo.set_head_detached(inner_c1).unwrap();
+        inner_repo
+            .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let checked_out_c1 = probe.fingerprint(&outer_dir).await.expect("fingerprint");
+        assert_ne!(
+            clean.dirty_hash, checked_out_c1.dirty_hash,
+            "checking a submodule out to a different commit must be visible"
+        );
+
+        std::fs::remove_dir_all(&outer_dir).ok();
     }
 
     /// New regression: a committed deletion must appear in changed_paths.
