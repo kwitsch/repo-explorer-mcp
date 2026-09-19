@@ -1,12 +1,11 @@
-//! CLI-driven text search backend (ripgrep) implementing
-//! `repo_explorer_core::search::SearchBackend`, plus the git-backed
-//! `RepoStateProbe` (`GitStateProbe`) — both subprocess-driven, which is this
-//! crate's dependency domain.
+//! In-process text/filename search backend (`NativeSearchBackend`) built on
+//! ripgrep's own `ignore` + `grep` crates, implementing
+//! `repo_explorer_core::search::SearchBackend` with no external binary; plus
+//! the git-backed `RepoStateProbe` (`GitStateProbe`), whose subprocess concern
+//! is this crate's remaining dependency domain.
 mod backend;
 mod git_probe;
-mod parser;
 mod process;
-mod resolver;
 
-pub use backend::CliSearchBackend;
+pub use backend::NativeSearchBackend;
 pub use git_probe::GitStateProbe;
