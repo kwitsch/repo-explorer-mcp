@@ -41,6 +41,17 @@ fn exec_bit(_full: &Path) -> u32 {
     0
 }
 
+/// `(len, mtime)` stat tag shared by the untracked-entry fingerprint and
+/// every tracked-changed hash-failure fallback below, so a future tweak to
+/// the stat heuristic (e.g. adding another field) only needs to land here
+/// instead of drifting across separately-typed-out copies.
+fn stat_tag(path: &str, tag: impl std::fmt::Display, full: &Path) -> String {
+    match std::fs::symlink_metadata(full) {
+        Ok(meta) => format!("{path}:{tag}:{}:{:?}", meta.len(), meta.modified().ok()),
+        Err(_) => format!("{path}:{tag}:missing"),
+    }
+}
+
 fn sha256_hex(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
     for part in parts {
@@ -82,11 +93,7 @@ fn fingerprint_blocking(repo_root: &Path) -> Option<RepoFingerprint> {
         let bits = s.bits();
         let full = workdir.join(path);
         if s.contains(Status::WT_NEW) {
-            let part = match std::fs::symlink_metadata(&full) {
-                Ok(meta) => format!("{path}:U:{}:{:?}", meta.len(), meta.modified().ok()),
-                Err(_) => format!("{path}:U:missing"),
-            };
-            parts.push(part);
+            parts.push(stat_tag(path, "U", &full));
         } else if (s.contains(Status::WT_DELETED) || s.contains(Status::INDEX_DELETED))
             && !full.exists()
         {
@@ -106,12 +113,7 @@ fn fingerprint_blocking(repo_root: &Path) -> Option<RepoFingerprint> {
                 Oid::hash_object(ObjectType::Blob, target.as_os_str().as_encoded_bytes()).ok()
             }) {
                 Some(oid) => format!("{path}:{bits}:{oid}"),
-                None => match std::fs::symlink_metadata(&full) {
-                    Ok(meta) => {
-                        format!("{path}:{bits}:{}:{:?}", meta.len(), meta.modified().ok())
-                    }
-                    Err(_) => format!("{path}:{bits}:missing"),
-                },
+                None => stat_tag(path, bits, &full),
             };
             parts.push(part);
         } else if full.is_dir() {
@@ -124,12 +126,7 @@ fn fingerprint_blocking(repo_root: &Path) -> Option<RepoFingerprint> {
             // back to the stat string like every other hash failure.
             let part = match fingerprint_blocking(&full) {
                 Some(fp) => format!("{path}:{bits}:sub:{}:{}", fp.head_sha, fp.dirty_hash),
-                None => match std::fs::symlink_metadata(&full) {
-                    Ok(meta) => {
-                        format!("{path}:{bits}:{}:{:?}", meta.len(), meta.modified().ok())
-                    }
-                    Err(_) => format!("{path}:{bits}:missing"),
-                },
+                None => stat_tag(path, bits, &full),
             };
             parts.push(part);
         } else {
@@ -140,12 +137,7 @@ fn fingerprint_blocking(repo_root: &Path) -> Option<RepoFingerprint> {
             // error fall back to a stat string so the entry still varies.
             let part = match Oid::hash_file(ObjectType::Blob, &full) {
                 Ok(oid) => format!("{path}:{bits}:{}:{oid}", exec_bit(&full)),
-                Err(_) => match std::fs::symlink_metadata(&full) {
-                    Ok(meta) => {
-                        format!("{path}:{bits}:{}:{:?}", meta.len(), meta.modified().ok())
-                    }
-                    Err(_) => format!("{path}:{bits}:missing"),
-                },
+                Err(_) => stat_tag(path, bits, &full),
             };
             parts.push(part);
         }
