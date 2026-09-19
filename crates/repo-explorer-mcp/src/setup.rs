@@ -362,28 +362,9 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
         eprintln!("  proxy URL must be a valid http:// or https:// URL with a host.");
     };
 
-    // Search: leave `[search]` at core defaults (`rg_path` omitted). `rg` is
-    // system-preferred and resolved dynamically at runtime (system PATH, then
-    // the managed fallback), so pinning a path here would freeze that choice.
+    // Search is in-process (no external `rg` binary), so `[search]` is left at
+    // core defaults and there is nothing to probe or provision here.
     let search = SearchConfig::default();
-    if which::which("rg").is_err() {
-        match crate::update::dedicated_rg_binary_path() {
-            Ok(rg_path) if !rg_path.exists() => {
-                eprintln!(
-                    "  note: no system `rg` found on PATH, and the managed rg binary is not \
-                     installed yet at {}; run `repo-explorer-mcp --update` to provision it.",
-                    rg_path.display()
-                );
-            }
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!(
-                    "  note: no system `rg` found on PATH, and the managed rg path could not \
-                     be resolved ({e:#}); run `repo-explorer-mcp --update` after fixing that."
-                );
-            }
-        }
-    }
 
     // agent / cache / logging left at defaults (fully defaulted in core); not
     // prompted.

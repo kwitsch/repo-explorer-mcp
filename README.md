@@ -3,7 +3,8 @@
 A Rust MCP server that exposes the `explore_repository` tool over an rmcp stdio
 transport, shipped for Linux (`x86_64-unknown-linux-gnu`) and Windows
 (`x86_64-pc-windows-msvc`). It drives an internal LLM exploration loop over a
-managed `codebase-memory-mcp` backend and ripgrep-based text search — both
+managed `codebase-memory-mcp` backend and in-process text search (over ripgrep's
+`ignore` + `grep` library crates, no external binary) — the memory backend is
 provisioned by `repo-explorer-mcp --update` into a shared per-user bin dir
 (`$XDG_BIN_HOME` if set to an absolute path, else `~/.local/bin`, on Linux;
 `%LOCALAPPDATA%\repo-explorer-mcp` on Windows), never a global PATH install.
@@ -83,13 +84,8 @@ The script installs into `$XDG_BIN_HOME` (when set to an absolute path) or
 `~/.local/bin` (Linux), or `%LOCALAPPDATA%\repo-explorer-mcp` (Windows) — the
 same directory `repo-explorer-mcp --update` provisions the managed helpers
 into. It never edits your shell profile or system PATH — it only reports
-whether the install directory is on PATH. `ripgrep` is installed via
-`apt`/`dnf`/`pacman` on Linux or `winget` on Windows when available; when no
-package manager is found, `rg` is instead provisioned on demand (latest GitHub
-release) into the shared bin dir by `repo-explorer-mcp --update`. A system `rg`
-already on PATH is always preferred and left untouched — the managed copy is a
-fallback, created only when none is present.
-`codebase-memory-mcp` is not taken from PATH: the installer invokes `repo-explorer-mcp --update` to install it as a managed per-user copy in the shared bin dir above (best-effort; if that step fails, run `repo-explorer-mcp --update` later). Search uses `rg`: a system `rg` on PATH is preferred, and a managed `rg` copy is provisioned into that shared bin dir only when none is present. The server fails fast if no `rg` can be resolved, pointing you at `--update`.
+whether the install directory is on PATH.
+`codebase-memory-mcp` is not taken from PATH: the installer invokes `repo-explorer-mcp --update` to install it as a managed per-user copy in the shared bin dir above (best-effort; if that step fails, run `repo-explorer-mcp --update` later). Search is in-process, so no external binary is required.
 
 ## Install (manual fallback)
 
@@ -188,9 +184,8 @@ args = ["--stdio"]
 
 [search]
 timeout_seconds = 45
-# rg_path may be set explicitly to an existing rg binary; omitted => runtime
-# resolution — a system `rg` on PATH (via `which`) is preferred, and the
-# managed `rg` copy provisioned by `--update` is used only as a fallback.
+# rg_path is deprecated/ignored: search is in-process (no external rg binary).
+# The field is kept for configuration back-compatibility.
 
 # Exploration pipeline knobs (all optional; shown with their defaults).
 [agent]
@@ -259,7 +254,7 @@ repository fingerprint moved:
 - `strict` (default) — serve only for a repo state proven unchanged: an
   identical fingerprint, or a fingerprint change with a provably empty diff.
   This is the pre-existing behavior.
-- `paths` — additionally serve after an *unrelated* edit, by re-stat'ing only
+- `paths` — additionally serve after an _unrelated_ edit, by re-stat'ing only
   the files the cached answer references. Much higher hit rate while you are
   editing, with a known ceiling: a newly added file that would have been the
   better match is missed. Entries with no referenced files fall back to
@@ -273,8 +268,8 @@ Cache inspection, both printing a JSON report to stdout and exiting non-zero on
 failure (neither starts the server, connects to anything, or prompts):
 
 ```bash
-repo-explorer-mcp cache stats   # dir, schema_version, entries, bytes, max_bytes, oldest/newest
-repo-explorer-mcp cache clear   # delete every persisted result; reports what was removed
+repo-explorer-mcp cache stats # dir, schema_version, entries, bytes, max_bytes, oldest/newest
+repo-explorer-mcp cache clear # delete every persisted result; reports what was removed
 ```
 
 Setting `REPO_EXPLORER_METRICS=<path>` appends one JSON line of per-query

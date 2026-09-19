@@ -9,7 +9,7 @@ use repo_explorer_core::llm::SystemClock;
 use repo_explorer_core::retrieval::is_unknown_location;
 use repo_explorer_llm::GenaiProvider;
 use repo_explorer_memory::MemoryClientBackend;
-use repo_explorer_search::{CliSearchBackend, GitStateProbe};
+use repo_explorer_search::{GitStateProbe, NativeSearchBackend};
 use rmcp::{
     Json, ServerHandler,
     handler::server::{
@@ -30,7 +30,7 @@ use tracing::Instrument;
 /// methods and `AgentLoop::run` take `&self`, so a shared `Arc<Agent>` (no
 /// `Mutex`) supports concurrent tool calls.
 pub type Agent =
-    AgentLoop<MemoryClientBackend, CliSearchBackend, GenaiProvider, GitStateProbe, SystemClock>;
+    AgentLoop<MemoryClientBackend, NativeSearchBackend, GenaiProvider, GitStateProbe, SystemClock>;
 
 /// How much snippet text the response carries. Affects the *response* only —
 /// LLM prompt rendering always uses `agent.snippet_max_chars`.

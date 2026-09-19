@@ -1,5 +1,9 @@
 # Stage 3 — ripgrep/rtk Such-Layer
 
+**Note:** This design document describes a historical approach. The search layer
+is now in-process using ripgrep's `ignore` + `grep` library crates
+(`NativeSearchBackend`), with no external `rg` binary required.
+
 ## Ziel
 
 Schnelle, textbasierte Fallback-/Ergänzungssuche für Fälle, in denen `codebase-memory-mcp` keine Treffer liefert oder eine literale Muster-Suche gefragt ist.

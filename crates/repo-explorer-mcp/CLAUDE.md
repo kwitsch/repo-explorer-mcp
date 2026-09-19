@@ -20,7 +20,7 @@ errors are consumed via `?`/`.context(...)`).
 - Serialization lives in core (`config::to_toml_string`); the binary adds no `toml` dependency.
 - The wizard writes to the _resolved_ config path (the XDG default unless `--config`/`REPO_EXPLORER_CONFIG` overrides it).
 - It self-verifies the written file via `repo_explorer_core::config::load`.
-- The `[search]` section is left at core defaults (`rg_path` omitted); `rg` is resolved at runtime — a system `rg` on PATH is preferred, the managed copy is the fallback — so the wizard pins no path. It does, however, print a note (mirroring the codebase-memory-mcp provisioning note above it) if no system `rg` is on PATH and the managed copy isn't installed yet, pointing at `--update`. `[agent]`, `[cache]`, and `[logging]` are likewise left at their (fully defaulted) core values. `main.rs::run` plumbs `config.agent`/`config.cache` into `AgentLoop::new` together with a `GitStateProbe` built from `config.search.timeout_seconds`.
+- The `[search]` section is left at core defaults because search is in-process (no external `rg` binary); `[agent]`, `[cache]`, and `[logging]` are likewise left at their (fully defaulted) core values. `main.rs::run` plumbs `config.agent`/`config.cache` into `AgentLoop::new` together with a `GitStateProbe` built from `config.search.timeout_seconds`.
 
 ## Config path resolution
 
@@ -30,9 +30,8 @@ errors are consumed via `?`/`.context(...)`).
 - This crate owns the `dirs` dependency used for XDG resolution; core and the other crates stay free of it.
 - The on-disk result cache follows the same rule: `xdg_default_cache_dir()` (`dirs::cache_dir()/repo-explorer`; `$XDG_CACHE_HOME` on Linux, `%LOCALAPPDATA%` on Windows) and `resolve_cache_dir` — `[cache] dir` verbatim when set, else the XDG default, `None` when neither resolves. `run()` writes the result back into `config.cache.dir` before `AgentLoop::new`, so the agent crate receives an already-resolved (or deliberately empty = no on-disk layer) string and never touches XDG. `cache stats`/`cache clear` reuse the same two functions.
 - `codebase-memory-mcp` managed copy: lives in the shared bin dir (`~/.local/bin` on Linux via `dirs::executable_dir()`, `%LOCALAPPDATA%\repo-explorer-mcp` on Windows via `dirs::data_local_dir().join("repo-explorer-mcp")` — the same dir the npx installer uses for the main binary); provisioned/updated only by `--update` and launched by absolute path — never resolved via PATH/`which`.
-- Search uses `rg` instead: a system `rg` on PATH is preferred, and the managed `rg` copy (also in that shared bin dir) is only a fallback.
-- `setup` writes the absolute `codebase-memory-mcp` path into `[codebase_memory] command` but pins no `[search]` path.
-- `run()` fails fast with a `--update` hint if the memory binary is missing or if no `rg` is resolvable, and never downloads.
+- `setup` writes the absolute `codebase-memory-mcp` path into `[codebase_memory] command`.
+- `run()` fails fast with a `--update` hint if the memory binary is missing, and never downloads.
 - The Node installer's `installDir()` mirrors this same resolution (`$XDG_BIN_HOME` if absolute, else `$HOME/.local/bin`; `%LOCALAPPDATA%\repo-explorer-mcp` on Windows) so both installers place binaries in one shared dir.
 - `codebase-memory-mcp` runs one per-user daemon that admits only clients launched from the _exact same executable path string_ (a same-build copy/symlink/hardlink elsewhere hangs 30s then fails; a different build is refused outright).
 - `run()` scans `/proc` (Linux only, `running_memory_binary`) for an already-running `codebase-memory-mcp` owned by this user — e.g. the Claude Code plugin's — and spawns that path instead of the configured command.
@@ -65,11 +64,10 @@ errors are consumed via `?`/`.context(...)`).
 
 ## Self-update (`src/update.rs`)
 
-- Tracked components: `repo-explorer-mcp` (`kwitsch/repo-explorer-mcp`) plus two managed install-if-absent / update-if-stale copies in the shared bin dir (`$XDG_BIN_HOME` or `~/.local/bin` on Linux, `%LOCALAPPDATA%\repo-explorer-mcp` on Windows): `codebase-memory-mcp` (`DeusData/codebase-memory-mcp`) via `provision_or_update_memory_binary`, and `rg`/ripgrep (`BurntSushi/ripgrep`) via `provision_or_update_rg_binary`.
+- Tracked components: `repo-explorer-mcp` (`kwitsch/repo-explorer-mcp`) plus one managed install-if-absent / update-if-stale copy in the shared bin dir (`$XDG_BIN_HOME` or `~/.local/bin` on Linux, `%LOCALAPPDATA%\repo-explorer-mcp` on Windows): `codebase-memory-mcp` (`DeusData/codebase-memory-mcp`) via `provision_or_update_memory_binary`.
 - Runs instead of the MCP server loop, dispatched before config resolution and before the `setup` dispatch/auto-run.
-- `rg` is managed only as a fallback: a system `rg` resolvable on PATH (any `which`-resolved `rg` other than the managed copy) is preferred and left untouched (`action: skipped`), never overwritten; the managed copy under `managed_bin_dir()` is provisioned only when no system `rg` is present, and updated when stale. `codebase-memory-mcp` is always managed (installed when absent, updated when stale — `installed`/`updated`/`up-to-date`). `rtk` is no longer provisioned by this server — the search backend it once fed was migrated to direct `rg` and provisioning it became dead weight.
+- `codebase-memory-mcp` is always managed (installed when absent, updated when stale — `installed`/`updated`/`up-to-date`). Search is in-process (`NativeSearchBackend`), so no external `rg` binary is provisioned.
 - This crate owns the `reqwest`/`semver`/`sha2`/`hex`/`flate2`/`tar`/`zip`/`self-replace` dependencies; core stays free of them.
-- It also uses `which`, already owned by `repo-explorer-search` — the only dependency this crate shares with another non-core crate rather than owning outright.
 
 ## Install/uninstall (`src/install.rs`)
 
