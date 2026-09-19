@@ -10,7 +10,7 @@ sha2 = "0.11"
 hex = "0.4"
 ignore = "0.4"
 grep = "0.3"
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 
 [dev-dependencies]
 which = "8"
-git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
