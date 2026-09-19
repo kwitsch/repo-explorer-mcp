@@ -1,81 +1,25 @@
-//! Git-backed `RepoStateProbe`: repository fingerprinting for the result
-//! caches. Lives in this crate because subprocess concerns belong here (the
-//! same `process::run` used for rtk/rg drives `git`).
+//! git2-backed `RepoStateProbe`: repository fingerprinting for the result
+//! caches. Uses the in-process `git2` (libgit2) bindings — no external `git`
+//! binary at runtime or in tests. Lives in this crate alongside the other
+//! backend probes; every failure degrades to `None`.
 
-use crate::process::{SpawnSpec, run};
+use git2::{ObjectType, Oid, Repository, Status, StatusOptions};
 use repo_explorer_core::fingerprint::{RepoFingerprint, RepoStateProbe};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-/// Probes repository state via the `git` CLI. Every failure (no git binary,
-/// not a repository, timeout) degrades to `None` — "no fingerprint" simply
-/// disables caching for that call.
-pub struct GitStateProbe {
-    timeout: Duration,
-}
+/// Probes repository state via the in-process `git2` (libgit2) library. Every
+/// failure (not a repository, bare repo, unborn HEAD, per-file stat/hash
+/// error) degrades to `None` — "no fingerprint" simply disables caching for
+/// that call.
+pub struct GitStateProbe;
 
 impl GitStateProbe {
-    /// `timeout_seconds = 0` means "no timeout", matching `SearchConfig`.
-    pub fn new(timeout_seconds: u64) -> Self {
-        Self {
-            timeout: Duration::from_secs(timeout_seconds),
-        }
+    /// `timeout_seconds` is accepted for call-site compatibility but unused:
+    /// git2 does local-only filesystem ops with no cancellation point.
+    pub fn new(_timeout_seconds: u64) -> Self {
+        Self
     }
-
-    async fn git(&self, repo_root: &Path, args: &[&str]) -> Option<String> {
-        let spec = SpawnSpec {
-            backend: "git",
-            program: PathBuf::from("git"),
-            args: args.iter().map(|s| s.to_string()).collect(),
-            cwd: repo_root.to_path_buf(),
-            timeout: self.timeout,
-        };
-        run(&spec).await.ok()
-    }
-}
-
-/// Fold each untracked file's `(size, mtime)` into a stable string, so an
-/// edit to an already-untracked file's bytes changes the dirty fingerprint
-/// even though neither `git status --porcelain` nor `git diff HEAD` would
-/// notice (F-07). Cheap stat, not a full read — avoids the perf risk of
-/// hashing content across a large untracked directory that isn't gitignored.
-/// Untracked paths are read straight out of the already-fetched `status`
-/// text (lines prefixed `"?? "`), so no extra `git` subprocess call is
-/// needed. `parts` is sorted so this is stable regardless of `status`'s own
-/// line order.
-///
-/// ponytail: git's C-style quoting of exotic filenames in `--porcelain`
-/// output isn't unescaped here, so such a path won't resolve via
-/// `repo_root.join(rel)` and falls into the `Err` "missing" arm — no worse
-/// than the total blind spot this replaces; unquote it if it ever bites.
-///
-/// Stats the path itself (`symlink_metadata`), not through a symlink: a
-/// symlink's *target* content is already covered separately, by the
-/// target's own `?? `/tracked status entry, so following the link here would
-/// only mean a dangling symlink (a real, common untracked-scratch case)
-/// always reports "missing" regardless of what it points at or how that's
-/// repointed — collapsing every such retarget into the same fingerprint.
-///
-/// ponytail: `(size, mtime)` is a heuristic, not a content hash — a same-byte-
-/// length edit landing inside one mtime tick (coarse on some filesystems) is
-/// invisible; hash real content instead if that ever bites. Also: a
-/// gitignored file never appears in `status` at all (git omits it unless
-/// `--ignored` is passed), so its content stays outside this fingerprint
-/// entirely even though it's fully readable via `read_file` — a deliberately
-/// separate, unaddressed gap (whether an ignored file's content should count
-/// as "dirty" for caching is a design question, not a one-line fix).
-fn untracked_fingerprint(repo_root: &Path, status: &str) -> String {
-    let mut parts: Vec<String> = status
-        .lines()
-        .filter_map(|l| l.strip_prefix("?? "))
-        .map(|rel| match std::fs::symlink_metadata(repo_root.join(rel)) {
-            Ok(meta) => format!("{rel}:{}:{:?}", meta.len(), meta.modified().ok()),
-            Err(_) => format!("{rel}:missing"),
-        })
-        .collect();
-    parts.sort();
-    parts.join("\n")
 }
 
 fn sha256_hex(parts: &[&str]) -> String {
@@ -87,57 +31,111 @@ fn sha256_hex(parts: &[&str]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Single blocking status walk. Every relative path is joined against
+/// `workdir` (never the caller's `repo_root`, which may be a strict
+/// subdirectory of the git top level). Tracked-changed entries fold in a
+/// cheap content-sensitive blob oid (`Oid::hash_file`, no odb write, works for
+/// text AND binary); untracked entries fold in a `(len, mtime)` stat via
+/// `symlink_metadata` (F-07) — deliberately NOT a content hash, preserving the
+/// large-untracked-tree perf guard, and stating the link itself so a dangling
+/// untracked symlink's own target string is what varies. Ignored files stay
+/// excluded (default `StatusOptions`), a deliberate carried-forward gap.
+/// `parts` is sorted because git2's status entry order is not guaranteed.
+fn fingerprint_blocking(repo_root: &Path) -> Option<RepoFingerprint> {
+    let repo = Repository::discover(repo_root).ok()?;
+    let workdir = repo.workdir()?.to_path_buf();
+
+    // Unborn branch (commit-less repo) → head() fails → None, matching the
+    // old CLI's empty-`rev-parse`→None behavior.
+    let head_sha = repo.head().ok()?.peel_to_commit().ok()?.id().to_string();
+
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true).recurse_untracked_dirs(true);
+    let statuses = repo.statuses(Some(&mut opts)).ok()?;
+
+    let mut parts: Vec<String> = Vec::new();
+    for entry in statuses.iter() {
+        // Skip non-UTF-8 paths (matching the existing exotic-name blind spot).
+        let Ok(path) = entry.path() else {
+            continue;
+        };
+        let s = entry.status();
+        let bits = s.bits();
+        let full = workdir.join(path);
+        if s.contains(Status::WT_NEW) {
+            let part = match std::fs::symlink_metadata(&full) {
+                Ok(meta) => format!("{path}:U:{}:{:?}", meta.len(), meta.modified().ok()),
+                Err(_) => format!("{path}:U:missing"),
+            };
+            parts.push(part);
+        } else if (s.contains(Status::WT_DELETED) || s.contains(Status::INDEX_DELETED))
+            && !full.exists()
+        {
+            parts.push(format!("{path}:{bits}:gone"));
+        } else {
+            // Tracked-changed (modified/added/typechange/renamed, staged or
+            // unstaged). Content-sensitive blob oid; on error (e.g. a
+            // typechange to a directory) fall back to a stat string so the
+            // entry still varies.
+            let part = match Oid::hash_file(ObjectType::Blob, &full) {
+                Ok(oid) => format!("{path}:{bits}:{oid}"),
+                Err(_) => match std::fs::symlink_metadata(&full) {
+                    Ok(meta) => {
+                        format!("{path}:{bits}:{}:{:?}", meta.len(), meta.modified().ok())
+                    }
+                    Err(_) => format!("{path}:{bits}:missing"),
+                },
+            };
+            parts.push(part);
+        }
+    }
+    parts.sort();
+    let joined = parts.join("\n");
+    Some(RepoFingerprint {
+        head_sha,
+        dirty_hash: sha256_hex(&[&joined]),
+    })
+}
+
+/// Committed leg of `changed_paths`: diff the two resolved commit trees.
+/// Deleted deltas leave `new_file().path()` empty in libgit2 — only
+/// `old_file()` carries the path — so fall back to it, otherwise every deleted
+/// file is silently dropped (regresses vs `git diff --name-only`). Any
+/// resolution failure → `None`.
+fn changed_paths_blocking(repo_root: &Path, from_sha: &str, to_sha: &str) -> Option<Vec<PathBuf>> {
+    let repo = Repository::discover(repo_root).ok()?;
+    let from_tree = repo
+        .find_commit(Oid::from_str(from_sha).ok()?)
+        .ok()?
+        .tree()
+        .ok()?;
+    let to_tree = repo
+        .find_commit(Oid::from_str(to_sha).ok()?)
+        .ok()?
+        .tree()
+        .ok()?;
+    let diff = repo
+        .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)
+        .ok()?;
+    let paths = diff
+        .deltas()
+        .filter_map(|d| {
+            d.new_file()
+                .path()
+                .or_else(|| d.old_file().path())
+                .map(PathBuf::from)
+        })
+        .collect();
+    Some(paths)
+}
+
 impl RepoStateProbe for GitStateProbe {
     async fn fingerprint(&self, repo_root: &Path) -> Option<RepoFingerprint> {
-        // The dirty digest covers the porcelain status (path set incl.
-        // untracked files) plus the full `git diff HEAD` patch text, whose
-        // `index` lines pin the base blobs — so an equal digest means equal
-        // dirty *content* for tracked files, not merely an equal path set.
-        // `untracked_fingerprint` covers the remaining blind spot: content
-        // edits inside an already-untracked file (F-07) — `diff HEAD` never
-        // covers untracked content, and `status` only ever shows the same
-        // one-line "??" entry regardless of what changed inside.
-        // `--untracked-files=all` (rather than git's directory-collapsing
-        // default) so a brand-new, not-yet-`git add`ed directory is listed
-        // file-by-file — otherwise git reports it as one `?? dir/` line, and
-        // `untracked_fingerprint` below would stat the directory itself
-        // (whose own mtime doesn't change when a file inside it is edited),
-        // silently missing every content edit inside a new scratch/feature
-        // subdirectory. ponytail: this makes `git status` walk into large
-        // untracked-and-not-gitignored trees instead of stopping at the
-        // directory boundary; acceptable since each call is already
-        // timeout-bounded (`self.timeout`), same tradeoff already accepted
-        // for `--sort path` in `repo-explorer-search::backend`.
-        let (head, status, diff) = tokio::join!(
-            self.git(repo_root, &["rev-parse", "HEAD"]),
-            self.git(
-                repo_root,
-                &["status", "--porcelain", "--untracked-files=all"]
-            ),
-            self.git(repo_root, &["diff", "HEAD"])
-        );
-        let head_sha = head?.trim().to_string();
-        if head_sha.is_empty() {
-            return None;
-        }
-        let status = status?;
-        let diff = diff?;
-        // Off the async runtime thread: `untracked_fingerprint` does one
-        // blocking `std::fs::metadata` per untracked path, and this runs on
-        // every cache-consulting `explore_repository` call (`AgentLoop::run`
-        // Stage 0), same reasoning as `dispatch::read_file_canonical`'s own
-        // `spawn_blocking` wrap.
-        let untracked = {
-            let repo_root = repo_root.to_path_buf();
-            let status = status.clone();
-            tokio::task::spawn_blocking(move || untracked_fingerprint(&repo_root, &status))
-                .await
-                .unwrap_or_default()
-        };
-        Some(RepoFingerprint {
-            head_sha,
-            dirty_hash: sha256_hex(&[&status, &diff, &untracked]),
-        })
+        let repo_root = repo_root.to_path_buf();
+        tokio::task::spawn_blocking(move || fingerprint_blocking(&repo_root))
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn changed_paths(
@@ -146,76 +144,78 @@ impl RepoStateProbe for GitStateProbe {
         from: &RepoFingerprint,
         to: &RepoFingerprint,
     ) -> Option<Vec<PathBuf>> {
-        // A differing dirty state cannot be enumerated after the fact (the
-        // `from` side's dirty paths are gone) — report "unknown" and let the
-        // caller invalidate.
+        // A differing dirty state cannot be enumerated after the fact — report
+        // "unknown" and let the caller invalidate. Same head → no committed
+        // change. Both short-circuits are pure Rust (no git2).
         if from.dirty_hash != to.dirty_hash {
             return None;
         }
         if from.head_sha == to.head_sha {
             return Some(Vec::new());
         }
-        let out = self
-            .git(
-                repo_root,
-                &["diff", "--name-only", &from.head_sha, &to.head_sha],
-            )
-            .await?;
-        Some(
-            out.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(PathBuf::from)
-                .collect(),
-        )
+        let repo_root = repo_root.to_path_buf();
+        let from_sha = from.head_sha.clone();
+        let to_sha = to.head_sha.clone();
+        tokio::task::spawn_blocking(move || changed_paths_blocking(&repo_root, &from_sha, &to_sha))
+            .await
+            .ok()
+            .flatten()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn git_available() -> bool {
-        which::which("git").is_ok()
-    }
-
-    async fn sh_git(dir: &Path, args: &[&str]) {
-        let probe = GitStateProbe::new(30);
-        probe
-            .git(dir, args)
-            .await
-            .unwrap_or_else(|| panic!("git {args:?} failed in {}", dir.display()));
-    }
-
-    async fn init_repo(dir: &Path) {
-        std::fs::create_dir_all(dir).unwrap();
-        sh_git(dir, &["init", "-q"]).await;
-        sh_git(dir, &["config", "user.email", "t@example.com"]).await;
-        sh_git(dir, &["config", "user.name", "t"]).await;
-    }
-
-    async fn commit_all(dir: &Path, msg: &str) {
-        sh_git(dir, &["add", "-A"]).await;
-        sh_git(dir, &["commit", "-q", "-m", msg]).await;
-    }
+    use git2::{Commit, IndexAddOption, Signature};
 
     fn temp_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("git_probe_{tag}_{}", std::process::id()))
     }
 
+    fn init_repo(dir: &Path) -> Repository {
+        std::fs::create_dir_all(dir).unwrap();
+        let repo = Repository::init(dir).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.email", "t@example.com").unwrap();
+            cfg.set_str("user.name", "t").unwrap();
+        }
+        repo
+    }
+
+    /// Commit whatever is currently staged in the index (parent = current
+    /// HEAD if any, else a root commit).
+    fn commit_index(repo: &Repository, msg: &str) {
+        let mut index = repo.index().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = Signature::now("t", "t@example.com").unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
+            .unwrap();
+    }
+
+    /// Stage all working-tree files and commit.
+    fn write_commit(repo: &Repository, msg: &str) {
+        {
+            let mut index = repo.index().unwrap();
+            index
+                .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+                .unwrap();
+            index.write().unwrap();
+        }
+        commit_index(repo, msg);
+    }
+
     #[tokio::test]
     async fn non_repo_yields_no_fingerprint() {
-        if !git_available() {
-            eprintln!("skipping: git not on PATH");
-            return;
-        }
         let dir = temp_dir("nonrepo");
         std::fs::create_dir_all(&dir).unwrap();
-        // Guard against the temp dir living under some parent repository:
-        // `rev-parse` succeeding there would still be a real answer, so only
-        // assert when git itself reports failure.
         let probe = GitStateProbe::new(30);
-        if probe.git(&dir, &["rev-parse", "HEAD"]).await.is_none() {
+        // The temp dir might live under a parent repository; only assert the
+        // None contract when git2 itself reports "not a repository".
+        if Repository::discover(&dir).is_err() {
             assert_eq!(probe.fingerprint(&dir).await, None);
         }
         std::fs::remove_dir_all(&dir).ok();
@@ -223,14 +223,10 @@ mod tests {
 
     #[tokio::test]
     async fn dirty_change_and_commit_change_the_fingerprint() {
-        if !git_available() {
-            eprintln!("skipping: git not on PATH");
-            return;
-        }
         let dir = temp_dir("fp");
-        init_repo(&dir).await;
+        let repo = init_repo(&dir);
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
-        commit_all(&dir, "c1").await;
+        write_commit(&repo, "c1");
 
         let probe = GitStateProbe::new(30);
         let clean = probe.fingerprint(&dir).await.expect("fingerprint");
@@ -240,7 +236,7 @@ mod tests {
         assert_eq!(clean.head_sha, dirty.head_sha);
         assert_ne!(clean.dirty_hash, dirty.dirty_hash);
 
-        commit_all(&dir, "c2").await;
+        write_commit(&repo, "c2");
         let committed = probe.fingerprint(&dir).await.expect("fingerprint");
         assert_ne!(clean.head_sha, committed.head_sha);
         assert_eq!(clean.dirty_hash, committed.dirty_hash, "clean == clean");
@@ -263,26 +259,20 @@ mod tests {
     }
 
     /// F-07: editing bytes inside an already-untracked file must change the
-    /// fingerprint even though neither `status --porcelain` nor `diff HEAD`
-    /// notices the content change (only the file's continued presence).
+    /// fingerprint even though neither status nor a HEAD diff notices the
+    /// content change (only the file's continued presence).
     #[tokio::test]
     async fn untracked_file_content_edit_changes_the_fingerprint() {
-        if !git_available() {
-            eprintln!("skipping: git not on PATH");
-            return;
-        }
         let dir = temp_dir("untracked");
-        init_repo(&dir).await;
+        let repo = init_repo(&dir);
         std::fs::write(dir.join("tracked.txt"), "one\n").unwrap();
-        commit_all(&dir, "c1").await;
+        write_commit(&repo, "c1");
 
         let probe = GitStateProbe::new(30);
         std::fs::write(dir.join("scratch.txt"), "one\n").unwrap();
         let before = probe.fingerprint(&dir).await.expect("fingerprint");
 
-        // Editing the untracked file's bytes (no `git add`) must change it —
-        // this is a *size* change, so it's visible regardless of mtime
-        // resolution on the test filesystem.
+        // A size change, so it is visible regardless of mtime resolution.
         std::fs::write(dir.join("scratch.txt"), "one\ntwo\n").unwrap();
         let after = probe.fingerprint(&dir).await.expect("fingerprint");
         assert_ne!(
@@ -293,30 +283,21 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// F-07 follow-up: git's default `status --porcelain` collapses a
-    /// brand-new, wholly-untracked directory into one `?? dir/` line, which
-    /// would make `untracked_fingerprint` stat the directory (whose own mtime
-    /// doesn't change) instead of the file inside it — `--untracked-files=all`
-    /// must keep this case visible too, not just a loose untracked file.
+    /// F-07 follow-up: a brand-new wholly-untracked directory must be listed
+    /// file-by-file (recurse_untracked_dirs), so an edit inside it is visible
+    /// rather than collapsed to the directory's own unchanged mtime.
     #[tokio::test]
     async fn untracked_file_inside_a_new_directory_content_edit_changes_the_fingerprint() {
-        if !git_available() {
-            eprintln!("skipping: git not on PATH");
-            return;
-        }
         let dir = temp_dir("untracked_dir");
-        init_repo(&dir).await;
+        let repo = init_repo(&dir);
         std::fs::write(dir.join("tracked.txt"), "one\n").unwrap();
-        commit_all(&dir, "c1").await;
+        write_commit(&repo, "c1");
 
         let probe = GitStateProbe::new(30);
         std::fs::create_dir_all(dir.join("newdir")).unwrap();
         std::fs::write(dir.join("newdir/scratch.txt"), "one\n").unwrap();
         let before = probe.fingerprint(&dir).await.expect("fingerprint");
 
-        // Same length as the F-07 test above (a size change), so this isn't
-        // relying on mtime resolution either — only on `newdir/` being
-        // listed file-by-file instead of collapsed to one line.
         std::fs::write(dir.join("newdir/scratch.txt"), "one\ntwo\n").unwrap();
         let after = probe.fingerprint(&dir).await.expect("fingerprint");
         assert_ne!(
@@ -327,35 +308,91 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// An untracked dangling symlink retargeted to a *different*, still-
-    /// missing path must change the fingerprint: following the link
-    /// (`std::fs::metadata`) would make both targets resolve to the same
-    /// `Err(NotFound)` and collapse to an identical `"<name>:missing"`
-    /// string regardless of what the link actually points at.
+    /// An untracked dangling symlink retargeted to a different, still-missing
+    /// path must change the fingerprint: symlink_metadata (not metadata)
+    /// stats the link itself, and recreating it yields a fresh mtime.
     #[cfg(unix)]
     #[tokio::test]
     async fn untracked_dangling_symlink_retarget_changes_the_fingerprint() {
-        if !git_available() {
-            eprintln!("skipping: git not on PATH");
-            return;
-        }
         let dir = temp_dir("dangling_symlink");
-        init_repo(&dir).await;
+        let repo = init_repo(&dir);
         std::fs::write(dir.join("tracked.txt"), "one\n").unwrap();
-        commit_all(&dir, "c1").await;
+        write_commit(&repo, "c1");
 
         let probe = GitStateProbe::new(30);
         std::os::unix::fs::symlink("missing-a", dir.join("link")).unwrap();
         let before = probe.fingerprint(&dir).await.expect("fingerprint");
 
-        // Both targets are still missing — only the link's own target string
-        // changed.
         std::fs::remove_file(dir.join("link")).unwrap();
         std::os::unix::fs::symlink("missing-b", dir.join("link")).unwrap();
         let after = probe.fingerprint(&dir).await.expect("fingerprint");
         assert_ne!(
             before.dirty_hash, after.dirty_hash,
             "retargeting a dangling untracked symlink must be visible"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// New regression (F-07 + workdir-vs-repo_root): all status paths must be
+    /// joined against workdir(), never repo_root. Probe a SUBDIRECTORY of the
+    /// repo while an untracked file lives at the git TOP LEVEL; its content
+    /// edit must still be visible.
+    #[tokio::test]
+    async fn untracked_content_edit_visible_when_repo_root_is_a_subdirectory() {
+        let dir = temp_dir("subdir_workdir");
+        let repo = init_repo(&dir);
+        std::fs::write(dir.join("tracked.txt"), "one\n").unwrap();
+        write_commit(&repo, "c1");
+
+        std::fs::create_dir_all(dir.join("subdir")).unwrap();
+        // Untracked file at the repo TOP LEVEL, deliberately outside subdir.
+        std::fs::write(dir.join("scratch.txt"), "one\n").unwrap();
+
+        let probe = GitStateProbe::new(30);
+        let sub = dir.join("subdir");
+        let before = probe.fingerprint(&sub).await.expect("fingerprint");
+
+        std::fs::write(dir.join("scratch.txt"), "one\ntwo\n").unwrap();
+        let after = probe.fingerprint(&sub).await.expect("fingerprint");
+        assert_ne!(
+            before.dirty_hash, after.dirty_hash,
+            "an untracked-content edit at the git top level must be visible even when repo_root is a subdirectory"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// New regression: a committed deletion must appear in changed_paths.
+    /// Deleted deltas carry the path only on old_file() in libgit2, so a
+    /// new_file()-only collector would silently drop it.
+    #[tokio::test]
+    async fn changed_paths_includes_deleted_files() {
+        let dir = temp_dir("deleted_paths");
+        let repo = init_repo(&dir);
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        write_commit(&repo, "c1");
+
+        let probe = GitStateProbe::new(30);
+        let from = probe.fingerprint(&dir).await.expect("fingerprint");
+
+        std::fs::remove_file(dir.join("b.txt")).unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.remove_path(Path::new("b.txt")).unwrap();
+            index.write().unwrap();
+        }
+        commit_index(&repo, "c2");
+        let to = probe.fingerprint(&dir).await.expect("fingerprint");
+
+        let changed = probe
+            .changed_paths(&dir, &from, &to)
+            .await
+            .expect("changed paths");
+        assert!(
+            changed.contains(&PathBuf::from("b.txt")),
+            "a committed deletion must appear in changed_paths, got {changed:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
