@@ -13,7 +13,7 @@ use anyhow::Context;
 use repo_explorer_agent::AgentLoop;
 use repo_explorer_core::config::LogLevel;
 use repo_explorer_memory::MemoryClientBackend;
-use repo_explorer_search::{CliSearchBackend, GitStateProbe};
+use repo_explorer_search::{GitStateProbe, NativeSearchBackend};
 use rmcp::ServiceExt;
 use server::RepoExplorerServer;
 use std::io::IsTerminal;
@@ -204,22 +204,7 @@ async fn run(mut config: repo_explorer_core::config::Config) -> anyhow::Result<(
          daemon after this server looked for one; restart this server so it reuses that \
          install)",
     )?;
-    // Resolve the managed `rg` fallback path. System PATH is preferred inside
-    // the constructor; this managed copy is consulted only when no system
-    // `rg` is found. A resolution failure here is non-fatal: search still
-    // works with a system `rg` on PATH.
-    let managed_rg_path = update::dedicated_rg_binary_path()
-        .inspect_err(|e| {
-            tracing::warn!(
-                "could not resolve the managed rg path ({e:#}); \
-                 search will use only a system `rg` on PATH"
-            );
-        })
-        .ok();
-    let search = CliSearchBackend::new(&config.search, managed_rg_path.clone()).await;
-    if !search.rg_available() {
-        anyhow::bail!("{}", rg_unresolved_message(managed_rg_path.as_deref()));
-    }
+    let search = NativeSearchBackend::new(&config.search);
     let router = repo_explorer_llm::build_router(&config.llm)
         .context("failed to build LLM provider router")?;
     let probe = GitStateProbe::new(config.search.timeout_seconds);
@@ -387,19 +372,6 @@ fn paths_match_managed(cmd: &Path, managed: &Path) -> bool {
     } else {
         cmd == managed
     }
-}
-
-/// Fail-fast message when the mandatory `rg` search binary is unresolved,
-/// pointing at `--update` (and the managed install path when resolvable).
-fn rg_unresolved_message(managed: Option<&Path>) -> String {
-    let managed = managed
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "~/.local/bin/rg".to_string());
-    format!(
-        "rg is required for search but could not be resolved; \
-         run `repo-explorer-mcp --update` to install it to {managed}, \
-         or set `[search] rg_path` to an existing rg binary"
-    )
 }
 
 /// Resolve the config path. Precedence: `--config <path>` / `--config=<path>`
@@ -998,17 +970,6 @@ mod tests {
         let managed = PathBuf::from(r"C:\Users\user\AppData\Local\repo-explorer-mcp\rtk.exe");
         let forward_slashes = Path::new("C:/Users/user/AppData/Local/repo-explorer-mcp/rtk.exe");
         assert!(paths_match_managed(forward_slashes, &managed));
-    }
-
-    #[test]
-    fn rg_unresolved_message_points_at_update_and_managed_path() {
-        let msg = rg_unresolved_message(Some(Path::new("/home/user/.local/bin/rg")));
-        assert!(msg.contains("--update"));
-        assert!(msg.contains("/home/user/.local/bin/rg"));
-        assert!(msg.contains("rg_path"));
-        // Fallback when no managed path resolves.
-        let fallback = rg_unresolved_message(None);
-        assert!(fallback.contains("~/.local/bin/rg"));
     }
 
     #[test]
