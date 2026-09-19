@@ -126,8 +126,8 @@ pub struct CodebaseMemoryConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SearchConfig {
-    /// Explicit path to the `rg` binary; `None` → auto-detect (system PATH via
-    /// `which`, then the managed fallback).
+    /// Deprecated/ignored: search is in-process (no external `rg` binary);
+    /// retained so older configs that still set it keep parsing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rg_path: Option<PathBuf>,
     /// Per-search subprocess timeout. `0` means "no timeout" — the explicit

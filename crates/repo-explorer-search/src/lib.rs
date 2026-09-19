@@ -5,9 +5,7 @@
 //! `git2` (libgit2) bindings — no external `git` binary.
 mod backend;
 mod git_probe;
-mod parser;
 mod process;
-mod resolver;
 
-pub use backend::CliSearchBackend;
+pub use backend::NativeSearchBackend;
 pub use git_probe::GitStateProbe;

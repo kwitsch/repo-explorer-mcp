@@ -1,111 +1,101 @@
-//! `CliSearchBackend`: resolves the `rg` binary once at construction, then
-//! wires resolver -> process -> parser on each `search` call. `rg` is invoked
-//! directly as `rg -H -n --sort path ...` (one fixed line grammar); `-H`
-//! guarantees filenames so the parser grammar is fixed, and `--sort path`
-//! pins file-traversal order so the client-side `truncate(max_results)` keeps
-//! the same hits across process runs (F-03). `rg` is the sole, mandatory
-//! search backend: an unresolved backend is still constructible (`new` is
-//! infallible) and `search` returns `BackendNotFound`, while the serve-time
-//! gate in `main.rs` (see `rg_available`) refuses to start.
+//! `NativeSearchBackend`: in-process text/filename search implementing
+//! `repo_explorer_core::search::SearchBackend` on ripgrep's own library
+//! crates — `ignore` for traversal + glob overrides, `grep` for matching — so
+//! no external `rg` binary is ever spawned. Traversal uses rg's defaults
+//! (`.gitignore`/`.ignore`/hidden/binary skips, no symlink follow,
+//! single-threaded); determinism (F-03) comes from an explicit
+//! `(path, line)` sort before the client-side `max_results` truncation.
 
-use crate::parser::parse_rg;
-use crate::process::{SpawnSpec, run};
-use crate::resolver::resolve_rg;
+use grep::regex::{RegexMatcher, RegexMatcherBuilder};
+use grep::searcher::{
+    BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
+};
+use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
 use repo_explorer_core::config::SearchConfig;
-use repo_explorer_core::domain::ExplorationFinding;
+use repo_explorer_core::domain::{ExplorationFinding, FileLocation, saturate_u32};
 use repo_explorer_core::search::{SearchBackend, SearchError, SearchOptions};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
-pub struct CliSearchBackend {
-    rg: Option<PathBuf>,
+pub struct NativeSearchBackend {
     timeout_seconds: u64,
 }
 
-impl CliSearchBackend {
-    /// Resolve the `rg` binary once from config + PATH + the managed fallback.
-    /// Precedence: explicit `[search] rg_path` > system `rg` on PATH (`which`) >
-    /// the repo-explorer-managed `rg` copy (`managed_rg_path`) when it exists on
-    /// disk. Still infallible: an unresolved backend is constructible; `search`
-    /// fails fast via `BackendNotFound` and the serve-time gate in `main.rs`
-    /// (see `rg_available`) refuses to start.
-    ///
-    /// Async: only when no explicit path is configured does resolution fall
-    /// through to `which::which`, whose PATH-wide stat calls run via
-    /// `spawn_blocking` rather than directly on a tokio worker thread (an
-    /// unusually long/slow-to-stat PATH must not stall it) — mirroring
-    /// `update.rs`'s `which_rg_blocking`.
-    pub async fn new(config: &SearchConfig, managed_rg_path: Option<PathBuf>) -> Self {
-        let system_rg = if config.rg_path.is_some() {
-            None
-        } else {
-            tokio::task::spawn_blocking(|| which::which("rg").ok())
-                .await
-                .unwrap_or(None)
-        };
-        let rg = resolve_rg(config.rg_path.as_deref(), || {
-            system_rg
-                .clone()
-                .or_else(|| managed_rg_path.clone().filter(|p| p.exists()))
-        });
+impl NativeSearchBackend {
+    /// Infallible, synchronous — there is no binary to resolve, so a native
+    /// backend is always available. `timeout_seconds` (`0` = no timeout) is
+    /// honored as a soft per-file deadline in the walk loop.
+    pub fn new(config: &SearchConfig) -> Self {
         Self {
-            rg,
             timeout_seconds: config.timeout_seconds,
         }
     }
+}
 
-    /// True when the `rg` binary resolved. Consumed by the serve-time
-    /// fail-fast in `main.rs`, since a resolvable `rg` is required for search.
-    pub fn rg_available(&self) -> bool {
-        self.rg.is_some()
+/// Per-file line collector implementing `grep`'s `Sink`. Matched lines become
+/// entries; before-context is buffered and prepended to the next match,
+/// trailing context is appended to the previous match — the same grouping the
+/// deleted `rg`-output parser produced.
+#[derive(Default)]
+struct Collector {
+    entries: Vec<(u64, String)>,
+    pending_before: Vec<String>,
+}
+
+/// A matched/context line's bytes as UTF-8 (lossy), with any trailing newline
+/// trimmed. Multiline mode is off, so a match is exactly one line.
+fn trim_line(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim_end_matches(['\r', '\n'])
+        .to_string()
+}
+
+impl Sink for Collector {
+    type Error = std::io::Error;
+
+    fn matched(
+        &mut self,
+        _searcher: &Searcher,
+        mat: &SinkMatch<'_>,
+    ) -> Result<bool, std::io::Error> {
+        let line = mat.line_number().unwrap_or(0);
+        let text = trim_line(mat.bytes());
+        let snippet = if self.pending_before.is_empty() {
+            text
+        } else {
+            let mut combined = self.pending_before.join("\n");
+            combined.push('\n');
+            combined.push_str(&text);
+            self.pending_before.clear();
+            combined
+        };
+        self.entries.push((line, snippet));
+        Ok(true)
+    }
+
+    fn context(
+        &mut self,
+        _searcher: &Searcher,
+        ctx: &SinkContext<'_>,
+    ) -> Result<bool, std::io::Error> {
+        let text = trim_line(ctx.bytes());
+        match ctx.kind() {
+            // Leading context precedes a not-yet-created match: buffer it.
+            SinkContextKind::Before => self.pending_before.push(text),
+            // Trailing (or other) context follows a match: append to it.
+            _ => {
+                if let Some(last) = self.entries.last_mut() {
+                    last.1.push('\n');
+                    last.1.push_str(&text);
+                }
+            }
+        }
+        Ok(true)
     }
 }
 
-/// Append the flags common to the `rg` invocation.
-fn push_flags(args: &mut Vec<String>, options: &SearchOptions) {
-    if options.case_sensitive {
-        args.push("-s".to_string());
-    } else {
-        args.push("-S".to_string());
-    }
-    if let Some(n) = options.context_lines {
-        args.push("-C".to_string());
-        args.push(n.to_string());
-    }
-    if let Some(g) = &options.file_glob {
-        args.push("-g".to_string());
-        args.push(g.clone());
-    }
-}
-
-/// Build the full `rg` argv (after the program name) for one search. Pure and
-/// subprocess-free so the always-on flags — notably `--sort path`, which pins
-/// file-traversal order so the client-side `truncate(max_results)` keeps the
-/// same hits across process runs (F-03) — are unit-testable without spawning
-/// `rg`. See `args_pin_sort_path_before_terminator`.
-///
-/// Invocation: `rg -H -n --sort path <flags> -- <pattern> <target>`.
-fn build_args(pattern: &str, target: String, options: &SearchOptions) -> Vec<String> {
-    // `--sort path` forces deterministic, path-ordered traversal.
-    // ponytail: rg 14.1 implements `--sort` by dropping to a single thread (no
-    // parallel stable sort exists), so this trades cross-file parallelism for
-    // reproducibility. Acceptable — legs already fan out concurrently and each
-    // rg call is timeout-bounded (SearchConfig.timeout_seconds). Add a
-    // size-gated opt-out only if large-repo latency is measured to bite.
-    let mut args: Vec<String> = ["-H", "-n", "--sort", "path"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    push_flags(&mut args, options);
-    // `--` ends option parsing so a pattern/target starting with `-` (e.g.
-    // `-\d+` or a leading-dash file name) is never misread as a flag.
-    args.push("--".to_string());
-    args.push(pattern.to_string());
-    args.push(target);
-    args
-}
-
-impl SearchBackend for CliSearchBackend {
+impl SearchBackend for NativeSearchBackend {
     async fn search(
         &self,
         repo_root: &Path,
@@ -118,64 +108,320 @@ impl SearchBackend for CliSearchBackend {
                 "empty search pattern".to_string(),
             ));
         }
-        let program = self
-            .rg
-            .as_ref()
-            .ok_or_else(|| SearchError::BackendNotFound("rg could not be resolved".to_string()))?;
 
-        let target = scope
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| ".".to_string());
+        // Build the matcher on the async side so a malformed pattern returns
+        // without spawning a blocking thread. `case_smart(true)` reproduces rg
+        // `-S` when the caller wants insensitive/default; a caller-forced
+        // `case_sensitive` maps to `case_smart(false)` + `case_insensitive(false)`.
+        let matcher = RegexMatcherBuilder::new()
+            .case_smart(!options.case_sensitive)
+            .case_insensitive(false)
+            .build(pattern)
+            .map_err(|e| SearchError::InvalidInput(e.to_string()))?;
 
-        let args = build_args(pattern, target, options);
+        // `scope` is always repo-root-relative and non-escaping
+        // (`dispatch::validate_scope` rejects absolute/`..` paths upstream).
+        let base = scope
+            .map(|s| repo_root.join(s))
+            .unwrap_or_else(|| repo_root.to_path_buf());
+        let repo_root = repo_root.to_path_buf();
+        let file_glob = options.file_glob.clone();
+        let context_lines = options.context_lines.unwrap_or(0) as usize;
+        let max_results = options.max_results;
+        let timeout_seconds = self.timeout_seconds;
 
-        let spec = SpawnSpec {
-            backend: "rg",
-            program: program.clone(),
-            args,
-            cwd: repo_root.to_path_buf(),
-            timeout: Duration::from_secs(self.timeout_seconds),
-        };
+        // The walk and line search are blocking; the pre-stage fans out many
+        // concurrent `search()` calls, so keep this off the tokio workers —
+        // mirrors `git_probe`'s and `dispatch::read_file`'s `spawn_blocking`.
+        // Do NOT wrap this in `tokio::time::timeout`: that would stop awaiting
+        // without stopping the running thread (leaked work). The timeout is a
+        // soft per-file deadline checked inside `run_walk` instead.
+        let mut findings = tokio::task::spawn_blocking(move || {
+            run_walk(
+                &base,
+                &repo_root,
+                &matcher,
+                file_glob.as_deref(),
+                context_lines,
+                timeout_seconds,
+            )
+        })
+        .await
+        .map_err(|e| SearchError::BackendFailed {
+            backend: "native",
+            message: format!("search task failed: {e}"),
+        })??;
 
-        let stdout = run(&spec).await?;
-
-        let mut findings = parse_rg(&stdout);
-        if let Some(max) = options.max_results {
+        // F-03: `ignore`'s walk is readdir-ordered, so an explicit sort is
+        // what makes the client-side truncation deterministic across runs.
+        findings.sort_by(|a, b| {
+            a.location
+                .path
+                .cmp(&b.location.path)
+                .then(a.location.line_start.cmp(&b.location.line_start))
+                .then(a.location.line_end.cmp(&b.location.line_end))
+        });
+        if let Some(max) = max_results {
             findings.truncate(max as usize);
         }
         Ok(findings)
     }
 }
 
+/// Synchronous walk + per-file line search. Per-entry walk/read errors are
+/// skipped (rg's partial-walk tolerance) and never fail the whole search.
+///
+/// ponytail: the timeout is a soft, per-file-granularity deadline — a single
+/// pathological huge file can overrun it; upgrade to an intra-file counting
+/// `Sink` only if that ever bites (in-process, line-bounded reads make it
+/// unlikely).
+fn run_walk(
+    base: &Path,
+    repo_root: &Path,
+    matcher: &RegexMatcher,
+    file_glob: Option<&str>,
+    context_lines: usize,
+    timeout_seconds: u64,
+) -> Result<Vec<ExplorationFinding>, SearchError> {
+    let mut builder = WalkBuilder::new(base);
+    if let Some(glob) = file_glob {
+        // rg `-g`: a whitelist-only override restricts the walk to matching
+        // files; a no-slash glob (`name.ext` or `*name*`) matches the basename
+        // anywhere — identical to `file_glob_for`'s contract.
+        let mut ov = OverrideBuilder::new(base);
+        ov.add(glob)
+            .map_err(|e| SearchError::InvalidInput(e.to_string()))?;
+        let ov = ov
+            .build()
+            .map_err(|e| SearchError::InvalidInput(e.to_string()))?;
+        builder.overrides(ov);
+    }
+    // Single-threaded (`build`, not `build_parallel`) to avoid an
+    // N-searches x M-threads explosion under the concurrent leg fanout;
+    // determinism comes from the caller's sort, not walk order. Defaults keep
+    // git-ignore/hidden/parent-ignore all on and do not follow symlinks.
+    let walker = builder.build();
+
+    let mut searcher = SearcherBuilder::new()
+        .binary_detection(BinaryDetection::quit(0))
+        .line_number(true)
+        .before_context(context_lines)
+        .after_context(context_lines)
+        .build();
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    let mut findings: Vec<ExplorationFinding> = Vec::new();
+    for result in walker {
+        if timeout_seconds > 0 && Instant::now() >= deadline {
+            return Err(SearchError::Timeout {
+                backend: "native",
+                seconds: timeout_seconds,
+            });
+        }
+        let Ok(entry) = result else { continue };
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let mut collector = Collector::default();
+        if searcher
+            .search_path(matcher, entry.path(), &mut collector)
+            .is_err()
+        {
+            continue;
+        }
+        // Repo-root-relative, no `./` prefix. `base` is under `repo_root`, so
+        // strip_prefix succeeds; the fallback keeps a path that somehow isn't.
+        let rel = entry.path().strip_prefix(repo_root).unwrap_or(entry.path());
+        for (line, snippet) in collector.entries {
+            let n = saturate_u32(line);
+            findings.push(ExplorationFinding {
+                location: FileLocation {
+                    path: rel.to_path_buf(),
+                    line_start: n,
+                    line_end: n,
+                },
+                snippet: Some(snippet),
+                note: None,
+            });
+        }
+    }
+    Ok(findings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
 
-    /// F-03: `rg` must run with `--sort path` (deterministic, path-ordered
-    /// traversal) so the client-side `truncate(max_results)` keeps the same
-    /// hits across process runs. This pins the argv without spawning `rg`; the
-    /// integration test proves the real ordering behavior.
-    #[test]
-    fn args_pin_sort_path_before_terminator() {
-        let args = build_args("needle", ".".to_string(), &SearchOptions::default());
+    fn tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rex_native_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 
-        let sort_pos = args
-            .iter()
-            .position(|a| a == "--sort")
-            .expect("`--sort` flag must be present");
+    fn backend() -> NativeSearchBackend {
+        NativeSearchBackend::new(&SearchConfig::default())
+    }
+
+    async fn run(dir: &Path, pattern: &str, opts: SearchOptions) -> Vec<ExplorationFinding> {
+        backend()
+            .search(dir, pattern, None, &opts)
+            .await
+            .expect("search should succeed")
+    }
+
+    fn paths(f: &[ExplorationFinding]) -> Vec<PathBuf> {
+        f.iter().map(|x| x.location.path.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn smart_case_lowercase_matches_mixed_case() {
+        let dir = tmp("smart_lower");
+        fs::write(dir.join("a.txt"), "Needle up\nneedle down\n").unwrap();
+        let findings = run(&dir, "needle", SearchOptions::default()).await;
+        // Lowercase pattern -> case-insensitive (rg -S): both lines match.
+        assert_eq!(findings.len(), 2);
+        // Repo-root-relative path, no `./` prefix.
+        assert_eq!(findings[0].location.path, PathBuf::from("a.txt"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn smart_case_uppercase_pattern_is_case_sensitive() {
+        let dir = tmp("smart_upper");
+        fs::write(dir.join("a.txt"), "Needle up\nneedle down\n").unwrap();
+        let findings = run(&dir, "Needle", SearchOptions::default()).await;
+        // An uppercase letter in the pattern -> case-sensitive: only line 1.
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].location.line_start, 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn case_sensitive_flag_forces_sensitivity() {
+        let dir = tmp("case_sensitive");
+        fs::write(dir.join("a.txt"), "Needle up\nneedle down\n").unwrap();
+        let opts = SearchOptions {
+            case_sensitive: true,
+            ..Default::default()
+        };
+        let findings = run(&dir, "needle", opts).await;
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].location.line_start, 2);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn gitignore_hidden_and_dotgit_are_skipped() {
+        let dir = tmp("gitignore");
+        // An empty `.git` dir activates git-ignore semantics (rg's
+        // `require_git` default). `.git/` is itself hidden, so it is never
+        // descended.
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(dir.join(".git").join("config"), "needle\n").unwrap();
+        fs::write(dir.join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(dir.join("kept.txt"), "needle\n").unwrap();
+        fs::write(dir.join("ignored.txt"), "needle\n").unwrap();
+        fs::write(dir.join(".hidden.txt"), "needle\n").unwrap();
+        let findings = run(&dir, "needle", SearchOptions::default()).await;
+        assert_eq!(paths(&findings), vec![PathBuf::from("kept.txt")]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn binary_files_are_skipped() {
+        let dir = tmp("binary");
+        // A NUL before the literal: BinaryDetection::quit stops before the
+        // match, so the binary file yields nothing.
+        fs::write(dir.join("bin.dat"), b"\x00needle\n").unwrap();
+        fs::write(dir.join("plain.txt"), "needle\n").unwrap();
+        let findings = run(&dir, "needle", SearchOptions::default()).await;
+        assert_eq!(paths(&findings), vec![PathBuf::from("plain.txt")]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_glob_restricts_by_basename() {
+        let dir = tmp("glob");
+        fs::write(dir.join("target.txt"), "needle\n").unwrap();
+        fs::write(dir.join("other.log"), "needle\n").unwrap();
+        // `name.ext` form (file_glob_for output for a dotted token).
+        let opts = SearchOptions {
+            file_glob: Some("target.txt".to_string()),
+            ..Default::default()
+        };
         assert_eq!(
-            args.get(sort_pos + 1).map(String::as_str),
-            Some("path"),
-            "`--sort` must be immediately followed by `path`"
+            paths(&run(&dir, "needle", opts).await),
+            vec![PathBuf::from("target.txt")]
         );
+        // `*name*` form (file_glob_for output for an extensionless token).
+        let opts = SearchOptions {
+            file_glob: Some("*other*".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            paths(&run(&dir, "needle", opts).await),
+            vec![PathBuf::from("other.log")]
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
 
-        let term_pos = args
-            .iter()
-            .position(|a| a == "--")
-            .expect("`--` option terminator must be present");
-        assert!(
-            sort_pos < term_pos,
-            "`--sort path` must precede the `--` terminator (sort at {sort_pos}, `--` at {term_pos})"
+    #[tokio::test]
+    async fn context_lines_fold_into_the_snippet() {
+        let dir = tmp("context");
+        fs::write(dir.join("a.txt"), "line one\nneedle two\nline three\n").unwrap();
+        let opts = SearchOptions {
+            context_lines: Some(1),
+            ..Default::default()
+        };
+        let findings = run(&dir, "needle", opts).await;
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].snippet.as_deref(),
+            Some("line one\nneedle two\nline three")
         );
+        assert_eq!(findings[0].location.line_start, 2);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn scope_narrows_the_walk_and_paths_stay_repo_relative() {
+        let dir = tmp("scope");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("top.txt"), "needle\n").unwrap();
+        fs::write(dir.join("sub").join("inner.txt"), "needle\n").unwrap();
+        let findings = backend()
+            .search(
+                &dir,
+                "needle",
+                Some(Path::new("sub")),
+                &SearchOptions::default(),
+            )
+            .await
+            .expect("scoped search should succeed");
+        assert_eq!(
+            paths(&findings),
+            vec![PathBuf::from("sub").join("inner.txt")]
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn empty_pattern_is_invalid_input() {
+        let dir = tmp("empty");
+        let err = backend()
+            .search(&dir, "", None, &SearchOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SearchError::InvalidInput(_)));
+        fs::remove_dir_all(&dir).ok();
     }
 }
