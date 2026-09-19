@@ -1,8 +1,8 @@
 //! Repository-state fingerprinting for cache keying and invalidation.
 //!
 //! Core owns only the value type and the trait; the production impl
-//! (`GitStateProbe`, subprocess-driven) lives in `repo-explorer-search`, the
-//! crate that owns subprocess concerns.
+//! (`GitStateProbe`, git2-backed via the `repo-explorer-search` crate) lives
+//! outside core, which stays free of git2/backend concerns.
 
 use std::path::{Path, PathBuf};
 
