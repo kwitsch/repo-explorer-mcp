@@ -27,6 +27,7 @@
     primary_mode: all
     primary:
       - { path: src/requests/sessions.py, symbol: resolve_redirects, span: [186, 307] }
+    stage: early-exit
   notes: "early-exit expected (unique definition); span verified via next sibling def (rebuild_auth:309)"
 
 - id: requests-P1-DE-01
@@ -37,6 +38,7 @@
     primary_mode: all
     primary:
       - { path: src/requests/auth.py, symbol: HTTPBasicAuth, span: [85, 113] }
+    stage: early-exit
 
 - id: requests-P1d-01
   cat: P1d
@@ -202,3 +204,14 @@
   expect:
     primary_mode: all
     primary: []
+
+- id: requests-N-02
+  cat: N
+  sub: near
+  lang: en
+  query: "where is brotli decompression implemented"
+  negative: { kind: near }
+  expect:
+    primary_mode: all
+    primary: []
+  notes: "near negative: brotli is mentioned in docs/user/quickstart.rst and docs/community/faq.rst (the feature lives in the urllib3 dependency), zero hits under src/ at this pin"

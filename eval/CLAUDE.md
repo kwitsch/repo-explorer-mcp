@@ -16,7 +16,15 @@ How to run it: the `run-eval` skill (`.claude/skills/run-eval/SKILL.md`).
 - A fresh server process's _first_ call always fails its memory legs
   ("project not found or not indexed") — the project only becomes indexed
   partway through that first call. This is why a warm-up call exists before
-  the scored passes and must never itself be scored.
+  the scored passes and must never itself be scored. The warm-up query is
+  `warmup_query` in `repos.toml` and must not be a corpus query: it seeds the
+  process's L1 cache, so a corpus query used here is a `stage=cache` row in
+  every scored pass and never measured.
+- `score.py`'s `Retrieval leg health` section is the memory-outage alarm: a
+  memory leg that fails never appears in `leg_timings`, so before it existed a
+  100%-failing `codebase-memory` backend just vanished from the per-leg table
+  (2026-09-07 .. #56, two weeks of grep-only `cand_recall`). Never compare
+  `cand_recall` across a run that prints its `WARNING` line.
 - Always rescore an older `results/<run-id>` with the _current_ `score.py`
   before trusting its numbers — past scoring bugs have materially changed
   historical counts (see `git log -- eval/score.py` for specifics).

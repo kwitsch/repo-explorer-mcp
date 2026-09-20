@@ -49,6 +49,8 @@ from mcp.client.stdio import stdio_client
 
 EVAL_DIR = Path(__file__).resolve().parent
 REPO_ROOT = EVAL_DIR.parent
+# Default SUT; `--binary` overrides it (a release build under test without touching the
+# installed one, which an open Claude Code session holds busy).
 BINARY = Path.home() / ".local" / "bin" / "repo-explorer-mcp"
 
 # ANSI escape codes are present in raw stderr whenever NO_COLOR isn't honoured by the reader
@@ -438,7 +440,9 @@ def query_cache_key(q: QuerySpec) -> str:
     return f"{q.query.strip().lower()}|{q.scope_hint or ''}|{q.max_results if q.max_results is not None else ''}"
 
 
-async def run_one_repo_pass(repo: dict, queries: list[QuerySpec], config: Path, pass_n: int, out_dir: Path) -> list[dict]:
+async def run_one_repo_pass(
+    repo: dict, queries: list[QuerySpec], config: Path, pass_n: int, out_dir: Path, binary: Path
+) -> list[dict]:
     repo_id = repo["id"]
     pass_dir = out_dir / repo_id
     pass_dir.mkdir(parents=True, exist_ok=True)
@@ -456,7 +460,7 @@ async def run_one_repo_pass(repo: dict, queries: list[QuerySpec], config: Path, 
     import os
 
     server_params = StdioServerParameters(
-        command=str(BINARY),
+        command=str(binary),
         args=[],
         env={**os.environ, "REPO_EXPLORER_CONFIG": str(config.resolve()), "NO_COLOR": "1"},
         cwd=str(clone_path(repo)),
@@ -535,10 +539,12 @@ async def run_one_repo_pass(repo: dict, queries: list[QuerySpec], config: Path, 
                     rows.append(row)
                     return row
 
-                # Warm-up: first query of the corpus, generous timeout (§8.1 step 2: 900s; a
-                # pilot smoke run may reasonably use a shorter value via --warmup-timeout).
+                # Warm-up: the repo's `warmup_query` (repos.toml), generous timeout (§8.1 step 2:
+                # 900s). It must NOT be a corpus query: the warm-up seeds the process's L1 result
+                # cache, so warming up with queries[0] turned that query into a `stage=cache` row
+                # in every scored pass (P1-01 was never measured in any run before 2026-09-20).
                 warm_up_timeout = 900
-                first = queries[0]
+                first = QuerySpec(id="warmup", cat="W", query=repo["warmup_query"], scope_hint=queries[0].scope_hint)
                 print(f"[{repo_id} pass{pass_n}] warm-up: {first.id}", file=sys.stderr)
                 warm_row = await call(first, warm_up=True, timeout=warm_up_timeout)
                 print(
@@ -599,12 +605,26 @@ def resolve_config(config: Path, cache_dir: str | None, out_dir: Path) -> Path:
     return derived
 
 
+def memory_version(config: Path) -> str | None:
+    """`<command> --version` for the `[codebase_memory] command` the config names, or None."""
+    import tomllib
+
+    try:
+        cmd = tomllib.loads(config.read_text()).get("codebase_memory", {}).get("command")
+        if not cmd:
+            return None
+        return subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=30).stdout.strip() or None
+    except (OSError, subprocess.SubprocessError, tomllib.TOMLDecodeError):
+        return None
+
+
 async def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repos", nargs="*", default=None, help="repo ids to run (default: all in repos.toml)")
     ap.add_argument("--passes", type=int, default=2, help="number of passes (Phase 1 default: 2)")
     ap.add_argument("--config", default=str(EVAL_DIR / "config" / "default.toml"))
     ap.add_argument("--out", default=None, help="results directory (default: results/<run-id>)")
+    ap.add_argument("--binary", default=str(BINARY), help=f"repo-explorer-mcp binary to drive (default: {BINARY})")
     ap.add_argument(
         "--cache-dir",
         default=None,
@@ -614,8 +634,9 @@ async def main() -> None:
     )
     args = ap.parse_args()
 
-    if not BINARY.exists():
-        sys.exit(f"installed binary not found: {BINARY}")
+    binary = Path(args.binary).expanduser()
+    if not binary.exists():
+        sys.exit(f"binary not found: {binary}")
 
     run_id = time.strftime("%Y%m%dT%H%M%S")
     out_dir = Path(args.out) if args.out else REPO_ROOT / "results" / run_id
@@ -631,8 +652,11 @@ async def main() -> None:
 
     manifest = {
         "run_id": run_id,
-        "binary": str(BINARY),
-        "binary_version": subprocess.run([str(BINARY), "--version"], capture_output=True, text=True).stdout.strip(),
+        "binary": str(binary),
+        "binary_version": subprocess.run([str(binary), "--version"], capture_output=True, text=True).stdout.strip(),
+        # The memory backend is a second SUT: its wire format changed under us once (0.11.0,
+        # F-08/#56) and a run is only comparable against the same pair of versions.
+        "memory_version": memory_version(config),
         "config": str(config),
         "cache_dir": args.cache_dir,
         "passes": args.passes,
@@ -648,7 +672,7 @@ async def main() -> None:
     for repo in repos:
         queries = load_queries(repo["id"])
         for pass_n in range(1, args.passes + 1):
-            await run_one_repo_pass(repo, queries, config, pass_n, out_dir)
+            await run_one_repo_pass(repo, queries, config, pass_n, out_dir, binary)
 
     print(f"done: {out_dir}", file=sys.stderr)
 

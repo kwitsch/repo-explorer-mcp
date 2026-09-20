@@ -96,6 +96,32 @@ built out here — see the plan's §11 phase table.
   `docs/eval/real-world-test-plan.md` for the full breakdown and residual
   follow-ups).
 
+## Coverage gaps closed 2026-09-20
+
+Found by auditing the harness against the 0.10.1 pipeline after the F-08/#56 memory outage
+(`results/2026091*`: `symbol`/`semantic` failed on 100% of calls for two weeks and no report line
+said so — the per-leg latency table only lists legs that _succeeded_):
+
+- `score.py` prints a **Retrieval leg health** section (runs / failed / with_hits per leg, from
+  `leg_timings` + `leg_failures`) and a `WARNING: memory legs ... dead` line when no
+  `symbol`/`semantic`/`bm25` leg returned a candidate in the whole run; `cand_recall` gains
+  `hit delivered by candidate kind` (Symbol*/SemanticHit = memory, ContentHit/FileNameHit =
+  native search). Rescoring `results/20260916T230101` now prints the warning; the 0.8.0 and
+  0.10.1 runs do not.
+- The warm-up call was `queries[0]`, which seeded the process L1 cache — `P1-01` was a
+  `stage=cache` row in **every scored pass of every run** and never measured. `repos.toml` now
+  carries a dedicated `warmup_query` (a bare unique symbol not in the corpus).
+- `Confident-wrong` lines print `early_exit_route` (F-23 is a `unique-symbol` route defect).
+- `P1`/`P1-DE` queries carry `stage: early-exit`, so an early-exit regression shows up in the
+  stage-mismatch section instead of nowhere; one `sub: near` negative per repo (`self-N-02`,
+  `requests-N-02`) — the plan's N category had only `far` negatives.
+- `run.py --binary PATH` drives a build other than the installed one; `manifest.json` records
+  `memory_version` (`codebase-memory-mcp --version`) next to `binary_version`.
+- `eval/test_score.py` runs in CI (`test-eval` job, gated).
+
+Still unmeasured, by design of a scripted client: `outer_followup_rate`, the manual rubrics
+(§7.2), Layer B baselines, `pre_stage_identical`/`variance` (F-03), `result_bytes`.
+
 ## Decisions in force for this pilot (accepted 2026-09-05)
 
 - Logging patch: built, independently re-verified, merged, released as v0.5.3, and installed —
