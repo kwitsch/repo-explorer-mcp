@@ -91,7 +91,7 @@ tool call {query, scope_hint?, max_results?}
              grep_patterns = first 6 of literals+identifiers, regex-escaped;
                            unquoted metacharacters are tokenized away, not escaped
            fanout (concurrent, soft-fail → DEBUG "retrieval leg failed" leg= ctx= error=):
-             symbol legs   ≤4 identifiers → CBM search_graph{name_pattern}
+             symbol legs   ≤4 identifiers → CBM search_graph{name_pattern}; +1 BM25 leg: search_graph{query = raw text}
                            exact iff last_segment(symbol) == token (case-sensitive)
              semantic legs ≤4 (literals first) → CBM search_code, ONE TOKEN per leg,
                            literal substring search; max_results forwarded as `limit`
@@ -110,7 +110,7 @@ tool call {query, scope_hint?, max_results?}
            summary "Resolved deterministically by the retrieval pre-stage (confidence
            N/100, no LLM involved): K location(s) matching "…"." [+ index_note]
   Stage 4  30 ≤ confidence < 90 ∧ candidates ≠ ∅ → verify: 1 LLM turn over top-12
-           candidates rendered per file as a skeleton (≤30 symbols from search_graph,
+           candidates rendered per file as a skeleton (≤30 symbols from get_file_outline,
            one extra CBM call per unique file) OR, when no skeleton, the ≤400-char
            snippet; tools expand|finish; turn 2 (or budget exhausted) forces finish.
            Any provider error → WARN "verification stage provider call failed;

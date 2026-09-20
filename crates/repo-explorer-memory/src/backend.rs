@@ -872,6 +872,39 @@ fn cell_text(v: &Value) -> String {
     }
 }
 
+/// `get_file_outline{format:"json"}`: `{"file_path": ..., "cols": ["name",
+/// "label", "lines", "qn"], "rows": [[..], ..], "total", "has_more"}` — a flat
+/// table whose file lives once at the top level instead of in a column, so
+/// [`flat_rows_findings`] (which needs a file column) cannot read it. Rows
+/// come in source order with the file/folder/container nodes already
+/// excluded; each becomes a finding with the qualified name in `note`.
+fn file_outline_findings(tool: &'static str, json: &Value, _repo_root: &Path) -> ExplorationResult {
+    let names: Vec<&str> = json
+        .get("cols")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let rows = json.get("rows").and_then(Value::as_array);
+    let Some((file, rows)) = json.get("file_path").and_then(Value::as_str).zip(rows) else {
+        return result_with_finding_count(tool, Vec::new());
+    };
+    let t = table_cols(&names);
+    let findings = rows
+        .iter()
+        .filter_map(|row| {
+            let cells: Vec<String> = row.as_array()?.iter().map(cell_text).collect();
+            let cell = |i: Option<usize>| i.and_then(|i| cells.get(i)).map(String::as_str);
+            let (line_start, line_end) = cell(t.lines).map(parse_line_range).unwrap_or((0, 0));
+            let line_end = correct_module_end(cell(t.label), line_start, line_end);
+            let note = cell(t.qn.or(t.name)).map(str::to_string);
+            Some(finding(file, line_start, line_end, note))
+        })
+        .collect();
+    result_with_finding_count(tool, findings)
+}
+
 /// Parse the plain-text tables `codebase-memory-mcp` answers with — one or
 /// more sections shaped like:
 ///
@@ -1265,6 +1298,7 @@ impl MemoryBackend for MemoryClientBackend {
     ) -> Result<ExplorationResult, MemoryError> {
         self.call_memory_tool("search_graph", repo_root, |args| {
             insert_str(args, "format", "json");
+            insert_opt_str(args, "query", &query.query);
             insert_opt_str(args, "name_pattern", &query.name_pattern);
             insert_opt_str(args, "file_pattern", &query.file_pattern);
             insert_opt_str(args, "label", &query.label);
@@ -1367,6 +1401,26 @@ impl MemoryBackend for MemoryClientBackend {
             .call_memory_tool_with("get_architecture", repo_root, |_args| {}, raw_text_summary)
             .await?
             .summary)
+    }
+
+    async fn file_outline(
+        &self,
+        repo_root: &Path,
+        path: &Path,
+        limit: Option<u32>,
+    ) -> Result<ExplorationResult, MemoryError> {
+        let file_path = path.to_string_lossy().into_owned();
+        self.call_memory_tool_with(
+            "get_file_outline",
+            repo_root,
+            |args| {
+                insert_str(args, "format", "json");
+                insert_str(args, "file_path", file_path);
+                insert_opt_u32(args, "limit", limit);
+            },
+            file_outline_findings,
+        )
+        .await
     }
 }
 
@@ -1659,6 +1713,75 @@ mod tests {
                 res.findings[1].location.line_end
             ),
             (0, 0)
+        );
+    }
+
+    /// Real CBM 0.11.0 `get_file_outline{format:"json"}` payload: the file
+    /// sits once at the top level, rows are in source order and carry the
+    /// qualified name.
+    #[test]
+    fn file_outline_json_payload_decodes() {
+        let payload = json!({
+            "file_path": "crates/a/src/skeleton.rs",
+            "cols": ["name", "label", "lines", "qn"],
+            "rows": [
+                ["MAX_OUTLINE_SYMBOLS", "Variable", "10-10", "repo.crates.a.src.skeleton.MAX_OUTLINE_SYMBOLS"],
+                ["skeleton_for", "Function", "14-48", "repo.crates.a.src.skeleton.skeleton_for"]
+            ],
+            "total": 2, "offset": 0, "limit": 100, "returned": 2, "has_more": false
+        });
+        let res = file_outline_findings("get_file_outline", &payload, Path::new("/repo"));
+        assert_eq!(res.findings.len(), 2);
+        let f = &res.findings[1];
+        assert_eq!(
+            f.location.path,
+            std::path::PathBuf::from("crates/a/src/skeleton.rs")
+        );
+        assert_eq!((f.location.line_start, f.location.line_end), (14, 48));
+        assert_eq!(
+            f.note.as_deref(),
+            Some("repo.crates.a.src.skeleton.skeleton_for")
+        );
+        assert!(res.summary.contains("2 locatable finding"));
+        // No file → nothing to locate (never a panic).
+        let res = file_outline_findings(
+            "get_file_outline",
+            &json!({"cols": ["name"], "rows": [["x"]]}),
+            Path::new("/repo"),
+        );
+        assert!(res.findings.is_empty());
+    }
+
+    /// Real CBM 0.11.0 BM25 `search_graph{query, format:"json"}` payload — a
+    /// flat table (unlike the grouped `name_pattern` answer) with the file in
+    /// its own column, so the shared flat decoder reads it.
+    #[test]
+    fn flat_rows_bm25_search_graph_payload_decodes() {
+        let payload = json!({
+            "cols": ["qn", "label", "file", "lines", "rank"],
+            "rows": [
+                ["repo.crates.a.src.brief.render_brief", "Function", "crates/a/src/brief.rs", "100-207", -23.25],
+                ["repo.crates.a.src.brief.estimate_tokens", "Function", "crates/a/src/brief.rs", "81-83", -21.73]
+            ],
+            "total": 114, "total_relation": "eq", "search_mode": "bm25",
+            "returned": 2, "count": 2, "has_more": true, "next_offset": 2, "truncated": true
+        });
+        let res = findings_and_summary("search_graph", &payload, Path::new("/repo"));
+        assert_eq!(res.findings.len(), 2);
+        assert_eq!(
+            res.findings[0].location.path,
+            std::path::PathBuf::from("crates/a/src/brief.rs")
+        );
+        assert_eq!(
+            (
+                res.findings[0].location.line_start,
+                res.findings[0].location.line_end
+            ),
+            (100, 207)
+        );
+        assert_eq!(
+            res.findings[0].note.as_deref(),
+            Some("repo.crates.a.src.brief.render_brief")
         );
     }
 
