@@ -136,6 +136,35 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
             }),
     );
 
+    // The one leg that sees the query as the user wrote it: `search_graph`'s
+    // BM25 `query` ranks symbols by how well their names/qualified names match
+    // the words (live: "where is the fallback loop token budget enforced" →
+    // `default_token_budget`, `AgentLoop.fallback_loop`), where the exact
+    // `name_pattern` legs above need an identifier and the literal legs below
+    // need a substring that occurs verbatim in source. Hits rank as
+    // `SemanticHit` — the same weight as the memory backend's other
+    // relevance-ranked answers, below any exact symbol match.
+    let bm25_leg = memoized(
+        repo_root,
+        leg_cache,
+        || leg_key("bm25", &query.text, scope),
+        async {
+            let graph_query = GraphQuery {
+                query: Some(query.text.clone()),
+                file_pattern: scope.map(|p| p.to_string_lossy().into_owned()),
+                max_results: Some(PER_LEG_MAX_RESULTS),
+                ..GraphQuery::default()
+            };
+            soft_leg(
+                "bm25",
+                &query.text,
+                memory.search_graph(repo_root, &graph_query),
+                |res| candidates_of_kind(res.findings, CandidateKind::SemanticHit),
+            )
+            .await
+        },
+    );
+
     // The connected backend's `search_code` is a literal-substring search, not
     // semantic search (confirmed live): the raw free-text `query.text` almost
     // never appears verbatim in source, so it must never be forwarded as-is.
@@ -233,11 +262,13 @@ pub(crate) async fn retrieve<M: MemoryBackend, S: SearchBackend>(
             }),
     );
 
-    let (symbols, semantic, greps, files) =
-        futures_util::future::join4(symbol_legs, semantic_legs, grep_legs, file_legs).await;
+    let (symbols, bm25, semantic, greps, files) =
+        futures_util::future::join5(symbol_legs, bm25_leg, semantic_legs, grep_legs, file_legs)
+            .await;
 
     let mut raw: Vec<Candidate> = Vec::new();
     raw.extend(symbols.into_iter().flatten());
+    raw.extend(bm25);
     raw.extend(semantic.into_iter().flatten());
     raw.extend(greps.into_iter().flatten());
     raw.extend(files.into_iter().flatten());
@@ -1047,6 +1078,41 @@ mod tests {
             search_code_texts.contains(&"foo_bar"),
             "expected a per-token search_code call, got {search_code_texts:?}"
         );
+    }
+
+    /// The BM25 leg is the one place the raw query text is forwarded — as
+    /// `search_graph`'s `query`, never as a `name_pattern` — and it shares
+    /// the filtered `scope` with every other leg.
+    #[tokio::test]
+    async fn bm25_leg_forwards_the_raw_query_as_search_graph_query() {
+        let search = MockSearchBackend::new().with_search_result(Ok(vec![]));
+        let memory = MockMemoryBackend::new();
+        let query = ExplorationQuery {
+            text: "where is the token budget enforced".to_string(),
+            scope_hint: Some(PathBuf::from("crates")),
+            max_results: None,
+            detailed_snippets: false,
+        };
+        let _ = retrieve(&memory, &search, Path::new("/repo"), &query, 12, None).await;
+        let bm25: Vec<_> = memory
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                repo_explorer_core::memory::mock::Call::SearchGraph { query, .. }
+                    if query.query.is_some() =>
+                {
+                    Some(query)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bm25.len(), 1, "exactly one BM25 leg per query");
+        assert_eq!(
+            bm25[0].query.as_deref(),
+            Some("where is the token budget enforced")
+        );
+        assert_eq!(bm25[0].name_pattern, None);
+        assert_eq!(bm25[0].file_pattern.as_deref(), Some("crates"));
     }
 
     /// Regression for the semantic leg forwarding the raw, unsanitized

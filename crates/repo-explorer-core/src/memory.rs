@@ -25,6 +25,10 @@ pub enum IndexStatus {
 /// A lean graph-search request (maps onto the upstream `search_graph` tool).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GraphQuery {
+    /// Free-text BM25 query over symbol names/qualified names (upstream
+    /// `query`), ranked by relevance — for natural-language wording, where
+    /// `name_pattern` (a regex that must match) finds nothing.
+    pub query: Option<String>,
     pub name_pattern: Option<String>,
     pub file_pattern: Option<String>,
     pub label: Option<String>,
@@ -126,6 +130,18 @@ pub trait MemoryBackend {
         target: &SnippetTarget,
     ) -> Result<ExplorationResult, MemoryError>;
 
+    /// The declaration outline of one exact repository-relative file, in
+    /// source order (upstream `get_file_outline`): one finding per symbol
+    /// with its line range and qualified name in `note`, at most `limit`.
+    /// Unlike `search_graph{file_pattern}` it matches the path exactly (no
+    /// regex), keeps source order and omits the file/module container rows.
+    async fn file_outline(
+        &self,
+        repo_root: &Path,
+        path: &Path,
+        limit: Option<u32>,
+    ) -> Result<ExplorationResult, MemoryError>;
+
     /// `get_architecture` with the raw multi-section response preserved
     /// verbatim instead of mapped to findings — the `node_labels:`/
     /// `edge_types:`/`packages:` sections carry no file column, so the
@@ -182,6 +198,11 @@ pub mod mock {
             repo_root: PathBuf,
             target: SnippetTarget,
         },
+        FileOutline {
+            repo_root: PathBuf,
+            path: PathBuf,
+            limit: Option<u32>,
+        },
     }
 
     fn empty_result() -> ExplorationResult {
@@ -203,6 +224,7 @@ pub mod mock {
         get_architecture: Result<ExplorationResult, MemoryError>,
         get_architecture_text: Result<String, MemoryError>,
         get_code_snippet: Result<ExplorationResult, MemoryError>,
+        file_outline: Result<ExplorationResult, MemoryError>,
         calls: Arc<Mutex<Vec<Call>>>,
     }
 
@@ -218,6 +240,7 @@ pub mod mock {
                 get_architecture: Ok(empty_result()),
                 get_architecture_text: Ok(String::new()),
                 get_code_snippet: Ok(empty_result()),
+                file_outline: Ok(empty_result()),
                 calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -280,6 +303,13 @@ pub mod mock {
             r: Result<ExplorationResult, MemoryError>,
         ) -> Self {
             self.get_code_snippet = r;
+            self
+        }
+        pub fn with_file_outline_result(
+            mut self,
+            r: Result<ExplorationResult, MemoryError>,
+        ) -> Self {
+            self.file_outline = r;
             self
         }
 
@@ -395,6 +425,20 @@ pub mod mock {
             });
             self.get_code_snippet.clone()
         }
+
+        async fn file_outline(
+            &self,
+            repo_root: &Path,
+            path: &Path,
+            limit: Option<u32>,
+        ) -> Result<ExplorationResult, MemoryError> {
+            self.record(Call::FileOutline {
+                repo_root: repo_root.to_path_buf(),
+                path: path.to_path_buf(),
+                limit,
+            });
+            self.file_outline.clone()
+        }
     }
 }
 
@@ -418,6 +462,7 @@ mod tests {
     #[test]
     fn graph_query_default_is_all_none() {
         let q = GraphQuery::default();
+        assert_eq!(q.query, None);
         assert_eq!(q.name_pattern, None);
         assert_eq!(q.file_pattern, None);
         assert_eq!(q.label, None);

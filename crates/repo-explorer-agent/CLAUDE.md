@@ -5,7 +5,7 @@ catalog/dispatch, compressed rendering, and fingerprint-keyed result caches.
 Owns `serde_json` — core stays free of it.
 
 `AgentLoop::run` returns core's `ExplorationOutcome`: the `ExplorationResult`
-plus `retrieval_confidence` (the pre-stage's 0-100 candidate-set score, *not*
+plus `retrieval_confidence` (the pre-stage's 0-100 candidate-set score, _not_
 an answer confidence), `stage_exit` (`early-exit`/`verify`/`fallback`/`cache`,
 the same four literals `QueryMetrics::path` logs) and a sparse
 `symbols: Vec<(FileLocation, String)>`. It is built in exactly one place,
@@ -18,8 +18,12 @@ with `stage_exit` rewritten to `cache` and everything else replayed. Full pipeli
 
 ## Pipeline stages
 
-- **Retrieval pre-stage** — concurrent symbol/grep/file fanout; exits with
-  zero LLM calls when it finds a confident match. Two routes into that
+- **Retrieval pre-stage** — concurrent symbol/BM25/semantic/grep/file fanout;
+  exits with zero LLM calls when it finds a confident match. The BM25 leg
+  (`search_graph{query}`) is the only one that forwards the query text as
+  written — it ranks symbols by name relevance; its hits are `SemanticHit`.
+  Verification skeletons come from `MemoryBackend::file_outline`
+  (`get_file_outline`: exact path, source order, no container rows). Two routes into that
   Stage-3 exit, both requiring a trusted exact symbol match (F-16), reported
   as `early_exit_route` in `QueryMetrics`: `confidence` (score clears
   `agent.early_exit_confidence`) and `unique-symbol` (exactly one trusted
@@ -114,13 +118,13 @@ through `ResultCache::{get_query_l2, put_query_l2}`, which do their I/O in
 - **`disk_cache::SCHEMA_VERSION` is `2`** (M-3 moved the stored payload from
   `ExplorationResult` to `ExplorationOutcome`). It is the single versioning
   point for the
-  stored shape — directory segment *and* `v` field — so a bump makes every old
-  entry unreachable and the sweep deletes strictly *older* version directories
+  stored shape — directory segment _and_ `v` field — so a bump makes every old
+  entry unreachable and the sweep deletes strictly _older_ version directories
   (never a newer one: a mixed-version window would otherwise leave both
   binaries permanently cold). Bump it (and nothing else) when the stored value
   changes. The shape spans two crates — the envelope in `disk_cache.rs`, the
   payload in core's `ExplorationOutcome` — so `stored_shape_is_pinned_to_the_
-  schema_version` pins the serialized JSON as a literal: any move on either
+schema_version` pins the serialized JSON as a literal: any move on either
   side fails that test instead of silently changing the on-disk format.
 - **The key is the query key plus the response cap.** L2 reuses
   `ResultCache::query_key` and `AgentLoop::run_query_key` appends the
@@ -128,7 +132,7 @@ through `ResultCache::{get_query_l2, put_query_l2}`, which do their I/O in
   truncated and outlives the config file that set the cap. `query_cache_key`
   (the MCP server's `req_id` source) stays on the bare query key: it is a
   correlation id, not a cache lookup. No fingerprint in the key either:
-  invalidation stays in the *value*, which is what keeps the empty-diff
+  invalidation stays in the _value_, which is what keeps the empty-diff
   relabel working.
 - **One validity policy, `AgentLoop::entry_still_valid`, shared by both
   layers.** `[cache] key_mode = "strict"` (default) is the pre-M-1 behaviour:

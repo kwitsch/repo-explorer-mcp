@@ -24,8 +24,11 @@ tree text factors shared prefixes into `X_refs:` tables and `@N+suffix`
 cells (`@2+pipeline.rs` is not a path), and the `index_status`/
 `detect_changes` tree text decodes to a `Value::String` no field lookup can
 read (which forced a reindex on every call). Shapes, all pinned by tests
-with real payloads: `search_graph` columnar `{cols, groups}`; `search_code`
-and `query_graph` flat `{cols|columns, rows:[[..]]}` (`flat_rows_findings`);
+with real payloads: `search_graph` columnar `{cols, groups}` for `name_pattern`/`file_pattern`,
+but a flat `{cols: [qn,label,file,lines,rank], rows}` for a BM25 `query`;
+`search_code` and `query_graph` flat `{cols|columns, rows:[[..]]}`
+(`flat_rows_findings`); `get_file_outline` flat rows with the file once at
+the top level (`file_outline_findings`);
 `index_status` `{status, indexed_at, root_path}` — `indexed_at` is the last
 **full-generation** stamp (incremental refreshes, ours or the daemon's
 watcher, do not move it), so it only seeds `decide_freshness` when this

@@ -83,6 +83,7 @@ pub(crate) async fn dispatch_inner<M: MemoryBackend, S: SearchBackend>(
                 .transpose()?
                 .map(|p| p.to_string_lossy().into_owned());
             let query = GraphQuery {
+                query: None,
                 name_pattern: args.name_pattern,
                 file_pattern,
                 label: args.label,
