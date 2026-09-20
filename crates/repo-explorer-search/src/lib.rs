@@ -1,11 +1,8 @@
 //! In-process text/filename search backend (`NativeSearchBackend`) built on
-//! ripgrep's own `ignore` + `grep` crates, implementing
-//! `repo_explorer_core::search::SearchBackend` with no external binary; plus
-//! the git-backed `RepoStateProbe` (`GitStateProbe`), whose subprocess concern
-//! is this crate's remaining dependency domain.
+//! ripgrep's own `ignore` + `grep` crates, plus the git2-backed
+//! `RepoStateProbe` (`GitStateProbe`) — neither spawns an external binary.
 mod backend;
 mod git_probe;
-mod process;
 
 pub use backend::NativeSearchBackend;
 pub use git_probe::GitStateProbe;

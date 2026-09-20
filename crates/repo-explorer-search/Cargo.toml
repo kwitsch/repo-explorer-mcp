@@ -5,11 +5,12 @@ edition.workspace = true
 
 [dependencies]
 repo-explorer-core = { version = "0.10.0", path = "../repo-explorer-core" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 sha2 = "0.11"
 hex = "0.4"
 ignore = "0.4"
 grep = "0.3"
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 
 [dev-dependencies]
 which = "8"
