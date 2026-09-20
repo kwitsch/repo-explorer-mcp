@@ -1,8 +1,8 @@
 //! `rmcp` client plumbing: connect to `codebase-memory-mcp` over stdio, call a
-//! tool, decode its result, and derive the project name from a repo root. All
-//! `rmcp`/tool failures are mapped to `repo_explorer_core::memory::MemoryError`
-//! here, so the rest of the crate — and all of core — stays `rmcp`-free at the
-//! type level.
+//! tool, decode its result, and resolve a repo root to the upstream project
+//! name. All `rmcp`/tool failures are mapped to
+//! `repo_explorer_core::memory::MemoryError` here, so the rest of the crate —
+//! and all of core — stays `rmcp`-free at the type level.
 
 use repo_explorer_core::config::CodebaseMemoryConfig;
 use repo_explorer_core::memory::MemoryError;
@@ -11,8 +11,14 @@ use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use std::path::Path;
+
+/// `list_projects` page size. CBM's default is 50; one page covers every
+/// realistic per-user daemon, the loop below follows `has_more` regardless.
+const LIST_PROJECTS_PAGE: u64 = 200;
+/// Hard stop for the paging loop so a misbehaving server that always reports
+/// `has_more` cannot spin it forever.
+const LIST_PROJECTS_MAX_ROWS: usize = 10_000;
 
 /// A connected `rmcp` client to `codebase-memory-mcp`.
 #[derive(Debug)]
@@ -70,6 +76,54 @@ impl MemoryClient {
     pub(crate) async fn close(&mut self) {
         let _ = self.service.close().await;
     }
+
+    /// Resolve the already-canonicalized repo root `abs` to the name of the
+    /// upstream project indexed from it, by paging `list_projects` and
+    /// matching `root_path`. `codebase-memory-mcp` names projects itself
+    /// (from the path it was given at `index_repository` time — e.g.
+    /// `/home/k/repos/x` → `home-k-repos-x`, with its own normalization
+    /// rules) and shares one index across every client, so deriving a name
+    /// locally would either miss the existing index or, if also passed as
+    /// `name`, build a duplicate one. `Ok(None)` means no project has this
+    /// root: the caller must index first and read the assigned name from
+    /// that response.
+    pub(crate) async fn find_project_by_root(
+        &self,
+        abs: &Path,
+    ) -> Result<Option<String>, MemoryError> {
+        let mut rows = Vec::new();
+        let mut offset = 0u64;
+        loop {
+            let mut args = Map::new();
+            args.insert("format".to_string(), Value::String("json".to_string()));
+            args.insert(
+                "limit".to_string(),
+                Value::Number(LIST_PROJECTS_PAGE.into()),
+            );
+            args.insert("offset".to_string(), Value::Number(offset.into()));
+            let json = decode_result(self.call("list_projects", args).await?)?;
+            let page = project_rows(&json);
+            let returned = page.len() as u64;
+            rows.extend(page);
+            let has_more = json
+                .get("has_more")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !has_more || returned == 0 || rows.len() >= LIST_PROJECTS_MAX_ROWS {
+                break;
+            }
+            offset = json
+                .get("next_offset")
+                .and_then(Value::as_u64)
+                .unwrap_or(offset + returned);
+        }
+        let abs = abs.to_path_buf();
+        // `project_matching_root` may `canonicalize` every listed root — a
+        // blocking syscall per row, kept off the runtime thread.
+        tokio::task::spawn_blocking(move || project_matching_root(rows, &abs))
+            .await
+            .map_err(|e| MemoryError::Transport(format!("list_projects match task failed: {e}")))
+    }
 }
 
 /// Concatenate all text content blocks of a result into a single string.
@@ -97,39 +151,36 @@ pub(crate) fn decode_result(result: CallToolResult) -> Result<Value, MemoryError
     Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
 }
 
-/// Derive the project name from the repo root's final path component (matching
-/// `index_repository`'s documented default of the directory name). Root or
-/// non-UTF-8 paths error as `InvalidInput` — a bad `repo_root` is not a
-/// transport/connection failure, so callers must not treat it as retryable.
-///
-/// Canonicalizes `repo_root` first — same normalization `run_index` applies
-/// before calling `index_repository` — so a relative value like `.` resolves
-/// to its real directory name instead of erroring out immediately.
-pub(crate) async fn project_name(repo_root: &Path) -> Result<String, MemoryError> {
-    let abs = canonicalize_repo_root(repo_root).await;
-    project_name_from_abs(repo_root, &abs)
+/// The `(name, root_path)` pairs of a `list_projects{format:"json"}` page
+/// (`{"projects":[{"name":..,"root_path":..},..],"has_more":..}`); rows
+/// missing either field are skipped.
+pub(crate) fn project_rows(json: &Value) -> Vec<(String, String)> {
+    json.get("projects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            Some((
+                p.get("name")?.as_str()?.to_string(),
+                p.get("root_path")?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
 }
 
-/// Derive the project name from an already-canonicalized path, without
-/// canonicalizing again. Shared by `project_name` and by call sites (like
-/// `ensure_fresh_index`) that need both the project name and the
-/// canonicalized path itself and must not `canonicalize` twice for one
-/// logical resolution.
-pub(crate) fn project_name_from_abs(repo_root: &Path, abs: &Path) -> Result<String, MemoryError> {
-    let base = abs.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
-        MemoryError::InvalidInput(format!(
-            "cannot derive project name from repo_root `{}`",
-            repo_root.display()
-        ))
-    })?;
-    // Hash the CANONICAL abs path (not the raw repo_root): `.` and the
-    // absolute spelling of one repo must resolve to one stable upstream
-    // project, the opposite of the raw-path in-process cache keys. 8 hex chars
-    // (32 bits) is plenty to keep basename collisions across many repos
-    // astronomically unlikely; it is not a security boundary (a collision only
-    // costs a shared index), so a truncated prefix is fine.
-    let hash = hex::encode(Sha256::digest(abs.to_string_lossy().as_bytes()));
-    Ok(format!("{base}-{}", &hash[..8]))
+/// The name of the row whose `root_path` is `abs`: an exact path comparison
+/// first (`Path` equality already ignores a trailing separator), then, for
+/// roots recorded under another spelling (a symlinked checkout, `..`
+/// segments), the row whose root canonicalizes to `abs`. Roots that no longer
+/// exist on disk (deleted worktrees) simply fail to canonicalize and never
+/// match.
+pub(crate) fn project_matching_root(rows: Vec<(String, String)>, abs: &Path) -> Option<String> {
+    if let Some((name, _)) = rows.iter().find(|(_, root)| Path::new(root) == abs) {
+        return Some(name.clone());
+    }
+    rows.into_iter()
+        .find(|(_, root)| std::fs::canonicalize(root).is_ok_and(|p| p == abs))
+        .map(|(name, _)| name)
 }
 
 /// Canonicalize `repo_root` off the async runtime thread (the blocking
@@ -167,44 +218,68 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn project_name_from_directory() {
-        // The name is now `{basename}-{8 hex chars of Sha256 over the
-        // canonical abs path}` so two different repos that share a basename
-        // never collide upstream. `/home/user/my-repo` does not exist, so
-        // canonicalize falls back to the raw path and the hash is taken over
-        // that exact string.
-        let name = project_name(Path::new("/home/user/my-repo")).await.unwrap();
-        assert!(
-            name.starts_with("my-repo-"),
-            "name must keep the human-readable basename prefix: {name}"
+    /// Real CBM 0.11.0 `list_projects{format:"json"}` page: `branch` is
+    /// optional per row and must not matter.
+    #[test]
+    fn project_rows_reads_real_list_projects_page() {
+        let json = serde_json::json!({
+            "projects": [
+                {"name": "home-k-.config-repo-explorer", "root_path": "/home/k/.config/repo-explorer"},
+                {"name": "home-k-repos-repo-explorer-mcp", "root_path": "/home/k/repos/repo-explorer-mcp", "branch": "main"},
+                {"name": "broken-row-without-root"}
+            ],
+            "total": 119, "offset": 0, "limit": 200, "returned": 3, "has_more": false
+        });
+        assert_eq!(
+            project_rows(&json),
+            vec![
+                (
+                    "home-k-.config-repo-explorer".to_string(),
+                    "/home/k/.config/repo-explorer".to_string()
+                ),
+                (
+                    "home-k-repos-repo-explorer-mcp".to_string(),
+                    "/home/k/repos/repo-explorer-mcp".to_string()
+                ),
+            ]
         );
-        let suffix = name.strip_prefix("my-repo-").unwrap();
-        assert_eq!(suffix.len(), 8, "hash suffix must be 8 hex chars: {name}");
-        assert!(
-            suffix.chars().all(|c| c.is_ascii_hexdigit()),
-            "hash suffix must be hex: {name}"
+        assert!(project_rows(&Value::String("not json".into())).is_empty());
+    }
+
+    #[test]
+    fn project_matching_root_matches_exact_root_only() {
+        let rows = vec![
+            ("a".to_string(), "/nonexistent/repos/x".to_string()),
+            (
+                "a-worktree".to_string(),
+                "/nonexistent/repos/x/.claude/worktrees/w".to_string(),
+            ),
+            ("b".to_string(), "/nonexistent/repos/x-other/".to_string()),
+        ];
+        assert_eq!(
+            project_matching_root(rows.clone(), Path::new("/nonexistent/repos/x")),
+            Some("a".to_string())
+        );
+        // A trailing separator in the recorded root is not a different root.
+        assert_eq!(
+            project_matching_root(rows.clone(), Path::new("/nonexistent/repos/x-other")),
+            Some("b".to_string())
+        );
+        // A prefix/suffix of the root (parent repo, nested worktree) never matches.
+        assert_eq!(
+            project_matching_root(rows, Path::new("/nonexistent/repos")),
+            None
         );
     }
 
-    #[tokio::test]
-    async fn project_name_disambiguates_shared_basename_across_parents() {
-        // Two distinct repositories that share a directory basename must
-        // derive DIFFERENT project names (the whole point of the hash suffix).
-        // Neither path exists, so canonicalize falls back to the raw path and
-        // the hash is taken over the distinct full paths.
-        let a = project_name(Path::new("/home/a/my-repo")).await.unwrap();
-        let b = project_name(Path::new("/home/b/my-repo")).await.unwrap();
-        assert!(a.starts_with("my-repo-") && b.starts_with("my-repo-"));
-        assert_ne!(
-            a, b,
-            "same basename under different parents must not collide"
-        );
-    }
-
-    #[tokio::test]
-    async fn project_name_root_path_errors() {
-        let err = project_name(Path::new("/")).await.unwrap_err();
-        assert!(matches!(err, MemoryError::InvalidInput(_)));
+    #[test]
+    fn project_matching_root_falls_back_to_canonical_spelling() {
+        // The recorded root is a `..`-spelled alias of the canonical `abs`
+        // (only an existing path canonicalizes, so use the temp dir).
+        let tmp = std::env::temp_dir();
+        let abs = std::fs::canonicalize(&tmp).unwrap();
+        let alias = tmp.join("..").join(tmp.file_name().unwrap());
+        let rows = vec![("t".to_string(), alias.to_string_lossy().into_owned())];
+        assert_eq!(project_matching_root(rows, &abs), Some("t".to_string()));
     }
 }

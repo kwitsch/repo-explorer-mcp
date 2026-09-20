@@ -2,9 +2,7 @@
 //! each of the six query methods onto an upstream `codebase-memory-mcp` tool,
 //! decoding every response into the uniform `ExplorationResult`.
 
-use crate::client::{
-    MemoryClient, canonicalize_repo_root, decode_result, project_name, project_name_from_abs,
-};
+use crate::client::{MemoryClient, canonicalize_repo_root, decode_result};
 use crate::freshness::{ChangeCount, FreshnessDecision, IndexProbe, decide_freshness};
 use repo_explorer_core::config::CodebaseMemoryConfig;
 use repo_explorer_core::domain::{
@@ -28,16 +26,18 @@ pub struct MemoryClientBackend {
     client: Option<MemoryClient>,
     staleness: Duration,
     /// Wall-clock time this process last successfully ran `index_repository`
-    /// for a given repo root, used as the `last_indexed_at` fed to
-    /// `decide_freshness`. Per-repo because one server instance now serves
+    /// for a given repo root — the `last_indexed_at` fallback fed to
+    /// `decide_freshness` when `index_status` answers without its own
+    /// `indexed_at`. Per-repo because one server instance now serves
     /// many roots per request: a single global timestamp would let repo A's
     /// reindex be read as repo B's `last_indexed_at`.
     // ponytail: unbounded per-repo cache; add LRU/TTL eviction if long-lived
     // multi-repo servers grow this unboundedly.
     last_reindexed_at: Mutex<HashMap<PathBuf, SystemTime>>,
-    /// Project name resolved per `repo_root`. Per-repo (not single-slot) so one
-    /// server serving many roots caches each repo's name independently instead
-    /// of the two alternating repos thrashing a single slot.
+    /// Upstream project name resolved per `repo_root` (see
+    /// `cached_project_name`). Per-repo (not single-slot) so one server
+    /// serving many roots caches each repo's name independently instead of
+    /// the two alternating repos thrashing a single slot.
     // ponytail: unbounded per-repo cache; add LRU/TTL eviction if long-lived
     // multi-repo servers grow this unboundedly.
     project_name_cache: Mutex<HashMap<PathBuf, String>>,
@@ -88,104 +88,76 @@ impl MemoryClientBackend {
 
     /// Shared `call_and_decode` invocation for a project-scoped probe (the
     /// tail `probe_status`/`probe_changes` share): both differ only in which
-    /// tool name they call against `{"project": ...}` — one place that
-    /// builds and sends that call, so a future change to how a probe call is
-    /// assembled (an added shared argument, a different project encoding)
-    /// only needs to be made here, not hand-kept in sync at each call site.
+    /// tool name they call against [`probe_args`] — one place that builds
+    /// and sends that call, so a future change to how a probe call is
+    /// assembled only needs to be made here, not hand-kept in sync at each
+    /// call site.
     async fn probe(&self, tool: &'static str, project: &str) -> Result<Value, MemoryError> {
-        self.call_and_decode(tool, base_args(project.to_string()))
-            .await
+        self.call_and_decode(tool, probe_args(project)).await
     }
 
-    /// Probe `index_status` for the project, returning whether it exists; a
-    /// tool error meaning "not indexed" is reported as `exists = false`
-    /// rather than an `Err`. The changed-file count is not this call's to
-    /// know, so the full `IndexProbe` is assembled by `ensure_fresh_index`
-    /// instead of being returned half-filled here. The real response carries
-    /// no last-indexed timestamp of any kind, so this does not attempt to
-    /// parse one — `ensure_fresh_index` sources `last_indexed_at` from
-    /// `last_reindexed_at` instead.
-    async fn probe_status(&self, project: &str) -> Result<bool, MemoryError> {
+    /// Probe `index_status` for the project; a tool error meaning "not
+    /// indexed" is reported as `exists = false` rather than an `Err`. The
+    /// changed-file count is not this call's to know, so the full
+    /// `IndexProbe` is assembled by `ensure_fresh_index` instead of being
+    /// returned half-filled here.
+    async fn probe_status(&self, project: &str) -> Result<StatusProbe, MemoryError> {
         match self.probe("index_status", project).await {
-            Ok(json) => {
-                // An unrecognized/empty response must NOT be optimistically
-                // treated as "already indexed" — default to `false` so an
-                // unknown shape forces a (safe) reindex instead of skipping one.
-                // The real tool reports a `status` string (e.g. "ready"), not a
-                // boolean `indexed`/`exists`; the latter are kept as a fallback
-                // in case another response shape ever uses them.
-                let exists = json
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| !s.trim().is_empty())
-                    || first_field(&json, &["indexed", "exists"])
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                Ok(exists)
-            }
+            Ok(json) => Ok(status_probe(&json)),
             // Only a tool error that explicitly indicates the project is
             // unknown/not-yet-indexed is downgraded to "not indexed"; any other
             // tool failure (permission error, malformed input, internal fault)
             // is surfaced to the caller instead of being silently reinterpreted.
             Err(MemoryError::ToolFailed { message, .. }) if is_not_indexed_error(&message) => {
-                Ok(false)
+                Ok(StatusProbe {
+                    exists: false,
+                    indexed_at: None,
+                })
             }
             Err(e) => Err(e),
         }
     }
 
     /// Fill `changed_files` from `detect_changes` for an existing project.
-    async fn probe_changes(&self, project: &str) -> Result<ChangeCount, MemoryError> {
-        match self.probe("detect_changes", project).await {
-            Ok(json) => {
-                // Only a shape we actually understand yields a `Known` count.
-                // An absent field, an unexpected type, or a number that is not
-                // a plain non-negative integer is `Unknown` — never `Known(0)`,
-                // which `decide_freshness` reads as "confirmed no changes" and
-                // would optimistically skip a needed reindex (same rule as
-                // `probe_status`: an unrecognized response must not be treated
-                // as "already indexed").
-                //
-                // The real tool answers with a plain-text block (a `changed_files:
-                // N` line followed by the changed paths), decoded as
-                // `Value::String` — `Value::get`/`first_field` never match a
-                // string, so that shape needs its own parse ahead of the
-                // structured-JSON fallback below.
-                let changed = match &json {
-                    Value::String(text) => parse_changed_count(text)
-                        .map(ChangeCount::Known)
-                        .unwrap_or(ChangeCount::Unknown),
-                    _ => match first_field(&json, &["changed_files", "changed_count"]) {
-                        Some(Value::Array(a)) => ChangeCount::Known(a.len()),
-                        // Saturate rather than `as`-truncate: on a platform where
-                        // `usize` is narrower than `u64`, a huge count must clamp,
-                        // not wrap to a small, wrong value (matches the
-                        // `line_start`/`line_end` saturating casts in this module).
-                        Some(Value::Number(n)) => match n.as_u64() {
-                            Some(n) => ChangeCount::Known(n.min(usize::MAX as u64) as usize),
-                            None => ChangeCount::Unknown,
-                        },
-                        _ => ChangeCount::Unknown,
-                    },
-                };
-                Ok(changed)
-            }
+    async fn probe_changes(&self, project: &str) -> Result<ChangesProbe, MemoryError> {
+        match self
+            .call_and_decode("detect_changes", detect_changes_args(project))
+            .await
+        {
+            Ok(json) => Ok(changes_probe(&json)),
             // Per the `MemoryBackend::ensure_fresh_index` contract, a soft tool
             // failure must not abort exploration outright. We cannot confirm
             // freshness, so report `Unknown` explicitly (rather than an
             // arbitrary nonzero count) — `decide_freshness` treats it as
             // forcing a reindex attempt, same as a real change, without
             // pretending to know how many files changed.
-            Err(MemoryError::ToolFailed { .. }) => Ok(ChangeCount::Unknown),
+            Err(MemoryError::ToolFailed { .. }) => Ok(ChangesProbe {
+                count: ChangeCount::Unknown,
+                files: None,
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Does the index already cover every one of `files` (see
+    /// [`coverage_covers_all`])? A soft tool failure is "no" — the reindex it
+    /// then causes is the safe outcome; only a transport failure is `Err`.
+    async fn probe_coverage(&self, project: &str, files: &[String]) -> Result<bool, MemoryError> {
+        match self
+            .call_and_decode("check_index_coverage", coverage_args(project, files))
+            .await
+        {
+            Ok(json) => Ok(coverage_covers_all(&json)),
+            Err(MemoryError::ToolFailed { .. }) => Ok(false),
             Err(e) => Err(e),
         }
     }
 
     /// Run `index_repository` against the given, already-canonicalized repo
     /// root. Soft tool failure -> `IndexingFailed`; transport failure -> `Err`.
-    /// `repo_root` is the raw path used to key `last_reindexed_at` (matching
-    /// every other per-repo cache lookup); `abs_repo_root` is the canonical
-    /// path sent to the tool (`ensure_fresh_index` already resolved it once).
+    /// `repo_root` is the raw path used to key the per-repo caches (matching
+    /// every other lookup); `abs_repo_root` is the canonical path sent to the
+    /// tool (`ensure_fresh_index` already resolved it once).
     async fn run_index(
         &self,
         repo_root: &Path,
@@ -193,10 +165,26 @@ impl MemoryClientBackend {
     ) -> Result<IndexStatus, MemoryError> {
         let args = index_repository_args(abs_repo_root);
         match self.client().call("index_repository", args).await {
-            Ok(_) => {
-                // Record when *we* just rebuilt it, keyed on the raw repo_root
-                // — the only clock available, since the upstream tool never
-                // reports a build timestamp.
+            Ok(result) => {
+                // The response names the project CBM filed this root under —
+                // the only authoritative source for it right after a first
+                // index. A response without one drops any cached name so the
+                // next call re-resolves via `list_projects` instead of
+                // reusing a guess.
+                let assigned = decode_result(result)
+                    .ok()
+                    .and_then(|json| indexed_project(&json));
+                {
+                    let mut cache = self.project_name_cache.lock().unwrap();
+                    match assigned {
+                        Some(name) => {
+                            cache.insert(repo_root.to_path_buf(), name);
+                        }
+                        None => {
+                            cache.remove(repo_root);
+                        }
+                    }
+                }
                 self.last_reindexed_at
                     .lock()
                     .unwrap()
@@ -210,28 +198,53 @@ impl MemoryClientBackend {
         }
     }
 
-    /// [`project_name`], but cached per `repo_root`: one backend instance
-    /// serves requests for many different repo roots over its lifetime, so
-    /// the cache is keyed on `repo_root` — only the first call for a given
-    /// root actually canonicalizes and derives the name; later calls for
-    /// that same root return the cached value straight off the lock, with
-    /// no `spawn_blocking` round trip.
-    async fn cached_project_name(&self, repo_root: &Path) -> Result<String, MemoryError> {
-        if let Some(name) = self
-            .project_name_cache
+    fn cached_name(&self, repo_root: &Path) -> Option<String> {
+        self.project_name_cache
             .lock()
             .unwrap()
             .get(repo_root)
             .cloned()
-        {
+    }
+
+    /// The upstream project name for `repo_root`, cached per root: a hit
+    /// costs one lock; a miss canonicalizes the root and pages
+    /// `list_projects` for a matching `root_path` (see
+    /// `MemoryClient::find_project_by_root`). `ensure_fresh_index` and
+    /// `run_index` seed the same cache, so the read-only query methods that
+    /// follow them in `AgentLoop::run` never pay the lookup. A root no
+    /// project was ever indexed from is a `ToolFailed` naming
+    /// `list_projects`, phrased so `is_not_indexed_error` recognizes it.
+    async fn cached_project_name(&self, repo_root: &Path) -> Result<String, MemoryError> {
+        if let Some(name) = self.cached_name(repo_root) {
             return Ok(name);
         }
-        let name = project_name(repo_root).await?;
-        self.project_name_cache
-            .lock()
-            .unwrap()
-            .insert(repo_root.to_path_buf(), name.clone());
-        Ok(name)
+        let abs = canonicalize_repo_root(repo_root).await;
+        self.resolve_project(repo_root, &abs)
+            .await?
+            .ok_or_else(|| MemoryError::ToolFailed {
+                tool: "list_projects",
+                message: format!(
+                    "project not indexed: no indexed project has root_path `{}`",
+                    abs.display()
+                ),
+            })
+    }
+
+    /// `find_project_by_root` plus caching of a hit. `Ok(None)` is not
+    /// cached: the next call may follow an `index_repository`.
+    async fn resolve_project(
+        &self,
+        repo_root: &Path,
+        abs: &Path,
+    ) -> Result<Option<String>, MemoryError> {
+        let found = self.client().find_project_by_root(abs).await?;
+        if let Some(name) = &found {
+            self.project_name_cache
+                .lock()
+                .unwrap()
+                .insert(repo_root.to_path_buf(), name.clone());
+        }
+        Ok(found)
     }
 
     /// Shared tail of every read-only memory-query method: resolve
@@ -299,9 +312,36 @@ fn base_args(project: String) -> Map<String, Value> {
     args
 }
 
+/// `{"project": ..., "format": "json"}` — the freshness probes'
+/// (`index_status`/`detect_changes`) argument map. `format:"json"` is not
+/// optional: CBM 0.11.0's default is a tree text (`status: ready`,
+/// `changed_total: 0`) that decodes to a `Value::String` no field lookup
+/// can see into, which read as "not indexed, changes unknown" and forced a
+/// reindex on every call.
+fn probe_args(project: &str) -> Map<String, Value> {
+    let mut args = base_args(project.to_string());
+    insert_str(&mut args, "format", "json");
+    args
+}
+
+/// [`probe_args`] plus `scope:"files"` for `detect_changes`. Without the
+/// scope CBM 0.11.0 also runs its symbol impact analysis, and the changed
+/// *files* list is the first casualty of the shared output budget
+/// (live-verified: 13 changed files → `changed_returned: 0,
+/// changed_has_more: true` while 63 impacted symbols were returned in full),
+/// which would leave `all_indexed_since` nothing to check.
+fn detect_changes_args(project: &str) -> Map<String, Value> {
+    let mut args = probe_args(project);
+    insert_str(&mut args, "scope", "files");
+    args
+}
+
 /// Build the `index_repository` argument map — the one place the upstream
 /// `repo_path` key name lives (CBM 0.10.8 requires `repo_path`, not `path`;
-/// sending `path` hard-fails with "repo_path is required").
+/// sending `path` hard-fails with "repo_path is required"). Deliberately no
+/// `name`: the project keeps CBM's own path-derived name, so this index is
+/// the same one every other CBM client of this repo (e.g. the Claude Code
+/// plugin) reads and refreshes, instead of a duplicate under a private name.
 fn index_repository_args(abs_repo_root: &Path) -> Map<String, Value> {
     let mut args = Map::new();
     insert_str(
@@ -312,6 +352,15 @@ fn index_repository_args(abs_repo_root: &Path) -> Map<String, Value> {
     args
 }
 
+/// The project name in an `index_repository` response
+/// (`{"project":"home-k-repos-x","status":"indexed",...}`).
+fn indexed_project(json: &Value) -> Option<String> {
+    json.get("project")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
 /// Read the first present field among `keys`, in order — the single place
 /// every "which key name did the upstream tool use this time" guess goes
 /// through, instead of a separate `.or_else()` chain per call site.
@@ -319,13 +368,126 @@ fn first_field<'a>(json: &'a Value, keys: &[&str]) -> Option<&'a Value> {
     keys.iter().find_map(|k| json.get(*k))
 }
 
-/// Parse `detect_changes`' plain-text response for its `changed_files: N`
-/// line (the count the tool reports up front, ahead of the indented list of
-/// changed paths); `None` when no such line is present.
-fn parse_changed_count(text: &str) -> Option<usize> {
-    text.lines()
-        .find_map(|line| line.trim().strip_prefix("changed_files:"))
-        .and_then(|rest| rest.trim().parse::<usize>().ok())
+/// What `index_status{format:"json"}` says about a project.
+struct StatusProbe {
+    exists: bool,
+    /// The index's last full-generation stamp (`"indexed_at":"2026-09-20T17:23:57Z"`),
+    /// shared with every other CBM client of the repo. Incremental refreshes
+    /// (ours or the daemon's watcher) do not move it (live-verified), so it
+    /// only stands in for `last_reindexed_at` before this process has
+    /// reindexed itself — enough to spare a fresh process the reindex its
+    /// first call used to assume. `None` when missing or unparsable.
+    indexed_at: Option<SystemTime>,
+}
+
+/// `exists` is a non-empty `status` string (`"ready"`; the boolean
+/// `indexed`/`exists` keys are kept as a fallback for other shapes) — never
+/// optimistically `true` for an unrecognized shape (a tree-text
+/// `Value::String` included), so an unknown response forces a safe reindex
+/// instead of skipping one.
+fn status_probe(json: &Value) -> StatusProbe {
+    let exists = json
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+        || first_field(json, &["indexed", "exists"])
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let indexed_at = json
+        .get("indexed_at")
+        .and_then(Value::as_str)
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(SystemTime::from);
+    StatusProbe { exists, indexed_at }
+}
+
+/// The changed-file count in `detect_changes{format:"json"}` (CBM 0.11.0
+/// answers `"changed_total":N` alongside a possibly page-capped
+/// `"changed_files":[...]`, so the total is read first). Only a shape we
+/// understand yields `Known`; an absent field, an unexpected type or a
+/// non-integer is `Unknown` — never `Known(0)`, which `decide_freshness`
+/// reads as "confirmed no changes" and would skip a needed reindex on.
+fn changed_count(json: &Value) -> ChangeCount {
+    match first_field(json, &["changed_total", "changed_files", "changed_count"]) {
+        Some(Value::Array(a)) => ChangeCount::Known(a.len()),
+        // Saturate rather than `as`-truncate: on a platform where `usize` is
+        // narrower than `u64`, a huge count must clamp, not wrap to a small,
+        // wrong value (matches the line-number saturating casts in this module).
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(n) => ChangeCount::Known(n.min(usize::MAX as u64) as usize),
+            None => ChangeCount::Unknown,
+        },
+        _ => ChangeCount::Unknown,
+    }
+}
+
+/// What `detect_changes{format:"json"}` reports.
+struct ChangesProbe {
+    count: ChangeCount,
+    /// The complete repo-relative changed-path list; `None` when the tool
+    /// paged it (`changed_has_more`) or answered without one.
+    files: Option<Vec<String>>,
+}
+
+fn changes_probe(json: &Value) -> ChangesProbe {
+    let paged = json
+        .get("changed_has_more")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let files = json
+        .get("changed_files")
+        .and_then(Value::as_array)
+        .filter(|_| !paged)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        });
+    ChangesProbe {
+        count: changed_count(json),
+        files,
+    }
+}
+
+/// `{"project", "paths": [...], "format": "json"}` for `check_index_coverage`.
+fn coverage_args(project: &str, files: &[String]) -> Map<String, Value> {
+    let mut args = probe_args(project);
+    args.insert(
+        "paths".to_string(),
+        Value::Array(files.iter().cloned().map(Value::String).collect()),
+    );
+    args
+}
+
+/// `detect_changes` diffs the working tree against the base branch —
+/// "changed since the branch point", not "changed since the index was built"
+/// (live-verified on CBM 0.11.0: `since` accepts only git revisions). A dirty
+/// tree therefore reports the same files on every call, even right after
+/// they were indexed. Whether the index already covers them is what
+/// `check_index_coverage{paths}` answers per file: `freshness` is
+/// `metadata_match` when the indexed content matches the file on disk, and
+/// `not_tracked` for a file the index ignores anyway (`Cargo.lock`) — both
+/// need no reindex. Anything else (a stale or missing file, a paged answer,
+/// an unrecognized shape) is "not covered", so an unknown response forces the
+/// safe reindex rather than skipping one.
+fn coverage_covers_all(json: &Value) -> bool {
+    if json
+        .get("path_has_more")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    let Some(rows) = json.get("paths").and_then(Value::as_array) else {
+        return false;
+    };
+    rows.iter().all(|row| {
+        matches!(
+            row.get("freshness").and_then(Value::as_str),
+            Some("metadata_match" | "not_tracked")
+        )
+    })
 }
 
 /// Insert `key: v` into `args` when `v` is `Some` — the single place every
@@ -356,6 +518,9 @@ fn insert_str(args: &mut Map<String, Value>, key: &str, v: impl Into<String>) {
 /// already seeded with `base_args`. The upstream row cap key is `max_rows`
 /// (CBM 0.10.8), not `limit` — sending `limit` silently drops the cap.
 fn insert_query_graph_args(args: &mut Map<String, Value>, query: &str, max_results: Option<u32>) {
+    // `format:"json"`: see `flat_rows_findings` for why the default tree
+    // text is unusable for paths.
+    insert_str(args, "format", "json");
     insert_str(args, "query", query);
     insert_opt_u32(args, "max_rows", max_results);
 }
@@ -593,23 +758,118 @@ fn col_name(c: &str) -> &str {
     c.rsplit('.').next().unwrap_or(c)
 }
 
-/// Parse a header line's tail (after the section name's `:`) for a
-/// `(cols: ...)` list; `None` when the line carries no such list (e.g. a
-/// trailing summary line like `total_grep_matches: 44`).
-fn parse_header_cols(rest: &str) -> Option<TableCols> {
-    let (_, tail) = rest.split_once("(cols:")?;
-    let names: Vec<&str> = tail.trim_end_matches(')').split_whitespace().collect();
+/// Resolve a table's column `names` — a `(cols: ...)` header's list or a
+/// JSON `cols`/`columns` array — into the positions every row is read by.
+/// `file_path` is the graph node property's real name (what a `query_graph`
+/// `RETURN n.file_path` yields), alongside the `file`/`path` literals the
+/// fixed-shape tools use.
+fn table_cols(names: &[&str]) -> TableCols {
     let pos = |name: &str| names.iter().position(|c| col_name(c) == name);
-    Some(TableCols {
+    TableCols {
         len: names.len(),
-        file: pos("file").or_else(|| pos("path")),
+        file: pos("file")
+            .or_else(|| pos("path"))
+            .or_else(|| pos("file_path")),
         lines: pos("lines"),
         line_start: pos("line_start").or_else(|| pos("start_line")),
         line_end: pos("line_end").or_else(|| pos("end_line")),
         qn: pos("qn").or_else(|| pos("qualified_name")),
         name: pos("name"),
         label: pos("label"),
-    })
+    }
+}
+
+/// Parse a header line's tail (after the section name's `:`) for a
+/// `(cols: ...)` list; `None` when the line carries no such list (e.g. a
+/// trailing summary line like `total_grep_matches: 44`).
+fn parse_header_cols(rest: &str) -> Option<TableCols> {
+    let (_, tail) = rest.split_once("(cols:")?;
+    let names: Vec<&str> = tail.trim_end_matches(')').split_whitespace().collect();
+    Some(table_cols(&names))
+}
+
+/// One table row's cells → a finding, shared by the text and the JSON table
+/// shapes. `None` for a row whose cell count does not match its header or
+/// that has no file cell.
+fn table_row_finding(t: &TableCols, cells: &[&str]) -> Option<ExplorationFinding> {
+    if cells.len() != t.len {
+        return None;
+    }
+    let file = cells.get(t.file?).copied()?;
+    // Separate `line_start`/`line_end` columns, when the table has either,
+    // take priority over a combined `lines` column: every fixed-shape tool
+    // (`search_code`/`get_architecture`/`search_graph`) only ever emits one
+    // or the other, but an arbitrary `query_graph` `RETURN` clause can name
+    // both in the same row (e.g. `n.lines` alongside `n.start_line`/
+    // `n.end_line`) — there, `lines` is just whatever unrelated graph-node
+    // property the caller happened to return, not a `"start-end"` range, so
+    // it must not shadow the real range sitting in the other columns.
+    let (line_start, line_end) = if t.line_start.is_some() || t.line_end.is_some() {
+        let start = t
+            .line_start
+            .and_then(|i| cells.get(i).copied())
+            .and_then(parse_line_cell)
+            .unwrap_or(0);
+        let end = t
+            .line_end
+            .and_then(|i| cells.get(i).copied())
+            .and_then(parse_line_cell)
+            .unwrap_or(start);
+        (start, end)
+    } else {
+        t.lines
+            .and_then(|i| cells.get(i).copied())
+            .map(parse_line_range)
+            .unwrap_or((0, 0))
+    };
+    let label = t.label.and_then(|i| cells.get(i).copied());
+    let line_end = correct_module_end(label, line_start, line_end);
+    let note =
+        t.qn.or(t.name)
+            .and_then(|i| cells.get(i).copied())
+            .map(str::to_string);
+    Some(finding(file, line_start, line_end, note))
+}
+
+/// The flat JSON table `search_code{format:"json"}` (`cols`) and
+/// `query_graph{format:"json"}` (`columns`) answer with:
+/// `{cols|columns: [..], rows: [[cell, ..], ..]}`. Requested instead of the
+/// default tree text because CBM 0.11.0's tree output factors shared
+/// prefixes into `X_refs:` tables and `@N+suffix` cells — a `file` cell like
+/// `@2+pipeline.rs` is not a path. `None` unless both arrays are present and
+/// every row is itself an array (the columnar `{cols, groups}` shape has no
+/// `rows`; object rows are decoded elsewhere), so the other decoders still
+/// get their turn.
+fn flat_rows_findings(json: &Value) -> Option<Vec<ExplorationFinding>> {
+    let names: Vec<&str> = first_field(json, &["cols", "columns"])?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let rows = json.get("rows")?.as_array()?;
+    if rows.iter().any(|r| !r.is_array()) {
+        return None;
+    }
+    let t = table_cols(&names);
+    Some(
+        rows.iter()
+            .filter_map(|row| {
+                let cells: Vec<String> = row.as_array()?.iter().map(cell_text).collect();
+                let cells: Vec<&str> = cells.iter().map(String::as_str).collect();
+                table_row_finding(&t, &cells)
+            })
+            .collect(),
+    )
+}
+
+/// A JSON table cell as the text the row parser reads: strings as-is,
+/// numbers rendered, anything else (`null`, the `matches` line arrays) empty.
+fn cell_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
 }
 
 /// Parse the plain-text tables `codebase-memory-mcp` answers with — one or
@@ -645,48 +905,13 @@ fn text_table_findings(text: &str) -> Vec<ExplorationFinding> {
         // Known from the header, once per section — skip the row's
         // allocation entirely for a column-less/file-less section instead of
         // collecting cells just to discard them below.
-        let Some(file_col) = t.file else { continue };
-        let cells: Vec<&str> = line.split_whitespace().collect();
-        if cells.len() != t.len {
+        if t.file.is_none() {
             continue;
         }
-        let Some(file) = cells.get(file_col).copied() else {
-            continue;
-        };
-        // Separate `line_start`/`line_end` columns, when the section has
-        // either, take priority over a combined `lines` column: every
-        // fixed-shape tool (`search_code`/`get_architecture`/`search_graph`)
-        // only ever emits one or the other, but an arbitrary `query_graph`
-        // `RETURN` clause can name both in the same row (e.g. `n.lines`
-        // alongside `n.start_line`/`n.end_line`) — there, `lines` is just
-        // whatever unrelated graph-node property the caller happened to
-        // return, not a `"start-end"` range, so it must not shadow the real
-        // range sitting in the other columns of that same row.
-        let (line_start, line_end) = if t.line_start.is_some() || t.line_end.is_some() {
-            let start = t
-                .line_start
-                .and_then(|i| cells.get(i).copied())
-                .and_then(parse_line_cell)
-                .unwrap_or(0);
-            let end = t
-                .line_end
-                .and_then(|i| cells.get(i).copied())
-                .and_then(parse_line_cell)
-                .unwrap_or(start);
-            (start, end)
-        } else {
-            t.lines
-                .and_then(|i| cells.get(i).copied())
-                .map(parse_line_range)
-                .unwrap_or((0, 0))
-        };
-        let label = t.label.and_then(|i| cells.get(i).copied());
-        let line_end = correct_module_end(label, line_start, line_end);
-        let note =
-            t.qn.or(t.name)
-                .and_then(|i| cells.get(i).copied())
-                .map(str::to_string);
-        findings.push(finding(file, line_start, line_end, note));
+        let cells: Vec<&str> = line.split_whitespace().collect();
+        if let Some(f) = table_row_finding(t, &cells) {
+            findings.push(f);
+        }
     }
     findings
 }
@@ -849,11 +1074,13 @@ fn ambiguous_summary(json: &Value) -> Option<String> {
 }
 
 /// Turn a tool response into findings plus a compact summary string. Handles
-/// the five shapes `codebase-memory-mcp` actually produces: an array of
-/// object rows (`results`/`rows`/`hits`), the columnar `{cols, groups}` JSON,
-/// the plain-text table (reaching here as `Value::String`), `trace_path`'s own
-/// plain-text shape (grouped, columnless -- see [`trace_path_findings`]), and
-/// `trace_path`'s ambiguous-match success payload (see [`ambiguous_summary`]).
+/// the six shapes `codebase-memory-mcp` actually produces: the flat JSON
+/// table (`{cols|columns, rows: [[..]]}` — see [`flat_rows_findings`]), an
+/// array of object rows (`results`/`rows`/`hits`), the columnar
+/// `{cols, groups}` JSON, the plain-text table (reaching here as
+/// `Value::String`), `trace_path`'s own plain-text shape (grouped, columnless
+/// -- see [`trace_path_findings`]), and `trace_path`'s ambiguous-match
+/// success payload (see [`ambiguous_summary`]).
 fn findings_and_summary(tool: &'static str, json: &Value, repo_root: &Path) -> ExplorationResult {
     if let Value::String(text) = json {
         let findings = if tool == "trace_path" {
@@ -868,6 +1095,9 @@ fn findings_and_summary(tool: &'static str, json: &Value, repo_root: &Path) -> E
             findings: Vec::new(),
             summary: format!("{tool}: {message}"),
         };
+    }
+    if let Some(findings) = flat_rows_findings(json) {
+        return result_with_finding_count(tool, findings);
     }
     let mut findings = Vec::new();
     if let Some(rows) = first_field(json, &["results", "rows", "hits"]).and_then(Value::as_array) {
@@ -906,45 +1136,70 @@ impl MemoryClientBackend {
     /// method below can time and log it uniformly across every early-return
     /// path (`?` on the freshness probes included).
     async fn ensure_fresh_index_inner(&self, repo_root: &Path) -> Result<IndexStatus, MemoryError> {
-        // Canonicalize once and derive the project name from that same
-        // resolved path, instead of calling `project_name` (which
-        // canonicalizes again internally) and then re-canonicalizing a
-        // second time inside `run_index`.
+        // Canonicalize once; `resolve_project` and `run_index` both take the
+        // resolved path rather than re-canonicalizing.
         let abs = canonicalize_repo_root(repo_root).await;
-        let project = project_name_from_abs(repo_root, &abs)?;
-        let exists = self.probe_status(&project).await?;
+        let project = match self.cached_name(repo_root) {
+            Some(name) => Some(name),
+            None => self.resolve_project(repo_root, &abs).await?,
+        };
+        // No project has this root yet: index it now — `run_index` learns
+        // the name CBM assigns from the response.
+        let Some(project) = project else {
+            return self.run_index(repo_root, &abs).await;
+        };
+        // A cached name can still be stale (project deleted upstream):
+        // `exists = false` then routes to `run_index`, which re-learns it.
+        let status = self.probe_status(&project).await?;
         // `detect_changes` is only meaningful for a project that exists.
-        let changed_files = if exists {
+        let changes = if status.exists {
             self.probe_changes(&project).await?
         } else {
-            ChangeCount::Known(0)
+            ChangesProbe {
+                count: ChangeCount::Known(0),
+                files: None,
+            }
         };
-        // Seed the cache now, after `project`'s last borrow (keyed on the raw
-        // `repo_root`, same as `cached_project_name` compares against) so the
-        // retrieval calls that immediately follow this in `AgentLoop::run`
-        // skip the redundant canonicalize + project-name round trip on their
-        // first call -- moving `project` by value instead of cloning it, since
-        // nothing below needs it anymore.
-        self.project_name_cache
-            .lock()
-            .unwrap()
-            .insert(repo_root.to_path_buf(), project);
-        // Only meaningful once this project has been indexed; irrelevant
-        // (and forced to `Reindex` regardless) when `exists` is false.
-        let last_indexed_at = if exists {
+        let mut changed_files = changes.count;
+        let files_listed = changes.files.is_some();
+        let mut covered = false;
+        // Branch-relative changes the index already covers are not changes
+        // (see `coverage_covers_all`); only decidable with the complete list.
+        if let (ChangeCount::Known(n), Some(files)) = (changes.count, &changes.files)
+            && n > 0
+        {
+            covered = self.probe_coverage(&project, files).await?;
+            if covered {
+                changed_files = ChangeCount::Known(0);
+            }
+        }
+        // This process's own last reindex is the freshest evidence; the
+        // upstream generation stamp only stands in before that (see
+        // `StatusProbe::indexed_at`). Irrelevant (and forced to `Reindex`
+        // regardless) when `exists` is false.
+        let last_indexed_at = if status.exists {
             self.last_reindexed_at
                 .lock()
                 .unwrap()
                 .get(repo_root)
                 .copied()
+                .or(status.indexed_at)
         } else {
             None
         };
         let probe = IndexProbe {
-            exists,
+            exists: status.exists,
             last_indexed_at,
             changed_files,
         };
+        tracing::debug!(
+            exists = status.exists,
+            changed = ?changes.count,
+            files_listed,
+            covered,
+            indexed_at = ?status.indexed_at,
+            "freshness probe"
+        );
         match decide_freshness(&probe, self.staleness, SystemTime::now()) {
             FreshnessDecision::UpToDate => Ok(IndexStatus::UpToDate),
             FreshnessDecision::Reindex => self.run_index(repo_root, &abs).await,
@@ -982,7 +1237,7 @@ impl MemoryBackend for MemoryClientBackend {
 
     async fn probe_index_ready(&self, repo_root: &Path) -> Result<bool, MemoryError> {
         let project = self.cached_project_name(repo_root).await?;
-        self.probe_status(&project).await
+        Ok(self.probe_status(&project).await?.exists)
     }
 
     async fn search_code(
@@ -990,7 +1245,10 @@ impl MemoryBackend for MemoryClientBackend {
         repo_root: &Path,
         query: &ExplorationQuery,
     ) -> Result<ExplorationResult, MemoryError> {
+        // `format:"json"`: see `flat_rows_findings` for why the default tree
+        // text is unusable for paths.
         self.call_memory_tool("search_code", repo_root, |args| {
+            insert_str(args, "format", "json");
             insert_str(args, "pattern", query.text.clone());
             if let Some(scope) = &query.scope_hint {
                 insert_str(args, "file_pattern", scope_glob(scope));
@@ -1118,14 +1376,13 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn project_name_cache_keeps_a_separate_entry_per_repo_root() {
+    async fn cached_project_name_serves_each_repo_root_without_the_client() {
         // Regression: the cache was a single-slot `Option<(PathBuf, String)>`
         // that, driven with two different roots, kept only the last writer's
         // entry — so one server serving repo A then repo B would thrash and
-        // could serve A's project name for B. It must now be a per-repo map
-        // holding BOTH entries at once. Both paths are nonexistent so
-        // `project_name` canonicalizes-with-fallback and never touches the
-        // (absent) client.
+        // could serve A's project name for B. Both roots seeded (as
+        // `ensure_fresh_index`/`run_index` do) must be served from the cache
+        // alone — `client` is `None`, so any lookup would panic.
         let backend = MemoryClientBackend {
             client: None,
             staleness: Duration::from_secs(1),
@@ -1134,13 +1391,296 @@ mod tests {
         };
         let root_a = Path::new("/nonexistent/alpha-repo");
         let root_b = Path::new("/nonexistent/beta-repo");
-        let name_a = backend.cached_project_name(root_a).await.unwrap();
-        let name_b = backend.cached_project_name(root_b).await.unwrap();
-        assert_ne!(name_a, name_b, "distinct roots must get distinct names");
-        let cache = backend.project_name_cache.lock().unwrap();
-        assert_eq!(cache.len(), 2, "both repos' names must be cached at once");
-        assert_eq!(cache.get(root_a), Some(&name_a));
-        assert_eq!(cache.get(root_b), Some(&name_b));
+        {
+            let mut cache = backend.project_name_cache.lock().unwrap();
+            cache.insert(root_a.to_path_buf(), "nonexistent-alpha-repo".into());
+            cache.insert(root_b.to_path_buf(), "nonexistent-beta-repo".into());
+        }
+        assert_eq!(
+            backend.cached_project_name(root_a).await.unwrap(),
+            "nonexistent-alpha-repo"
+        );
+        assert_eq!(
+            backend.cached_project_name(root_b).await.unwrap(),
+            "nonexistent-beta-repo"
+        );
+    }
+
+    /// Real CBM 0.11.0 `index_repository` response: the assigned name is the
+    /// only source of the project name right after a first index.
+    #[test]
+    fn indexed_project_reads_the_assigned_name() {
+        let payload = json!({
+            "project": "home-k-repos-repo-explorer-mcp",
+            "excluded": {"dirs": [".git"], "count": 7, "truncated": true},
+            "nodes": 2338, "edges": 11817, "status": "indexed"
+        });
+        assert_eq!(
+            indexed_project(&payload),
+            Some("home-k-repos-repo-explorer-mcp".to_string())
+        );
+        assert_eq!(
+            indexed_project(&Value::String("status: indexed".into())),
+            None
+        );
+        assert_eq!(indexed_project(&json!({"project": ""})), None);
+    }
+
+    #[test]
+    fn probe_args_request_json_format() {
+        let args = probe_args("p");
+        assert_eq!(args.get("project").and_then(Value::as_str), Some("p"));
+        assert_eq!(args.get("format").and_then(Value::as_str), Some("json"));
+        assert!(!args.contains_key("scope"));
+        let args = detect_changes_args("p");
+        assert_eq!(args.get("format").and_then(Value::as_str), Some("json"));
+        assert_eq!(args.get("scope").and_then(Value::as_str), Some("files"));
+    }
+
+    /// Real CBM 0.11.0 `index_status{format:"json"}` payload: `status` marks
+    /// existence and `indexed_at` (RFC 3339) is the index's own build time.
+    #[test]
+    fn status_probe_reads_real_index_status_json() {
+        let payload = json!({
+            "project": "home-k-repos-repo-explorer-mcp",
+            "nodes": 2338, "edges": 11817, "status": "ready",
+            "root_path": "/home/k/repos/repo-explorer-mcp",
+            "indexed_at": "2026-09-20T17:23:57Z",
+            "parse_partial": {"files": [], "count": 0, "truncated": false}
+        });
+        let probe = status_probe(&payload);
+        assert!(probe.exists);
+        assert_eq!(
+            probe.indexed_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_789_925_037))
+        );
+    }
+
+    /// The default (tree-text) shape decodes to a `Value::String` that no
+    /// field lookup can see into — it must read as "not indexed" (safe
+    /// reindex), which is why `probe_args` asks for JSON in the first place.
+    #[test]
+    fn status_probe_treats_tree_text_and_unknown_shapes_as_absent() {
+        let tree = Value::String("project: p\nnodes: 1\nstatus: ready\n".into());
+        let probe = status_probe(&tree);
+        assert!(!probe.exists);
+        assert_eq!(probe.indexed_at, None);
+        let odd = json!({"status": "ready", "indexed_at": "yesterday"});
+        assert!(status_probe(&odd).exists);
+        assert_eq!(status_probe(&odd).indexed_at, None);
+        assert!(!status_probe(&json!({"nodes": 1})).exists);
+    }
+
+    /// Real CBM 0.11.0 `detect_changes{format:"json"}` payload: the exact
+    /// `changed_total` wins over the page-capped `changed_files` list.
+    #[test]
+    fn changed_count_reads_real_detect_changes_json() {
+        let payload = json!({
+            "base": "main", "merge_base": "0282120", "direction": "inbound",
+            "changed_total": 2, "changed_returned": 1, "changed_has_more": true,
+            "changed_files": ["docs/a.md"], "seed_symbols": 0
+        });
+        assert_eq!(changed_count(&payload), ChangeCount::Known(2));
+        assert_eq!(
+            changed_count(&json!({"changed_files": []})),
+            ChangeCount::Known(0)
+        );
+        assert_eq!(
+            changed_count(&json!({"changed_files": ["a", "b", "c"]})),
+            ChangeCount::Known(3)
+        );
+    }
+
+    #[test]
+    fn changed_count_is_unknown_for_tree_text_and_unknown_shapes() {
+        let tree = Value::String("base: main\nchanged_total: 0\n".into());
+        assert_eq!(changed_count(&tree), ChangeCount::Unknown);
+        assert_eq!(
+            changed_count(&json!({"base": "main"})),
+            ChangeCount::Unknown
+        );
+        assert_eq!(
+            changed_count(&json!({"changed_total": -1})),
+            ChangeCount::Unknown
+        );
+    }
+
+    /// The changed-path list is only usable for the mtime check when the
+    /// tool did not page it.
+    #[test]
+    fn changes_probe_keeps_the_file_list_only_when_complete() {
+        let complete = json!({
+            "changed_total": 2, "changed_returned": 2, "changed_has_more": false,
+            "changed_files": ["Cargo.toml", "crates/a/src/lib.rs"]
+        });
+        let probe = changes_probe(&complete);
+        assert_eq!(probe.count, ChangeCount::Known(2));
+        assert_eq!(
+            probe.files,
+            Some(vec![
+                "Cargo.toml".to_string(),
+                "crates/a/src/lib.rs".to_string()
+            ])
+        );
+        let paged = json!({
+            "changed_total": 500, "changed_returned": 1, "changed_has_more": true,
+            "changed_files": ["Cargo.toml"]
+        });
+        let probe = changes_probe(&paged);
+        assert_eq!(probe.count, ChangeCount::Known(500));
+        assert_eq!(probe.files, None);
+        assert_eq!(changes_probe(&json!({"base": "main"})).files, None);
+    }
+
+    #[test]
+    fn coverage_args_carry_the_paths_and_json_format() {
+        let args = coverage_args("p", &["Cargo.toml".to_string(), "src/lib.rs".to_string()]);
+        assert_eq!(args.get("project").and_then(Value::as_str), Some("p"));
+        assert_eq!(args.get("format").and_then(Value::as_str), Some("json"));
+        assert_eq!(
+            args.get("paths"),
+            Some(&json!(["Cargo.toml", "src/lib.rs"]))
+        );
+    }
+
+    /// Real CBM 0.11.0 `check_index_coverage{format:"json"}` payload: an
+    /// indexed-and-current file (`metadata_match`) and a file the index
+    /// ignores (`Cargo.lock`, `not_tracked`) both need no reindex.
+    #[test]
+    fn coverage_covers_all_reads_real_check_index_coverage_json() {
+        let payload = json!({
+            "project": "home-k-repos-repo-explorer-mcp", "signal": "best_effort",
+            "indexed_at": "2026-09-20T17:55:29Z",
+            "path_total": 2, "path_returned": 2, "path_has_more": false,
+            "scopes": [], "has_more": false,
+            "paths": [
+                {"requested_path": "Cargo.lock", "path": "Cargo.lock", "status": "no_recorded_issue",
+                 "freshness": "not_tracked", "recommended_action": "read_source_and_reindex", "coverage": []},
+                {"requested_path": "crates/a/src/backend.rs", "path": "crates/a/src/backend.rs",
+                 "status": "no_recorded_issue", "freshness": "metadata_match",
+                 "recommended_action": "use_graph_with_best_effort_caveat", "coverage": []}
+            ]
+        });
+        assert!(coverage_covers_all(&payload));
+    }
+
+    /// Boundary of the "already indexed" rule: one stale row, a paged answer,
+    /// or a shape without rows is "not covered" (safe reindex).
+    #[test]
+    fn coverage_covers_all_rejects_stale_paged_or_unknown() {
+        let stale = json!({
+            "path_has_more": false,
+            "paths": [
+                {"path": "a.rs", "freshness": "metadata_match"},
+                {"path": "b.rs", "freshness": "metadata_changed"}
+            ]
+        });
+        assert!(!coverage_covers_all(&stale));
+        let paged = json!({
+            "path_has_more": true,
+            "paths": [{"path": "a.rs", "freshness": "metadata_match"}]
+        });
+        assert!(!coverage_covers_all(&paged));
+        assert!(!coverage_covers_all(&json!({"path_has_more": false})));
+        assert!(!coverage_covers_all(&Value::String("paths: 1".into())));
+        // An empty complete list covers vacuously (never reached: the caller
+        // only asks with a non-zero change count).
+        assert!(coverage_covers_all(
+            &json!({"path_has_more": false, "paths": []})
+        ));
+    }
+
+    /// Real CBM 0.11.0 `search_code{format:"json"}` payload: a flat
+    /// `{cols, rows:[[..]]}` table whose cells mix strings, numbers and the
+    /// `matches` line array; the nested `raw_matches` table is not ours.
+    #[test]
+    fn flat_rows_search_code_json_payload_decodes() {
+        let payload = json!({
+            "cols": ["qn", "label", "file", "lines", "matches", "matches_omitted", "in", "out"],
+            "rows": [
+                ["repo.crates.a.src.pipeline.retrieve", "Function", "crates/a/src/pipeline.rs", "80-265", [80], 0, 13, 23],
+                ["repo.crates.a.src.agent.agent_with", "Function", "crates/a/src/agent.rs", "1820-1843", [1823, 1835], 0, 8, 8]
+            ],
+            "raw_matches": {"cols": ["file", "line", "content"], "rows": []},
+            "directories": {"crates/": 98},
+            "total_results": 102, "results_returned": 2, "has_more": true, "next_offset": 2
+        });
+        let res = findings_and_summary("search_code", &payload, Path::new("/repo"));
+        assert_eq!(res.findings.len(), 2);
+        let f = &res.findings[0];
+        assert_eq!(
+            f.location.path,
+            std::path::PathBuf::from("crates/a/src/pipeline.rs")
+        );
+        assert_eq!((f.location.line_start, f.location.line_end), (80, 265));
+        assert_eq!(
+            f.note.as_deref(),
+            Some("repo.crates.a.src.pipeline.retrieve")
+        );
+        assert_eq!(
+            (
+                res.findings[1].location.line_start,
+                res.findings[1].location.line_end
+            ),
+            (1820, 1843)
+        );
+        assert!(res.summary.contains("2 locatable finding"));
+    }
+
+    /// Real CBM 0.11.0 `query_graph{format:"json"}` payload: `columns` are
+    /// the caller's `RETURN` names, so the graph's `file_path`/`start_line`/
+    /// `end_line` property names must resolve; cells are strings, `""` for a
+    /// null.
+    #[test]
+    fn flat_rows_query_graph_json_payload_decodes() {
+        let payload = json!({
+            "columns": ["f.qualified_name", "f.name", "f.file_path", "f.start_line", "f.end_line"],
+            "rows": [
+                ["repo.crates.a.src.skeleton.skeleton_for", "skeleton_for", "crates/a/src/skeleton.rs", "14", "48"],
+                ["repo.crates.a.src.cache.encode_field_into", "encode_field_into", "crates/a/src/cache.rs", "", ""]
+            ],
+            "returned": 2, "total": 2, "total_relation": "eq", "has_more": false, "truncated": false
+        });
+        let res = findings_and_summary("query_graph", &payload, Path::new("/repo"));
+        assert_eq!(res.findings.len(), 2);
+        let f = &res.findings[0];
+        assert_eq!(
+            f.location.path,
+            std::path::PathBuf::from("crates/a/src/skeleton.rs")
+        );
+        assert_eq!((f.location.line_start, f.location.line_end), (14, 48));
+        assert_eq!(
+            f.note.as_deref(),
+            Some("repo.crates.a.src.skeleton.skeleton_for")
+        );
+        assert_eq!(
+            (
+                res.findings[1].location.line_start,
+                res.findings[1].location.line_end
+            ),
+            (0, 0)
+        );
+    }
+
+    /// The default tree text CBM 0.11.0 answers `search_code` with factors
+    /// shared prefixes into `@N+suffix` refs — documented here as the shape
+    /// that must never be requested: its `file` cells are not paths.
+    #[test]
+    fn tree_text_prefix_refs_are_not_paths() {
+        let text = "results_refs: 2  (cols: id prefix)\n  0 repo.crates.a.src.\n  1 crates/a/src/\n\
+results_ref_rule: @N+suffix=prefix+suffix\n\
+results: 1  (cols: qn label file lines matches matches_omitted in out)\n  \
+@0+pipeline.retrieve Function @1+pipeline.rs 80-265 \"80\" 0 13 23\n";
+        let res = findings_and_summary(
+            "search_code",
+            &Value::String(text.to_string()),
+            Path::new("/repo"),
+        );
+        assert_eq!(
+            res.findings[0].location.path,
+            std::path::PathBuf::from("@1+pipeline.rs"),
+            "tree text is decoded verbatim; only format:\"json\" yields real paths"
+        );
     }
 
     /// Real `search_graph format:"json"` payload shape (columnar).
@@ -1569,24 +2109,6 @@ ensure_fresh_index crates/repo-explorer-core/src/memory.rs \"1\" \"81\" \"81\"\n
         );
     }
 
-    /// Real `detect_changes` payload shape (plain-text block via `Value::String`).
-    #[test]
-    fn parse_changed_count_reads_real_detect_changes_text() {
-        let text = "base: main\nmerge_base: abc123\ndirection: inbound\nchanged_files: 2\n  \
-docs/project-plan/9-custom_model_training.md\n  \
-docs/project-plan/9b-open_weights_finetune.md\nseed_symbols: 0\n";
-        assert_eq!(parse_changed_count(text), Some(2));
-    }
-
-    #[test]
-    fn parse_changed_count_zero_and_missing() {
-        assert_eq!(parse_changed_count("changed_files: 0\n"), Some(0));
-        assert_eq!(
-            parse_changed_count("base: main\ndirection: inbound\n"),
-            None
-        );
-    }
-
     /// `search_code`'s `file_pattern` needs real glob syntax, unlike the bare
     /// prefix `scope_hint` is built from everywhere else — verifies the
     /// conversion, trailing-slash-or-not alike.
@@ -1615,7 +2137,7 @@ docs/project-plan/9b-open_weights_finetune.md\nseed_symbols: 0\n";
     }
 
     #[test]
-    fn query_graph_args_uses_max_rows_key() {
+    fn query_graph_args_uses_max_rows_key_and_json_format() {
         // CBM 0.10.8's row cap is `max_rows`, not `limit` (silent drop).
         // No `project` assertion — the helper never sees `project`;
         // `call_memory_tool_with` seeds it via `base_args`.
@@ -1624,6 +2146,7 @@ docs/project-plan/9b-open_weights_finetune.md\nseed_symbols: 0\n";
         assert_eq!(args.get("max_rows").and_then(Value::as_u64), Some(5));
         assert!(!args.contains_key("limit"));
         assert_eq!(args.get("query").and_then(Value::as_str), Some("q"));
+        assert_eq!(args.get("format").and_then(Value::as_str), Some("json"));
     }
 
     #[test]
