@@ -634,7 +634,9 @@ async def main() -> None:
     )
     args = ap.parse_args()
 
-    binary = Path(args.binary).expanduser()
+    # Resolved: the server is spawned with cwd = the pinned clone, so a relative path would be
+    # looked up there, not here.
+    binary = Path(args.binary).expanduser().resolve()
     if not binary.exists():
         sys.exit(f"binary not found: {binary}")
 

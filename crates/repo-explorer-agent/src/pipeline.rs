@@ -10,8 +10,8 @@ use repo_explorer_core::domain::{
 use repo_explorer_core::fingerprint::RepoFingerprint;
 use repo_explorer_core::memory::{GraphQuery, MemoryBackend};
 use repo_explorer_core::retrieval::{
-    QueryPatterns, confidence, derive_patterns, is_unknown_location, leg_identifiers,
-    merge_and_rank,
+    QueryPatterns, confidence, derive_patterns, is_symbol_token, is_unknown_location,
+    leg_identifiers, merge_and_rank,
 };
 use repo_explorer_core::search::{SearchBackend, SearchOptions};
 use std::collections::HashSet;
@@ -351,17 +351,32 @@ fn unique_trusted_symbol(candidates: &[Candidate], patterns: &QueryPatterns) -> 
         .map(|(index, _)| index)
 }
 
+/// Longest query (in as-typed identifier tokens, stopwords excluded) in
+/// which a plain-word symbol match — a name with no underscore, digit or case
+/// change, indistinguishable from an English word — is still trusted for the
+/// early-exit gate. `verify`, `explain verify`, `who calls dispatch` are
+/// symbol lookups; `Claude Code says the server exited instead of starting
+/// the setup wizard` (F-23, hit the `server` module) and `where is the Wilson
+/// score interval computed` (F-24, hit the `Candidate.score` field) are prose
+/// that happens to contain a word some symbol is also called.
+const PLAIN_WORD_TRUST_MAX_IDENTIFIERS: usize = 2;
+
 /// A `SymbolExact` candidate is trustworthy for the early-exit gate only when
 /// its matched name was typed as a standalone query word, not merely a
 /// fragment extracted from decomposing a path/qualified-name compound (F-16:
 /// `.../verify.rs:35 what does this constant do` coincidentally matches the
 /// real `verify` module via the path's own basename, but the query never
-/// named `verify` as a symbol to look up).
+/// named `verify` as a symbol to look up), and — when that name is shaped
+/// like an ordinary word rather than code — only in a short, symbol-like
+/// query (F-23/F-24: a prose sentence naming `server` or `score` is not a
+/// request for the module or field of that name).
 fn is_trusted_symbol_match(candidate: &Candidate, patterns: &QueryPatterns) -> bool {
     candidate.kind == CandidateKind::SymbolExact
         && candidate.symbol.as_deref().is_some_and(|name| {
             let matched = last_segment(name);
             !patterns.path_tokens.iter().any(|p| p.contains(matched))
+                && (is_symbol_token(matched)
+                    || patterns.original_identifier_count <= PLAIN_WORD_TRUST_MAX_IDENTIFIERS)
         })
 }
 
@@ -599,6 +614,49 @@ mod tests {
         // verify against the filesystem, so it must not license the skip.
         let unknown = vec![symbol_candidate("a.rs", 0, "m::decide_freshness")];
         assert_eq!(unique_trusted_symbol(&unknown, &patterns), None);
+    }
+
+    #[test]
+    fn plain_word_symbol_match_in_a_prose_query_is_untrusted() {
+        // F-23: `server` is a real Module node, but the query is a sentence.
+        let f23 = derive_patterns(
+            "Claude Code says the server exited instead of starting the setup wizard",
+        );
+        let module = symbol_candidate("crates/repo-explorer-mcp/src/server.rs", 1, "p.src.server");
+        assert!(!is_trusted_symbol_match(&module, &f23));
+        assert_eq!(
+            unique_trusted_symbol(std::slice::from_ref(&module), &f23),
+            None
+        );
+
+        // F-24: `score` is a real struct field, but the query is a sentence.
+        let f24 = derive_patterns("where is the Wilson score interval computed");
+        let field = symbol_candidate(
+            "crates/repo-explorer-core/src/domain.rs",
+            75,
+            "p.domain.Candidate.score",
+        );
+        assert!(!is_trusted_symbol_match(&field, &f24));
+
+        // F-16 stays: a plain-word symbol typed as (nearly) the whole query is
+        // a lookup, whatever its shape.
+        for q in ["verify", "explain verify", "where is verify defined"] {
+            let p = derive_patterns(q);
+            assert!(
+                is_trusted_symbol_match(&symbol_candidate("v.rs", 10, "m.verify"), &p),
+                "{q}"
+            );
+        }
+        // A code-shaped name is trusted regardless of how much prose surrounds it.
+        let prose = derive_patterns("where exactly is the derive_patterns helper function defined");
+        assert!(is_trusted_symbol_match(
+            &symbol_candidate("r.rs", 150, "m.derive_patterns"),
+            &prose
+        ));
+        assert!(is_trusted_symbol_match(
+            &symbol_candidate("a.rs", 52, "m.TokenBudget"),
+            &f23
+        ));
     }
 
     #[test]
