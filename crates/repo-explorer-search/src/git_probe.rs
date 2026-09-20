@@ -6,19 +6,38 @@
 use git2::{ObjectType, Oid, Repository, Status, StatusOptions};
 use repo_explorer_core::fingerprint::{RepoFingerprint, RepoStateProbe};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+
+/// Single-slot cache for the most-recently-opened top-level `Repository`,
+/// keyed by the exact `repo_root` it was opened for.
+type RepoSlot = Mutex<Option<(PathBuf, Repository)>>;
+/// Per-file `(len, mtime) -> content oid` cache, guarded by the
+/// [`RACY_MARGIN`] check in `cached_hash_or_compute`.
+type HashCache = Mutex<HashMap<PathBuf, (u64, Option<SystemTime>, Oid)>>;
 
 /// Probes repository state via the in-process `git2` (libgit2) library. Every
 /// failure (not a repository, bare repo, unborn HEAD, per-file stat/hash
 /// error) degrades to `None` — "no fingerprint" simply disables caching for
-/// that call.
-pub struct GitStateProbe;
+/// that call. Holds a single-slot repo handle (shared between `fingerprint`
+/// and `changed_paths`) and a per-file content-hash cache, both behind
+/// `Arc<Mutex<_>>` so they can be moved into the `spawn_blocking` closures.
+pub struct GitStateProbe {
+    timeout: Duration,
+    repo_slot: Arc<RepoSlot>,
+    hash_cache: Arc<HashCache>,
+}
 
 impl GitStateProbe {
-    /// `timeout_seconds` is accepted for call-site compatibility but unused:
-    /// git2 does local-only filesystem ops with no cancellation point.
-    pub fn new(_timeout_seconds: u64) -> Self {
-        Self
+    /// `timeout_seconds = 0` means "no timeout", matching `SearchConfig`.
+    pub fn new(timeout_seconds: u64) -> Self {
+        Self {
+            timeout: Duration::from_secs(timeout_seconds),
+            repo_slot: Arc::new(Mutex::new(None)),
+            hash_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -61,18 +80,90 @@ fn sha256_hex(parts: &[&str]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Single blocking status walk. Every relative path is joined against
-/// `workdir` (never the caller's `repo_root`, which may be a strict
-/// subdirectory of the git top level). Tracked-changed entries fold in a
-/// cheap content-sensitive blob oid (`Oid::hash_file`, no odb write, works for
-/// text AND binary); untracked entries fold in a `(len, mtime)` stat via
-/// `symlink_metadata` (F-07) — deliberately NOT a content hash, preserving the
-/// large-untracked-tree perf guard, and stating the link itself so a dangling
-/// untracked symlink's own target string is what varies. Ignored files stay
-/// excluded (default `StatusOptions`), a deliberate carried-forward gap.
-/// `parts` is sorted because git2's status entry order is not guaranteed.
-fn fingerprint_blocking(repo_root: &Path) -> Option<RepoFingerprint> {
-    let repo = Repository::discover(repo_root).ok()?;
+/// Racy-git guard: a cache entry is only trusted (read or written) when the
+/// file's mtime is already safely older than this margin relative to "now".
+/// Two writes to the same path within one filesystem mtime tick would
+/// otherwise be indistinguishable by `(len, mtime)` alone, silently hiding a
+/// real content change (exactly the risk the design explicitly rejected for
+/// "path-set-only" fingerprinting). Requiring the file to have been quiet for
+/// at least `RACY_MARGIN` before trusting its stat means a just-written file
+/// is always rehashed — a large *stable* dirty file (the actual perf target)
+/// gets the fast path; a file mid-edit never does.
+const RACY_MARGIN: Duration = Duration::from_secs(2);
+
+/// Content oid for a tracked-changed file, with a racy-git-safe stat cache to
+/// avoid re-reading and re-hashing a large file that hasn't changed since the
+/// last call. No eviction: an upgrade path if long-running processes with
+/// many distinct dirty files ever make this cache's memory use a concern.
+fn cached_hash_or_compute(full: &Path, cache: &HashCache) -> Option<Oid> {
+    let meta = std::fs::metadata(full).ok()?;
+    let len = meta.len();
+    let mtime = meta.modified().ok();
+    let stable = mtime
+        .and_then(|m| SystemTime::now().duration_since(m).ok())
+        .is_some_and(|age| age > RACY_MARGIN);
+
+    if stable
+        && let Some((cached_len, cached_mtime, oid)) = cache.lock().unwrap().get(full)
+        && *cached_len == len
+        && *cached_mtime == mtime
+    {
+        return Some(*oid);
+    }
+
+    let oid = Oid::hash_file(ObjectType::Blob, full).ok()?;
+    if stable {
+        cache
+            .lock()
+            .unwrap()
+            .insert(full.to_path_buf(), (len, mtime, oid));
+    }
+    Some(oid)
+}
+
+/// Runs `f` against the cached top-level `Repository` for `repo_root`,
+/// (re)opening it only when the slot is empty or holds a different
+/// `repo_root` — shared between `fingerprint` and `changed_paths` so a
+/// same-repo call pair (the common `AgentLoop` pattern) discovers `.git`
+/// once, not twice. Single slot, so concurrent calls for different repos
+/// serialize on this lock; upgrade to a keyed table if that ever matters.
+fn with_repo<T>(
+    repo_root: &Path,
+    repo_slot: &RepoSlot,
+    f: impl FnOnce(&Repository) -> Option<T>,
+) -> Option<T> {
+    let mut guard = repo_slot.lock().unwrap();
+    let reuse = matches!(guard.as_ref(), Some((cached, _)) if cached == repo_root);
+    if !reuse {
+        let repo = Repository::discover(repo_root).ok()?;
+        *guard = Some((repo_root.to_path_buf(), repo));
+    }
+    f(&guard.as_ref()?.1)
+}
+
+fn fingerprint_blocking(
+    repo_root: &Path,
+    repo_slot: &RepoSlot,
+    hash_cache: &HashCache,
+) -> Option<RepoFingerprint> {
+    with_repo(repo_root, repo_slot, |repo| {
+        fingerprint_from_repo(repo, hash_cache)
+    })
+}
+
+/// Single blocking status walk over an already-opened `repo`. Every relative
+/// path is joined against `workdir` (never the caller's `repo_root`, which
+/// may be a strict subdirectory of the git top level). Tracked-changed
+/// entries fold in a cheap content-sensitive blob oid (`Oid::hash_file`, no
+/// odb write, works for text AND binary, cached — see
+/// `cached_hash_or_compute`); untracked entries fold in a `(len, mtime)` stat
+/// via `symlink_metadata` (F-07) — deliberately NOT a content hash,
+/// preserving the large-untracked-tree perf guard, and stating the link
+/// itself so a dangling untracked symlink's own target string is what
+/// varies. Ignored files stay excluded (default `StatusOptions`), a
+/// deliberate carried-forward gap. `parts` is sorted because git2's status
+/// entry order is not guaranteed.
+fn fingerprint_from_repo(repo: &Repository, hash_cache: &HashCache) -> Option<RepoFingerprint> {
     let workdir = repo.workdir()?.to_path_buf();
 
     // Unborn branch (commit-less repo) → head() fails → None, matching the
@@ -121,10 +212,16 @@ fn fingerprint_blocking(repo_root: &Path) -> Option<RepoFingerprint> {
             // Oid::hash_file cannot read a directory, and the directory's
             // own mtime does not change either when a file nested inside it
             // is edited or when it is checked out to a different commit.
-            // Recurse as its own repo so both transitions are visible; if
-            // it isn't actually a git repo (or has no commits yet), fall
-            // back to the stat string like every other hash failure.
-            let part = match fingerprint_blocking(&full) {
+            // Recurse as its own repo so both transitions are visible; a
+            // fresh (uncached) discover, since a submodule isn't the
+            // top-level repo_root the shared slot tracks, and reusing that
+            // slot here would recursively lock it. If it isn't actually a
+            // git repo (or has no commits yet), fall back to the stat
+            // string like every other hash failure.
+            let part = match Repository::discover(&full)
+                .ok()
+                .and_then(|sub| fingerprint_from_repo(&sub, hash_cache))
+            {
                 Some(fp) => format!("{path}:{bits}:sub:{}:{}", fp.head_sha, fp.dirty_hash),
                 None => stat_tag(path, bits, &full),
             };
@@ -135,9 +232,9 @@ fn fingerprint_blocking(repo_root: &Path) -> Option<RepoFingerprint> {
             // (so a mode-only `chmod +x`/`-x` with no content change still
             // varies the fingerprint, matching git's own mode tracking); on
             // error fall back to a stat string so the entry still varies.
-            let part = match Oid::hash_file(ObjectType::Blob, &full) {
-                Ok(oid) => format!("{path}:{bits}:{}:{oid}", exec_bit(&full)),
-                Err(_) => stat_tag(path, bits, &full),
+            let part = match cached_hash_or_compute(&full, hash_cache) {
+                Some(oid) => format!("{path}:{bits}:{}:{oid}", exec_bit(&full)),
+                None => stat_tag(path, bits, &full),
             };
             parts.push(part);
         }
@@ -155,40 +252,70 @@ fn fingerprint_blocking(repo_root: &Path) -> Option<RepoFingerprint> {
 /// `old_file()` carries the path — so fall back to it, otherwise every deleted
 /// file is silently dropped (regresses vs `git diff --name-only`). Any
 /// resolution failure → `None`.
-fn changed_paths_blocking(repo_root: &Path, from_sha: &str, to_sha: &str) -> Option<Vec<PathBuf>> {
-    let repo = Repository::discover(repo_root).ok()?;
-    let from_tree = repo
-        .find_commit(Oid::from_str(from_sha).ok()?)
-        .ok()?
-        .tree()
-        .ok()?;
-    let to_tree = repo
-        .find_commit(Oid::from_str(to_sha).ok()?)
-        .ok()?
-        .tree()
-        .ok()?;
-    let diff = repo
-        .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)
-        .ok()?;
-    let paths = diff
-        .deltas()
-        .filter_map(|d| {
-            d.new_file()
-                .path()
-                .or_else(|| d.old_file().path())
-                .map(PathBuf::from)
-        })
-        .collect();
-    Some(paths)
+fn changed_paths_blocking(
+    repo_root: &Path,
+    from_sha: &str,
+    to_sha: &str,
+    repo_slot: &RepoSlot,
+) -> Option<Vec<PathBuf>> {
+    with_repo(repo_root, repo_slot, |repo| {
+        let from_tree = repo
+            .find_commit(Oid::from_str(from_sha).ok()?)
+            .ok()?
+            .tree()
+            .ok()?;
+        let to_tree = repo
+            .find_commit(Oid::from_str(to_sha).ok()?)
+            .ok()?
+            .tree()
+            .ok()?;
+        let diff = repo
+            .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)
+            .ok()?;
+        let paths = diff
+            .deltas()
+            .filter_map(|d| {
+                d.new_file()
+                    .path()
+                    .or_else(|| d.old_file().path())
+                    .map(PathBuf::from)
+            })
+            .collect();
+        Some(paths)
+    })
+}
+
+/// Runs blocking git2 work off the async runtime, bounded by `timeout`
+/// (`Duration::ZERO` = no timeout, matching `SearchConfig`). A `spawn_blocking`
+/// task cannot be cancelled, so on timeout the blocking call keeps running in
+/// the background while this returns `None` — acceptable for the fast local
+/// reads git2 does here; a stuck network-mounted `.git` or pathologically
+/// large repo degrades to "no fingerprint" instead of hanging the caller.
+async fn run_blocking<T: Send + 'static>(
+    timeout: Duration,
+    f: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Option<T> {
+    let handle = tokio::task::spawn_blocking(f);
+    if timeout.is_zero() {
+        handle.await.ok().flatten()
+    } else {
+        tokio::time::timeout(timeout, handle)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+    }
 }
 
 impl RepoStateProbe for GitStateProbe {
     async fn fingerprint(&self, repo_root: &Path) -> Option<RepoFingerprint> {
         let repo_root = repo_root.to_path_buf();
-        tokio::task::spawn_blocking(move || fingerprint_blocking(&repo_root))
-            .await
-            .ok()
-            .flatten()
+        let repo_slot = Arc::clone(&self.repo_slot);
+        let hash_cache = Arc::clone(&self.hash_cache);
+        run_blocking(self.timeout, move || {
+            fingerprint_blocking(&repo_root, &repo_slot, &hash_cache)
+        })
+        .await
     }
 
     async fn changed_paths(
@@ -209,10 +336,11 @@ impl RepoStateProbe for GitStateProbe {
         let repo_root = repo_root.to_path_buf();
         let from_sha = from.head_sha.clone();
         let to_sha = to.head_sha.clone();
-        tokio::task::spawn_blocking(move || changed_paths_blocking(&repo_root, &from_sha, &to_sha))
-            .await
-            .ok()
-            .flatten()
+        let repo_slot = Arc::clone(&self.repo_slot);
+        run_blocking(self.timeout, move || {
+            changed_paths_blocking(&repo_root, &from_sha, &to_sha, &repo_slot)
+        })
+        .await
     }
 }
 
@@ -580,6 +708,31 @@ mod tests {
         assert!(
             changed.contains(&PathBuf::from("b.txt")),
             "a committed deletion must appear in changed_paths, got {changed:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// New regression: two same-length, same-tick tracked edits must never
+    /// collapse via the hash cache's racy-git guard — the second edit lands
+    /// well within `RACY_MARGIN` of the first, so it must always be rehashed.
+    #[tokio::test]
+    async fn rapid_same_length_tracked_edits_are_never_hidden_by_the_hash_cache() {
+        let dir = temp_dir("racy");
+        let repo = init_repo(&dir);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        write_commit(&repo, "c1");
+
+        let probe = GitStateProbe::new(30);
+        std::fs::write(dir.join("a.txt"), "AAA\n").unwrap();
+        let first = probe.fingerprint(&dir).await.expect("fingerprint");
+        // Same length as "AAA\n", written immediately after — well inside
+        // RACY_MARGIN, so a naive (len, mtime) cache could wrongly hit.
+        std::fs::write(dir.join("a.txt"), "BBB\n").unwrap();
+        let second = probe.fingerprint(&dir).await.expect("fingerprint");
+        assert_ne!(
+            first.dirty_hash, second.dirty_hash,
+            "a same-length rapid re-edit must never be hidden by the stat cache"
         );
 
         std::fs::remove_dir_all(&dir).ok();

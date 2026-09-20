@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 repo-explorer-core = { version = "0.10.0", path = "../repo-explorer-core" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 sha2 = "0.11"
 hex = "0.4"
 ignore = "0.4"
