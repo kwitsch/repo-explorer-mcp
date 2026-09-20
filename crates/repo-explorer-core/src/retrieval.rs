@@ -355,6 +355,107 @@ fn kind_base_score(kind: CandidateKind) -> u32 {
     }
 }
 
+/// Base score for a `ContentHit` whose matched text reproduces a quoted
+/// literal or a code-shaped identifier from the query verbatim. A grep hit on
+/// a plain word (`text`, `come`) is noise and keeps `kind_base_score`'s floor,
+/// but `"Invalid URL"` or `merge_and_rank` landing on a line is exactly the
+/// evidence the query asked for — at the 150 floor it could never outrank a
+/// `SymbolFuzzy` row (400) and was truncated out of `top_k` on every run
+/// (F-25). Sits just under `SymbolExact` so a definition still outranks its
+/// call sites.
+const STRONG_CONTENT_HIT_BASE: u32 = 650;
+
+/// True when a `ContentHit`'s snippet contains one of `strong_keys` (already
+/// folded via `canonical_coverage_key`). Only the snippet counts: a path that
+/// happens to contain the identifier is not a content match.
+fn has_strong_content_match(candidate: &Candidate, strong_keys: &[String]) -> bool {
+    if !matches!(candidate.kind, CandidateKind::ContentHit) || strong_keys.is_empty() {
+        return false;
+    }
+    let Some(snippet) = candidate.snippet.as_deref() else {
+        return false;
+    };
+    let folded = canonical_coverage_key(snippet);
+    strong_keys.iter().any(|key| folded.contains(key.as_str()))
+}
+
+/// The base a candidate scores from: `STRONG_CONTENT_HIT_BASE` for a grep hit
+/// that reproduces a strong key, `kind_base_score` otherwise. Used both for
+/// scoring and for deciding which side of an overlapping merge keeps its
+/// identity, so a literal hit inside a wide `SemanticHit` range survives as
+/// the `ContentHit` it is instead of being swallowed at the semantic floor.
+fn effective_base(candidate: &Candidate, strong_keys: &[String]) -> u32 {
+    if has_strong_content_match(candidate, strong_keys) {
+        STRONG_CONTENT_HIT_BASE
+    } else {
+        kind_base_score(candidate.kind)
+    }
+}
+
+/// Identifiers eligible as strong keys: `is_symbol_token` minus tokens whose
+/// only code signal is a capitalized first letter. `Wilson`, `Authorization`
+/// or a sentence-initial `Claude` read as code to `is_symbol_token` (upper +
+/// lower) but are prose; `InvalidURL`, `HTTPBasicAuth`, `merge_and_rank` and
+/// `gemini3` keep an interior underscore/digit/case change and stay eligible.
+fn is_strong_identifier(token: &str) -> bool {
+    is_symbol_token(token) && !token.chars().skip(1).all(|c| c.is_ascii_lowercase())
+}
+
+/// At most this many candidates from one file survive `top_k` truncation
+/// while other files still have rows waiting. A file that repeats one strong
+/// hit many times (a JSON schema naming `additionalProperties` on every tool,
+/// a test module calling the function under test a dozen times) must not fill
+/// the whole list and push every other file out (F-25). Once every other file
+/// is exhausted the remaining slots are backfilled by score, so a "list every
+/// occurrence" query over a single file still gets its full `top_k`.
+const MAX_PER_FILE_IN_TOP_K: usize = 3;
+
+/// Truncate `sorted` (score-desc order) to `top_k`, giving each file at most
+/// `MAX_PER_FILE_IN_TOP_K` slots in a first pass and backfilling by score.
+/// Relative order is preserved.
+fn truncate_with_file_cap(sorted: &mut Vec<Candidate>, top_k: usize) {
+    if sorted.len() <= top_k {
+        return;
+    }
+    let mut keep = vec![false; sorted.len()];
+    let mut kept = 0;
+    let mut per_file: Vec<(&Path, usize)> = Vec::new();
+    for (i, candidate) in sorted.iter().enumerate() {
+        if kept == top_k {
+            break;
+        }
+        let path = candidate.location.path.as_path();
+        let slot = match per_file.iter().position(|(p, _)| *p == path) {
+            Some(slot) => slot,
+            None => {
+                per_file.push((path, 0));
+                per_file.len() - 1
+            }
+        };
+        let count = &mut per_file[slot].1;
+        if *count < MAX_PER_FILE_IN_TOP_K {
+            *count += 1;
+            keep[i] = true;
+            kept += 1;
+        }
+    }
+    for slot in keep.iter_mut() {
+        if kept == top_k {
+            break;
+        }
+        if !*slot {
+            *slot = true;
+            kept += 1;
+        }
+    }
+    let mut index = 0;
+    sorted.retain(|_| {
+        let k = keep[index];
+        index += 1;
+        k
+    });
+}
+
 /// Fold a token to a convention-insensitive coverage key: lowercase and drop
 /// `_`, so `resolveRedirects`, `resolve_redirects`, and `resolveredirects` all
 /// compare equal for coverage counting.
@@ -425,11 +526,12 @@ fn overlaps(a: &FileLocation, b: &FileLocation) -> bool {
     a.line_start <= b.line_end && b.line_start <= a.line_end
 }
 
-/// Merge `b` into `a`: widen the range, keep the stronger kind's identity.
-fn merge_into(a: &mut Candidate, b: Candidate) {
+/// Merge `b` into `a`: widen the range, keep the identity of the side with the
+/// higher `effective_base` (kind, or strong-content promotion).
+fn merge_into(a: &mut Candidate, b: Candidate, strong_keys: &[String]) {
     a.location.line_start = a.location.line_start.min(b.location.line_start);
     a.location.line_end = a.location.line_end.max(b.location.line_end);
-    if kind_base_score(b.kind) > kind_base_score(a.kind) {
+    if effective_base(&b, strong_keys) > effective_base(a, strong_keys) {
         a.kind = b.kind;
         a.symbol = b.symbol.or(a.symbol.take());
         if b.snippet.is_some() {
@@ -460,6 +562,22 @@ pub fn merge_and_rank(raw: Vec<Candidate>, patterns: &QueryPatterns, top_k: u32)
         let key = canonical_coverage_key(token);
         if key.len() >= MIN_COVERAGE_KEY_LEN {
             push_unique(&mut lowered_patterns, key);
+        }
+    }
+    // The subset a grep hit may reproduce verbatim to earn
+    // STRONG_CONTENT_HIT_BASE: every quoted literal, plus identifiers that are
+    // code-shaped (`is_symbol_token`) — the same "looks like code" test the
+    // early-exit trust gate uses (F-23), so a plain prose word never qualifies.
+    let mut strong_keys: Vec<String> = Vec::new();
+    for token in patterns.literals.iter().chain(
+        patterns
+            .identifiers
+            .iter()
+            .filter(|t| is_strong_identifier(t)),
+    ) {
+        let key = canonical_coverage_key(token);
+        if key.len() >= MIN_COVERAGE_KEY_LEN {
+            push_unique(&mut strong_keys, key);
         }
     }
 
@@ -496,7 +614,7 @@ pub fn merge_and_rank(raw: Vec<Candidate>, patterns: &QueryPatterns, top_k: u32)
             let candidate = candidates.next().expect("peeked Some above");
             match file_merged.last_mut() {
                 Some(last) if overlaps(&last.location, &candidate.location) => {
-                    merge_into(last, candidate);
+                    merge_into(last, candidate, &strong_keys);
                 }
                 _ => file_merged.push(candidate),
             }
@@ -505,7 +623,7 @@ pub fn merge_and_rank(raw: Vec<Candidate>, patterns: &QueryPatterns, top_k: u32)
         // to be the answer; boost each surviving candidate.
         let density_boost = 15 * (file_merged.len().saturating_sub(1)).min(4) as u32;
         for mut candidate in file_merged {
-            let base = kind_base_score(candidate.kind);
+            let base = effective_base(&candidate, &strong_keys);
             let coverage_boost = (30 * coverage(&candidate, &lowered_patterns)).min(120);
             candidate.score = (base + coverage_boost + density_boost).min(MAX_SCORE);
             merged.push(candidate);
@@ -518,7 +636,7 @@ pub fn merge_and_rank(raw: Vec<Candidate>, patterns: &QueryPatterns, top_k: u32)
             .then_with(|| a.location.path.cmp(&b.location.path))
             .then_with(|| a.location.line_start.cmp(&b.location.line_start))
     });
-    merged.truncate(top_k as usize);
+    truncate_with_file_cap(&mut merged, top_k as usize);
     merged
 }
 
@@ -943,25 +1061,25 @@ mod tests {
         // must collapse to one distinct term for coverage scoring.
         let p = derive_patterns("check Cache and cache items");
         assert_eq!(p.identifiers, vec!["check", "Cache", "cache", "items"]);
-        let mut c = candidate("a.rs", 1, 1, CandidateKind::ContentHit);
+        let mut c = candidate("a.rs", 1, 1, CandidateKind::SemanticHit);
         c.snippet = Some("check cache items".to_string());
         let ranked = merge_and_rank(vec![c], &p, 10);
         // 3 distinct terms ("check", "cache", "items") -> boost of 90, not 120.
         assert_eq!(
             ranked[0].score,
-            kind_base_score(CandidateKind::ContentHit) + 90
+            kind_base_score(CandidateKind::SemanticHit) + 90
         );
     }
 
     #[test]
     fn coverage_boost_is_capped() {
         let p = derive_patterns("alpha_x beta_x gamma_x delta_x epsilon_x zeta_x");
-        let mut c = candidate("a.rs", 1, 1, CandidateKind::ContentHit);
+        let mut c = candidate("a.rs", 1, 1, CandidateKind::SemanticHit);
         c.snippet = Some("alpha_x beta_x gamma_x delta_x epsilon_x zeta_x".to_string());
         let ranked = merge_and_rank(vec![c], &p, 10);
         assert_eq!(
             ranked[0].score,
-            kind_base_score(CandidateKind::ContentHit) + 120
+            kind_base_score(CandidateKind::SemanticHit) + 120
         );
     }
 
@@ -974,13 +1092,13 @@ mod tests {
         // them.
         let p = derive_patterns("resolveRedirects");
         assert!(p.identifiers.contains(&"resolve_redirects".to_string()));
-        let mut c = candidate("a.rs", 1, 1, CandidateKind::ContentHit);
+        let mut c = candidate("a.rs", 1, 1, CandidateKind::SemanticHit);
         c.snippet = Some("call resolveRedirects then resolve_redirects".to_string());
         let ranked = merge_and_rank(vec![c], &p, 10);
         // one distinct concept -> boost of 30, not 60.
         assert_eq!(
             ranked[0].score,
-            kind_base_score(CandidateKind::ContentHit) + 30
+            kind_base_score(CandidateKind::SemanticHit) + 30
         );
     }
 
@@ -995,6 +1113,148 @@ mod tests {
         c.snippet = Some("considering the options".to_string());
         let ranked = merge_and_rank(vec![c], &p, 10);
         assert_eq!(ranked[0].score, kind_base_score(CandidateKind::ContentHit));
+    }
+
+    #[test]
+    fn literal_content_hit_outranks_fuzzy_symbol_noise() {
+        // F-25: requests-P3-01. The grep hit reproducing the quoted literal
+        // must not sit below a SymbolFuzzy row that merely contains the plain
+        // word "text" — at the 150 floor it was truncated out of top_k.
+        let p = derive_patterns("where does the error text \"Invalid URL\" come from");
+        let mut hit = candidate(
+            "src/requests/models.py",
+            522,
+            522,
+            CandidateKind::ContentHit,
+        );
+        hit.snippet = Some("raise InvalidURL(f\"Invalid URL {url!r}: No host supplied\")".into());
+        let mut noise = candidate(
+            "src/requests/adapters.py",
+            85,
+            119,
+            CandidateKind::SymbolFuzzy,
+        );
+        noise.symbol = Some("_urllib3_request_context".into());
+        let ranked = merge_and_rank(vec![noise, hit], &p, 10);
+        assert_eq!(
+            ranked[0].location.path,
+            PathBuf::from("src/requests/models.py")
+        );
+        assert!(ranked[0].score >= STRONG_CONTENT_HIT_BASE);
+        // Still below an exact symbol match: a definition outranks a call site.
+        assert!(ranked[0].score < kind_base_score(CandidateKind::SymbolExact));
+    }
+
+    #[test]
+    fn code_shaped_identifier_content_hit_is_strong() {
+        // F-25: self-P4-01. `merge_and_rank` is snake_case, so its call site
+        // qualifies; `calls` is a plain word and does not.
+        let p = derive_patterns("who calls merge_and_rank");
+        let mut call_site = candidate("pipeline.rs", 281, 281, CandidateKind::ContentHit);
+        call_site.snippet = Some("let candidates = merge_and_rank(raw, &patterns, top_k);".into());
+        let mut plain = candidate("agent.rs", 5, 5, CandidateKind::ContentHit);
+        plain.snippet = Some("// counts provider calls".into());
+        let ranked = merge_and_rank(vec![plain, call_site], &p, 10);
+        assert_eq!(ranked[0].location.path, PathBuf::from("pipeline.rs"));
+        assert!(ranked[0].score >= STRONG_CONTENT_HIT_BASE);
+        assert_eq!(
+            ranked[1].score,
+            kind_base_score(CandidateKind::ContentHit) + 30
+        );
+    }
+
+    #[test]
+    fn strong_key_in_path_only_does_not_promote_content_hit() {
+        // Only the matched text counts: a plain-word grep hit inside a file
+        // whose *path* carries the code-shaped identifier stays at the floor
+        // (plus its coverage boost from the path match).
+        let p = derive_patterns("merge_and_rank calls");
+        let mut c = candidate("merge_and_rank.rs", 1, 1, CandidateKind::ContentHit);
+        c.snippet = Some("// calls".into());
+        let ranked = merge_and_rank(vec![c], &p, 10);
+        assert!(ranked[0].score < STRONG_CONTENT_HIT_BASE);
+    }
+
+    #[test]
+    fn merely_capitalized_word_is_not_a_strong_key() {
+        // F-25 follow-up: `Wilson` / `Authorization` pass is_symbol_token
+        // (upper + lower) but are prose; only an interior underscore, digit,
+        // or case change makes an identifier strong.
+        assert!(!is_strong_identifier("Wilson"));
+        assert!(!is_strong_identifier("Authorization"));
+        assert!(is_strong_identifier("InvalidURL"));
+        assert!(is_strong_identifier("HTTPBasicAuth"));
+        assert!(is_strong_identifier("merge_and_rank"));
+        assert!(is_strong_identifier("gemini3"));
+        let p = derive_patterns("where is the Wilson interval computed");
+        let mut c = candidate("a.rs", 1, 1, CandidateKind::ContentHit);
+        c.snippet = Some("// Wilson interval".into());
+        let ranked = merge_and_rank(vec![c], &p, 10);
+        assert!(ranked[0].score < STRONG_CONTENT_HIT_BASE);
+    }
+
+    #[test]
+    fn strong_content_hit_survives_merge_into_wider_semantic_range() {
+        // A literal hit inside a method that a SemanticHit already covers must
+        // keep its ContentHit identity (and strong base), not be swallowed at
+        // the semantic floor.
+        let p = derive_patterns("where does \"Invalid URL\" come from");
+        let wide = candidate("models.py", 400, 530, CandidateKind::SemanticHit);
+        let mut hit = candidate("models.py", 522, 522, CandidateKind::ContentHit);
+        hit.snippet = Some("raise InvalidURL(f\"Invalid URL {url!r}\")".into());
+        let ranked = merge_and_rank(vec![wide, hit], &p, 10);
+        assert_eq!(ranked.len(), 1);
+        assert!(matches!(ranked[0].kind, CandidateKind::ContentHit));
+        assert!(ranked[0].score >= STRONG_CONTENT_HIT_BASE);
+        assert_eq!(
+            (ranked[0].location.line_start, ranked[0].location.line_end),
+            (400, 530)
+        );
+    }
+
+    #[test]
+    fn one_file_cannot_fill_top_k_while_other_files_wait() {
+        // F-25 follow-up: a schema file repeating `additionalProperties` on
+        // every line must leave room for the lower-scored real answer.
+        let p = derive_patterns("strips additionalProperties");
+        let mut raw: Vec<Candidate> = (1..=6)
+            .map(|i| {
+                let mut c = candidate("tools.rs", i * 10, i * 10, CandidateKind::ContentHit);
+                c.snippet = Some("\"additionalProperties\": false".into());
+                c
+            })
+            .collect();
+        let mut answer = candidate("lib.rs", 444, 453, CandidateKind::SymbolFuzzy);
+        answer.symbol = Some("strip_additional_properties".into());
+        raw.push(answer);
+        let ranked = merge_and_rank(raw, &p, 4);
+        assert_eq!(ranked.len(), 4);
+        let tools = ranked
+            .iter()
+            .filter(|c| c.location.path == Path::new("tools.rs"))
+            .count();
+        assert_eq!(tools, MAX_PER_FILE_IN_TOP_K);
+        assert!(
+            ranked
+                .iter()
+                .any(|c| c.location.path == Path::new("lib.rs"))
+        );
+        // Score order is preserved: the lib.rs row is last, not interleaved.
+        assert_eq!(ranked[3].location.path, PathBuf::from("lib.rs"));
+    }
+
+    #[test]
+    fn file_cap_backfills_when_no_other_file_remains() {
+        let p = derive_patterns("tracing_info");
+        let raw: Vec<Candidate> = (1..=6)
+            .map(|i| {
+                let mut c = candidate("agent.rs", i * 10, i * 10, CandidateKind::ContentHit);
+                c.snippet = Some("tracing_info!(...)".into());
+                c
+            })
+            .collect();
+        let ranked = merge_and_rank(raw, &p, 5);
+        assert_eq!(ranked.len(), 5);
     }
 
     // --- confidence boundaries ---
