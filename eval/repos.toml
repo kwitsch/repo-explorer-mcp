@@ -6,7 +6,8 @@
 # run; `path` is the clone location outside this workspace. `git_probe_ms` is the Phase-0
 # measurement from §5 step 1 (median of 5 warm `git status --porcelain && git diff HEAD` runs) —
 # used as the cache-latency threshold in §7.5. `files`/`loc_by_ext` are the Phase-0 probe from
-# §5 step 1 too.
+# §5 step 1 too. `warmup_query` is the unscored first call of every pass (index trigger + L1
+# seed) and must not appear in queries/<id>.yaml, or that query is a cache hit in every pass.
 
 [[repo]]
 id = "self"
@@ -20,6 +21,8 @@ path = "~/repos/eval-corpus/self"
 files = 76
 git_probe_ms = 2
 notes = "dogfood; exact ground truth; author bias; all queries use scope_hint=crates (§3.2, corpus contamination)"
+# Bare unique symbol: 0-LLM early exit, indexes the project, and is not a corpus query (see run.py).
+warmup_query = "canonicalize_repo_root"
 
 [[repo]]
 id = "requests"
@@ -33,3 +36,4 @@ path = "~/repos/eval-corpus/requests"
 files = 130
 git_probe_ms = 2
 notes = "canonical small lib; typed; decorators, hooks"
+warmup_query = "HTTPDigestAuth"

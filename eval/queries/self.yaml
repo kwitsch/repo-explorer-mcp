@@ -14,6 +14,7 @@
     primary_mode: all
     primary:
       - { path: crates/repo-explorer-core/src/retrieval.rs, symbol: derive_patterns, span: [150, 215] }
+    stage: early-exit
   notes: "21 grep hits for 'derive_patterns' concentrated in retrieval.rs — grep leg should survive; early-exit expected. span is the full function body (150-215), confirmed live during Phase-0 harness validation: the tool correctly returns the whole function, and a def-line-only span [150,150] would wrongly fail range_hit's 3x/40-line cap"
 
 - id: self-P1-DE-01
@@ -25,6 +26,7 @@
     primary_mode: all
     primary:
       - { path: crates/repo-explorer-mcp/src/main.rs, symbol: wait_for_running_memory_binary, span: [261, 274] }
+    stage: early-exit
 
 - id: self-P1t-01
   cat: P1t
@@ -200,3 +202,15 @@
   expect:
     primary_mode: all
     primary: []
+
+- id: self-N-02
+  cat: N
+  sub: near
+  lang: en
+  query: "where is the Wilson score interval computed"
+  scope_hint: crates
+  negative: { kind: near }
+  expect:
+    primary_mode: all
+    primary: []
+  notes: "near negative: wilson_ci exists in this repo's own eval/score.py (Python, outside scope_hint=crates), nowhere under crates/ at this pin"

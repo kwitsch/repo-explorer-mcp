@@ -371,21 +371,56 @@ def compute_cand_recall(candidates_ranked: list[dict] | None, expect: dict) -> d
     it), and at what rank? Distinguishes `retrieval-miss` (never a candidate) from `rank>k`
     (a candidate, just not surfaced by the LLM stage) from everything downstream of retrieval."""
     if candidates_ranked is None:
-        return {"cand_recall_at_topk": None, "cand_rank": None}
+        return {"cand_recall_at_topk": None, "cand_rank": None, "cand_kind": None}
     primary = expect.get("primary", []) or []
     target_files = {p["path"] for p in primary}
     for member in expect.get("equivalent", []) or []:
         target_files.add(member["path"])
     if not target_files:
-        return {"cand_recall_at_topk": None, "cand_rank": None}  # negative query: nothing to find
+        return {"cand_recall_at_topk": None, "cand_rank": None, "cand_kind": None}  # negative query
     best_rank = None
+    best_kind = None
     for c in candidates_ranked:
         rel = normalize_finding_path(c.get("path", ""))
         if rel in target_files:
             rank = c.get("rank")
             if best_rank is None or (rank is not None and rank < best_rank):
                 best_rank = rank
-    return {"cand_recall_at_topk": best_rank is not None, "cand_rank": best_rank}
+                best_kind = c.get("kind")
+    # `cand_kind` names the leg family that delivered the hit (SymbolExact/SymbolFuzzy/
+    # SemanticHit come from codebase-memory, ContentHit/FileNameHit from the native search),
+    # so a run whose hits are all ContentHit is visibly grep-only even when cand_recall holds.
+    return {"cand_recall_at_topk": best_rank is not None, "cand_rank": best_rank, "cand_kind": best_kind}
+
+
+MEMORY_LEGS = ("symbol", "semantic", "bm25")
+
+
+def leg_health(rows: list[dict]) -> dict:
+    """Per retrieval leg: runs, failures, runs that returned >= 1 candidate. A failed leg
+    (`retrieval leg failed`) never reaches `leg_timings`, so the per-leg latency table simply
+    omits it — which is how a codebase-memory backend that failed on 100% of calls
+    ("project not found or not indexed", 2026-09-07 .. #56) went unnoticed for two weeks while
+    cand_recall quietly measured grep alone. `memory_dead` is True when at least one memory leg
+    ran and none of them returned a single candidate across the whole run."""
+    legs: dict[str, dict] = {}
+
+    def slot(leg):
+        return legs.setdefault(leg or "?", {"runs": 0, "failed": 0, "with_hits": 0})
+
+    for r in rows:
+        for lt in r.get("leg_timings") or []:
+            h = slot(lt.get("leg"))
+            h["runs"] += 1
+            if (lt.get("hits") or 0) > 0:
+                h["with_hits"] += 1
+        for lf in r.get("leg_failures") or []:
+            h = slot(lf.get("leg") if isinstance(lf, dict) else lf)
+            h["runs"] += 1
+            h["failed"] += 1
+    memory = [legs[l] for l in MEMORY_LEGS if l in legs]
+    memory_dead = bool(memory) and all(h["with_hits"] == 0 for h in memory)
+    return {"legs": legs, "memory_dead": memory_dead}
 
 
 def attribution_class(row: dict, match: dict, cand: dict) -> str | None:
@@ -1073,7 +1108,10 @@ def print_report(result: dict) -> dict:
     for r in rows:
         if r["confident_wrong"]:
             any_cw = True
-            print(f"  {r['repo']}/{r['query_id']} pass{r['pass']}: confidence={r['confidence']}")
+            print(
+                f"  {r['repo']}/{r['query_id']} pass{r['pass']}: confidence={r['confidence']} "
+                f"route={r.get('early_exit_route')}"
+            )
     if not any_cw:
         print("  none")
 
@@ -1117,6 +1155,8 @@ def print_report(result: dict) -> dict:
         if ranked:
             ranked.sort()
             print(f"  cand_rank (of hits): median={ranked[len(ranked)//2]}  max={max(ranked)}")
+            kinds = Counter(r.get("cand_kind") for r in cand_rows if r["cand_recall_at_topk"])
+            print(f"  hit delivered by candidate kind: {dict(kinds.most_common())}")
 
     provider_rows = [pc for r in rows for pc in r.get("provider_calls", [])]
     if provider_rows:
@@ -1142,6 +1182,17 @@ def print_report(result: dict) -> dict:
     print(f"\n=== Forced finish ({len(forced)} rows) ===")
     for r in forced:
         print(f"  {r['repo']}/{r['query_id']} pass{r['pass']}: stage={r['stage']} tokens={r['tokens']}")
+
+    health = leg_health(rows)
+    if health["legs"]:
+        print("\n=== Retrieval leg health (runs = done + failed; with_hits = runs returning >= 1 candidate) ===")
+        for leg, h in sorted(health["legs"].items()):
+            print(f"  {leg:10s} runs={h['runs']:4d}  failed={h['failed']:4d}  with_hits={h['with_hits']:4d}")
+        if health["memory_dead"]:
+            print(
+                "  WARNING: memory legs (symbol/semantic/bm25) returned no candidate in the whole run - "
+                "the codebase-memory backend is dead; cand_recall above is grep-only and NOT comparable"
+            )
 
     leg_rows = [lt for r in rows for lt in r.get("leg_timings", [])]
     if leg_rows:

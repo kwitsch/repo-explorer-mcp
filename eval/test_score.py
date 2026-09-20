@@ -20,6 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from score import (
     NA_ABSENT,
+    compute_cand_recall,
+    leg_health,
     m3_fields,
     qw0_m3,
     schema_valid_of,
@@ -501,6 +503,44 @@ def check_cache_hit_metrics() -> None:
     assert csv_row["turns_saved_by_cache"] == 4 and csv_row["tokens_saved_by_cache"] == 20000
 
 
+def check_leg_health() -> None:
+    """The alarm that was missing while the memory backend was dead (2026-09-07 .. #56): a leg
+    that fails never reaches leg_timings, so the per-leg latency table simply dropped it."""
+    dead = [
+        _row(
+            leg_timings=[{"leg": "grep", "ctx": "x", "hits": 3, "duration_ms": 1}],
+            leg_failures=[
+                {"leg": "symbol", "error": "project not found or not indexed"},
+                {"leg": "semantic", "error": "project not found or not indexed"},
+            ],
+        )
+    ] * 2
+    h = leg_health(dead)
+    assert h["memory_dead"] is True, h
+    assert h["legs"]["symbol"] == {"runs": 2, "failed": 2, "with_hits": 0}, h
+    assert h["legs"]["grep"] == {"runs": 2, "failed": 0, "with_hits": 2}, h
+
+    # One memory leg returning a single candidate anywhere in the run clears the alarm.
+    alive = dead + [_row(leg_timings=[{"leg": "bm25", "ctx": "x", "hits": 1, "duration_ms": 5}])]
+    assert leg_health(alive)["memory_dead"] is False
+
+    # A run with no memory legs at all (Mode B / pre-observability rows) is "unknown", not dead.
+    assert leg_health([_row(leg_timings=[{"leg": "grep", "hits": 0}])])["memory_dead"] is False
+    assert leg_health([_row()]) == {"legs": {}, "memory_dead": False}
+
+    # cand_kind names the leg family that delivered the best-ranked hit.
+    expect = {"primary": [{"path": "src/a.py"}]}
+    ranked = [
+        {"rank": 1, "kind": "ContentHit", "path": "src/b.py"},
+        {"rank": 2, "kind": "SymbolFuzzy", "path": "src/a.py"},
+        {"rank": 3, "kind": "ContentHit", "path": "src/a.py"},
+    ]
+    got = compute_cand_recall(ranked, expect)
+    assert got == {"cand_recall_at_topk": True, "cand_rank": 2, "cand_kind": "SymbolFuzzy"}, got
+    assert compute_cand_recall(None, expect)["cand_kind"] is None
+    assert compute_cand_recall(ranked, {"primary": []})["cand_kind"] is None
+
+
 def _write_file(dir_path: Path, name: str, n_lines: int) -> None:
     body = "\n".join(f"SENTINEL_{i:03d}_line_content" for i in range(n_lines))
     (dir_path / name).write_text(body + "\n")
@@ -613,6 +653,7 @@ def main() -> None:
         check_repo_brief_metrics()
         check_cache_hit_metrics()
         check_m3_metrics()
+        check_leg_health()
 
         # English-only invariant: every eval query string is pure ASCII
         # (scoped to item["query"]; notes/comments keep their non-ASCII

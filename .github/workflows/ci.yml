@@ -37,10 +37,21 @@ jobs:
           node-version: 18
       - run: npm test
 
+  test-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      - run: python eval/test_score.py
+      - run: python -m py_compile eval/run.py
+
   test-gate:
     name: Test gate
-    needs: [test, test-setup]
+    needs: [test, test-setup, test-eval]
     runs-on: ubuntu-latest
     if: always()
     steps:
-      - run: ${{ needs.test.result == 'success' && needs['test-setup'].result == 'success' && 'exit 0' || 'exit 1' }}
+      - run: ${{ needs.test.result == 'success' && needs['test-setup'].result == 'success' && needs['test-eval'].result == 'success' && 'exit 0' || 'exit 1' }}
