@@ -24,7 +24,9 @@ with `stage_exit` rewritten to `cache` and everything else replayed. Full pipeli
   written — it ranks symbols by name relevance; its hits are `SemanticHit`.
   Verification skeletons come from `MemoryBackend::file_outline`
   (`get_file_outline`: exact path, source order, no container rows). Two routes into that
-  Stage-3 exit, both requiring a trusted exact symbol match (F-16), reported
+  Stage-3 exit, both requiring a trusted exact symbol match (F-16; a match on a
+  plain-word name like `server`/`score` is trusted only in a query of at most
+  `PLAIN_WORD_TRUST_MAX_IDENTIFIERS` identifier tokens — F-23/F-24), reported
   as `early_exit_route` in `QueryMetrics`: `confidence` (score clears
   `agent.early_exit_confidence`) and `unique-symbol` (exactly one trusted
   exact match at a known location — unambiguous by construction, so the
