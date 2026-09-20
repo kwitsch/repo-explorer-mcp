@@ -1,11 +1,8 @@
-//! CLI-driven text search backend (ripgrep) implementing
-//! `repo_explorer_core::search::SearchBackend`, plus the git2-backed
-//! `RepoStateProbe` (`GitStateProbe`). The ripgrep path is subprocess-driven
-//! (this crate's dependency domain); `GitStateProbe` uses the in-process
-//! `git2` (libgit2) bindings — no external `git` binary.
+//! In-process text/filename search backend (`NativeSearchBackend`) built on
+//! ripgrep's own `ignore` + `grep` crates, plus the git2-backed
+//! `RepoStateProbe` (`GitStateProbe`) — neither spawns an external binary.
 mod backend;
 mod git_probe;
-mod process;
 
 pub use backend::NativeSearchBackend;
 pub use git_probe::GitStateProbe;
