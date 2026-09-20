@@ -92,7 +92,7 @@ fn build_catalog() -> Vec<Tool> {
     vec![
         tool(
             "search_code",
-            "PRIMARY/authoritative: literal/regex text search (grep-style, not natural language) over the indexed memory graph. Args: query (required, a literal string or regex pattern — not a natural-language question), optional scope_hint, max_results.",
+            "PRIMARY/authoritative: literal substring search over the indexed memory graph, ranked by graph relevance — case-sensitive, NOT a regex (use grep for regex) and not natural language. Args: query (required, an identifier or literal string — not a natural-language question), optional scope_hint, max_results.",
             json!({
                 "type": "object",
                 "properties": {
@@ -121,7 +121,7 @@ fn build_catalog() -> Vec<Tool> {
         ),
         tool(
             "query_graph",
-            "PRIMARY: run a graph query against the memory graph. Args: query (required), optional max_results.",
+            "PRIMARY: run a read-only Cypher query against the memory graph (node labels like Function, Method, Struct, Class, File; edges like CALLS, USAGE, IMPORTS, DEFINES — the repo brief lists the exact vocabulary). RETURN n.qualified_name, n.file_path, n.start_line, n.end_line so rows are locatable. Args: query (required), optional max_results.",
             json!({
                 "type": "object",
                 "properties": {
@@ -147,12 +147,10 @@ fn build_catalog() -> Vec<Tool> {
         ),
         tool(
             "get_architecture",
-            "PRIMARY: retrieve a high-level architecture overview from memory. Args: optional depth.",
+            "PRIMARY: retrieve a high-level architecture overview from memory (languages, packages, entry points). No args.",
             json!({
                 "type": "object",
-                "properties": {
-                    "depth": {"type": "integer"}
-                },
+                "properties": {},
                 "required": [],
                 "additionalProperties": false
             }),
@@ -276,6 +274,9 @@ pub(crate) struct TracePathArgs {
     pub max_depth: Option<u32>,
 }
 
+/// `depth` is no longer advertised in the schema (the connected backend has
+/// no such knob and always dropped it) but stays accepted, so a model that
+/// still sends it gets the overview instead of an "invalid arguments" turn.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GetArchitectureArgs {

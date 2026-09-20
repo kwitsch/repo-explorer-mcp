@@ -1749,12 +1749,12 @@ mod tests {
                 "finish",
             ]
         );
-        // 5387 content bytes (~5.9 KB on the wire) is roughly 1.5-1.7k tokens
+        // 5965 content bytes (~6.5 KB on the wire) is roughly 1.6-1.8k tokens
         // — over Anthropic's 1024-token minimum for Sonnet/Opus, under
         // Haiku's 2048.
         assert_eq!(
             cache_prefix_fingerprint(FALLBACK_SYSTEM_PROMPT, tool_catalog()),
-            (5658, 2865739095911421978)
+            (5965, 4653669523128741792)
         );
     }
 
