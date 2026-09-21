@@ -43,6 +43,10 @@ collects what is on `main` but not yet tagged.
 
 ### Changed
 
+- The six one-shot CLI reports (`config test`, `cache stats`, `cache clear`,
+  `--update`, `--install`, `--uninstall`) now print human-readable text by
+  default; pass `--json` for the previous pretty-JSON output. The flag is
+  position-independent (before or after the subcommand).
 - **Stufe-1 token reduction (QW-0…QW-3):** a stable cached prompt prefix,
   batched tool calls, compressed tool-result rendering and tighter response
   caps.

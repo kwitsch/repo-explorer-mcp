@@ -248,9 +248,37 @@ struct StepReport {
     detail: Option<String>,
 }
 
+impl std::fmt::Display for InstallReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let detected = if self.claude_code_detected {
+            "Claude Code detected"
+        } else {
+            "Claude Code not detected"
+        };
+        writeln!(f, "Status: {} ({detected})", self.status)?;
+        if let Some(message) = &self.message {
+            writeln!(f, "  {message}")?;
+        }
+        for step in &self.steps {
+            writeln!(f, "  {step}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for StepReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.name, self.action)?;
+        if let Some(detail) = &self.detail {
+            write!(f, " ({detail})")?;
+        }
+        Ok(())
+    }
+}
+
 /// `--install`: register the user-scope MCP server and write the explore
 /// agent. Fails fast (empty `steps`, non-zero exit) when `claude` is absent.
-pub fn run_install() -> ExitCode {
+pub fn run_install(json: bool) -> ExitCode {
     let Some(claude) = claude_binary() else {
         let report = InstallReport {
             status: "error",
@@ -258,7 +286,7 @@ pub fn run_install() -> ExitCode {
             message: Some("Claude Code (`claude`) not found on PATH; install it first".to_string()),
             steps: Vec::new(),
         };
-        crate::print_report(&report, "install");
+        crate::print_report(&report, "install", json);
         return ExitCode::FAILURE;
     };
 
@@ -289,7 +317,7 @@ pub fn run_install() -> ExitCode {
         message: None,
         steps,
     };
-    crate::print_report(&report, "install");
+    crate::print_report(&report, "install", json);
     if had_error {
         ExitCode::FAILURE
     } else {
@@ -397,7 +425,7 @@ fn install_agent_file_at(path: &Path) -> StepReport {
 /// `--uninstall`: reverse the two install steps. Tolerates an absent `claude`
 /// (the MCP step is skipped) and only deletes the agent file if its contents
 /// still match what install wrote.
-pub fn run_uninstall() -> ExitCode {
+pub fn run_uninstall(json: bool) -> ExitCode {
     let claude = claude_binary();
     let steps = vec![
         uninstall_mcp_server(claude.as_deref()),
@@ -411,7 +439,7 @@ pub fn run_uninstall() -> ExitCode {
         message: None,
         steps,
     };
-    crate::print_report(&report, "uninstall");
+    crate::print_report(&report, "uninstall", json);
     if had_error {
         ExitCode::FAILURE
     } else {
@@ -629,6 +657,61 @@ mod tests {
         let path = unique_temp_path("uninstall-absent");
         let report = uninstall_agent_file_at(&path);
         assert_eq!(report.action, "skipped");
+    }
+
+    #[test]
+    fn install_report_display_renders_each_step() {
+        let report = InstallReport {
+            status: "ok",
+            claude_code_detected: true,
+            message: None,
+            steps: vec![
+                StepReport {
+                    name: "mcp-server",
+                    action: "installed",
+                    detail: Some("/home/u/.local/bin/repo-explorer-mcp".to_string()),
+                },
+                StepReport {
+                    name: "agent-file",
+                    action: "installed",
+                    detail: Some("/home/u/.claude/agents/explore.md".to_string()),
+                },
+            ],
+        };
+        let text = report.to_string();
+        assert!(text.contains("ok"), "status: {text}");
+        assert!(text.contains("Claude Code detected"), "detection: {text}");
+        assert!(text.contains("mcp-server"), "step 1 name: {text}");
+        assert!(
+            text.contains("/home/u/.local/bin/repo-explorer-mcp"),
+            "step 1 detail: {text}"
+        );
+        assert!(text.contains("agent-file"), "step 2 name: {text}");
+        assert!(
+            text.contains("/home/u/.claude/agents/explore.md"),
+            "step 2 detail: {text}"
+        );
+        assert!(
+            !text.starts_with('{'),
+            "human output must not be JSON: {text}"
+        );
+    }
+
+    #[test]
+    fn install_report_display_shows_message_when_claude_absent() {
+        let report = InstallReport {
+            status: "error",
+            claude_code_detected: false,
+            message: Some("Claude Code (`claude`) not found on PATH; install it first".to_string()),
+            steps: Vec::new(),
+        };
+        let text = report.to_string();
+        assert!(text.contains("error"), "status: {text}");
+        assert!(
+            text.contains("Claude Code not detected"),
+            "detection: {text}"
+        );
+        assert!(text.contains("not found on PATH"), "message: {text}");
     }
 
     #[test]
