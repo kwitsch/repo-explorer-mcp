@@ -447,13 +447,24 @@ fn resolve_cache_dir(configured: &str, xdg_default: Option<PathBuf>) -> Option<P
 }
 
 /// True for `--config-test`, or the two-token subcommand `config test`
-/// (adjacent tokens). Callers pass [`args_without_config_value`] output, so a
-/// `--config <path>` value can never supply either token.
+/// (adjacent once `--json` is dropped — `--json` is position-independent, so
+/// `config --json test` must still match). Callers pass
+/// [`args_without_config_value`] output, so a `--config <path>` value can
+/// never supply either token.
 fn wants_config_test(args: &[String]) -> bool {
     if has_flag(args, &["--config-test"]) {
         return true;
     }
-    args.windows(2).any(|w| w[0] == "config" && w[1] == "test")
+    let args = without_json_flag(args);
+    args.windows(2)
+        .any(|w| w[0].as_str() == "config" && w[1].as_str() == "test")
+}
+
+/// `args` with every `--json` token dropped, so subcommand-adjacency checks
+/// see `cache stats` / `config test` as adjacent even when `--json` was
+/// inserted between them.
+fn without_json_flag(args: &[String]) -> Vec<&String> {
+    args.iter().filter(|a| a.as_str() != "--json").collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -462,11 +473,14 @@ enum CacheCommand {
     Clear,
 }
 
-/// The two-token subcommand `cache stats` / `cache clear` (adjacent tokens).
-/// Callers pass [`args_without_config_value`] output, so a `--config <path>`
-/// value can never supply either token.
+/// The two-token subcommand `cache stats` / `cache clear` (adjacent once
+/// `--json` is dropped — `--json` is position-independent, so
+/// `cache --json stats` must still match). Callers pass
+/// [`args_without_config_value`] output, so a `--config <path>` value can
+/// never supply either token.
 fn wants_cache_command(args: &[String]) -> Option<CacheCommand> {
-    args.windows(2)
+    without_json_flag(args)
+        .windows(2)
         .find_map(|w| match (w[0].as_str(), w[1].as_str()) {
             ("cache", "stats") => Some(CacheCommand::Stats),
             ("cache", "clear") => Some(CacheCommand::Clear),
@@ -945,6 +959,12 @@ mod tests {
             "test".to_string(),
             "config".to_string()
         ]));
+        // `--json` is position-independent and must not break adjacency.
+        assert!(wants_config_test(&[
+            "config".to_string(),
+            "--json".to_string(),
+            "test".to_string()
+        ]));
     }
 
     #[test]
@@ -962,6 +982,11 @@ mod tests {
         assert_eq!(wants_cache_command(&args(&["stats", "cache"])), None);
         assert_eq!(wants_cache_command(&args(&["cache", "purge"])), None);
         assert_eq!(wants_cache_command(&[]), None);
+        // `--json` is position-independent and must not break adjacency.
+        assert_eq!(
+            wants_cache_command(&args(&["cache", "--json", "stats"])),
+            Some(CacheCommand::Stats)
+        );
     }
 
     #[test]

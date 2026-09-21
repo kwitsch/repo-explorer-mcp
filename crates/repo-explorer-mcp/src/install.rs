@@ -270,7 +270,12 @@ impl std::fmt::Display for StepReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.name, self.action)?;
         if let Some(detail) = &self.detail {
-            write!(f, " ({detail})")?;
+            // `detail` can carry embedded newlines straight from the `claude`
+            // CLI's own multi-line stdout/stderr (`combined_output` only
+            // trims the outer whitespace). Indent every continuation line so
+            // it nests under this step instead of merging visually with the
+            // next step's `  name: action` line.
+            write!(f, " ({})", detail.replace('\n', "\n      "))?;
         }
         Ok(())
     }
@@ -694,6 +699,41 @@ mod tests {
         assert!(
             !text.starts_with('{'),
             "human output must not be JSON: {text}"
+        );
+    }
+
+    #[test]
+    fn step_report_display_indents_multiline_detail() {
+        // A multi-line `claude` CLI error (usage banner, stack trace, ...)
+        // must not merge visually with the next step's `  name: action` line.
+        let report = InstallReport {
+            status: "error",
+            claude_code_detected: true,
+            message: None,
+            steps: vec![
+                StepReport {
+                    name: "mcp-server",
+                    action: "error",
+                    detail: Some("usage: claude mcp add ...\nerror: missing --scope".to_string()),
+                },
+                StepReport {
+                    name: "agent-file",
+                    action: "skipped",
+                    detail: None,
+                },
+            ],
+        };
+        let text = report.to_string();
+        // The continuation line must be indented deeper than a step line's
+        // own 2-space indent, so it nests under `mcp-server: error (...)`
+        // instead of reading as a sibling `  agent-file: skipped` line.
+        assert!(
+            text.contains("\n      error: missing --scope"),
+            "continuation line must be indented deeper than the step line: {text}"
+        );
+        assert!(
+            !text.contains("\nerror: missing --scope"),
+            "continuation line must never start flush left: {text}"
         );
     }
 
