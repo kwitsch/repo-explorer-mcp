@@ -42,7 +42,9 @@ use crate::brief;
 use crate::cache::{CappedMap, QueryEntry, ResultCache};
 use crate::disk_cache::{self, FileDep};
 use crate::dispatch::{canonical_repo_root, clamp_location, dispatch_inner, read_verified_file};
-use crate::judge_verify::{JudgeVerifyOutcome, classify_agreement, judge_verify, llm_overlap_set};
+use crate::judge_verify::{
+    JudgeVerifyOutcome, classify_agreement, judge_verify, llm_overlap_set, select_indices,
+};
 use crate::pipeline;
 use crate::render::{RenderCaps, dedupe_key, symbols_for, tidy_findings};
 use crate::tools::{finish_only_catalog, parse_finish_lenient, resolve_finish, tool_catalog};
@@ -881,93 +883,70 @@ where
                     }
                     tracing::info!("verification escalated to the fallback loop");
                 }
-                JudgeMode::Laya => match judge_verify(
-                    &self.memory,
-                    &self.judge,
-                    repo_root,
-                    query,
-                    note.as_deref(),
-                    &outcome.candidates,
-                    &self.judge_settings,
-                )
-                .await
-                {
-                    JudgeVerifyOutcome::Finished {
-                        result,
-                        selected,
-                        judged,
-                        scores,
-                        elapsed_ms,
-                    } => {
-                        self.record_judge_metrics(
-                            &mut metrics,
-                            "selected",
-                            judged,
-                            Some(selected.len() as u32),
-                            &scores,
-                            elapsed_ms,
-                        );
-                        return Ok(self
-                            .finalize_and_complete(
-                                repo_root,
-                                &mut metrics,
-                                StageExit::Verify,
-                                result,
-                                query,
-                                &budget,
-                                false,
-                                &query_key,
-                                fingerprint,
-                                &outcome.candidates,
-                            )
-                            .await);
-                    }
-                    JudgeVerifyOutcome::Escalate {
-                        judged,
-                        scores,
-                        elapsed_ms,
-                    } => {
-                        self.record_judge_metrics(
-                            &mut metrics,
-                            "escalated",
-                            judged,
-                            Some(0),
-                            &scores,
-                            elapsed_ms,
-                        );
-                        // `judged == 0` means judge_verify escalated before ever
-                        // calling the judge (no candidate had a resolvable
-                        // location) — `scores` is all-`None` filler, not a real
-                        // judgement, so leave `escalate_scores` at `None` rather
-                        // than have offline_fallback report a threshold miss
-                        // that never happened.
-                        if judged > 0 {
-                            escalate_scores = Some(scores);
-                        }
-                    }
-                    JudgeVerifyOutcome::Failed { error, elapsed_ms } => {
-                        self.record_judge_metrics_failed(&mut metrics, elapsed_ms);
-                        tracing::warn!(error = %error, "local judge failed; degrading");
-                        if self.router.has_providers() {
-                            if let Some(done) = self
-                                .verify_and_complete(
+                JudgeMode::Laya => {
+                    let jv = judge_verify(
+                        &self.memory,
+                        &self.judge,
+                        repo_root,
+                        query,
+                        note.as_deref(),
+                        &outcome.candidates,
+                        &self.judge_settings,
+                    )
+                    .await;
+                    self.record_judge_outcome(&mut metrics, &jv);
+                    match jv {
+                        JudgeVerifyOutcome::Finished { result, .. } => {
+                            return Ok(self
+                                .finalize_and_complete(
                                     repo_root,
                                     &mut metrics,
+                                    StageExit::Verify,
+                                    result,
                                     query,
-                                    note.as_deref(),
-                                    &outcome,
-                                    &mut budget,
+                                    &budget,
+                                    false,
                                     &query_key,
-                                    &fingerprint,
+                                    fingerprint,
+                                    &outcome.candidates,
                                 )
-                                .await
-                            {
-                                return Ok(done);
+                                .await);
+                        }
+                        JudgeVerifyOutcome::Escalate { judged, scores, .. } => {
+                            // `judged == 0` means judge_verify escalated before
+                            // ever calling the judge (no candidate had a
+                            // resolvable location) — `scores` is all-`None`
+                            // filler, not a real judgement, so leave
+                            // `escalate_scores` at `None` rather than have
+                            // offline_fallback report a threshold miss that
+                            // never happened.
+                            if judged > 0 {
+                                escalate_scores = Some(scores);
                             }
-                            tracing::info!("verification escalated to the fallback loop");
+                        }
+                        JudgeVerifyOutcome::Failed { error, .. } => {
+                            tracing::warn!(error = %error, "local judge failed; degrading");
+                            if self.router.has_providers() {
+                                if let Some(done) = self
+                                    .verify_and_complete(
+                                        repo_root,
+                                        &mut metrics,
+                                        query,
+                                        note.as_deref(),
+                                        &outcome,
+                                        &mut budget,
+                                        &query_key,
+                                        &fingerprint,
+                                    )
+                                    .await
+                                {
+                                    return Ok(done);
+                                }
+                                tracing::info!("verification escalated to the fallback loop");
+                            }
                         }
                     }
-                },
+                }
                 JudgeMode::Shadow => {
                     // Both run; the LLM's answer is always the one returned, the
                     // judge's outcome is only observed. Only `verify` borrows
@@ -996,44 +975,7 @@ where
                         ),
                     )
                     .await;
-                    let judge_set = match &jv {
-                        JudgeVerifyOutcome::Finished {
-                            selected,
-                            judged,
-                            scores,
-                            elapsed_ms,
-                            ..
-                        } => {
-                            self.record_judge_metrics(
-                                &mut metrics,
-                                "selected",
-                                *judged,
-                                Some(selected.len() as u32),
-                                scores,
-                                *elapsed_ms,
-                            );
-                            Some(selected.clone())
-                        }
-                        JudgeVerifyOutcome::Escalate {
-                            judged,
-                            scores,
-                            elapsed_ms,
-                        } => {
-                            self.record_judge_metrics(
-                                &mut metrics,
-                                "escalated",
-                                *judged,
-                                Some(0),
-                                scores,
-                                *elapsed_ms,
-                            );
-                            None
-                        }
-                        JudgeVerifyOutcome::Failed { elapsed_ms, .. } => {
-                            self.record_judge_metrics_failed(&mut metrics, *elapsed_ms);
-                            None
-                        }
-                    };
+                    let judge_set = self.record_judge_outcome(&mut metrics, &jv);
                     // Agreement is only defined when the judge did not fail.
                     if !matches!(jv, JudgeVerifyOutcome::Failed { .. }) {
                         let llm_set = match &llm {
@@ -1345,6 +1287,58 @@ where
         metrics.judge_ms = Some(elapsed_ms);
     }
 
+    /// Shared `JudgeVerifyOutcome` metrics dispatch for both the `laya` and
+    /// `shadow` arms: records judged/scores/elapsed_ms via
+    /// `record_judge_metrics`/`record_judge_metrics_failed` and returns the
+    /// selected candidate-index set (`Some` on `Finished`, `None` on
+    /// `Escalate`/`Failed`). Each caller still matches on `jv` itself for the
+    /// behaviour that differs (`laya` finalizes or escalates on it, `shadow`
+    /// only uses the set for agreement classification).
+    fn record_judge_outcome(
+        &self,
+        metrics: &mut QueryMetrics,
+        jv: &JudgeVerifyOutcome,
+    ) -> Option<Vec<usize>> {
+        match jv {
+            JudgeVerifyOutcome::Finished {
+                selected,
+                judged,
+                scores,
+                elapsed_ms,
+                ..
+            } => {
+                self.record_judge_metrics(
+                    metrics,
+                    "selected",
+                    *judged,
+                    Some(selected.len() as u32),
+                    scores,
+                    *elapsed_ms,
+                );
+                Some(selected.clone())
+            }
+            JudgeVerifyOutcome::Escalate {
+                judged,
+                scores,
+                elapsed_ms,
+            } => {
+                self.record_judge_metrics(
+                    metrics,
+                    "escalated",
+                    *judged,
+                    Some(0),
+                    scores,
+                    *elapsed_ms,
+                );
+                None
+            }
+            JudgeVerifyOutcome::Failed { elapsed_ms, .. } => {
+                self.record_judge_metrics_failed(metrics, *elapsed_ms);
+                None
+            }
+        }
+    }
+
     /// Stage 5 with `agent.fallback = "off"`: deterministic offline synthesis of
     /// up to [`OFFLINE_FALLBACK_MAX_FINDINGS`] disk-verified candidates, with no
     /// LLM. Ordered by judge score descending (`None`/not-judged last, then by
@@ -1356,12 +1350,16 @@ where
         candidates: &[Candidate],
         scores: Option<&[Option<u32>]>,
     ) -> ExplorationResult {
-        let mut order: Vec<usize> = (0..candidates.len()).collect();
-        order.sort_by(|&a, &b| {
-            let sa = scores.and_then(|s| s.get(a).copied().flatten());
-            let sb = scores.and_then(|s| s.get(b).copied().flatten());
-            sb.cmp(&sa).then(a.cmp(&b))
-        });
+        // Reuse `select_indices`'s score-desc/index-asc ordering (threshold 0
+        // keeps every scored candidate instead of filtering by a select
+        // threshold), then append the unscored candidates in retrieval-rank
+        // order — the same single rule `judge_verify`'s selection uses,
+        // rather than a second hand-written copy of it.
+        let mut order: Vec<usize> = scores.map(|s| select_indices(s, 0)).unwrap_or_default();
+        if order.len() < candidates.len() {
+            let seen: HashSet<usize> = order.iter().copied().collect();
+            order.extend((0..candidates.len()).filter(|i| !seen.contains(i)));
+        }
         // Disk-verify in score-ordered chunks of the cap and stop as soon as
         // enough survivors are found — the common case (most top-ranked
         // candidates verify fine) pays for one chunk's worth of disk reads,

@@ -71,8 +71,7 @@ pub(crate) fn llm_overlap_set(
         let hit = findings.iter().any(|f| {
             f.location.line_start != 0
                 && normalize_rel_path(f.location.path.clone()) == cpath
-                && cs <= f.location.line_end
-                && ce >= f.location.line_start
+                && crate::ranges_overlap(cs, ce, f.location.line_start, f.location.line_end)
         });
         if hit {
             out.push(i);
@@ -116,13 +115,12 @@ pub(crate) async fn judge_verify<M: MemoryBackend, J: CandidateJudge>(
     settings: &JudgeSettings,
 ) -> JudgeVerifyOutcome {
     let rendered = render_judge_states(memory, repo_root, &query.text, candidates).await;
-    // (index, state) for every Some.
-    let mut idx_states: Vec<(usize, String)> = Vec::new();
-    for (i, s) in rendered.iter().enumerate() {
-        if let Some(text) = s {
-            idx_states.push((i, text.clone()));
-        }
-    }
+    // (index, state) for every Some, moved out of `rendered` once — no clones.
+    let (idx_states, state_texts): (Vec<usize>, Vec<String>) = rendered
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.map(|text| (i, text)))
+        .unzip();
     let mut scores: Vec<Option<u32>> = vec![None; candidates.len()];
     if idx_states.is_empty() {
         // No judge call was made at all, so there is no latency to report.
@@ -132,7 +130,6 @@ pub(crate) async fn judge_verify<M: MemoryBackend, J: CandidateJudge>(
             elapsed_ms: 0,
         };
     }
-    let state_texts: Vec<String> = idx_states.iter().map(|(_, s)| s.clone()).collect();
     let judged = state_texts.len() as u32;
     // Timed narrowly around the judge call itself (what `judge.timeout_ms`
     // bounds) — never `render_judge_states`'s local file reads before it, or
@@ -157,7 +154,7 @@ pub(crate) async fn judge_verify<M: MemoryBackend, J: CandidateJudge>(
         }
         Err(error) => return JudgeVerifyOutcome::Failed { error, elapsed_ms },
     };
-    for ((idx, _), j) in idx_states.iter().zip(&judgements) {
+    for (idx, j) in idx_states.iter().zip(&judgements) {
         scores[*idx] = Some(j.p_relevant_permille);
     }
     let selected = select_indices(&scores, settings.select_threshold);

@@ -32,3 +32,13 @@ mod verify;
 
 pub use agent::{AgentLoop, AgentLoopError};
 pub use snapshot::{RetrievalSnapshot, SnapshotStage, retrieval_snapshot};
+
+/// Do two 1-based, inclusive `[start, end]` line ranges intersect (one shared
+/// line is enough)? The one "do two ranges overlap" primitive shared by
+/// `render::symbols_for`, `tools::snaps_to_candidate` and
+/// `judge_verify::llm_overlap_set` — each still applies its own guards
+/// (unknown-location checks, inverted-range clamping, a strictly-inside
+/// carve-out) around this call.
+pub(crate) fn ranges_overlap(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> bool {
+    a_start <= b_end && b_start <= a_end
+}

@@ -783,10 +783,13 @@ def qw0_judge(rows: list[dict]) -> dict:
     `shadow_agreement_rate` = (exact + overlap) / (exact + overlap + disjoint): the share of
     shadow-mode queries where the judge's selection overlapped the LLM's — the one number the
     shadow rollout is read on. None when no shadow row reported an agreement."""
-    outcomes = Counter(qw0_field(r, "judge_outcome") for r in rows if qw0_field(r, "judge_outcome") is not None)
-    modes = Counter(qw0_field(r, "judge_mode") for r in rows if qw0_field(r, "judge_mode") is not None)
-    fallbacks = Counter(qw0_field(r, "fallback_mode") for r in rows if qw0_field(r, "fallback_mode") is not None)
-    agree = Counter(qw0_field(r, "shadow_agreement") for r in rows if qw0_field(r, "shadow_agreement") is not None)
+    def counted(name: str) -> Counter:
+        return Counter(v for r in rows if (v := qw0_field(r, name)) is not None)
+
+    outcomes = counted("judge_outcome")
+    modes = counted("judge_mode")
+    fallbacks = counted("fallback_mode")
+    agree = counted("shadow_agreement")
     denom = agree.get("exact", 0) + agree.get("overlap", 0) + agree.get("disjoint", 0)
     rate = (agree.get("exact", 0) + agree.get("overlap", 0)) / denom if denom else None
     return {
