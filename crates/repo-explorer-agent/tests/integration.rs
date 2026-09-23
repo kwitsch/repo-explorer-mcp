@@ -844,3 +844,53 @@ async fn repo_brief_disabled_makes_no_backend_call() {
         "the kill switch must restore the exact pre-M-2 prompt"
     );
 }
+
+#[tokio::test]
+async fn end_to_end_laya_run_selects_the_scored_candidate() {
+    use repo_explorer_core::config::{JudgeMode, JudgeSettings};
+    use repo_explorer_core::judge::mock::MockJudge;
+
+    // Empty provider: any LLM call would panic on the exhausted mock, proving
+    // the judge path made zero LLM calls end to end.
+    let provider = MockLlmProvider::new();
+    let provider_probe = provider.clone();
+    // 900 when the rendered state names the target location, 100 otherwise.
+    let judge =
+        MockJudge::new().with_scorer(|state| if state.contains("fresh_a") { 900 } else { 100 });
+    let settings = JudgeSettings {
+        mode: JudgeMode::Laya,
+        select_threshold: 50,
+        ..JudgeSettings::default()
+    };
+    let agent = AgentLoop::new(
+        ambiguous_memory(),
+        MockSearchBackend::new(),
+        single_router(provider),
+        MockRepoStateProbe::new(),
+        AgentSettings::default(),
+        CacheSettings::default(),
+        TEST_INDEX_TRUST_TTL,
+    )
+    .with_judge(judge, settings);
+    let dir = temp_repo("e2e_laya");
+    let got = agent.run(&dir, &query("decide_freshness")).await.unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+
+    // Exact final outcome: the judge picked the one candidate at/above
+    // threshold, disk-verified it, and finished the run with no LLM.
+    assert_eq!(got.stage_exit, StageExit::Verify);
+    assert!(
+        provider_probe.calls().is_empty(),
+        "no LLM call on the judge path"
+    );
+    assert_eq!(got.result.findings.len(), 1);
+    let f = &got.result.findings[0];
+    assert_eq!(f.location.path, PathBuf::from("src/fresh_a.rs"));
+    assert_eq!(f.location.line_start, 10);
+    assert_eq!(f.location.line_end, 20);
+    assert!(f.note.as_ref().unwrap().contains("judge p=0.90"));
+    assert_eq!(
+        got.result.summary,
+        "Selected by the local judge (no LLM involved): 1 of 2 candidate(s) for \"decide_freshness\"."
+    );
+}

@@ -4,11 +4,6 @@
 //! disk-verifies the selection, and builds a deterministic result with 0 LLM
 //! calls. See `crates/repo-explorer-agent/CLAUDE.md`.
 
-// ponytail: `agent.rs`'s Stage-4/5 dispatch is the only non-test consumer of
-// these items; until it lands the plain lib build sees them as unused. Drop
-// this allow once that dispatch calls `judge_verify`/`classify_agreement`.
-#![allow(dead_code)]
-
 use repo_explorer_core::config::JudgeSettings;
 use repo_explorer_core::domain::{
     Candidate, ExplorationFinding, ExplorationQuery, ExplorationResult,
