@@ -20,6 +20,7 @@ mod cache;
 pub mod disk_cache;
 mod dispatch;
 pub mod judge_input;
+mod judge_verify;
 mod pipeline;
 mod render;
 mod skeleton;
