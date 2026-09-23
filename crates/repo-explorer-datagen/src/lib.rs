@@ -3,6 +3,7 @@
 //! teacher LLM, no provider call. A library plus a thin binary (`src/main.rs`)
 //! so integration tests can reach the generator core directly.
 pub mod corpus;
+pub mod label;
 pub mod rng;
 pub mod symbols;
 pub mod templates;
