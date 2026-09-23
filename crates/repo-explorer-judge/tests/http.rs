@@ -72,6 +72,7 @@ fn settings(base_url: String) -> JudgeSettings {
         timeout_ms: 2000,
         max_concurrency: 2,
         select_threshold: 50,
+        ..JudgeSettings::default()
     }
 }
 
