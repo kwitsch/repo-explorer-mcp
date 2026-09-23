@@ -120,7 +120,11 @@ def take_qw0_fields(out: dict, f: dict) -> None:
     cache-hit-only, emitted on the query-cache line and nowhere else. `cache_layer` is `"l1"`
     (in-memory) or `"l2"` (on disk); the two saved counters are what the *producing* run spent,
     i.e. what this hit avoided, and are deliberately not folded into `tokens`, which keeps
-    meaning spend."""
+    meaning spend.
+
+    The 10b judge fields (judge_mode, fallback_mode, judge_outcome, judge_ms, judge_candidates,
+    judge_selected, judge_max_p, shadow_agreement) are judge-run-only, on the same
+    `exploration complete` line: absent (None) on an off-mode or pre-10b binary, never zero."""
     for key in (
         "candidate_count",
         "early_exit_route",
@@ -133,6 +137,17 @@ def take_qw0_fields(out: dict, f: dict) -> None:
         "turns_saved_by_cache",
         "tokens_saved_by_cache",
         "cited_candidate_ids",
+        # 10b Stage-4 judge: all None until a judge run emits them (an off-mode or pre-10b
+        # binary never does). judge_mode/fallback_mode/judge_outcome/shadow_agreement are
+        # string enums; judge_ms/judge_candidates/judge_selected/judge_max_p are integers.
+        "judge_mode",
+        "fallback_mode",
+        "judge_outcome",
+        "judge_ms",
+        "judge_candidates",
+        "judge_selected",
+        "judge_max_p",
+        "shadow_agreement",
     ):
         if f.get(key) is not None:
             out[key] = f[key]
@@ -293,8 +308,9 @@ def parse_call_lines(lines: list[str]) -> dict:
     exploration_failed, early_exit_fallthrough, early_exit_dropped_candidates (the last two
     from PR #47's early-exit disk verification), plus the QW-0 fields (candidate_count,
     early_exit_route, cache_read_tokens, cache_write_tokens, total_ms, brief_tokens,
-    orientation_calls_in_loop, cache_layer, turns_saved_by_cache, tokens_saved_by_cache) via
-    take_qw0_fields."""
+    orientation_calls_in_loop, cache_layer, turns_saved_by_cache, tokens_saved_by_cache) and the
+    10b Stage-4 judge fields (judge_mode, fallback_mode, judge_outcome, judge_ms, judge_candidates,
+    judge_selected, judge_max_p, shadow_agreement) via take_qw0_fields."""
     out = {
         "stage": None,
         "tokens": None,
@@ -340,6 +356,20 @@ def parse_call_lines(lines: list[str]) -> dict:
         # counting the absent ones as 0 would report the field as dead weight and get it
         # reverted.
         "cited_candidate_ids": None,
+        # 10b Stage-4 judge, emitted on the `exploration complete` line only when a judge ran
+        # (mode "laya"/"shadow"). None means the judge did not run, or the binary predates 10b —
+        # score.py's Judge section prints "judge not run" rather than a fabricated 0. The string
+        # enums: judge_mode ("laya"/"shadow"), fallback_mode ("llm"/"off"), judge_outcome
+        # ("selected"/"escalated"/...), shadow_agreement ("exact"/"overlap"/"disjoint"); the
+        # integers: judge_ms, judge_candidates, judge_selected, judge_max_p (per-mille).
+        "judge_mode": None,
+        "fallback_mode": None,
+        "judge_outcome": None,
+        "judge_ms": None,
+        "judge_candidates": None,
+        "judge_selected": None,
+        "judge_max_p": None,
+        "shadow_agreement": None,
     }
     for line in lines:
         kind = line_kind(line)

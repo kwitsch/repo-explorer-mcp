@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from score import (
     NA_ABSENT,
+    CSV_COLUMNS,
     compute_cand_recall,
     leg_health,
     m3_fields,
@@ -541,6 +542,60 @@ def check_leg_health() -> None:
     assert compute_cand_recall(ranked, {"primary": []})["cand_kind"] is None
 
 
+def check_judge_metrics() -> None:
+    """Stage-4 judge aggregates (10b): the outcome/mode counters, the shadow agreement rate, and
+    the eight judge CSV columns. Same absent-vs-zero degradation rule as the rest of QW-0 — a run
+    whose binary predates the judge reports the judge section absent, never as a fabricated zero."""
+    rows = [
+        _row(query_id="a", stage="verify", judge_mode="shadow", judge_outcome="selected",
+             judge_ms=100, judge_candidates=4, judge_selected=2, judge_max_p=900,
+             shadow_agreement="exact"),
+        _row(query_id="b", stage="verify", judge_mode="shadow", judge_outcome="escalated",
+             judge_ms=120, judge_candidates=3, judge_selected=0, judge_max_p=100,
+             shadow_agreement="disjoint"),
+        _row(query_id="c", stage="verify", judge_mode="shadow", judge_outcome="selected",
+             judge_ms=110, judge_candidates=5, judge_selected=1, judge_max_p=800,
+             shadow_agreement="overlap"),
+    ]
+    judge = qw0_metrics(rows)["judge"]
+    assert judge["judge_outcome"] == {"selected": 2, "escalated": 1}, judge["judge_outcome"]
+    assert judge["judge_mode"] == {"shadow": 3}, judge["judge_mode"]
+    # agreement rate = (exact + overlap) / (exact + overlap + disjoint) = 2/3
+    assert abs(judge["shadow_agreement_rate"] - 2 / 3) < 1e-9, judge["shadow_agreement_rate"]
+    assert judge["judge_selected"]["n"] == 3 and judge["judge_max_p"]["p95"] == 900
+
+    # A run with no judge at all (mode off, or a pre-10b binary): the section degrades to absent,
+    # never to zeros — the report prints "judge not run".
+    absent = qw0_metrics([_row(query_id="a", stage="verify")])["judge"]
+    assert absent["judge_outcome"] in (None, {}), absent["judge_outcome"]
+    assert absent["shadow_agreement_rate"] is None
+
+    # The report prints a Judge section only when the judge ran.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print_qw0_report(qw0_metrics([_row(query_id="a", stage="verify")]))
+    assert "judge not run" in buf.getvalue()
+
+    # The eight judge fields are exported for the flat per-query CSV.
+    for col in ("judge_mode", "fallback_mode", "judge_outcome", "judge_ms",
+                "judge_candidates", "judge_selected", "judge_max_p", "shadow_agreement"):
+        assert col in CSV_COLUMNS, col
+    csv_out = qw0_csv_rows({"run_id": "x", "scored_rows": rows})
+    assert csv_out[0]["judge_outcome"] == "selected" and csv_out[0]["judge_max_p"] == 900
+
+    # run.py must parse the judge fields off the `exploration complete` line, or score.py sees
+    # nothing and prints "judge not run" forever.
+    parsed = parse_call_lines([
+        "INFO explore{req_id=a-0}: repo_explorer_agent::agent: exploration complete "
+        'path="verify" tokens=8653 llm_calls=2 judge_mode="shadow" fallback_mode="llm" '
+        'judge_outcome="selected" judge_ms=97 judge_candidates=4 judge_selected=2 '
+        "judge_max_p=912 shadow_agreement=\"exact\""
+    ])
+    assert parsed["judge_mode"] == "shadow" and parsed["judge_outcome"] == "selected", parsed
+    assert parsed["judge_ms"] == 97 and parsed["judge_max_p"] == 912, parsed
+    assert parse_call_lines([COMPLETE_LINE])["judge_mode"] is None  # pre-10b line
+
+
 def _write_file(dir_path: Path, name: str, n_lines: int) -> None:
     body = "\n".join(f"SENTINEL_{i:03d}_line_content" for i in range(n_lines))
     (dir_path / name).write_text(body + "\n")
@@ -654,6 +709,7 @@ def main() -> None:
         check_cache_hit_metrics()
         check_m3_metrics()
         check_leg_health()
+        check_judge_metrics()
 
         # English-only invariant: every eval query string is pure ASCII
         # (scoped to item["query"]; notes/comments keep their non-ASCII

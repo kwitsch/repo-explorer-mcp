@@ -775,6 +775,33 @@ def qw0_m3(rows: list[dict]) -> dict:
     }
 
 
+def qw0_judge(rows: list[dict]) -> dict:
+    """10b Stage-4 judge aggregates. Same absent-vs-zero rule as the rest of QW-0: a run whose
+    binary predates the judge (or ran it off) emits none of these fields, so every counter comes
+    back None and print_qw0_report says "judge not run" rather than a fabricated 0.
+
+    `shadow_agreement_rate` = (exact + overlap) / (exact + overlap + disjoint): the share of
+    shadow-mode queries where the judge's selection overlapped the LLM's — the one number the
+    shadow rollout is read on. None when no shadow row reported an agreement."""
+    outcomes = Counter(qw0_field(r, "judge_outcome") for r in rows if qw0_field(r, "judge_outcome") is not None)
+    modes = Counter(qw0_field(r, "judge_mode") for r in rows if qw0_field(r, "judge_mode") is not None)
+    fallbacks = Counter(qw0_field(r, "fallback_mode") for r in rows if qw0_field(r, "fallback_mode") is not None)
+    agree = Counter(qw0_field(r, "shadow_agreement") for r in rows if qw0_field(r, "shadow_agreement") is not None)
+    denom = agree.get("exact", 0) + agree.get("overlap", 0) + agree.get("disjoint", 0)
+    rate = (agree.get("exact", 0) + agree.get("overlap", 0)) / denom if denom else None
+    return {
+        "judge_mode": dict(modes) or None,
+        "fallback_mode": dict(fallbacks) or None,
+        "judge_outcome": dict(outcomes) or None,
+        "judge_ms": _dist(numeric_field(rows, "judge_ms")),
+        "judge_candidates": _dist(numeric_field(rows, "judge_candidates")),
+        "judge_selected": _dist(numeric_field(rows, "judge_selected")),
+        "judge_max_p": _dist(numeric_field(rows, "judge_max_p")),
+        "shadow_agreement": dict(agree) or None,
+        "shadow_agreement_rate": rate,
+    }
+
+
 def qw0_metrics(rows: list[dict]) -> dict:
     """Every QW-0 aggregate over the already-warm-up-filtered scored rows. Pure — print_qw0_report
     and the --csv-out writer both consume this and neither recomputes anything."""
@@ -833,6 +860,7 @@ def qw0_metrics(rows: list[dict]) -> dict:
         "turns_saved_by_cache": _dist(numeric_field(rows, "turns_saved_by_cache")),
         "tokens_saved_by_cache": _dist(numeric_field(rows, "tokens_saved_by_cache")),
         "m3": qw0_m3(rows),
+        "judge": qw0_judge(rows),
     }
 
 
@@ -959,6 +987,28 @@ def print_qw0_report(agg: dict) -> None:
     else:
         print("  location hallucinations by stage (the M-3 proxy): none on any stage")
 
+    # 10b Stage-4 judge. Printed only when the judge actually ran (mode "laya"/"shadow"): an
+    # off-mode or pre-10b run reports "judge not run", never a fabricated zero. In shadow mode
+    # the agreement rate is the headline — the share of queries where the judge's selection
+    # overlapped the LLM's — read before promoting the judge from shadow to laya.
+    judge = agg["judge"]
+    if not judge["judge_outcome"]:
+        print("  judge: n/a - judge not run (mode off, or binary predates 10b)")
+    else:
+        modes = ", ".join(f"{m}={c}" for m, c in sorted(judge["judge_mode"].items()))
+        print(f"  judge mode: {modes}")
+        outcomes = ", ".join(f"{o}={c}" for o, c in sorted(judge["judge_outcome"].items(), key=lambda kv: -kv[1]))
+        print(f"  judge outcomes: {outcomes}")
+        print(f"  judge latency: {_fmt_dist(judge['judge_ms'], unit='ms')}")
+        print(f"  judge candidates: {_fmt_dist(judge['judge_candidates'])}"
+              f"   selected: {_fmt_dist(judge['judge_selected'])}")
+        print(f"  judge max_p (per-mille): {_fmt_dist(judge['judge_max_p'])}")
+        if judge["shadow_agreement_rate"] is None:
+            print(f"  shadow_agreement_rate: {NA_ABSENT}")
+        else:
+            agree = ", ".join(f"{k}={v}" for k, v in sorted(judge["shadow_agreement"].items()))
+            print(f"  shadow_agreement_rate: {judge['shadow_agreement_rate']:.1%}  ({agree})")
+
 
 CSV_COLUMNS = [
     "run_id",
@@ -986,6 +1036,14 @@ CSV_COLUMNS = [
     "turns_saved_by_cache",
     "tokens_saved_by_cache",
     "cited_candidate_ids",
+    "judge_mode",
+    "fallback_mode",
+    "judge_outcome",
+    "judge_ms",
+    "judge_candidates",
+    "judge_selected",
+    "judge_max_p",
+    "shadow_agreement",
 ]
 
 
@@ -1022,6 +1080,14 @@ def qw0_csv_rows(result: dict) -> list[dict]:
                 "turns_saved_by_cache": qw0_field(r, "turns_saved_by_cache"),
                 "tokens_saved_by_cache": qw0_field(r, "tokens_saved_by_cache"),
                 "cited_candidate_ids": qw0_field(r, "cited_candidate_ids"),
+                "judge_mode": qw0_field(r, "judge_mode"),
+                "fallback_mode": qw0_field(r, "fallback_mode"),
+                "judge_outcome": qw0_field(r, "judge_outcome"),
+                "judge_ms": qw0_field(r, "judge_ms"),
+                "judge_candidates": qw0_field(r, "judge_candidates"),
+                "judge_selected": qw0_field(r, "judge_selected"),
+                "judge_max_p": qw0_field(r, "judge_max_p"),
+                "shadow_agreement": qw0_field(r, "shadow_agreement"),
             }
         )
     return out

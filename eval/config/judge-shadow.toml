@@ -1,0 +1,52 @@
+# Judge SHADOW eval config (docs/laya-judge.md, docs/eval/real-world-test-plan.md §3.2, §8.1).
+#
+# `default.toml` verbatim, plus `[judge] mode = "shadow"`. Shadow mode runs the local Laya judge
+# ALONGSIDE the real LLM Stage-4 verification, logs the judge's decision and its agreement with
+# the LLM (judge_mode/judge_outcome/shadow_agreement on `exploration complete`), but the LLM's
+# answer is still what the query returns. Run this first — before judge-laya — to read the
+# agreement rate off `score.py`'s Judge section without changing any answer.
+#
+# The judge is a local service: start `judge-serve` on 127.0.0.1:8765 before running (see
+# judge-serve/README.md and docs/laya-judge.md). A judge outage never fails a query — a shadow
+# run with the judge down simply reports no judge rows.
+#
+# api_key_env only NAMES the environment variable; the harness never reads or copies the key
+# itself, and this file is committed with that in mind.
+
+[llm]
+cooldown_seconds = 60
+
+[[llm.providers]]
+name = "gemini"
+kind = "gemini"
+api_key_env = "GOOGLE_API_KEY"
+models = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+]
+
+[codebase_memory]
+command = "codebase-memory-mcp"
+args = ["--stdio"]
+staleness_seconds = 3600
+
+[search]
+timeout_seconds = 30
+prefer_rtk = true
+
+[logging]
+level = "debug"
+
+[cache]
+# The on-disk L2 is OFF for the harness, same as default.toml — passes must stay independent
+# samples (see default.toml for the full rationale).
+persistent = false
+
+[judge]
+mode = "shadow"
+base_url = "http://127.0.0.1:8765"
+select_threshold = 50
