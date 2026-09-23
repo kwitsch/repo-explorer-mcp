@@ -19,6 +19,7 @@ mod cache;
 /// without constructing an `AgentLoop`.
 pub mod disk_cache;
 mod dispatch;
+pub mod judge_input;
 mod pipeline;
 mod render;
 mod skeleton;
