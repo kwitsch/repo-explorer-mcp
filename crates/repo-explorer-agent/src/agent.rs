@@ -673,19 +673,7 @@ where
         //   known location. That is unambiguous by construction, so the
         //   confidence score — which a strong SymbolFuzzy runner-up deflates
         //   well below the threshold — is not consulted at all.
-        let early_exit_route = if outcome.candidates.is_empty() {
-            None
-        } else if outcome.confidence >= self.settings.early_exit_confidence
-            && outcome.has_exact_symbol_match
-        {
-            Some("confidence")
-        } else if self.settings.skip_verify_on_exact_symbol
-            && outcome.unique_trusted_symbol.is_some()
-        {
-            Some("unique-symbol")
-        } else {
-            None
-        };
+        let early_exit_route = early_exit_route(&outcome, &self.settings);
         if let Some(route) = early_exit_route {
             let result = self
                 .result_from_candidates(
@@ -1539,6 +1527,31 @@ fn index_status_label(result: &Result<IndexStatus, MemoryError>) -> &'static str
     }
 }
 
+/// The Stage-3 early-exit route choice, factored out of `AgentLoop::run` so the
+/// deterministic `snapshot::retrieval_snapshot` classifier can reuse the exact
+/// same rule. Pure; no behaviour change from the inlined form.
+///
+/// - `"confidence"`: confidence clears `early_exit_confidence` and some ranked
+///   candidate is a trusted exact symbol match.
+/// - `"unique-symbol"`: exactly one ranked candidate is, at a known location
+///   (and the escape hatch `skip_verify_on_exact_symbol` is on).
+/// - `None`: no early exit; the `authorized` re-check still stays in `run`.
+pub(crate) fn early_exit_route(
+    outcome: &pipeline::RetrievalOutcome,
+    settings: &AgentSettings,
+) -> Option<&'static str> {
+    if outcome.candidates.is_empty() {
+        None
+    } else if outcome.confidence >= settings.early_exit_confidence && outcome.has_exact_symbol_match
+    {
+        Some("confidence")
+    } else if settings.skip_verify_on_exact_symbol && outcome.unique_trusted_symbol.is_some() {
+        Some("unique-symbol")
+    } else {
+        None
+    }
+}
+
 /// Did `candidate` itself survive into the final findings? Path plus
 /// `line_start` identify it: filesystem verification only clamps `line_end`
 /// (a `line_start` past EOF drops the candidate outright) and tidying only
@@ -1723,6 +1736,57 @@ mod tests {
     /// Trust-window TTL used across these tests — centralized so a future
     /// default change or edge-case TTL needs editing in one place.
     const TEST_INDEX_TRUST_TTL: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn early_exit_route_selects_the_expected_branch() {
+        use crate::pipeline::RetrievalOutcome;
+        use repo_explorer_core::domain::{Candidate, CandidateKind, FileLocation};
+
+        let settings = AgentSettings::default();
+        let c = Candidate {
+            location: FileLocation {
+                path: std::path::PathBuf::from("a.rs"),
+                line_start: 1,
+                line_end: 1,
+            },
+            symbol: Some("foo".to_string()),
+            kind: CandidateKind::SymbolExact,
+            score: 700,
+            snippet: None,
+        };
+        let mk =
+            |cands: Vec<Candidate>, conf: u32, exact: bool, uniq: Option<usize>| RetrievalOutcome {
+                candidates: cands,
+                confidence: conf,
+                has_exact_symbol_match: exact,
+                unique_trusted_symbol: uniq,
+                scope_hint_escaped: false,
+            };
+
+        // Empty candidates: never an early exit, whatever the flags say.
+        assert_eq!(
+            super::early_exit_route(&mk(vec![], 100, true, Some(0)), &settings),
+            None
+        );
+        // High confidence + a trusted exact match -> "confidence".
+        assert_eq!(
+            super::early_exit_route(
+                &mk(vec![c.clone()], settings.early_exit_confidence, true, None),
+                &settings
+            ),
+            Some("confidence")
+        );
+        // Sole trusted symbol, sub-threshold confidence -> "unique-symbol".
+        assert_eq!(
+            super::early_exit_route(&mk(vec![c.clone()], 0, false, Some(0)), &settings),
+            Some("unique-symbol")
+        );
+        // Neither -> None.
+        assert_eq!(
+            super::early_exit_route(&mk(vec![c], 0, false, None), &settings),
+            None
+        );
+    }
 
     #[test]
     fn fallback_cache_prefix_is_byte_stable() {
