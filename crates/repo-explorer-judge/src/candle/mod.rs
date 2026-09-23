@@ -16,9 +16,8 @@ use repo_explorer_core::config::{JudgeBackend, JudgeDevice, JudgeSettings};
 use repo_explorer_core::judge::{self, CandidateJudge, JudgeError, Judgement};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, mpsc, oneshot};
 
 /// A fully loaded checkpoint: tokenizer, encoder, head and calibration.
 pub struct LoadedModel {
@@ -188,14 +187,100 @@ impl LoadedModel {
     }
 }
 
-/// In-process candle judge: lazily loads the checkpoint, then runs one
-/// inference at a time in a blocking task behind a `Mutex`.
+/// One inference request sent to the dedicated worker thread.
+struct Job {
+    states: Vec<String>,
+    respond: oneshot::Sender<Result<Vec<Judgement>, JudgeError>>,
+}
+
+/// A handle to the dedicated OS thread that owns the loaded checkpoint and
+/// serializes inference. Unlike `spawn_blocking` + `Mutex`, a hung inference
+/// call only ever ties up this one thread: it never borrows from tokio's
+/// shared blocking pool, so it cannot starve unrelated `spawn_blocking` work
+/// elsewhere in the process. Queued requests simply time out.
+#[derive(Clone)]
+struct InferenceWorker {
+    tx: mpsc::UnboundedSender<Job>,
+}
+
+impl std::fmt::Debug for InferenceWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InferenceWorker").finish_non_exhaustive()
+    }
+}
+
+impl InferenceWorker {
+    /// Spawns the dedicated thread and awaits the checkpoint load. The
+    /// thread then loops forever, handling one job at a time.
+    async fn spawn(dir: PathBuf, device: JudgeDevice) -> Result<InferenceWorker, JudgeError> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
+        let (load_tx, load_rx) = oneshot::channel::<Result<(), JudgeError>>();
+        std::thread::Builder::new()
+            .name("candle-judge".to_string())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let model = match LoadedModel::load(&dir, device) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "candle judge load failed; queries will degrade");
+                        let _ = load_tx.send(Err(e));
+                        return;
+                    }
+                };
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "candle judge loaded"
+                );
+                if load_tx.send(Ok(())).is_err() {
+                    return;
+                }
+                while let Some(job) = rx.blocking_recv() {
+                    let res = model.judge_states(&job.states);
+                    let _ = job.respond.send(res);
+                }
+            })
+            .expect("failed to spawn candle judge worker thread");
+
+        match load_rx.await {
+            Ok(res) => res.map(|()| InferenceWorker { tx }),
+            Err(_recv_err) => Err(JudgeError::Unavailable {
+                message: "candle judge worker thread exited before loading".to_string(),
+            }),
+        }
+    }
+
+    /// Sends one job and awaits its response, bounded by `timeout_ms`. On
+    /// timeout the response is simply dropped: the worker thread (hung or
+    /// not) is left to finish in the background, exactly as before.
+    async fn judge(
+        &self,
+        states: Vec<String>,
+        timeout_ms: u64,
+    ) -> Result<Vec<Judgement>, JudgeError> {
+        let (respond, response) = oneshot::channel();
+        if self.tx.send(Job { states, respond }).is_err() {
+            return Err(JudgeError::Unavailable {
+                message: "candle judge worker thread is gone".to_string(),
+            });
+        }
+        match tokio::time::timeout(Duration::from_millis(timeout_ms), response).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(_recv_err)) => Err(JudgeError::Unavailable {
+                message: "candle judge worker thread is gone".to_string(),
+            }),
+            Err(_elapsed) => Err(JudgeError::Timeout { timeout_ms }),
+        }
+    }
+}
+
+/// In-process candle judge: lazily spawns the dedicated inference thread on
+/// first use, then serializes inference through it.
 #[derive(Debug)]
 pub struct LayaCandleJudge {
     dir: PathBuf,
     device: JudgeDevice,
     timeout_ms: u64,
-    model: OnceCell<Result<Arc<Mutex<LoadedModel>>, String>>,
+    worker: OnceCell<Result<InferenceWorker, String>>,
 }
 
 impl LayaCandleJudge {
@@ -214,38 +299,19 @@ impl LayaCandleJudge {
             dir: PathBuf::from(settings.checkpoint_dir.trim()),
             device: settings.device,
             timeout_ms: settings.timeout_ms,
-            model: OnceCell::new(),
+            worker: OnceCell::new(),
         })
     }
 
-    async fn loaded(&self) -> Result<Arc<Mutex<LoadedModel>>, JudgeError> {
+    async fn worker(&self) -> Result<InferenceWorker, JudgeError> {
         let dir = self.dir.clone();
         let device = self.device;
         let cell = self
-            .model
+            .worker
             .get_or_init(|| async move {
-                let started = std::time::Instant::now();
-                let res = tokio::task::spawn_blocking(move || LoadedModel::load(&dir, device))
+                InferenceWorker::spawn(dir, device)
                     .await
-                    .unwrap_or_else(|e| {
-                        Err(JudgeError::Unavailable {
-                            message: format!("judge load task failed: {e}"),
-                        })
-                    });
-                match res {
-                    Ok(m) => {
-                        tracing::info!(
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "candle judge loaded"
-                        );
-                        Ok(Arc::new(Mutex::new(m)))
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        tracing::warn!(error = %msg, "candle judge load failed; queries will degrade");
-                        Err(msg)
-                    }
-                }
+                    .map_err(|e| e.to_string())
             })
             .await;
         cell.clone()
@@ -258,26 +324,12 @@ impl CandidateJudge for LayaCandleJudge {
         if states.is_empty() {
             return Ok(vec![]);
         }
-        let model = self.loaded().await?;
-        let states = states.to_vec();
-        let timeout = Duration::from_millis(self.timeout_ms);
-        let handle = tokio::task::spawn_blocking(move || {
-            let guard = model.lock().unwrap_or_else(|p| p.into_inner());
-            guard.judge_states(&states)
-        });
-        match tokio::time::timeout(timeout, handle).await {
-            Ok(Ok(res)) => res,
-            Ok(Err(_join)) => Err(JudgeError::Unavailable {
-                message: "judge inference task failed".to_string(),
-            }),
-            Err(_elapsed) => Err(JudgeError::Timeout {
-                timeout_ms: self.timeout_ms,
-            }),
-        }
+        let worker = self.worker().await?;
+        worker.judge(states.to_vec(), self.timeout_ms).await
     }
 
     async fn warm_up(&self) -> Result<(), JudgeError> {
-        self.loaded().await.map(|_| ())
+        self.worker().await.map(|_| ())
     }
 }
 

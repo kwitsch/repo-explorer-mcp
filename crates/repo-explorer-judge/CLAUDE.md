@@ -31,7 +31,7 @@ encoder config are identical across HTTP and candle backends; only the runtime d
 
 **Module structure:**
 
-- `candle/mod.rs` — `LoadedModel` (full checkpoint + encoder + head + tokenizer), `LayaCandleJudge` (async wrapper with lazy `OnceCell` loading and `Mutex` serialization), integration as a `CandidateJudge`.
+- `candle/mod.rs` — `LoadedModel` (full checkpoint + encoder + head + tokenizer), `LayaCandleJudge` (async wrapper with lazy `OnceCell` loading), `InferenceWorker` (a dedicated OS thread owning the loaded model, serializing inference via an mpsc job queue so a hung call only ties up that one thread, never tokio's shared blocking pool), integration as a `CandidateJudge`.
 - `candle/calib.rs` — temperature selection (honoring `temperature_by_options["choice:2"]` if present, else `temperature[0]`, clamped to `[0.5, 5.0]`), numerically stable softmax over two logits, permille rounding.
 - `candle/sequence.rs` — exact port of Laya 0.3.7 `build_sequence` (choice branch) with fixed judge question from `repo_explorer_core::judge`. Builds token sequences with option markers.
 - `candle/head.rs` — decision head: type embedding, two pre-norm transformer encoder layers (relu, eps 1e-5), and a 2-logit scorer MLP. Inference is f32 on all devices.
