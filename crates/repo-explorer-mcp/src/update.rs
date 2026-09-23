@@ -177,11 +177,40 @@ struct ComponentReport {
     detail: Option<String>,
 }
 
+impl std::fmt::Display for UpdateReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Update: {}", self.status)?;
+        for component in &self.components {
+            writeln!(f, "  {component}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for ComponentReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.name, self.action)?;
+        match (&self.current_version, &self.latest_version) {
+            (Some(current), Some(latest)) if current != latest => {
+                write!(f, " {current} -> {latest}")?;
+            }
+            (Some(current), _) => write!(f, " ({current})")?,
+            (None, Some(latest)) => write!(f, " ({latest})")?,
+            (None, None) => {}
+        }
+        if let Some(detail) = &self.detail {
+            write!(f, " - {detail}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Run the update flow: check + install `repo-explorer-mcp` itself and each
-/// dependency binary concurrently. Prints a structured JSON report to stdout
-/// (stdout is otherwise reserved for the MCP protocol stream, but no MCP
-/// session exists in this mode) and returns non-zero if any component failed.
-pub async fn run_update() -> ExitCode {
+/// dependency binary concurrently. Prints a human-readable report to stdout
+/// by default (or JSON with `json: true`; stdout is otherwise reserved for
+/// the MCP protocol stream, but no MCP session exists in this mode) and
+/// returns non-zero if any component failed.
+pub async fn run_update(json: bool) -> ExitCode {
     let client = match build_http_client() {
         Ok(c) => c,
         Err(e) => {
@@ -222,7 +251,7 @@ pub async fn run_update() -> ExitCode {
         status: if had_error { "error" } else { "ok" },
         components,
     };
-    crate::print_report(&report, "update");
+    crate::print_report(&report, "update", json);
 
     if had_error {
         ExitCode::FAILURE
@@ -1066,6 +1095,60 @@ mod tests {
         let data = b"plain-binary-bytes".to_vec();
         let result = extract_binary("codebase-memory-mcp", &data, "codebase-memory-mcp").unwrap();
         assert_eq!(result, data);
+    }
+
+    #[test]
+    fn update_report_display_renders_each_component() {
+        let report = UpdateReport {
+            status: "ok",
+            components: vec![
+                ComponentReport {
+                    name: "repo-explorer-mcp".to_string(),
+                    current_version: Some("0.10.3".to_string()),
+                    latest_version: Some("0.10.3".to_string()),
+                    action: "up-to-date",
+                    detail: None,
+                },
+                ComponentReport {
+                    name: "codebase-memory-mcp".to_string(),
+                    current_version: Some("0.10.0".to_string()),
+                    latest_version: Some("0.11.0".to_string()),
+                    action: "updated",
+                    detail: None,
+                },
+            ],
+        };
+        let text = report.to_string();
+        assert!(text.contains("Update: ok"), "header: {text}");
+        assert!(text.contains("repo-explorer-mcp"), "self name: {text}");
+        assert!(text.contains("up-to-date"), "self action: {text}");
+        assert!(text.contains("0.10.3"), "self version: {text}");
+        assert!(text.contains("codebase-memory-mcp"), "dep name: {text}");
+        assert!(text.contains("updated"), "dep action: {text}");
+        assert!(text.contains("0.10.0"), "dep old version: {text}");
+        assert!(text.contains("0.11.0"), "dep new version: {text}");
+        assert!(
+            !text.starts_with('{'),
+            "human output must not be JSON: {text}"
+        );
+    }
+
+    #[test]
+    fn update_report_display_shows_error_detail() {
+        let report = UpdateReport {
+            status: "error",
+            components: vec![ComponentReport {
+                name: "codebase-memory-mcp".to_string(),
+                current_version: None,
+                latest_version: None,
+                action: "error",
+                detail: Some("network timeout".to_string()),
+            }],
+        };
+        let text = report.to_string();
+        assert!(text.contains("Update: error"), "header: {text}");
+        assert!(text.contains("error"), "action: {text}");
+        assert!(text.contains("network timeout"), "detail: {text}");
     }
 
     #[test]

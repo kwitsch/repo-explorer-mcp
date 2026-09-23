@@ -1,7 +1,8 @@
 # Troubleshooting
 
 Config loading fails fast with a named error. `repo-explorer-mcp config test`
-prints the error plus the offending TOML key path as JSON.
+prints the error plus the offending TOML key path (add `--json` for the JSON
+form).
 
 | Error                                 | Cause                                                | Fix                                        |
 | ------------------------------------- | ---------------------------------------------------- | ------------------------------------------ |

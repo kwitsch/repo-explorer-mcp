@@ -40,16 +40,16 @@ errors are consumed via `?`/`.context(...)`).
 ## Subcommands
 
 - `config test` (or `--config-test`) validates the resolved config only — parse + semantic checks, no server/memory/LLM/search connections.
-- It prints a structured JSON report to stdout and exits non-zero on failure.
-- `cache stats` / `cache clear` report or wipe the on-disk result cache (the agent crate's L2), printing the same style of JSON report to stdout and exiting non-zero on an io error or when no cache directory resolves.
-- They read `[cache]` through `config::cache_settings`, **not** `config::load`: validation is skipped, because it fails whenever the provider's `api_key_env` is not exported in the calling shell — and a fallback there would retarget `cache clear` from the configured `dir` to the per-user one while still reporting `ok`. A missing or unparseable file still falls back to `CacheSettings::default()` (reporting a broken config is `config test`'s job), announced on **stderr** so stdout stays pure JSON.
+- It prints a human-readable report to stdout by default, or JSON with `--json`, and exits non-zero on failure.
+- `cache stats` / `cache clear` report or wipe the on-disk result cache (the agent crate's L2), printing a human-readable report to stdout by default (or JSON with `--json`) and exiting non-zero on an io error or when no cache directory resolves.
+- They read `[cache]` through `config::cache_settings`, **not** `config::load`: validation is skipped, because it fails whenever the provider's `api_key_env` is not exported in the calling shell — and a fallback there would retarget `cache clear` from the configured `dir` to the per-user one while still reporting `ok`. A missing or unparseable file still falls back to `CacheSettings::default()` (reporting a broken config is `config test`'s job), announced on **stderr**, separate from the report on stdout (text by default, JSON with `--json`).
 - Numbers come from `repo_explorer_agent::disk_cache::{stats, clear}`; the binary only adds `status` and `max_bytes` and never re-derives them.
 - `setup` (mirroring `config test`) runs the interactive wizard.
 - The wizard also auto-runs when the resolved config is missing, but **only if stdin is a TTY**.
 - A non-interactive launch with no config prints guidance to stderr naming the `setup` subcommand, then exits non-zero — never blocking, never writing to stdout.
 - "Missing" means `ConfigError::is_not_found`, not a bare `Path::exists` probe, so an unreadable or malformed config reports its real error instead of "no config".
-- `--update` checks this binary and its runtime dependency binaries against their latest GitHub release, installs anything newer, and prints a structured JSON report to stdout; non-zero exit if any component errors.
-- Subcommand/flag detection runs over `args_without_config_value(argv)`, never raw `argv`: the value of a `--config <path>` pair must never be read as a subcommand (`--config setup` names a file, not the wizard).
+- `--update` checks this binary and its runtime dependency binaries against their latest GitHub release, installs anything newer, and prints a human-readable report to stdout by default (or JSON with `--json`); non-zero exit if any component errors.
+- Subcommand/flag detection runs over `args_without_config_value(argv)`, never raw `argv`: the value of a `--config <path>` pair must never be read as a subcommand (`--config setup` names a file, not the wizard). A single `--json` flag, detected once in `main()` via `has_flag` over `args_without_config_value` (position-independent), is threaded into every one-shot dispatch function and selects JSON instead of the default human-readable output in `print_report`.
 - `--install` registers this binary with Claude Code and is fully headless: it shells out to `claude mcp add repo-explorer-mcp --scope user -- <current_exe>` (idempotent remove-then-add, never hand-editing `~/.claude.json`); only once that registration succeeds does it write a Haiku subagent to `<home>/.claude/agents/explore.md`.
 - The agent file uses `name: Explore` (capital E, deliberately matching Claude Code's built-in `Explore` agent's `agentType` exactly, since overriding/shadowing a built-in is a literal, case-sensitive name match — a lowercase `explore` would just add a second, separate agent instead of replacing the built-in one).
 - Skip-vs-error semantics (shared by install and uninstall): a failed MCP registration reports the agent-file step `skipped` instead, so a broken/unregistered server is never left shadowing the built-in agent.
@@ -57,7 +57,7 @@ errors are consumed via `?`/`.context(...)`).
 - `--uninstall` tolerates an absent `claude` and an already-deleted agent file (both reported as `skipped`, not errors).
 - `--uninstall` only deletes the agent file if its contents still match what `--install` wrote — a hand-edited or replaced file at that path is left in place (`skipped`), never silently destroyed.
 - `--install` fails fast with a non-zero exit and `claude_code_detected: false` when `claude` is not on PATH.
-- Both print a per-step (`mcp-server`, `agent-file`) JSON report to stdout and exit non-zero only when a step errors, mirroring `--update`.
+- Both print a per-step (`mcp-server`, `agent-file`) human-readable report to stdout by default (or JSON with `--json`) and exit non-zero only when a step errors, mirroring `--update`.
 - Both are dispatched before config resolution, so neither loads or creates `repo-explorer.toml`.
 - Dispatch precedence: `--update` (checked first) takes precedence over both; when `--install`/`--uninstall` are both passed without `--update`, `--install` wins (checked first).
 - Full dispatch order in `main()`: `--version` -> `--help` -> `--update` -> `--install` -> `--uninstall` -> `resolve_config_path` -> `config test` -> `cache stats|clear` -> `setup` -> load config -> `run()`. Everything from `config test` down needs the resolved config path; everything above it must not create or read a config.

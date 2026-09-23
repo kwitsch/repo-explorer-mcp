@@ -19,8 +19,8 @@ explore.
 ```bash
 repo-explorer-mcp setup # interactive wizard: detects provider API-key
 # env vars and writes the per-user config
-repo-explorer-mcp config test # validate the resolved config (JSON report on
-# stdout, non-zero exit on failure)
+repo-explorer-mcp config test # validate the resolved config (human-readable
+# report by default, or `--json` for JSON; non-zero exit on failure)
 ```
 
 The wizard runs automatically when no config is found **and** stdin is a TTY.
@@ -149,8 +149,9 @@ There is deliberately no `head` mode. Keying on HEAD alone would serve snippets
 an uncommitted edit has already invalidated — the one failure this cache must
 never produce.
 
-Cache inspection, both printing a JSON report to stdout and exiting non-zero on
-failure (neither starts the server, connects to anything, or prompts):
+Cache inspection, both printing a human-readable report to stdout by default
+(`--json` for JSON) and exiting non-zero on failure (neither starts the
+server, connects to anything, or prompts):
 
 ```bash
 repo-explorer-mcp cache stats # dir, schema_version, entries, bytes, max_bytes, oldest/newest

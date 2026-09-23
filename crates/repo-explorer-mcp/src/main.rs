@@ -28,13 +28,16 @@ Usage:
   repo-explorer-mcp [--config <path>]   Serve on stdio (default)
   repo-explorer-mcp setup               Run the interactive first-run wizard
   repo-explorer-mcp config test         Validate the resolved config only
-  repo-explorer-mcp cache stats         Report the on-disk result cache (JSON)
+  repo-explorer-mcp cache stats         Report the on-disk result cache
   repo-explorer-mcp cache clear         Delete every persisted result
   repo-explorer-mcp --update            Check for and install updates
   repo-explorer-mcp --install           Register with Claude Code (user MCP server + explore agent)
   repo-explorer-mcp --uninstall         Reverse --install
   repo-explorer-mcp --version           Print the version
   repo-explorer-mcp --help              Print this help
+
+Flags:
+  --json                                Emit the one-shot report as JSON instead of text
 
 Config path precedence: --config <path> -> REPO_EXPLORER_CONFIG -> the
 per-user config dir -> ./repo-explorer.toml (when it exists).";
@@ -56,6 +59,7 @@ async fn main() -> ExitCode {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
+    let json = has_flag(&subcommand_args, &["--json"]);
     if update::wants_update(&subcommand_args) {
         if install::wants_install(&subcommand_args) || install::wants_uninstall(&subcommand_args) {
             // --update is a full one-shot mode (check, install, exit) and
@@ -66,13 +70,13 @@ async fn main() -> ExitCode {
                  in the same invocation; running --update only."
             );
         }
-        return update::run_update().await;
+        return update::run_update(json).await;
     }
     if install::wants_install(&subcommand_args) {
-        return install::run_install();
+        return install::run_install(json);
     }
     if install::wants_uninstall(&subcommand_args) {
-        return install::run_uninstall();
+        return install::run_uninstall(json);
     }
     let config_path = resolve_config_path(
         &argv,
@@ -81,10 +85,10 @@ async fn main() -> ExitCode {
         |p| p.exists(),
     );
     if wants_config_test(&subcommand_args) {
-        return run_config_test(&config_path);
+        return run_config_test(&config_path, json);
     }
     if let Some(command) = wants_cache_command(&subcommand_args) {
-        return run_cache_command(command, &config_path);
+        return run_cache_command(command, &config_path, json);
     }
     if setup::wants_setup(&subcommand_args) {
         return setup::run_setup(&config_path);
@@ -443,13 +447,24 @@ fn resolve_cache_dir(configured: &str, xdg_default: Option<PathBuf>) -> Option<P
 }
 
 /// True for `--config-test`, or the two-token subcommand `config test`
-/// (adjacent tokens). Callers pass [`args_without_config_value`] output, so a
-/// `--config <path>` value can never supply either token.
+/// (adjacent once `--json` is dropped — `--json` is position-independent, so
+/// `config --json test` must still match). Callers pass
+/// [`args_without_config_value`] output, so a `--config <path>` value can
+/// never supply either token.
 fn wants_config_test(args: &[String]) -> bool {
     if has_flag(args, &["--config-test"]) {
         return true;
     }
-    args.windows(2).any(|w| w[0] == "config" && w[1] == "test")
+    let args = without_json_flag(args);
+    args.windows(2)
+        .any(|w| w[0].as_str() == "config" && w[1].as_str() == "test")
+}
+
+/// `args` with every `--json` token dropped, so subcommand-adjacency checks
+/// see `cache stats` / `config test` as adjacent even when `--json` was
+/// inserted between them.
+fn without_json_flag(args: &[String]) -> Vec<&String> {
+    args.iter().filter(|a| a.as_str() != "--json").collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,11 +473,14 @@ enum CacheCommand {
     Clear,
 }
 
-/// The two-token subcommand `cache stats` / `cache clear` (adjacent tokens).
-/// Callers pass [`args_without_config_value`] output, so a `--config <path>`
-/// value can never supply either token.
+/// The two-token subcommand `cache stats` / `cache clear` (adjacent once
+/// `--json` is dropped — `--json` is position-independent, so
+/// `cache --json stats` must still match). Callers pass
+/// [`args_without_config_value`] output, so a `--config <path>` value can
+/// never supply either token.
 fn wants_cache_command(args: &[String]) -> Option<CacheCommand> {
-    args.windows(2)
+    without_json_flag(args)
+        .windows(2)
         .find_map(|w| match (w[0].as_str(), w[1].as_str()) {
             ("cache", "stats") => Some(CacheCommand::Stats),
             ("cache", "clear") => Some(CacheCommand::Clear),
@@ -493,17 +511,59 @@ struct CacheErrorReport {
     error: String,
 }
 
-/// Report or wipe the on-disk result cache, printing a structured JSON report
-/// to stdout like `config test`/`--update`. Only `[cache]` is read, and
-/// *without* validating the rest of the config (`config::cache_settings`):
-/// validation fails whenever the provider's `api_key_env` is not exported in
-/// the calling shell, and falling back to the defaults there would retarget
-/// `cache clear` from the configured `dir` to the per-user one — reporting
-/// `ok` after deleting nothing. A missing or unparseable file still falls back
-/// to the defaults, which is what a config-less install runs with; `config
-/// test` is where a broken config gets reported. Exits non-zero when no
-/// directory resolves or the filesystem call fails.
-fn run_cache_command(command: CacheCommand, config_path: &Path) -> ExitCode {
+impl std::fmt::Display for CacheStatsReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "Cache: {} ({}, schema v{})",
+            self.stats.dir, self.status, self.stats.schema_version
+        )?;
+        writeln!(f, "  entries: {}", self.stats.entries)?;
+        writeln!(
+            f,
+            "  size: {} bytes (max {})",
+            self.stats.bytes, self.max_bytes
+        )?;
+        match (self.stats.oldest_unix, self.stats.newest_unix) {
+            (Some(oldest), Some(newest)) => writeln!(f, "  oldest: {oldest}, newest: {newest}"),
+            _ => writeln!(f, "  oldest: -, newest: -"),
+        }
+    }
+}
+
+impl std::fmt::Display for CacheClearReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Cache cleared ({}): {}", self.status, self.cleared.dir)?;
+        writeln!(
+            f,
+            "  removed {} entries, {} bytes",
+            self.cleared.removed_entries, self.cleared.removed_bytes
+        )
+    }
+}
+
+impl std::fmt::Display for CacheErrorReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Cache {}", self.status)?;
+        if let Some(dir) = &self.dir {
+            writeln!(f, "  dir: {dir}")?;
+        }
+        writeln!(f, "  error: {}", self.error)
+    }
+}
+
+/// Report or wipe the on-disk result cache, printing a human-readable report
+/// to stdout by default (or JSON with `json: true`) like `config test`/
+/// `--update`. Only `[cache]` is read, and *without* validating the rest of
+/// the config (`config::cache_settings`): validation fails whenever the
+/// provider's `api_key_env` is not exported in the calling shell, and falling
+/// back to the defaults there would retarget `cache clear` from the
+/// configured `dir` to the per-user one — reporting `ok` after deleting
+/// nothing. A missing or unparseable file still falls back to the defaults,
+/// which is what a config-less install runs with; `config test` is where a
+/// broken config gets reported. Exits non-zero when no directory resolves or
+/// the filesystem call fails.
+fn run_cache_command(command: CacheCommand, config_path: &Path, json: bool) -> ExitCode {
     let kind = match command {
         CacheCommand::Stats => "cache-stats",
         CacheCommand::Clear => "cache-clear",
@@ -531,6 +591,7 @@ fn run_cache_command(command: CacheCommand, config_path: &Path) -> ExitCode {
                     .to_string(),
             },
             kind,
+            json,
         );
         return ExitCode::FAILURE;
     };
@@ -541,13 +602,13 @@ fn run_cache_command(command: CacheCommand, config_path: &Path) -> ExitCode {
                 stats,
                 max_bytes: cache.persistent_max_bytes,
             })
-            .map(|r| print_report(&r, kind)),
+            .map(|r| print_report(&r, kind, json)),
         CacheCommand::Clear => repo_explorer_agent::disk_cache::clear(&dir)
             .map(|cleared| CacheClearReport {
                 status: "ok",
                 cleared,
             })
-            .map(|r| print_report(&r, kind)),
+            .map(|r| print_report(&r, kind, json)),
     };
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
@@ -559,6 +620,7 @@ fn run_cache_command(command: CacheCommand, config_path: &Path) -> ExitCode {
                     error: e.to_string(),
                 },
                 kind,
+                json,
             );
             ExitCode::FAILURE
         }
@@ -581,12 +643,36 @@ struct ConfigTestError {
     toml_path: Option<String>,
 }
 
+impl std::fmt::Display for ConfigTestReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Config {}: {}", self.status, self.config_path)?;
+        for warning in &self.warnings {
+            writeln!(f, "  warning: {warning}")?;
+        }
+        if let Some(error) = &self.error {
+            write!(f, "{error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for ConfigTestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Error: {}", self.message)?;
+        if let Some(path) = &self.toml_path {
+            writeln!(f, "  at {path}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Validate-only mode: load + parse + validate the config and print a
-/// structured JSON report to stdout. No runtime subsystem is started (no
-/// tracing, memory/search/LLM connections, or rmcp stdio transport). Because
-/// no MCP session exists here, stdout is used for the report; exits non-zero
-/// on any load/parse/validation failure.
-fn run_config_test(config_path: &Path) -> ExitCode {
+/// human-readable report to stdout by default (or JSON with `json: true`).
+/// No runtime subsystem is started (no tracing, memory/search/LLM
+/// connections, or rmcp stdio transport). Because no MCP session exists here,
+/// stdout is used for the report; exits non-zero on any load/parse/validation
+/// failure.
+fn run_config_test(config_path: &Path, json: bool) -> ExitCode {
     match repo_explorer_core::config::load(config_path) {
         Ok((_, warnings)) => {
             let report = ConfigTestReport {
@@ -595,7 +681,7 @@ fn run_config_test(config_path: &Path) -> ExitCode {
                 warnings,
                 error: None,
             };
-            print_report(&report, "config-test");
+            print_report(&report, "config-test", json);
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -608,19 +694,28 @@ fn run_config_test(config_path: &Path) -> ExitCode {
                     toml_path: e.toml_path(),
                 }),
             };
-            print_report(&report, "config-test");
+            print_report(&report, "config-test", json);
             ExitCode::FAILURE
         }
     }
 }
 
-/// Print any of this binary's one-shot CLI reports (config-test, update) as a
-/// single pretty-printed JSON object to stdout. `kind` names the report in
-/// the error message printed on the (rare) serialization failure.
-pub(crate) fn print_report(report: &impl serde::Serialize, kind: &str) {
-    match serde_json::to_string_pretty(report) {
-        Ok(s) => println!("{s}"),
-        Err(e) => eprintln!("repo-explorer-mcp: failed to serialize {kind} report: {e}"),
+/// Print any of this binary's one-shot CLI reports to stdout. Human-readable
+/// text by default (`Display`); pretty JSON when `json` is set. `kind` names
+/// the report in the error message printed on the (rare) serialization
+/// failure.
+pub(crate) fn print_report(
+    report: &(impl serde::Serialize + std::fmt::Display),
+    kind: &str,
+    json: bool,
+) {
+    if json {
+        match serde_json::to_string_pretty(report) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("repo-explorer-mcp: failed to serialize {kind} report: {e}"),
+        }
+    } else {
+        println!("{report}");
     }
 }
 
@@ -864,6 +959,12 @@ mod tests {
             "test".to_string(),
             "config".to_string()
         ]));
+        // `--json` is position-independent and must not break adjacency.
+        assert!(wants_config_test(&[
+            "config".to_string(),
+            "--json".to_string(),
+            "test".to_string()
+        ]));
     }
 
     #[test]
@@ -881,6 +982,11 @@ mod tests {
         assert_eq!(wants_cache_command(&args(&["stats", "cache"])), None);
         assert_eq!(wants_cache_command(&args(&["cache", "purge"])), None);
         assert_eq!(wants_cache_command(&[]), None);
+        // `--json` is position-independent and must not break adjacency.
+        assert_eq!(
+            wants_cache_command(&args(&["cache", "--json", "stats"])),
+            Some(CacheCommand::Stats)
+        );
     }
 
     #[test]
@@ -970,6 +1076,132 @@ mod tests {
         let managed = PathBuf::from(r"C:\Users\user\AppData\Local\repo-explorer-mcp\rtk.exe");
         let forward_slashes = Path::new("C:/Users/user/AppData/Local/repo-explorer-mcp/rtk.exe");
         assert!(paths_match_managed(forward_slashes, &managed));
+    }
+
+    #[test]
+    fn config_test_report_display_valid() {
+        let report = ConfigTestReport {
+            status: "valid",
+            config_path: "/tmp/repo-explorer.toml".to_string(),
+            warnings: vec!["deprecated key ignored".to_string()],
+            error: None,
+        };
+        let text = report.to_string();
+        assert!(text.contains("valid"), "status word: {text}");
+        assert!(text.contains("/tmp/repo-explorer.toml"), "path: {text}");
+        assert!(text.contains("deprecated key ignored"), "warning: {text}");
+        assert!(
+            !text.starts_with('{'),
+            "human output must not be JSON: {text}"
+        );
+    }
+
+    #[test]
+    fn config_test_report_display_invalid() {
+        let report = ConfigTestReport {
+            status: "invalid",
+            config_path: "/tmp/repo-explorer.toml".to_string(),
+            warnings: Vec::new(),
+            error: Some(ConfigTestError {
+                message: "missing field `llm.provider`".to_string(),
+                toml_path: Some("llm.provider".to_string()),
+            }),
+        };
+        let text = report.to_string();
+        assert!(text.contains("invalid"), "status word: {text}");
+        assert!(
+            text.contains("missing field `llm.provider`"),
+            "message: {text}"
+        );
+        assert!(text.contains("llm.provider"), "toml path: {text}");
+    }
+
+    #[test]
+    fn cache_stats_report_display() {
+        let report = CacheStatsReport {
+            status: "ok",
+            stats: repo_explorer_agent::disk_cache::CacheStats {
+                dir: "/home/u/.cache/repo-explorer".to_string(),
+                schema_version: 2,
+                entries: 12,
+                bytes: 3_567_129,
+                oldest_unix: Some(1_758_400_000),
+                newest_unix: Some(1_758_490_000),
+            },
+            max_bytes: 268_435_456,
+        };
+        let text = report.to_string();
+        assert!(text.contains("/home/u/.cache/repo-explorer"), "dir: {text}");
+        assert!(text.contains("v2"), "schema: {text}");
+        assert!(text.contains("12"), "entries: {text}");
+        assert!(text.contains("3567129"), "bytes: {text}");
+        assert!(text.contains("268435456"), "max_bytes: {text}");
+        assert!(text.contains("1758400000"), "oldest: {text}");
+        assert!(text.contains("1758490000"), "newest: {text}");
+    }
+
+    #[test]
+    fn cache_clear_report_display() {
+        let report = CacheClearReport {
+            status: "ok",
+            cleared: repo_explorer_agent::disk_cache::CacheCleared {
+                dir: "/home/u/.cache/repo-explorer".to_string(),
+                removed_entries: 7,
+                removed_bytes: 4096,
+            },
+        };
+        let text = report.to_string();
+        assert!(text.contains("/home/u/.cache/repo-explorer"), "dir: {text}");
+        assert!(text.contains('7'), "removed entries: {text}");
+        assert!(text.contains("4096"), "removed bytes: {text}");
+    }
+
+    #[test]
+    fn cache_error_report_display() {
+        let report = CacheErrorReport {
+            status: "error",
+            dir: Some("/home/u/.cache/repo-explorer".to_string()),
+            error: "permission denied".to_string(),
+        };
+        let text = report.to_string();
+        assert!(text.contains("error"), "status: {text}");
+        assert!(text.contains("/home/u/.cache/repo-explorer"), "dir: {text}");
+        assert!(text.contains("permission denied"), "error message: {text}");
+        // With no directory resolved, the dir line is simply omitted.
+        let none = CacheErrorReport {
+            status: "unavailable",
+            dir: None,
+            error: "no cache directory resolved".to_string(),
+        };
+        let none_text = none.to_string();
+        assert!(
+            none_text.contains("no cache directory resolved"),
+            "{none_text}"
+        );
+    }
+
+    #[test]
+    fn json_flag_detected_anywhere() {
+        assert!(has_flag(&args(&["--json"]), &["--json"]));
+        assert!(has_flag(&args(&["cache", "stats", "--json"]), &["--json"]));
+        assert!(has_flag(&args(&["--json", "cache", "stats"]), &["--json"]));
+        assert!(!has_flag(&args(&["cache", "stats"]), &["--json"]));
+        // A `--config --json` pair means a config file literally named `--json`,
+        // never the flag, once the value token is stripped.
+        let stripped = args_without_config_value(&args(&["--config", "--json", "cache", "stats"]));
+        assert!(!has_flag(&stripped, &["--json"]));
+    }
+
+    #[test]
+    fn usage_documents_the_json_flag_and_drops_the_json_default_claim() {
+        assert!(
+            USAGE.contains("--json"),
+            "USAGE must document --json:\n{USAGE}"
+        );
+        assert!(
+            !USAGE.contains("cache stats         Report the on-disk result cache (JSON)"),
+            "the cache-stats USAGE line must no longer claim JSON-by-default:\n{USAGE}"
+        );
     }
 
     #[test]
