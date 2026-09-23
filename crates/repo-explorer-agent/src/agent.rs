@@ -1140,36 +1140,12 @@ where
         index_note: Option<&str>,
         repo_root: &Path,
     ) -> ExplorationResult {
-        let canonical_root = canonical_repo_root(repo_root).await.ok();
-        let mut verified = Vec::with_capacity(candidates.len());
-        if let Some(root) = &canonical_root {
-            let mut line_counts: HashMap<PathBuf, Result<u32, String>> = HashMap::new();
-            for candidate in candidates {
-                let location = normalize_location(candidate.location.clone());
-                let line_count = match line_counts.get(&location.path) {
-                    Some(cached) => cached.clone(),
-                    None => {
-                        let result = read_verified_file(&location.path, repo_root, root)
-                            .await
-                            .map(|(_content, line_count)| line_count);
-                        line_counts.insert(location.path.clone(), result.clone());
-                        result
-                    }
-                };
-                match line_count.and_then(|line_count| clamp_location(location, line_count)) {
-                    Ok(location) => {
-                        // Keep the backend-provided snippet (not LLM-authored,
-                        // so F-18 does not apply); only the location is verified.
-                        let mut candidate = candidate.clone();
-                        candidate.location = location;
-                        verified.push(finding_from_candidate(candidate));
-                    }
-                    Err(reason) => {
-                        tracing::debug!(reason = %reason, "early-exit dropped an unverifiable candidate")
-                    }
-                }
-            }
-        }
+        let refs: Vec<&Candidate> = candidates.iter().collect();
+        let verified: Vec<ExplorationFinding> = verified_candidate_findings(repo_root, &refs)
+            .await
+            .into_iter()
+            .map(|(_, f)| f)
+            .collect();
         let findings = self.tidy_and_truncate(verified, query);
         let mut summary = format!(
             "Resolved deterministically by the retrieval pre-stage (confidence {confidence}/100, no LLM involved): {} location(s) matching \"{}\".",
@@ -1525,6 +1501,47 @@ fn index_status_label(result: &Result<IndexStatus, MemoryError>) -> &'static str
         Ok(IndexStatus::IndexingFailed { .. }) => "IndexingFailed",
         Err(_) => "Unavailable",
     }
+}
+
+/// Disk-verify each candidate (path exists in the repo, `line_start` within
+/// the file, `line_end` clamped), returning the input position and the
+/// resulting finding for every survivor, in input order. Caches the per-path
+/// line count so several candidates in one file cost one read. The single
+/// disk-verification path shared by the early-exit, judge and offline legs.
+pub(crate) async fn verified_candidate_findings(
+    repo_root: &Path,
+    candidates: &[&Candidate],
+) -> Vec<(usize, ExplorationFinding)> {
+    let canonical_root = match canonical_repo_root(repo_root).await {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut verified = Vec::with_capacity(candidates.len());
+    let mut line_counts: HashMap<PathBuf, Result<u32, String>> = HashMap::new();
+    for (i, candidate) in candidates.iter().enumerate() {
+        let location = normalize_location(candidate.location.clone());
+        let line_count = match line_counts.get(&location.path) {
+            Some(cached) => cached.clone(),
+            None => {
+                let result = read_verified_file(&location.path, repo_root, &canonical_root)
+                    .await
+                    .map(|(_content, line_count)| line_count);
+                line_counts.insert(location.path.clone(), result.clone());
+                result
+            }
+        };
+        match line_count.and_then(|line_count| clamp_location(location, line_count)) {
+            Ok(location) => {
+                let mut candidate = (*candidate).clone();
+                candidate.location = location;
+                verified.push((i, finding_from_candidate(candidate)));
+            }
+            Err(reason) => {
+                tracing::debug!(reason = %reason, "dropped an unverifiable candidate")
+            }
+        }
+    }
+    verified
 }
 
 /// The Stage-3 early-exit route choice, factored out of `AgentLoop::run` so the
@@ -2049,6 +2066,46 @@ mod tests {
             "pre-dedupe truncation must not drop the distinct 4th candidate"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn verified_candidate_findings_returns_positions_and_drops_missing() {
+        use crate::agent::verified_candidate_findings;
+        let dir = crate::test_support::temp_repo_with(
+            "verified_candidate_findings",
+            "basic",
+            &[("src/lib.rs", "a\nb\nc\nd\n")],
+        );
+        let c_ok = Candidate {
+            location: FileLocation {
+                path: PathBuf::from("src/lib.rs"),
+                line_start: 2,
+                line_end: 3,
+            },
+            symbol: Some("f".to_string()),
+            kind: CandidateKind::SymbolExact,
+            score: 0,
+            snippet: None,
+        };
+        let c_missing = Candidate {
+            location: FileLocation {
+                path: PathBuf::from("src/gone.rs"),
+                line_start: 1,
+                line_end: 1,
+            },
+            symbol: None,
+            kind: CandidateKind::ContentHit,
+            score: 0,
+            snippet: None,
+        };
+        let refs: Vec<&Candidate> = vec![&c_missing, &c_ok];
+        let out = verified_candidate_findings(&dir, &refs).await;
+        std::fs::remove_dir_all(&dir).ok();
+        // Only the existing file survives; its input position (1) is preserved.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 1);
+        assert_eq!(out[0].1.location.path, PathBuf::from("src/lib.rs"));
+        assert_eq!(out[0].1.location.line_end, 3);
     }
 
     #[tokio::test]
