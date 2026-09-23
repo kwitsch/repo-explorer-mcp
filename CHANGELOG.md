@@ -7,6 +7,11 @@ collects what is on `main` but not yet tagged.
 
 ### Added
 
+- **In-process candle judge backend (`judge.backend = "candle"`).** An
+  alternative to the HTTP backend that runs the fine-tuned Laya checkpoint
+  inside the binary with no Python sidecar. CPU is in the default build, CUDA
+  via the `cuda-judge` feature. Same parity and decision semantics as the HTTP
+  backend; no per-request HTTP overhead. See `docs/laya-judge.md`.
 - **Training-data generator (`repo-explorer-datagen`, dev-only) and Laya
   fine-tune tooling (`train/laya/`)** for the upcoming local candidate judge.
 - **Local candidate judge (`[judge]`, `repo-explorer-judge`).** Stage-4

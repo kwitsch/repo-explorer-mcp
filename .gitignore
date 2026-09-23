@@ -21,3 +21,6 @@ __pycache__/
 train/laya/.venv/
 train/laya/**/*.pt
 train/laya/**/__pycache__/
+
+# Uncommitted local eval configs holding absolute checkpoint paths (Stage 10c P3).
+eval/config/*.local.toml
