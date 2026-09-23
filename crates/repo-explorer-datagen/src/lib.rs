@@ -5,5 +5,6 @@
 pub mod corpus;
 pub mod label;
 pub mod rng;
+pub mod rows;
 pub mod symbols;
 pub mod templates;
