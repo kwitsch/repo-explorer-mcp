@@ -29,3 +29,8 @@ tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 self-replace = "1"
 which = "8"
+
+[features]
+default = ["candle-judge"]
+candle-judge = ["repo-explorer-judge/candle"]
+cuda-judge = ["candle-judge", "repo-explorer-judge/cuda"]

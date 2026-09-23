@@ -2,6 +2,9 @@
 //! `laya-serve` wire format (`POST /v1/systemone`). Owns `reqwest` for the
 //! judge and never proxies (the judge is a local/LAN service).
 
+#[cfg(feature = "candle")]
+pub mod candle;
+
 use futures_util::future::try_join_all;
 use repo_explorer_core::config::{JudgeMode, JudgeSettings};
 use repo_explorer_core::judge::{
