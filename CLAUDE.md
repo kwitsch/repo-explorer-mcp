@@ -10,6 +10,8 @@ Rust MCP server, shipped for Linux and Windows. Exposes the `explore_repository`
 - `crates/repo-explorer-llm/` — `GenaiProvider` (the sole `LlmProvider` impl) backed by the `genai` crate. Details in `crates/repo-explorer-llm/CLAUDE.md`.
 - `crates/repo-explorer-search/` — `NativeSearchBackend`: in-process text/filename search over ripgrep's `ignore` + `grep` library crates, plus `GitStateProbe`. Details in `crates/repo-explorer-search/CLAUDE.md`.
 - `crates/repo-explorer-agent/` — `AgentLoop`: the exploration orchestrator; owns `serde_json` (core stays free of it). Details in `crates/repo-explorer-agent/CLAUDE.md`.
+- `crates/repo-explorer-datagen/` — dev-only training-data generator for the Stage-10 Laya judge; a library + thin binary, `publish = false`, never built by `release.yml`. Details in `crates/repo-explorer-datagen/CLAUDE.md`.
+- `train/laya/` — Python fine-tune tooling for the Stage-10 Laya judge (dev-only; pinned `laya==0.3.7`; CI runs only the numpy-only tests). See `docs/laya-judge-training.md`.
 - `.claude/rules/` — path-scoped rules Claude Code loads automatically when editing matching files.
 
 ## Build & test
