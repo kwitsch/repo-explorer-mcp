@@ -1849,6 +1849,7 @@ dependencies = [
  "hex",
  "repo-explorer-agent",
  "repo-explorer-core",
+ "repo-explorer-judge",
  "repo-explorer-llm",
  "repo-explorer-memory",
  "repo-explorer-search",

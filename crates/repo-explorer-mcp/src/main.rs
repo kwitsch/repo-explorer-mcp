@@ -212,17 +212,42 @@ async fn run(mut config: repo_explorer_core::config::Config) -> anyhow::Result<(
     let router = repo_explorer_llm::build_router(&config.llm)
         .context("failed to build LLM provider router")?;
     let probe = GitStateProbe::new(config.search.timeout_seconds);
-    let agent = AgentLoop::new(
-        memory,
-        search,
-        router,
-        probe,
-        config.agent,
-        config.cache,
-        std::time::Duration::from_secs(config.codebase_memory.staleness_seconds),
+    let judge = repo_explorer_judge::ConfiguredJudge::from_settings(&config.judge)
+        .context("failed to configure the local judge ([judge])")?;
+    tracing::info!(
+        mode = ?config.judge.mode,
+        fallback = ?config.agent.fallback,
+        base_url = %config.judge.base_url,
+        "local judge configuration"
     );
+    let judge_settings = config.judge.clone();
+    let judge_mode = config.judge.mode;
+    let agent = Arc::new(
+        AgentLoop::new(
+            memory,
+            search,
+            router,
+            probe,
+            config.agent,
+            config.cache,
+            std::time::Duration::from_secs(config.codebase_memory.staleness_seconds),
+        )
+        .with_judge(judge, judge_settings),
+    );
+    if judge_mode != repo_explorer_core::config::JudgeMode::Off {
+        let a = Arc::clone(&agent);
+        tokio::spawn(async move {
+            match a.warm_judge().await {
+                Ok(()) => tracing::info!("local judge ready"),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "local judge not ready; queries will degrade until it is"
+                ),
+            }
+        });
+    }
 
-    let server = RepoExplorerServer::new(Arc::new(agent));
+    let server = RepoExplorerServer::new(agent);
     tracing::info!("repo-explorer-mcp serving on stdio");
     let service = server
         .serve(rmcp::transport::stdio())
