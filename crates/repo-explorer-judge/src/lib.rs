@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 /// A judge backed by an upstream `laya-serve` instance.
+#[derive(Debug)]
 pub struct LayaHttpJudge {
     client: reqwest::Client,
     endpoint: String,
@@ -202,18 +203,36 @@ impl CandidateJudge for LayaHttpJudge {
 
 /// Runtime choice of judge without `dyn`: the crate convention is static
 /// dispatch.
+#[derive(Debug)]
 pub enum ConfiguredJudge {
     Disabled(NoJudge),
     Laya(LayaHttpJudge),
+    #[cfg(feature = "candle")]
+    Candle(candle::LayaCandleJudge),
 }
 
 impl ConfiguredJudge {
     pub fn from_settings(settings: &JudgeSettings) -> Result<Self, JudgeError> {
+        use repo_explorer_core::config::JudgeBackend;
         match settings.mode {
             JudgeMode::Off => Ok(ConfiguredJudge::Disabled(NoJudge)),
-            JudgeMode::Laya | JudgeMode::Shadow => {
-                Ok(ConfiguredJudge::Laya(LayaHttpJudge::new(settings)?))
-            }
+            JudgeMode::Laya | JudgeMode::Shadow => match settings.backend {
+                JudgeBackend::Http => Ok(ConfiguredJudge::Laya(LayaHttpJudge::new(settings)?)),
+                JudgeBackend::Candle => {
+                    #[cfg(feature = "candle")]
+                    {
+                        Ok(ConfiguredJudge::Candle(candle::LayaCandleJudge::new(
+                            settings,
+                        )?))
+                    }
+                    #[cfg(not(feature = "candle"))]
+                    {
+                        Err(JudgeError::Unavailable {
+                            message: "this build has no candle judge backend (built without the candle-judge feature)".to_string(),
+                        })
+                    }
+                }
+            },
         }
     }
 }
@@ -223,6 +242,8 @@ impl CandidateJudge for ConfiguredJudge {
         match self {
             ConfiguredJudge::Disabled(j) => j.judge(states).await,
             ConfiguredJudge::Laya(j) => j.judge(states).await,
+            #[cfg(feature = "candle")]
+            ConfiguredJudge::Candle(j) => j.judge(states).await,
         }
     }
 
@@ -230,6 +251,50 @@ impl CandidateJudge for ConfiguredJudge {
         match self {
             ConfiguredJudge::Disabled(j) => j.warm_up().await,
             ConfiguredJudge::Laya(j) => j.warm_up().await,
+            #[cfg(feature = "candle")]
+            ConfiguredJudge::Candle(j) => j.warm_up().await,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "candle"))]
+mod configured_candle_tests {
+    use super::ConfiguredJudge;
+    use repo_explorer_core::config::{JudgeBackend, JudgeMode, JudgeSettings};
+
+    #[test]
+    fn candle_backend_selects_candle_variant() {
+        let s = JudgeSettings {
+            mode: JudgeMode::Laya,
+            backend: JudgeBackend::Candle,
+            checkpoint_dir: "/nonexistent/ckpt".to_string(),
+            ..JudgeSettings::default()
+        };
+        let j = ConfiguredJudge::from_settings(&s).unwrap();
+        assert!(matches!(j, ConfiguredJudge::Candle(_)));
+    }
+}
+
+#[cfg(all(test, not(feature = "candle")))]
+mod configured_no_candle_tests {
+    use super::ConfiguredJudge;
+    use repo_explorer_core::config::{JudgeBackend, JudgeMode, JudgeSettings};
+    use repo_explorer_core::judge::JudgeError;
+
+    #[test]
+    fn candle_backend_without_feature_is_unavailable() {
+        let s = JudgeSettings {
+            mode: JudgeMode::Laya,
+            backend: JudgeBackend::Candle,
+            checkpoint_dir: "/x".to_string(),
+            ..JudgeSettings::default()
+        };
+        let err = ConfiguredJudge::from_settings(&s).unwrap_err();
+        match err {
+            JudgeError::Unavailable { message } => {
+                assert!(message.contains("candle-judge"), "{message}")
+            }
+            _ => panic!("wrong variant"),
         }
     }
 }
