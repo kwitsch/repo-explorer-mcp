@@ -5,3 +5,4 @@
 pub mod corpus;
 pub mod rng;
 pub mod symbols;
+pub mod templates;
