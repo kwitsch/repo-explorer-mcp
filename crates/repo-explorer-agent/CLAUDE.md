@@ -154,3 +154,21 @@ schema_version` pins the serialized JSON as a literal: any move on either
 - Cache-hit runs report `cache_layer` (`l1`/`l2`), `turns_saved_by_cache` and
   `tokens_saved_by_cache` in `QueryMetrics`; all three are `Option`, absent on
   every non-cache path.
+
+## Judge input (Stage 10)
+
+`judge_input::render_judge_state` renders the plain-text judge state for ONE
+retrieval candidate (`JUDGE_STATE_VERSION = 1`, format pinned in
+`repo_explorer_core::judge`). The 10a datagen generator and the 10b runtime both
+call it, so training and serving see byte-identical input — **train/serve parity
+by construction**. `render_judge_states` batches the per-candidate reads
+(outline once per file, body window `[start-3, end+5]`), returning `None` for
+unknown-location candidates (never judged). **Bump `JUDGE_STATE_VERSION`
+(in core) on any change to the rendering or the D1 constants** — a checkpoint is
+valid only for the version it was trained on.
+
+`snapshot::retrieval_snapshot` runs the deterministic pre-stage alone (no index
+refresh, no cache, no LLM) and classifies the result as `EarlyExit`/`Verify`/
+`Fallback` via the shared `early_exit_route`. The datagen generator labels rows
+only from `Verify`-stage snapshots (the only case 10b calls the judge). The disk
+authorization of the real early exit is not simulated — an accepted approximation.
