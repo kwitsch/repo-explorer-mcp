@@ -1492,6 +1492,17 @@ fn may_skip_index_refresh(
 }
 
 /// Map `ensure_fresh_index`'s result onto a short label for the
+/// `exploration complete` log line — `Unavailable` covers the `Err` arm,
+/// which carries no `IndexStatus` value of its own.
+fn index_status_label(result: &Result<IndexStatus, MemoryError>) -> &'static str {
+    match result {
+        Ok(IndexStatus::Reindexed) => "Reindexed",
+        Ok(IndexStatus::UpToDate) => "UpToDate",
+        Ok(IndexStatus::IndexingFailed { .. }) => "IndexingFailed",
+        Err(_) => "Unavailable",
+    }
+}
+
 /// Disk-verify each candidate (path exists in the repo, `line_start` within
 /// the file, `line_end` clamped), returning the input position and the
 /// resulting finding for every survivor, in input order. Caches the per-path
@@ -1531,17 +1542,6 @@ pub(crate) async fn verified_candidate_findings(
         }
     }
     verified
-}
-
-/// `exploration complete` log line — `Unavailable` covers the `Err` arm,
-/// which carries no `IndexStatus` value of its own.
-fn index_status_label(result: &Result<IndexStatus, MemoryError>) -> &'static str {
-    match result {
-        Ok(IndexStatus::Reindexed) => "Reindexed",
-        Ok(IndexStatus::UpToDate) => "UpToDate",
-        Ok(IndexStatus::IndexingFailed { .. }) => "IndexingFailed",
-        Err(_) => "Unavailable",
-    }
 }
 
 /// The Stage-3 early-exit route choice, factored out of `AgentLoop::run` so the
