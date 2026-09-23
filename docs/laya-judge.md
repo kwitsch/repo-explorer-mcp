@@ -75,6 +75,94 @@ serial inferences at roughly 0.3-1 s each can noticeably add to query
 latency; `judge.timeout_ms` defaults to 20,000 for this reason. GPU serving
 (`LAYA_DEVICE=cuda`) is recommended for anything beyond smoke-testing.
 
+## Backends
+
+The judge can run via HTTP (the default) or as an in-process `candle` backend:
+
+| Aspect          | HTTP (`judge-serve`)       | Candle (in-process)      |
+| --------------- | -------------------------- | ------------------------ |
+| Dependencies    | Python sidecar + open port | none (Rust binary only)  |
+| Per-candidate   | one HTTP request           | one forward pass         |
+| Batching        | concurrent HTTP clients    | up to 4 per forward pass |
+| Memory (f32)    | ~1.7 GB weights            | ~1.7 GB weights          |
+| Transient (GPU) | ~1 GiB per request         | ~1 GiB per batch         |
+
+### HTTP backend (default)
+
+```toml
+[judge]
+mode = "laya"
+backend = "http"
+base_url = "http://127.0.0.1:8765"
+model = "typed-decisions"
+timeout_ms = 20000
+max_concurrency = 4
+select_threshold = 50
+```
+
+Start the judge with `judge-serve/serve.py` (see above).
+
+### Candle backend (in-process)
+
+```toml
+[judge]
+mode = "laya"
+backend = "candle"
+checkpoint_dir = "/home/<user>/laya-ckpt/v1"
+device = "cpu"
+timeout_ms = 20000
+select_threshold = 50
+```
+
+**Note:** The binary does not expand `~`, so use an absolute path for `checkpoint_dir`.
+
+**Building with CUDA:** By default, the candle backend runs on CPU. To enable GPU inference, install with the `cuda-judge` feature:
+
+```bash
+cargo install --path crates/repo-explorer-mcp --features cuda-judge
+```
+
+Then set `device = "cuda"` in the config. The checkpoint and its encoder model are the same for both backends; only the runtime differs.
+
+### Parity validation
+
+Before promotion, verify that the in-process candle backend produces the same decisions as the HTTP backend against your checkpoint. The `judge-serve/export_golden.py` utility records golden-standard token sequences and logits from the PyTorch model:
+
+```bash
+# With laya==0.3.7 installed and the checkpoint ready:
+REPO_EXPLORER_LAYA_CHECKPOINT=~/laya-ckpt/v1 \
+  python judge-serve/export_golden.py \
+  --checkpoint ~/laya-ckpt/v1 \
+  --data ~/eval-data --n 50
+
+# Run the ignored parity tests (requires the checkpoint and golden.jsonl nearby):
+REPO_EXPLORER_LAYA_CHECKPOINT=~/laya-ckpt/v1 \
+  cargo test -p repo-explorer-judge --features candle -- --ignored
+```
+
+Expected: all three parity tests pass (`parity_token_ids`, `parity_logits_and_decisions`, `bench_judge_latency`).
+
+For the evaluation harness, copy your HTTP judge config to a local variant:
+
+```bash
+cp eval/config/judge-laya.toml eval/config/judge-candle.local.toml
+```
+
+Edit `eval/config/judge-candle.local.toml` to set `backend = "candle"`, absolute `checkpoint_dir`, and `device`:
+
+```toml
+[judge]
+backend = "candle"
+checkpoint_dir = "/home/<user>/laya-ckpt/v1"
+device = "cpu"
+```
+
+Then run the evaluation:
+
+```bash
+uv run --with pyyaml eval/run.py --config eval/config/judge-candle.local.toml
+```
+
 ## Configuration
 
 See `docs/configuration.md` for the full `[judge]` key reference
