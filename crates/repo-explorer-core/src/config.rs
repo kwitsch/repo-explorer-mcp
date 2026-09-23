@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 /// add fields without breaking existing configs.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
+    #[serde(default)]
     pub llm: LlmConfig,
     pub codebase_memory: CodebaseMemoryConfig,
     #[serde(default)]
@@ -21,6 +22,8 @@ pub struct Config {
     pub agent: AgentSettings,
     #[serde(default)]
     pub cache: CacheSettings,
+    #[serde(default)]
+    pub judge: JudgeSettings,
     #[serde(default)]
     pub logging: LoggingConfig,
 }
@@ -39,6 +42,19 @@ pub struct LlmConfig {
     /// is `http://` is not covered. Unset means "no proxy".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub https_proxy: Option<String>,
+}
+
+/// Hand-written so an absent `[llm]` (valid only with `judge.mode = "laya"` +
+/// `agent.fallback = "off"`) parses to an empty provider list rather than
+/// failing deserialization.
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            providers: Vec::new(),
+            cooldown_seconds: default_cooldown_seconds(),
+            https_proxy: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -190,6 +206,10 @@ pub struct AgentSettings {
     /// hatch: verification then runs for every sub-threshold query again.
     #[serde(default = "default_skip_verify_on_exact_symbol")]
     pub skip_verify_on_exact_symbol: bool,
+    /// Stage-5 strategy. `llm` runs the explorative fallback loop; `off`
+    /// synthesizes up to 5 disk-verified unverified candidates with no LLM.
+    #[serde(default)]
+    pub fallback: FallbackMode,
     /// Deterministic repo-brief prefetch injected into the explorative
     /// fallback loop (Stage 5 only). Must stay the LAST field: a nested
     /// table has to be serialized after every bare `[agent]` scalar.
@@ -239,6 +259,81 @@ impl Default for RepoBriefSettings {
     }
 }
 
+/// Stage-4 judge mode. `off` (the default) keeps today's LLM verification;
+/// `laya` replaces Stage 4 with the local judge; `shadow` runs both and only
+/// records the judge's agreement (the LLM decision still stands).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JudgeMode {
+    #[default]
+    Off,
+    Laya,
+    Shadow,
+}
+
+/// Stage-5 strategy. `llm` runs the explorative fallback loop (today's
+/// behaviour); `off` synthesizes disk-verified unverified candidates with no
+/// LLM, enabling a fully LLM-free configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FallbackMode {
+    #[default]
+    Llm,
+    Off,
+}
+
+/// Configuration for the local candidate judge (Stage 4). Default is fully
+/// off, so existing behaviour is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct JudgeSettings {
+    #[serde(default)]
+    pub mode: JudgeMode,
+    #[serde(default = "default_judge_base_url")]
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default = "default_judge_model")]
+    pub model: String,
+    #[serde(default = "default_judge_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_judge_max_concurrency")]
+    pub max_concurrency: u32,
+    #[serde(default = "default_judge_select_threshold")]
+    pub select_threshold: u32,
+}
+
+/// Hand-written for the same reason as `SearchConfig`: `Default` and the serde
+/// field defaults must be the same values.
+impl Default for JudgeSettings {
+    fn default() -> Self {
+        Self {
+            mode: JudgeMode::default(),
+            base_url: default_judge_base_url(),
+            api_key_env: None,
+            model: default_judge_model(),
+            timeout_ms: default_judge_timeout_ms(),
+            max_concurrency: default_judge_max_concurrency(),
+            select_threshold: default_judge_select_threshold(),
+        }
+    }
+}
+
+fn default_judge_base_url() -> String {
+    "http://127.0.0.1:8765".to_string()
+}
+fn default_judge_model() -> String {
+    "typed-decisions".to_string()
+}
+fn default_judge_timeout_ms() -> u64 {
+    20_000
+}
+fn default_judge_max_concurrency() -> u32 {
+    4
+}
+fn default_judge_select_threshold() -> u32 {
+    50
+}
+
 /// Hand-written for the same reason as `SearchConfig`: `Default` and the serde
 /// field defaults must be the same values.
 impl Default for AgentSettings {
@@ -253,6 +348,7 @@ impl Default for AgentSettings {
             snippet_max_chars: default_snippet_max_chars(),
             snippet_max_chars_detailed: default_snippet_max_chars_detailed(),
             skip_verify_on_exact_symbol: default_skip_verify_on_exact_symbol(),
+            fallback: FallbackMode::default(),
             repo_brief: RepoBriefSettings::default(),
         }
     }
@@ -527,6 +623,12 @@ pub enum ValidationError {
     ConflictingCodebaseMemoryConnection,
     #[error("llm.https_proxy `{url}` is not a valid http(s):// URL")]
     InvalidHttpsProxyUrl { url: String },
+    #[error("judge.base_url `{url}` is not a valid http(s):// URL")]
+    InvalidJudgeBaseUrl { url: String },
+    #[error("judge.{key} {reason}")]
+    InvalidJudgeSetting { key: &'static str, reason: String },
+    #[error("judge.api_key_env references environment variable `{var}`, which is not set")]
+    MissingJudgeEnvVar { var: String },
 }
 
 impl ValidationError {
@@ -555,6 +657,9 @@ impl ValidationError {
             ValidationError::MissingCodebaseMemoryConnection
             | ValidationError::ConflictingCodebaseMemoryConnection => "codebase_memory".to_string(),
             ValidationError::InvalidHttpsProxyUrl { .. } => "llm.https_proxy".to_string(),
+            ValidationError::InvalidJudgeBaseUrl { .. } => "judge.base_url".to_string(),
+            ValidationError::InvalidJudgeSetting { key, .. } => format!("judge.{key}"),
+            ValidationError::MissingJudgeEnvVar { .. } => "judge.api_key_env".to_string(),
         }
     }
 }
@@ -633,6 +738,7 @@ const KNOWN_SECTIONS: &[(&str, &[&str])] = &[
             "snippet_max_chars",
             "snippet_max_chars_detailed",
             "skip_verify_on_exact_symbol",
+            "fallback",
             "repo_brief",
         ],
     ),
@@ -645,6 +751,18 @@ const KNOWN_SECTIONS: &[(&str, &[&str])] = &[
             "persistent_max_bytes",
             "key_mode",
             "dir",
+        ],
+    ),
+    (
+        "judge",
+        &[
+            "mode",
+            "base_url",
+            "api_key_env",
+            "model",
+            "timeout_ms",
+            "max_concurrency",
+            "select_threshold",
         ],
     ),
     ("logging", &["level"]),
@@ -731,7 +849,13 @@ impl Config {
         &self,
         get_env: impl Fn(&str) -> Option<String>,
     ) -> Result<(), ValidationError> {
-        if self.llm.providers.is_empty() {
+        // The LLM is required unless the judge fully replaces both stages: a
+        // `laya` judge for Stage 4 AND an `off` fallback for Stage 5. Every
+        // other combination (`off`/`shadow` mode, or an `llm` fallback) still
+        // needs at least one provider.
+        let llm_required =
+            !(self.judge.mode == JudgeMode::Laya && self.agent.fallback == FallbackMode::Off);
+        if llm_required && self.llm.providers.is_empty() {
             return Err(ValidationError::EmptyProviderList);
         }
 
@@ -795,6 +919,43 @@ impl Config {
             return Err(ValidationError::InvalidHttpsProxyUrl { url: proxy.clone() });
         }
 
+        if self.judge.mode != JudgeMode::Off {
+            if !is_valid_https_proxy_url(&self.judge.base_url) {
+                return Err(ValidationError::InvalidJudgeBaseUrl {
+                    url: self.judge.base_url.clone(),
+                });
+            }
+            if !(1..=99).contains(&self.judge.select_threshold) {
+                return Err(ValidationError::InvalidJudgeSetting {
+                    key: "select_threshold",
+                    reason: "must be between 1 and 99".to_string(),
+                });
+            }
+            if self.judge.max_concurrency < 1 {
+                return Err(ValidationError::InvalidJudgeSetting {
+                    key: "max_concurrency",
+                    reason: "must be at least 1".to_string(),
+                });
+            }
+            if self.judge.timeout_ms < 1 {
+                return Err(ValidationError::InvalidJudgeSetting {
+                    key: "timeout_ms",
+                    reason: "must be at least 1".to_string(),
+                });
+            }
+            if self.judge.model.trim().is_empty() {
+                return Err(ValidationError::InvalidJudgeSetting {
+                    key: "model",
+                    reason: "must not be empty".to_string(),
+                });
+            }
+            if let Some(var) = &self.judge.api_key_env
+                && !env_var_is_set(&get_env, var)
+            {
+                return Err(ValidationError::MissingJudgeEnvVar { var: var.clone() });
+            }
+        }
+
         Ok(())
     }
 }
@@ -847,6 +1008,7 @@ mod tests {
             search: SearchConfig::default(),
             agent: AgentSettings::default(),
             cache: CacheSettings::default(),
+            judge: JudgeSettings::default(),
             logging: LoggingConfig::default(),
         }
     }
@@ -1165,9 +1327,16 @@ mod tests {
         let config = config_with_provider("primary", var);
         let toml = to_toml_string(&config).expect("serialize should succeed");
 
-        // None fields must be omitted (no `key = ` line) — guards skip_serializing_if.
+        // None fields must be omitted (no `key = ` line) — guards
+        // skip_serializing_if. `base_url` is scoped to the provider block
+        // because `[judge]` legitimately always serializes its own `base_url`.
+        let provider_block = toml
+            .split("[[llm.providers]]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .expect("serialized config must contain a provider block");
         assert!(
-            !toml.contains("base_url"),
+            !provider_block.contains("base_url"),
             "None base_url must be skipped, got:\n{toml}"
         );
         assert!(
@@ -1437,6 +1606,186 @@ command = "codebase-memory-mcp"
         assert_eq!(
             unknown_key_warnings("not valid toml =[["),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn judge_and_fallback_defaults() {
+        let a = AgentSettings::default();
+        assert_eq!(a.fallback, FallbackMode::Llm);
+        let j = JudgeSettings::default();
+        assert_eq!(j.mode, JudgeMode::Off);
+        assert_eq!(j.base_url, "http://127.0.0.1:8765");
+        assert_eq!(j.model, "typed-decisions");
+        assert_eq!(j.timeout_ms, 20_000);
+        assert_eq!(j.max_concurrency, 4);
+        assert_eq!(j.select_threshold, 50);
+        assert_eq!(j.api_key_env, None);
+    }
+
+    #[test]
+    fn llm_free_laya_offline_config_loads_and_validates() {
+        let toml = r#"
+[codebase_memory]
+command = "codebase-memory-mcp"
+args = ["--stdio"]
+[judge]
+mode = "laya"
+[agent]
+fallback = "off"
+"#;
+        let config: Config = toml::from_str(toml).expect("must parse without [llm]");
+        assert_eq!(config.judge.mode, JudgeMode::Laya);
+        assert_eq!(config.agent.fallback, FallbackMode::Off);
+        assert!(config.llm.providers.is_empty());
+        config
+            .validate_with_env(no_env)
+            .expect("laya+off needs no providers");
+    }
+
+    #[test]
+    fn off_mode_still_requires_providers() {
+        let mut config = config_with_provider("p", "V");
+        config.llm.providers.clear();
+        config.judge.mode = JudgeMode::Off;
+        assert_eq!(
+            config.validate_with_env(every_env),
+            Err(ValidationError::EmptyProviderList)
+        );
+        config.judge.mode = JudgeMode::Shadow;
+        assert_eq!(
+            config.validate_with_env(every_env),
+            Err(ValidationError::EmptyProviderList)
+        );
+    }
+
+    #[test]
+    fn judge_base_url_and_setting_validation() {
+        let mut config = config_with_provider("p", "V");
+        config.judge.mode = JudgeMode::Laya;
+        config.judge.base_url = "ftp://x".to_string();
+        assert_eq!(
+            config.validate_with_env(every_env),
+            Err(ValidationError::InvalidJudgeBaseUrl {
+                url: "ftp://x".to_string()
+            })
+        );
+        config.judge.base_url = "http://".to_string();
+        assert!(matches!(
+            config.validate_with_env(every_env),
+            Err(ValidationError::InvalidJudgeBaseUrl { .. })
+        ));
+        config.judge.base_url = "http://127.0.0.1:8765".to_string();
+        for bad in [0u32, 100u32] {
+            config.judge.select_threshold = bad;
+            assert_eq!(
+                config.validate_with_env(every_env),
+                Err(ValidationError::InvalidJudgeSetting {
+                    key: "select_threshold",
+                    reason: "must be between 1 and 99".to_string()
+                })
+            );
+        }
+        config.judge.select_threshold = 50;
+        config.judge.max_concurrency = 0;
+        assert_eq!(
+            config.validate_with_env(every_env),
+            Err(ValidationError::InvalidJudgeSetting {
+                key: "max_concurrency",
+                reason: "must be at least 1".to_string()
+            })
+        );
+        config.judge.max_concurrency = 4;
+        config.judge.timeout_ms = 0;
+        assert_eq!(
+            config.validate_with_env(every_env),
+            Err(ValidationError::InvalidJudgeSetting {
+                key: "timeout_ms",
+                reason: "must be at least 1".to_string()
+            })
+        );
+        config.judge.timeout_ms = 20_000;
+        config.judge.model = "  ".to_string();
+        assert_eq!(
+            config.validate_with_env(every_env),
+            Err(ValidationError::InvalidJudgeSetting {
+                key: "model",
+                reason: "must not be empty".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn judge_api_key_env_must_be_set() {
+        let mut config = config_with_provider("p", "V");
+        config.judge.mode = JudgeMode::Laya;
+        config.judge.api_key_env = Some("REX_JUDGE_KEY_UNSET".to_string());
+        // Providers set, judge var unset.
+        let acc = |v: &str| {
+            if v == "REX_JUDGE_KEY_UNSET" {
+                None
+            } else {
+                Some("k".to_string())
+            }
+        };
+        assert_eq!(
+            config.validate_with_env(acc),
+            Err(ValidationError::MissingJudgeEnvVar {
+                var: "REX_JUDGE_KEY_UNSET".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_key_warnings_knows_judge_and_fallback() {
+        let toml = r#"
+[llm]
+[[llm.providers]]
+name = "g"
+kind = "gemini"
+models = ["m"]
+[codebase_memory]
+command = "codebase-memory-mcp"
+[agent]
+fallback = "off"
+[judge]
+mode = "laya"
+base_url = "http://127.0.0.1:8765"
+bogus = 1
+"#;
+        assert_eq!(
+            unknown_key_warnings(toml),
+            vec!["unrecognized key `judge.bogus`"]
+        );
+    }
+
+    #[test]
+    fn to_toml_string_round_trips_with_judge() {
+        let mut config = config_with_provider("primary", "V");
+        config.judge.mode = JudgeMode::Shadow;
+        let toml = to_toml_string(&config).expect("serialize");
+        let parsed: Config = toml::from_str(&toml).expect("parse back");
+        assert_eq!(parsed.judge.mode, JudgeMode::Shadow);
+        assert_eq!(unknown_key_warnings(&toml), Vec::<String>::new());
+    }
+
+    #[test]
+    fn judge_toml_path_for_each_variant() {
+        assert_eq!(
+            ValidationError::InvalidJudgeBaseUrl { url: "x".into() }.toml_path(),
+            "judge.base_url"
+        );
+        assert_eq!(
+            ValidationError::InvalidJudgeSetting {
+                key: "select_threshold",
+                reason: "r".into()
+            }
+            .toml_path(),
+            "judge.select_threshold"
+        );
+        assert_eq!(
+            ValidationError::MissingJudgeEnvVar { var: "V".into() }.toml_path(),
+            "judge.api_key_env"
         );
     }
 }
