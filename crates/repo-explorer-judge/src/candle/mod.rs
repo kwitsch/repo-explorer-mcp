@@ -2,6 +2,7 @@
 //! Laya 0.3.7 inference for the one fixed judge question.
 
 pub mod calib;
+pub(crate) mod head;
 mod sequence;
 
 pub use sequence::{Encoded, SpecialIds, build_sequence};
