@@ -18,6 +18,17 @@ the bare `ExplorationResult`, for which `retrieval_confidence`/`stage_exit`/
 (the `StageExit` wire strings are therefore pinned by a test in the agent
 crate, `disk_cache::tests::stage_exit_wire_strings_are_pinned`).
 
+## `judge` module (Stage 10)
+
+`judge.rs` holds the fixed local-candidate-judge question as constants only
+(`QUESTION_ID`, `QUESTION_INSTRUCTIONS`, `POSITIVE_KEY`/`POSITIVE_CRITERION`,
+`NEGATIVE_KEY`/`NEGATIVE_CRITERION`) plus `JUDGE_STATE_VERSION`, which pins the
+plain-text state format rendered by `repo_explorer_agent::judge_input::
+render_judge_state`. **Bump `JUDGE_STATE_VERSION` on any change to that
+rendering or to these constants** — a trained checkpoint is valid only for the
+version it was trained on. See `crates/repo-explorer-agent/CLAUDE.md` (Judge
+input, Stage 10) for how the datagen and runtime crates consume this module.
+
 ## Crate-boundary rules
 
 - Must not add an `rmcp` dependency — `crates/repo-explorer-mcp` wires this

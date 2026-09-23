@@ -19,12 +19,15 @@ mod cache;
 /// without constructing an `AgentLoop`.
 pub mod disk_cache;
 mod dispatch;
+pub mod judge_input;
 mod pipeline;
 mod render;
 mod skeleton;
+mod snapshot;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 mod tools;
 mod verify;
 
 pub use agent::{AgentLoop, AgentLoopError};
+pub use snapshot::{RetrievalSnapshot, SnapshotStage, retrieval_snapshot};

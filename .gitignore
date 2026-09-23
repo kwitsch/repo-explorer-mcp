@@ -16,3 +16,8 @@
 /eval/claude-profile/.credentials.json
 /eval/claude-profile/.claude.json
 __pycache__/
+
+# Laya judge training (dev-only tooling; large artifacts, never committed)
+train/laya/.venv/
+train/laya/**/*.pt
+train/laya/**/__pycache__/

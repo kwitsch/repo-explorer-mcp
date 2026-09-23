@@ -1,0 +1,295 @@
+version = 1
+
+# --- rust ---
+[[repo]]
+name = "ripgrep"
+url = "https://github.com/BurntSushi/ripgrep"
+rev = "3fce3b5bb0236da2df6d99672afb8a719642eca7"
+license = "MIT OR Unlicense"
+lang = "rust"
+split = "train"
+
+[[repo]]
+name = "serde"
+url = "https://github.com/serde-rs/serde"
+rev = "6693a89cca77e0151437da1c7f890090b9ebf04c"
+license = "MIT OR Apache-2.0"
+lang = "rust"
+split = "train"
+
+[[repo]]
+name = "tracing"
+url = "https://github.com/tokio-rs/tracing"
+rev = "d9d4c542de10f5d3a711b7a45ffe450fd0666437"
+license = "MIT"
+lang = "rust"
+split = "train"
+
+[[repo]]
+name = "regex"
+url = "https://github.com/rust-lang/regex"
+rev = "72d650cb0a880a01ab6dc2137c0888e8f89740f7"
+license = "MIT OR Apache-2.0"
+lang = "rust"
+split = "train"
+
+[[repo]]
+name = "clap"
+url = "https://github.com/clap-rs/clap"
+rev = "8ab46fe22b4aa5c3bd09cc0e6c3fe9a75fc178a8"
+license = "MIT OR Apache-2.0"
+lang = "rust"
+split = "val"
+
+[[repo]]
+name = "axum"
+url = "https://github.com/tokio-rs/axum"
+rev = "c44f6650aa38d4c154e3cdb7347205e03813f4d5"
+license = "MIT"
+lang = "rust"
+split = "test"
+
+# --- python ---
+[[repo]]
+name = "flask"
+url = "https://github.com/pallets/flask"
+rev = "d73fa1cdcbd8b1465c151db8924ba58b1dd14e35"
+license = "BSD-3-Clause"
+lang = "python"
+split = "train"
+
+[[repo]]
+name = "fastapi"
+url = "https://github.com/fastapi/fastapi"
+rev = "50113da16fec53b66b80d75e80a89296de4fa5a5"
+license = "MIT"
+lang = "python"
+split = "train"
+
+[[repo]]
+name = "rich"
+url = "https://github.com/Textualize/rich"
+rev = "9d8f9a372cc5916fd4781fec207ced7ddac2f08f"
+license = "MIT"
+lang = "python"
+split = "train"
+
+[[repo]]
+name = "pydantic"
+url = "https://github.com/pydantic/pydantic"
+rev = "0384c970e37a59b344e75161eb106ea9996378ba"
+license = "MIT"
+lang = "python"
+split = "train"
+
+[[repo]]
+name = "httpx"
+url = "https://github.com/encode/httpx"
+rev = "b5addb64f0161ff6bfe94c124ef76f6a1fba5254"
+license = "BSD-3-Clause"
+lang = "python"
+split = "val"
+
+[[repo]]
+name = "click"
+url = "https://github.com/pallets/click"
+rev = "06b2a678741131fd577ce170e23e5ca0aeba0309"
+license = "BSD-3-Clause"
+lang = "python"
+split = "test"
+
+# --- typescript / javascript ---
+[[repo]]
+name = "vite"
+url = "https://github.com/vitejs/vite"
+rev = "f155b62ceabbaaf71abbf59933968787e3961c56"
+license = "MIT"
+lang = "typescript"
+split = "train"
+
+[[repo]]
+name = "trpc"
+url = "https://github.com/trpc/trpc"
+rev = "8b649ad874a8fe97c73962d4617912231b975736"
+license = "MIT"
+lang = "typescript"
+split = "train"
+
+[[repo]]
+name = "express"
+url = "https://github.com/expressjs/express"
+rev = "9a34acf03cb818ff3f8bc40e44176e277a25cbb9"
+license = "MIT"
+lang = "javascript"
+split = "train"
+
+[[repo]]
+name = "prettier"
+url = "https://github.com/prettier/prettier"
+rev = "de9ec361d3e2bb8fbc30da34ceaf402d351b5918"
+license = "MIT"
+lang = "javascript"
+split = "train"
+
+[[repo]]
+name = "hono"
+url = "https://github.com/honojs/hono"
+rev = "6cadf7537385c6e3df9cbd6d05c9b84c82ae0361"
+license = "MIT"
+lang = "typescript"
+split = "val"
+
+[[repo]]
+name = "zod"
+url = "https://github.com/colinhacks/zod"
+rev = "10dda3a3a4bc76ed0bf83e994de194587e489ef8"
+license = "MIT"
+lang = "typescript"
+split = "test"
+
+# --- go ---
+[[repo]]
+name = "cobra"
+url = "https://github.com/spf13/cobra"
+rev = "adbc8813901bba65827259daa8e22ff94ec1f30e"
+license = "Apache-2.0"
+lang = "go"
+split = "train"
+
+[[repo]]
+name = "gin"
+url = "https://github.com/gin-gonic/gin"
+rev = "3b08cd7235bd5ad2f055aa9e38135f111f6c5926"
+license = "MIT"
+lang = "go"
+split = "train"
+
+[[repo]]
+name = "viper"
+url = "https://github.com/spf13/viper"
+rev = "528f7416c4b56a4948673984b190bf8713f0c3c4"
+license = "MIT"
+lang = "go"
+split = "train"
+
+[[repo]]
+name = "fzf"
+url = "https://github.com/junegunn/fzf"
+rev = "b1be3a8be1b833ce5b92fbbac11637643d60a046"
+license = "MIT"
+lang = "go"
+split = "train"
+
+[[repo]]
+name = "urfave-cli"
+url = "https://github.com/urfave/cli"
+rev = "4fa44ab9ea85ac65410c91c77efeb72a4e8517bc"
+license = "MIT"
+lang = "go"
+split = "val"
+
+[[repo]]
+name = "chi"
+url = "https://github.com/go-chi/chi"
+rev = "3d1777a1ef8881f7d1da0b02c76ca8f0a29cd2bc"
+license = "MIT"
+lang = "go"
+split = "test"
+
+# --- java ---
+[[repo]]
+name = "gson"
+url = "https://github.com/google/gson"
+rev = "854c8255b625cf1e13c701a83ea9ccb4caaa576a"
+license = "Apache-2.0"
+lang = "java"
+split = "train"
+
+[[repo]]
+name = "mockito"
+url = "https://github.com/mockito/mockito"
+rev = "5a2f0f81cdafc9b34ddb4520db7f8866c787dac0"
+license = "MIT"
+lang = "java"
+split = "train"
+
+[[repo]]
+name = "commons-lang"
+url = "https://github.com/apache/commons-lang"
+rev = "6e8ced140e457a1622c8dd031cfa826d962a95ad"
+license = "Apache-2.0"
+lang = "java"
+split = "train"
+
+[[repo]]
+name = "javalin"
+url = "https://github.com/javalin/javalin"
+rev = "20ba71b211b5efa91f5c10ccb467326b86a1e5dc"
+license = "Apache-2.0"
+lang = "java"
+split = "train"
+
+[[repo]]
+name = "javapoet"
+url = "https://github.com/square/javapoet"
+rev = "b9017a9503b76e11b4ad4c1a9f050e2d29112cb0"
+license = "Apache-2.0"
+lang = "java"
+split = "val"
+
+[[repo]]
+name = "jsoup"
+url = "https://github.com/jhy/jsoup"
+rev = "49a15317317970a7ea3f0a5ded303ef319860f4a"
+license = "MIT"
+lang = "java"
+split = "test"
+
+# --- kotlin ---
+[[repo]]
+name = "ktor"
+url = "https://github.com/ktorio/ktor"
+rev = "d08fd0382b2acf314b2beb430b66ba148845a892"
+license = "Apache-2.0"
+lang = "kotlin"
+split = "train"
+
+[[repo]]
+name = "kotlinx-coroutines"
+url = "https://github.com/Kotlin/kotlinx.coroutines"
+rev = "bd2e9a1b90400fb7b2fa4f8731e7d8148799ab73"
+license = "Apache-2.0"
+lang = "kotlin"
+split = "train"
+
+[[repo]]
+name = "detekt"
+url = "https://github.com/detekt/detekt"
+rev = "e3c5b3ed68740908fcc2e25afa4fac5de6ab7908"
+license = "Apache-2.0"
+lang = "kotlin"
+split = "train"
+
+[[repo]]
+name = "koin"
+url = "https://github.com/InsertKoinIO/koin"
+rev = "dc86ef8dd8fbe8564fb7453c03f5b738da3450bb"
+license = "Apache-2.0"
+lang = "kotlin"
+split = "train"
+
+[[repo]]
+name = "moshi"
+url = "https://github.com/square/moshi"
+rev = "889013ec2edb8d8034902662a1dc8c4f3b3f8111"
+license = "Apache-2.0"
+lang = "kotlin"
+split = "val"
+
+[[repo]]
+name = "okio"
+url = "https://github.com/square/okio"
+rev = "c7d097b256530744652a17fb467e2e6db49ba371"
+license = "Apache-2.0"
+lang = "kotlin"
+split = "test"

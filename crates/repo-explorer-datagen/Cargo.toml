@@ -1,0 +1,24 @@
+[package]
+name = "repo-explorer-datagen"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+repo-explorer-core   = { version = "0.10.3", path = "../repo-explorer-core" }
+repo-explorer-memory = { version = "0.10.3", path = "../repo-explorer-memory" }
+repo-explorer-search = { version = "0.10.3", path = "../repo-explorer-search" }
+repo-explorer-agent  = { version = "0.10.3", path = "../repo-explorer-agent" }
+anyhow = "1"
+ignore = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+sha2 = "0.11"
+hex = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+repo-explorer-core = { version = "0.10.3", path = "../repo-explorer-core", features = ["test-support"] }

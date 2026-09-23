@@ -7,6 +7,8 @@ collects what is on `main` but not yet tagged.
 
 ### Added
 
+- **Training-data generator (`repo-explorer-datagen`, dev-only) and Laya
+  fine-tune tooling (`train/laya/`)** for the upcoming local candidate judge.
 - **Persistent cross-session result cache.** Results now survive a process
   restart: a second layer stores one JSON entry per query under
   `<cache dir>/<repo-id>/results/v1/`, behind the existing in-memory cache.

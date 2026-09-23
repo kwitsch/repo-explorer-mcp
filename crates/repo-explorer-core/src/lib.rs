@@ -2,6 +2,7 @@
 pub mod config;
 pub mod domain;
 pub mod fingerprint;
+pub mod judge;
 pub mod llm;
 pub mod memory;
 pub mod retrieval;
