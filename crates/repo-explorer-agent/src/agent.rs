@@ -210,6 +210,25 @@ pub(crate) struct QueryMetrics {
     /// no-finish synthesis). A run of zeroes across an eval says the models
     /// ignore the field and it should be reverted.
     pub cited_candidate_ids: Option<u32>,
+    /// `"off"` | `"laya"` | `"shadow"` — set right after `QueryMetrics::new`,
+    /// on every path including cache.
+    pub judge_mode: &'static str,
+    /// `"llm"` | `"off"` — set likewise.
+    pub fallback_mode: &'static str,
+    /// `"selected"` | `"escalated"` | `"error"`; `None` when the judge did not
+    /// run.
+    pub judge_outcome: Option<&'static str>,
+    /// Judge call wall time.
+    pub judge_ms: Option<u64>,
+    /// States sent to the judge.
+    pub judge_candidates: Option<u32>,
+    /// Selected candidates that survived disk verification, counted BEFORE
+    /// `finalize`'s dedupe/cap. `Some(0)` on escalate, `None` on judge failure.
+    pub judge_selected: Option<u32>,
+    /// Max permille over the judged scores.
+    pub judge_max_p: Option<u32>,
+    /// Shadow-mode agreement label (D3.4).
+    pub shadow_agreement: Option<&'static str>,
 }
 
 impl QueryMetrics {
@@ -247,6 +266,14 @@ impl QueryMetrics {
             turns_saved_by_cache: None,
             tokens_saved_by_cache: None,
             cited_candidate_ids: None,
+            judge_mode: "off",
+            fallback_mode: "llm",
+            judge_outcome: None,
+            judge_ms: None,
+            judge_candidates: None,
+            judge_selected: None,
+            judge_max_p: None,
+            shadow_agreement: None,
         }
     }
 
@@ -289,6 +316,14 @@ async fn emit_metrics(metrics: &mut QueryMetrics, msg: &'static str) {
         turns_saved_by_cache = metrics.turns_saved_by_cache,
         tokens_saved_by_cache = metrics.tokens_saved_by_cache,
         cited_candidate_ids = metrics.cited_candidate_ids,
+        judge_mode = metrics.judge_mode,
+        fallback_mode = metrics.fallback_mode,
+        judge_outcome = metrics.judge_outcome,
+        judge_ms = metrics.judge_ms,
+        judge_candidates = metrics.judge_candidates,
+        judge_selected = metrics.judge_selected,
+        judge_max_p = metrics.judge_max_p,
+        shadow_agreement = metrics.shadow_agreement,
         total_ms = metrics.total_ms,
         "{}",
         msg
@@ -1805,6 +1840,29 @@ mod tests {
     /// Trust-window TTL used across these tests — centralized so a future
     /// default change or edge-case TTL needs editing in one place.
     const TEST_INDEX_TRUST_TTL: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn query_metrics_new_seeds_judge_fields_off() {
+        let q = ExplorationQuery {
+            text: "q".to_string(),
+            scope_hint: None,
+            max_results: None,
+            detailed_snippets: false,
+        };
+        let m = QueryMetrics::new(Path::new("/repo"), &q, Instant::now());
+        assert_eq!(m.judge_mode, "off");
+        assert_eq!(m.fallback_mode, "llm");
+        assert_eq!(m.judge_outcome, None);
+        assert_eq!(m.judge_ms, None);
+        assert_eq!(m.judge_candidates, None);
+        assert_eq!(m.judge_selected, None);
+        assert_eq!(m.judge_max_p, None);
+        assert_eq!(m.shadow_agreement, None);
+        // Serializes cleanly (JSONL sink shape).
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"judge_mode\":\"off\""));
+        assert!(json.contains("\"fallback_mode\":\"llm\""));
+    }
 
     #[test]
     fn early_exit_route_selects_the_expected_branch() {
