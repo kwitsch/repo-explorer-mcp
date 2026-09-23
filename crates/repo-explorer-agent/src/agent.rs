@@ -15,12 +15,15 @@
 //! messages fed back to the model; only a `RouterError` in the fallback loop
 //! is a hard failure.
 
-use repo_explorer_core::config::{AgentSettings, CacheKeyMode, CacheSettings, RepoBriefKey};
+use repo_explorer_core::config::{
+    AgentSettings, CacheKeyMode, CacheSettings, JudgeSettings, RepoBriefKey,
+};
 use repo_explorer_core::domain::{
     Candidate, ExplorationFinding, ExplorationOutcome, ExplorationQuery, ExplorationResult,
     FileLocation, StageExit,
 };
 use repo_explorer_core::fingerprint::{RepoFingerprint, RepoStateProbe};
+use repo_explorer_core::judge::{CandidateJudge, JudgeError, NoJudge};
 use repo_explorer_core::llm::{
     CallOptions, Clock, LlmProvider, Message, ProviderResponse, ProviderRouter, SystemClock,
     TokenUsage, ToolCall,
@@ -406,13 +409,14 @@ thread_local! {
 /// The generic exploration orchestrator. Owns `memory`, `search`, the
 /// `router` (which owns its providers), and the repo-state `probe` — static
 /// dispatch, mirroring `ProviderRouter`.
-pub struct AgentLoop<M, S, P, R, C = SystemClock>
+pub struct AgentLoop<M, S, P, R, C = SystemClock, J = NoJudge>
 where
     M: MemoryBackend,
     S: SearchBackend,
     P: LlmProvider,
     R: RepoStateProbe,
     C: Clock,
+    J: CandidateJudge,
 {
     memory: M,
     search: S,
@@ -437,9 +441,16 @@ where
     /// How a cached entry is proved still valid once the fingerprint moved.
     /// One policy, applied identically to both cache layers.
     cache_key_mode: CacheKeyMode,
+    /// The Stage-4 candidate judge. Defaults to [`NoJudge`] (every call
+    /// `Unavailable`) until `with_judge` swaps in a real one.
+    judge: J,
+    /// Settings for the judge path (mode, threshold, timeout, …). Read by the
+    /// Stage-4/5 dispatch added in a later task; carried here from `with_judge`.
+    #[allow(dead_code)]
+    judge_settings: JudgeSettings,
 }
 
-impl<M, S, P, R, C> AgentLoop<M, S, P, R, C>
+impl<M, S, P, R, C> AgentLoop<M, S, P, R, C, NoJudge>
 where
     M: MemoryBackend,
     S: SearchBackend,
@@ -489,7 +500,48 @@ where
             index_refresh_seen: std::sync::Mutex::new(CappedMap::new(cache_settings.max_entries)),
             index_trust_ttl,
             cache_key_mode: cache_settings.key_mode,
+            judge: NoJudge,
+            judge_settings: JudgeSettings::default(),
         }
+    }
+}
+
+impl<M, S, P, R, C, J> AgentLoop<M, S, P, R, C, J>
+where
+    M: MemoryBackend,
+    S: SearchBackend,
+    P: LlmProvider,
+    R: RepoStateProbe,
+    C: Clock,
+    J: CandidateJudge,
+{
+    /// Move every field across into a loop carrying `judge` as its judge.
+    /// `AgentLoop::new` and every existing test keep the `NoJudge` default.
+    pub fn with_judge<J2: CandidateJudge>(
+        self,
+        judge: J2,
+        settings: JudgeSettings,
+    ) -> AgentLoop<M, S, P, R, C, J2> {
+        AgentLoop {
+            memory: self.memory,
+            search: self.search,
+            router: self.router,
+            probe: self.probe,
+            settings: self.settings,
+            cache: self.cache,
+            caps: self.caps,
+            rotation_seed: self.rotation_seed,
+            index_refresh_seen: self.index_refresh_seen,
+            index_trust_ttl: self.index_trust_ttl,
+            cache_key_mode: self.cache_key_mode,
+            judge,
+            judge_settings: settings,
+        }
+    }
+
+    /// Best-effort judge readiness; run in the background at startup.
+    pub async fn warm_judge(&self) -> Result<(), JudgeError> {
+        self.judge.warm_up().await
     }
 
     /// Deterministic per-query cache key, exposed so a caller (the MCP
@@ -1921,6 +1973,27 @@ mod tests {
             CacheSettings::default(),
             TEST_INDEX_TRUST_TTL,
         )
+    }
+
+    #[tokio::test]
+    async fn with_judge_moves_fields_and_warm_judge_delegates() {
+        use repo_explorer_core::config::JudgeSettings;
+        use repo_explorer_core::judge::mock::MockJudge;
+        let provider = MockLlmProvider::new().with_responses(vec![tool_calls(vec![finish_call()])]);
+        let agent = agent_with(provider).with_judge(MockJudge::new(), JudgeSettings::default());
+        // warm_judge delegates to the judge's default warm_up (Ok).
+        assert!(agent.warm_judge().await.is_ok());
+        // The loop still runs end-to-end after the builder moved every field.
+        let query = ExplorationQuery {
+            text: "where is main".to_string(),
+            scope_hint: None,
+            max_results: None,
+            detailed_snippets: false,
+        };
+        let dir = temp_repo("with_judge_smoke");
+        let got = agent.run(&dir, &query).await.unwrap();
+        assert_eq!(got.result.summary, "done");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
