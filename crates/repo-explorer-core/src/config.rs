@@ -271,6 +271,25 @@ pub enum JudgeMode {
     Shadow,
 }
 
+/// Judge serving backend. `http` (default) talks to `judge-serve`/`laya-serve`;
+/// `candle` runs the fine-tuned checkpoint in-process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JudgeBackend {
+    #[default]
+    Http,
+    Candle,
+}
+
+/// Inference device for the in-process candle backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JudgeDevice {
+    #[default]
+    Cpu,
+    Cuda,
+}
+
 /// Stage-5 strategy. `llm` runs the explorative fallback loop (today's
 /// behaviour); `off` synthesizes disk-verified unverified candidates with no
 /// LLM, enabling a fully LLM-free configuration.
@@ -288,6 +307,12 @@ pub enum FallbackMode {
 pub struct JudgeSettings {
     #[serde(default)]
     pub mode: JudgeMode,
+    #[serde(default)]
+    pub backend: JudgeBackend,
+    #[serde(default)]
+    pub checkpoint_dir: String,
+    #[serde(default)]
+    pub device: JudgeDevice,
     #[serde(default = "default_judge_base_url")]
     pub base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -308,6 +333,9 @@ impl Default for JudgeSettings {
     fn default() -> Self {
         Self {
             mode: JudgeMode::default(),
+            backend: JudgeBackend::default(),
+            checkpoint_dir: String::new(),
+            device: JudgeDevice::default(),
             base_url: default_judge_base_url(),
             api_key_env: None,
             model: default_judge_model(),
@@ -757,6 +785,9 @@ const KNOWN_SECTIONS: &[(&str, &[&str])] = &[
         "judge",
         &[
             "mode",
+            "backend",
+            "checkpoint_dir",
+            "device",
             "base_url",
             "api_key_env",
             "model",
@@ -920,21 +951,10 @@ impl Config {
         }
 
         if self.judge.mode != JudgeMode::Off {
-            if !is_valid_https_proxy_url(&self.judge.base_url) {
-                return Err(ValidationError::InvalidJudgeBaseUrl {
-                    url: self.judge.base_url.clone(),
-                });
-            }
             if !(1..=99).contains(&self.judge.select_threshold) {
                 return Err(ValidationError::InvalidJudgeSetting {
                     key: "select_threshold",
                     reason: "must be between 1 and 99".to_string(),
-                });
-            }
-            if self.judge.max_concurrency < 1 {
-                return Err(ValidationError::InvalidJudgeSetting {
-                    key: "max_concurrency",
-                    reason: "must be at least 1".to_string(),
                 });
             }
             if self.judge.timeout_ms < 1 {
@@ -943,16 +963,39 @@ impl Config {
                     reason: "must be at least 1".to_string(),
                 });
             }
-            if self.judge.model.trim().is_empty() {
-                return Err(ValidationError::InvalidJudgeSetting {
-                    key: "model",
-                    reason: "must not be empty".to_string(),
-                });
-            }
-            if let Some(var) = &self.judge.api_key_env
-                && !env_var_is_set(&get_env, var)
-            {
-                return Err(ValidationError::MissingJudgeEnvVar { var: var.clone() });
+            match self.judge.backend {
+                JudgeBackend::Http => {
+                    if !is_valid_https_proxy_url(&self.judge.base_url) {
+                        return Err(ValidationError::InvalidJudgeBaseUrl {
+                            url: self.judge.base_url.clone(),
+                        });
+                    }
+                    if self.judge.max_concurrency < 1 {
+                        return Err(ValidationError::InvalidJudgeSetting {
+                            key: "max_concurrency",
+                            reason: "must be at least 1".to_string(),
+                        });
+                    }
+                    if self.judge.model.trim().is_empty() {
+                        return Err(ValidationError::InvalidJudgeSetting {
+                            key: "model",
+                            reason: "must not be empty".to_string(),
+                        });
+                    }
+                    if let Some(var) = &self.judge.api_key_env
+                        && !env_var_is_set(&get_env, var)
+                    {
+                        return Err(ValidationError::MissingJudgeEnvVar { var: var.clone() });
+                    }
+                }
+                JudgeBackend::Candle => {
+                    if self.judge.checkpoint_dir.trim().is_empty() {
+                        return Err(ValidationError::InvalidJudgeSetting {
+                            key: "checkpoint_dir",
+                            reason: "must be set when judge.backend = \"candle\"".to_string(),
+                        });
+                    }
+                }
             }
         }
 
@@ -1621,6 +1664,69 @@ command = "codebase-memory-mcp"
         assert_eq!(j.max_concurrency, 4);
         assert_eq!(j.select_threshold, 50);
         assert_eq!(j.api_key_env, None);
+    }
+
+    #[test]
+    fn judge_backend_and_device_default_and_parse() {
+        let s = JudgeSettings::default();
+        assert_eq!(s.backend, JudgeBackend::Http);
+        assert_eq!(s.device, JudgeDevice::Cpu);
+        assert_eq!(s.checkpoint_dir, "");
+        let toml = r#"
+mode = "laya"
+backend = "candle"
+device = "cpu"
+checkpoint_dir = "/ckpt/v1"
+"#;
+        let parsed: JudgeSettings = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.backend, JudgeBackend::Candle);
+        assert_eq!(parsed.checkpoint_dir, "/ckpt/v1");
+    }
+
+    #[test]
+    fn candle_backend_requires_checkpoint_dir() {
+        let mut config = config_with_provider("p", "V");
+        config.judge.mode = JudgeMode::Laya;
+        config.judge.backend = JudgeBackend::Candle;
+        config.judge.checkpoint_dir = "  ".to_string();
+        let err = config.validate_with_env(every_env).unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::InvalidJudgeSetting {
+                key: "checkpoint_dir",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn candle_backend_does_not_validate_http_only_fields() {
+        let mut config = config_with_provider("p", "V");
+        config.judge.mode = JudgeMode::Laya;
+        config.judge.backend = JudgeBackend::Candle;
+        config.judge.checkpoint_dir = "/ckpt/v1".to_string();
+        config.judge.base_url = "ftp://x".to_string();
+        config.judge.model = String::new();
+        config.judge.max_concurrency = 0;
+        config.validate_with_env(every_env).unwrap();
+    }
+
+    #[test]
+    fn unknown_key_warnings_accept_new_judge_keys() {
+        let toml = r#"
+[judge]
+mode = "laya"
+backend = "candle"
+device = "cpu"
+checkpoint_dir = "/ckpt/v1"
+"#;
+        let warnings = unknown_key_warnings(toml);
+        assert!(
+            warnings.iter().all(|w| !w.contains("backend")
+                && !w.contains("checkpoint_dir")
+                && !w.contains("device")),
+            "unexpected warnings: {warnings:?}"
+        );
     }
 
     #[test]
