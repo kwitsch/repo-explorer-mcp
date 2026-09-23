@@ -12,10 +12,13 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::modernbert::ModernBert;
 use head::DecisionHead;
-use repo_explorer_core::config::JudgeDevice;
-use repo_explorer_core::judge::{self, JudgeError, Judgement};
+use repo_explorer_core::config::{JudgeBackend, JudgeDevice, JudgeSettings};
+use repo_explorer_core::judge::{self, CandidateJudge, JudgeError, Judgement};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::OnceCell;
 
 /// A fully loaded checkpoint: tokenizer, encoder, head and calibration.
 pub struct LoadedModel {
@@ -181,6 +184,132 @@ impl LoadedModel {
 
     pub fn select_threshold(&self) -> u32 {
         self.select_threshold
+    }
+}
+
+/// In-process candle judge: lazily loads the checkpoint, then runs one
+/// inference at a time in a blocking task behind a `Mutex`.
+#[derive(Debug)]
+pub struct LayaCandleJudge {
+    dir: PathBuf,
+    device: JudgeDevice,
+    timeout_ms: u64,
+    model: OnceCell<Result<Arc<Mutex<LoadedModel>>, String>>,
+}
+
+impl LayaCandleJudge {
+    /// No I/O: validates the settings shape only; loading is lazy.
+    pub fn new(settings: &JudgeSettings) -> Result<Self, JudgeError> {
+        debug_assert_eq!(settings.backend, JudgeBackend::Candle);
+        // Fail fast on a device the build cannot serve.
+        #[cfg(not(feature = "cuda"))]
+        if settings.device == JudgeDevice::Cuda {
+            return Err(JudgeError::Unavailable {
+                message: "judge.device = \"cuda\" requires a build with the cuda-judge feature"
+                    .to_string(),
+            });
+        }
+        Ok(Self {
+            dir: PathBuf::from(settings.checkpoint_dir.trim()),
+            device: settings.device,
+            timeout_ms: settings.timeout_ms,
+            model: OnceCell::new(),
+        })
+    }
+
+    async fn loaded(&self) -> Result<Arc<Mutex<LoadedModel>>, JudgeError> {
+        let dir = self.dir.clone();
+        let device = self.device;
+        let cell = self
+            .model
+            .get_or_init(|| async move {
+                let started = std::time::Instant::now();
+                let res = tokio::task::spawn_blocking(move || LoadedModel::load(&dir, device))
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(JudgeError::Unavailable {
+                            message: format!("judge load task failed: {e}"),
+                        })
+                    });
+                match res {
+                    Ok(m) => {
+                        tracing::info!(
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "candle judge loaded"
+                        );
+                        Ok(Arc::new(Mutex::new(m)))
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        tracing::warn!(error = %msg, "candle judge load failed; queries will degrade");
+                        Err(msg)
+                    }
+                }
+            })
+            .await;
+        cell.clone()
+            .map_err(|message| JudgeError::Unavailable { message })
+    }
+}
+
+impl CandidateJudge for LayaCandleJudge {
+    async fn judge(&self, states: &[String]) -> Result<Vec<Judgement>, JudgeError> {
+        if states.is_empty() {
+            return Ok(vec![]);
+        }
+        let model = self.loaded().await?;
+        let states = states.to_vec();
+        let timeout = Duration::from_millis(self.timeout_ms);
+        let handle = tokio::task::spawn_blocking(move || {
+            let guard = model.lock().unwrap_or_else(|p| p.into_inner());
+            guard.judge_states(&states)
+        });
+        match tokio::time::timeout(timeout, handle).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(_join)) => Err(JudgeError::Unavailable {
+                message: "judge inference task failed".to_string(),
+            }),
+            Err(_elapsed) => Err(JudgeError::Timeout {
+                timeout_ms: self.timeout_ms,
+            }),
+        }
+    }
+
+    async fn warm_up(&self) -> Result<(), JudgeError> {
+        self.loaded().await.map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod judge_tests {
+    use super::LayaCandleJudge;
+    use repo_explorer_core::config::{JudgeBackend, JudgeDevice, JudgeMode, JudgeSettings};
+    use repo_explorer_core::judge::{CandidateJudge, JudgeError};
+
+    fn candle_settings(dir: &str) -> JudgeSettings {
+        JudgeSettings {
+            mode: JudgeMode::Laya,
+            backend: JudgeBackend::Candle,
+            device: JudgeDevice::Cpu,
+            checkpoint_dir: dir.to_string(),
+            ..JudgeSettings::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_states_returns_empty_without_loading() {
+        let j = LayaCandleJudge::new(&candle_settings("/does/not/exist")).unwrap();
+        assert_eq!(j.judge(&[]).await.unwrap(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn missing_checkpoint_is_cached_error() {
+        let j = LayaCandleJudge::new(&candle_settings("/does/not/exist")).unwrap();
+        let e1 = j.warm_up().await.unwrap_err();
+        assert!(matches!(e1, JudgeError::Unavailable { .. }));
+        // A second judge call returns the same cached error, no retry.
+        let e2 = j.judge(&["s".to_string()]).await.unwrap_err();
+        assert!(matches!(e2, JudgeError::Unavailable { .. }));
     }
 }
 
