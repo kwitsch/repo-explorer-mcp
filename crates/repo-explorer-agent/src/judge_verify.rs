@@ -115,7 +115,6 @@ pub(crate) async fn judge_verify<M: MemoryBackend, J: CandidateJudge>(
     candidates: &[Candidate],
     settings: &JudgeSettings,
 ) -> JudgeVerifyOutcome {
-    let start = Instant::now();
     let rendered = render_judge_states(memory, repo_root, &query.text, candidates).await;
     // (index, state) for every Some.
     let mut idx_states: Vec<(usize, String)> = Vec::new();
@@ -126,14 +125,20 @@ pub(crate) async fn judge_verify<M: MemoryBackend, J: CandidateJudge>(
     }
     let mut scores: Vec<Option<u32>> = vec![None; candidates.len()];
     if idx_states.is_empty() {
+        // No judge call was made at all, so there is no latency to report.
         return JudgeVerifyOutcome::Escalate {
             scores,
             judged: 0,
-            elapsed_ms: start.elapsed().as_millis() as u64,
+            elapsed_ms: 0,
         };
     }
     let state_texts: Vec<String> = idx_states.iter().map(|(_, s)| s.clone()).collect();
     let judged = state_texts.len() as u32;
+    // Timed narrowly around the judge call itself (what `judge.timeout_ms`
+    // bounds) — never `render_judge_states`'s local file reads before it, or
+    // `verified_candidate_findings`'s disk verification after it, so
+    // `judge_ms` stays a true judge-latency metric for `eval/score.py`.
+    let start = Instant::now();
     let result = judge.judge(&state_texts).await;
     let elapsed_ms = start.elapsed().as_millis() as u64;
     let judgements = match result {

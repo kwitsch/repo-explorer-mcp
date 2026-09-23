@@ -141,7 +141,17 @@ impl LayaHttpJudge {
 
 /// Never let a transport error string leak an authorization header.
 fn sanitize(s: &str) -> String {
-    s.replace("Bearer ", "Bearer <redacted>")
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(idx) = rest.find("Bearer ") {
+        out.push_str(&rest[..idx]);
+        out.push_str("Bearer <redacted>");
+        rest = &rest["Bearer ".len() + idx..];
+        let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        rest = &rest[token_end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 impl CandidateJudge for LayaHttpJudge {
@@ -218,5 +228,17 @@ impl CandidateJudge for ConfiguredJudge {
             ConfiguredJudge::Disabled(j) => j.warm_up().await,
             ConfiguredJudge::Laya(j) => j.warm_up().await,
         }
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize;
+
+    #[test]
+    fn strips_the_token_not_just_marks_it() {
+        let s = sanitize("request failed: Bearer sk-live-abc123 rejected by proxy");
+        assert!(!s.contains("sk-live-abc123"), "token leaked: {s}");
+        assert_eq!(s, "request failed: Bearer <redacted> rejected by proxy");
     }
 }

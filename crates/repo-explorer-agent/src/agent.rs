@@ -935,7 +935,15 @@ where
                             &scores,
                             elapsed_ms,
                         );
-                        escalate_scores = Some(scores);
+                        // `judged == 0` means judge_verify escalated before ever
+                        // calling the judge (no candidate had a resolvable
+                        // location) — `scores` is all-`None` filler, not a real
+                        // judgement, so leave `escalate_scores` at `None` rather
+                        // than have offline_fallback report a threshold miss
+                        // that never happened.
+                        if judged > 0 {
+                            escalate_scores = Some(scores);
+                        }
                     }
                     JudgeVerifyOutcome::Failed { error, elapsed_ms } => {
                         self.record_judge_metrics_failed(&mut metrics, elapsed_ms);
@@ -1354,22 +1362,34 @@ where
             let sb = scores.and_then(|s| s.get(b).copied().flatten());
             sb.cmp(&sa).then(a.cmp(&b))
         });
-        let ordered_refs: Vec<&Candidate> = order.iter().map(|&i| &candidates[i]).collect();
-        let verified = verified_candidate_findings(repo_root, &ordered_refs).await;
+        // Disk-verify in score-ordered chunks of the cap and stop as soon as
+        // enough survivors are found — the common case (most top-ranked
+        // candidates verify fine) pays for one chunk's worth of disk reads,
+        // not the whole candidate list, while a run of stale candidates still
+        // falls through to later chunks so the cap is filled when possible.
         let mut findings = Vec::new();
-        for (pos_in_order, mut finding) in verified.into_iter().take(OFFLINE_FALLBACK_MAX_FINDINGS)
-        {
-            let cand_index = order[pos_in_order];
-            let base = finding.note.take().unwrap_or_default();
-            let cand_score = scores.and_then(|s| s.get(cand_index).copied().flatten());
-            let suffix = match cand_score {
-                Some(p) => format!("unverified candidate; judge p={:.2}", p as f64 / 1000.0),
-                // 1-based retrieval rank when unscored (or this candidate was
-                // never judged).
-                None => format!("unverified candidate; retrieval rank {}", cand_index + 1),
-            };
-            finding.note = Some(format!("{base}; {suffix}"));
-            findings.push(finding);
+        for chunk in order.chunks(OFFLINE_FALLBACK_MAX_FINDINGS) {
+            if findings.len() >= OFFLINE_FALLBACK_MAX_FINDINGS {
+                break;
+            }
+            let chunk_refs: Vec<&Candidate> = chunk.iter().map(|&i| &candidates[i]).collect();
+            let verified = verified_candidate_findings(repo_root, &chunk_refs).await;
+            for (pos_in_chunk, mut finding) in verified {
+                if findings.len() >= OFFLINE_FALLBACK_MAX_FINDINGS {
+                    break;
+                }
+                let cand_index = chunk[pos_in_chunk];
+                let base = finding.note.take().unwrap_or_default();
+                let cand_score = scores.and_then(|s| s.get(cand_index).copied().flatten());
+                let suffix = match cand_score {
+                    Some(p) => format!("unverified candidate; judge p={:.2}", p as f64 / 1000.0),
+                    // 1-based retrieval rank when unscored (or this candidate
+                    // was never judged).
+                    None => format!("unverified candidate; retrieval rank {}", cand_index + 1),
+                };
+                finding.note = Some(format!("{base}; {suffix}"));
+                findings.push(finding);
+            }
         }
         let n = findings.len();
         let mut summary = if scores.is_some() {
