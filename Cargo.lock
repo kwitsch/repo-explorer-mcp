@@ -1816,6 +1816,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "repo-explorer-judge"
+version = "0.10.3"
+dependencies = [
+ "futures-util",
+ "repo-explorer-core",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "repo-explorer-llm"
 version = "0.10.3"
 dependencies = [
@@ -1837,6 +1849,7 @@ dependencies = [
  "hex",
  "repo-explorer-agent",
  "repo-explorer-core",
+ "repo-explorer-judge",
  "repo-explorer-llm",
  "repo-explorer-memory",
  "repo-explorer-search",

@@ -130,8 +130,12 @@ pub(crate) fn symbols_for(
     for f in findings {
         let mut covering = candidates.iter().filter(|c| {
             c.location.path == f.location.path
-                && c.location.line_start <= f.location.line_end
-                && f.location.line_start <= c.location.line_end
+                && crate::ranges_overlap(
+                    c.location.line_start,
+                    c.location.line_end,
+                    f.location.line_start,
+                    f.location.line_end,
+                )
         });
         let (Some(only), None) = (covering.next(), covering.next()) else {
             continue;

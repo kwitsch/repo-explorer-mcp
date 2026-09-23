@@ -15,12 +15,16 @@
 //! messages fed back to the model; only a `RouterError` in the fallback loop
 //! is a hard failure.
 
-use repo_explorer_core::config::{AgentSettings, CacheKeyMode, CacheSettings, RepoBriefKey};
+use repo_explorer_core::config::{
+    AgentSettings, CacheKeyMode, CacheSettings, FallbackMode, JudgeMode, JudgeSettings,
+    RepoBriefKey,
+};
 use repo_explorer_core::domain::{
     Candidate, ExplorationFinding, ExplorationOutcome, ExplorationQuery, ExplorationResult,
     FileLocation, StageExit,
 };
 use repo_explorer_core::fingerprint::{RepoFingerprint, RepoStateProbe};
+use repo_explorer_core::judge::{CandidateJudge, JudgeError, NoJudge};
 use repo_explorer_core::llm::{
     CallOptions, Clock, LlmProvider, Message, ProviderResponse, ProviderRouter, SystemClock,
     TokenUsage, ToolCall,
@@ -38,6 +42,9 @@ use crate::brief;
 use crate::cache::{CappedMap, QueryEntry, ResultCache};
 use crate::disk_cache::{self, FileDep};
 use crate::dispatch::{canonical_repo_root, clamp_location, dispatch_inner, read_verified_file};
+use crate::judge_verify::{
+    JudgeVerifyOutcome, classify_agreement, judge_verify, llm_overlap_set, select_indices,
+};
 use crate::pipeline;
 use crate::render::{RenderCaps, dedupe_key, symbols_for, tidy_findings};
 use crate::tools::{finish_only_catalog, parse_finish_lenient, resolve_finish, tool_catalog};
@@ -207,6 +214,25 @@ pub(crate) struct QueryMetrics {
     /// no-finish synthesis). A run of zeroes across an eval says the models
     /// ignore the field and it should be reverted.
     pub cited_candidate_ids: Option<u32>,
+    /// `"off"` | `"laya"` | `"shadow"` — set right after `QueryMetrics::new`,
+    /// on every path including cache.
+    pub judge_mode: &'static str,
+    /// `"llm"` | `"off"` — set likewise.
+    pub fallback_mode: &'static str,
+    /// `"selected"` | `"escalated"` | `"error"`; `None` when the judge did not
+    /// run.
+    pub judge_outcome: Option<&'static str>,
+    /// Judge call wall time.
+    pub judge_ms: Option<u64>,
+    /// States sent to the judge.
+    pub judge_candidates: Option<u32>,
+    /// Selected candidates that survived disk verification, counted BEFORE
+    /// `finalize`'s dedupe/cap. `Some(0)` on escalate, `None` on judge failure.
+    pub judge_selected: Option<u32>,
+    /// Max permille over the judged scores.
+    pub judge_max_p: Option<u32>,
+    /// Shadow-mode agreement label (D3.4).
+    pub shadow_agreement: Option<&'static str>,
 }
 
 impl QueryMetrics {
@@ -244,6 +270,14 @@ impl QueryMetrics {
             turns_saved_by_cache: None,
             tokens_saved_by_cache: None,
             cited_candidate_ids: None,
+            judge_mode: "off",
+            fallback_mode: "llm",
+            judge_outcome: None,
+            judge_ms: None,
+            judge_candidates: None,
+            judge_selected: None,
+            judge_max_p: None,
+            shadow_agreement: None,
         }
     }
 
@@ -286,6 +320,14 @@ async fn emit_metrics(metrics: &mut QueryMetrics, msg: &'static str) {
         turns_saved_by_cache = metrics.turns_saved_by_cache,
         tokens_saved_by_cache = metrics.tokens_saved_by_cache,
         cited_candidate_ids = metrics.cited_candidate_ids,
+        judge_mode = metrics.judge_mode,
+        fallback_mode = metrics.fallback_mode,
+        judge_outcome = metrics.judge_outcome,
+        judge_ms = metrics.judge_ms,
+        judge_candidates = metrics.judge_candidates,
+        judge_selected = metrics.judge_selected,
+        judge_max_p = metrics.judge_max_p,
+        shadow_agreement = metrics.shadow_agreement,
         total_ms = metrics.total_ms,
         "{}",
         msg
@@ -406,13 +448,14 @@ thread_local! {
 /// The generic exploration orchestrator. Owns `memory`, `search`, the
 /// `router` (which owns its providers), and the repo-state `probe` — static
 /// dispatch, mirroring `ProviderRouter`.
-pub struct AgentLoop<M, S, P, R, C = SystemClock>
+pub struct AgentLoop<M, S, P, R, C = SystemClock, J = NoJudge>
 where
     M: MemoryBackend,
     S: SearchBackend,
     P: LlmProvider,
     R: RepoStateProbe,
     C: Clock,
+    J: CandidateJudge,
 {
     memory: M,
     search: S,
@@ -437,9 +480,16 @@ where
     /// How a cached entry is proved still valid once the fingerprint moved.
     /// One policy, applied identically to both cache layers.
     cache_key_mode: CacheKeyMode,
+    /// The Stage-4 candidate judge. Defaults to [`NoJudge`] (every call
+    /// `Unavailable`) until `with_judge` swaps in a real one.
+    judge: J,
+    /// Settings for the judge path (mode, threshold, timeout, …). Read by the
+    /// Stage-4/5 dispatch added in a later task; carried here from `with_judge`.
+    #[allow(dead_code)]
+    judge_settings: JudgeSettings,
 }
 
-impl<M, S, P, R, C> AgentLoop<M, S, P, R, C>
+impl<M, S, P, R, C> AgentLoop<M, S, P, R, C, NoJudge>
 where
     M: MemoryBackend,
     S: SearchBackend,
@@ -489,7 +539,48 @@ where
             index_refresh_seen: std::sync::Mutex::new(CappedMap::new(cache_settings.max_entries)),
             index_trust_ttl,
             cache_key_mode: cache_settings.key_mode,
+            judge: NoJudge,
+            judge_settings: JudgeSettings::default(),
         }
+    }
+}
+
+impl<M, S, P, R, C, J> AgentLoop<M, S, P, R, C, J>
+where
+    M: MemoryBackend,
+    S: SearchBackend,
+    P: LlmProvider,
+    R: RepoStateProbe,
+    C: Clock,
+    J: CandidateJudge,
+{
+    /// Move every field across into a loop carrying `judge` as its judge.
+    /// `AgentLoop::new` and every existing test keep the `NoJudge` default.
+    pub fn with_judge<J2: CandidateJudge>(
+        self,
+        judge: J2,
+        settings: JudgeSettings,
+    ) -> AgentLoop<M, S, P, R, C, J2> {
+        AgentLoop {
+            memory: self.memory,
+            search: self.search,
+            router: self.router,
+            probe: self.probe,
+            settings: self.settings,
+            cache: self.cache,
+            caps: self.caps,
+            rotation_seed: self.rotation_seed,
+            index_refresh_seen: self.index_refresh_seen,
+            index_trust_ttl: self.index_trust_ttl,
+            cache_key_mode: self.cache_key_mode,
+            judge,
+            judge_settings: settings,
+        }
+    }
+
+    /// Best-effort judge readiness; run in the background at startup.
+    pub async fn warm_judge(&self) -> Result<(), JudgeError> {
+        self.judge.warm_up().await
     }
 
     /// Deterministic per-query cache key, exposed so a caller (the MCP
@@ -515,6 +606,19 @@ where
             &mut key,
             &self.response_caps(query).snippet_max_chars.to_string(),
         );
+        // `off`/`shadow` runs keep the pre-feature key byte-identical, so
+        // existing L1/L2 entries stay valid. Only `laya` (whose answer depends
+        // on the selection threshold) and `fallback = off` (a different Stage 5)
+        // extend the key.
+        if self.judge_settings.mode == JudgeMode::Laya {
+            crate::cache::encode_field_into(
+                &mut key,
+                &format!("judge=laya:{}", self.judge_settings.select_threshold),
+            );
+        }
+        if self.settings.fallback == FallbackMode::Off {
+            crate::cache::encode_field_into(&mut key, "fallback=off");
+        }
         key
     }
 
@@ -528,6 +632,16 @@ where
         let git_probe_start = std::time::Instant::now();
         let fingerprint = self.probe.fingerprint(repo_root).await;
         let mut metrics = QueryMetrics::new(repo_root, query, git_probe_start);
+        // Set on every path, including the cache-hit early return below.
+        metrics.judge_mode = match self.judge_settings.mode {
+            JudgeMode::Off => "off",
+            JudgeMode::Laya => "laya",
+            JudgeMode::Shadow => "shadow",
+        };
+        metrics.fallback_mode = match self.settings.fallback {
+            FallbackMode::Llm => "llm",
+            FallbackMode::Off => "off",
+        };
         metrics.git_probe_ms = git_probe_start.elapsed().as_millis() as u64;
         let query_key = self.run_query_key(repo_root, query);
         if let Some((hit, layer)) = self
@@ -742,44 +856,189 @@ where
             );
         }
 
-        // Stage 4: LLM verification over the candidates.
+        // Stage 4: verification over the candidates. Which verifier runs is set
+        // by `judge.mode`: the LLM (`off`), the local judge (`laya`), or both
+        // concurrently with the LLM answer returned (`shadow`). A judge that
+        // escalates carries its scores forward so offline synthesis can order by
+        // them; every other fall-through leaves `escalate_scores` at `None`.
+        let mut escalate_scores: Option<Vec<Option<u32>>> = None;
         if outcome.confidence >= self.settings.fallback_confidence && !outcome.candidates.is_empty()
         {
-            if let VerifyOutcome::Finished(result, cited) = verify(
-                &self.memory,
-                &self.router,
-                repo_root,
-                query,
-                outcome.scope_hint_escaped,
-                note.as_deref(),
-                &outcome.candidates,
-                self.settings.max_verify_iterations,
-                &mut budget,
-                &self.caps,
-            )
-            .await
-            {
-                metrics.cited_candidate_ids = Some(cited);
-                return Ok(self
-                    .finalize_and_complete(
+            match self.judge_settings.mode {
+                JudgeMode::Off => {
+                    if let Some(done) = self
+                        .verify_and_complete(
+                            repo_root,
+                            &mut metrics,
+                            query,
+                            note.as_deref(),
+                            &outcome,
+                            &mut budget,
+                            &query_key,
+                            &fingerprint,
+                        )
+                        .await
+                    {
+                        return Ok(done);
+                    }
+                    tracing::info!("verification escalated to the fallback loop");
+                }
+                JudgeMode::Laya => {
+                    let jv = judge_verify(
+                        &self.memory,
+                        &self.judge,
                         repo_root,
-                        &mut metrics,
-                        StageExit::Verify,
-                        result,
                         query,
-                        &budget,
-                        false,
-                        &query_key,
-                        fingerprint,
+                        note.as_deref(),
                         &outcome.candidates,
+                        &self.judge_settings,
                     )
-                    .await);
+                    .await;
+                    self.record_judge_outcome(&mut metrics, &jv);
+                    match jv {
+                        JudgeVerifyOutcome::Finished { result, .. } => {
+                            return Ok(self
+                                .finalize_and_complete(
+                                    repo_root,
+                                    &mut metrics,
+                                    StageExit::Verify,
+                                    result,
+                                    query,
+                                    &budget,
+                                    false,
+                                    &query_key,
+                                    fingerprint,
+                                    &outcome.candidates,
+                                )
+                                .await);
+                        }
+                        JudgeVerifyOutcome::Escalate { judged, scores, .. } => {
+                            // `judged == 0` means judge_verify escalated before
+                            // ever calling the judge (no candidate had a
+                            // resolvable location) — `scores` is all-`None`
+                            // filler, not a real judgement, so leave
+                            // `escalate_scores` at `None` rather than have
+                            // offline_fallback report a threshold miss that
+                            // never happened.
+                            if judged > 0 {
+                                escalate_scores = Some(scores);
+                            }
+                        }
+                        JudgeVerifyOutcome::Failed { error, .. } => {
+                            tracing::warn!(error = %error, "local judge failed; degrading");
+                            if self.router.has_providers() {
+                                if let Some(done) = self
+                                    .verify_and_complete(
+                                        repo_root,
+                                        &mut metrics,
+                                        query,
+                                        note.as_deref(),
+                                        &outcome,
+                                        &mut budget,
+                                        &query_key,
+                                        &fingerprint,
+                                    )
+                                    .await
+                                {
+                                    return Ok(done);
+                                }
+                                tracing::info!("verification escalated to the fallback loop");
+                            }
+                        }
+                    }
+                }
+                JudgeMode::Shadow => {
+                    // Both run; the LLM's answer is always the one returned, the
+                    // judge's outcome is only observed. Only `verify` borrows
+                    // `budget` mutably, so the concurrent `join` is sound.
+                    let (llm, jv) = futures_util::future::join(
+                        verify(
+                            &self.memory,
+                            &self.router,
+                            repo_root,
+                            query,
+                            outcome.scope_hint_escaped,
+                            note.as_deref(),
+                            &outcome.candidates,
+                            self.settings.max_verify_iterations,
+                            &mut budget,
+                            &self.caps,
+                        ),
+                        judge_verify(
+                            &self.memory,
+                            &self.judge,
+                            repo_root,
+                            query,
+                            note.as_deref(),
+                            &outcome.candidates,
+                            &self.judge_settings,
+                        ),
+                    )
+                    .await;
+                    let judge_set = self.record_judge_outcome(&mut metrics, &jv);
+                    // Agreement is only defined when the judge did not fail.
+                    if !matches!(jv, JudgeVerifyOutcome::Failed { .. }) {
+                        let llm_set = match &llm {
+                            VerifyOutcome::Finished(result, _) => {
+                                Some(llm_overlap_set(&outcome.candidates, &result.findings))
+                            }
+                            VerifyOutcome::Escalate => None,
+                        };
+                        metrics.shadow_agreement =
+                            classify_agreement(llm_set.as_deref(), judge_set.as_deref());
+                    }
+                    // Continue exactly as `off` with the LLM answer; the judge's
+                    // scores are never passed on to Stage 5.
+                    if let VerifyOutcome::Finished(result, cited) = llm {
+                        metrics.cited_candidate_ids = Some(cited);
+                        return Ok(self
+                            .finalize_and_complete(
+                                repo_root,
+                                &mut metrics,
+                                StageExit::Verify,
+                                result,
+                                query,
+                                &budget,
+                                false,
+                                &query_key,
+                                fingerprint,
+                                &outcome.candidates,
+                            )
+                            .await);
+                    }
+                    tracing::info!("verification escalated to the fallback loop");
+                }
             }
-            tracing::info!("verification escalated to the fallback loop");
         }
 
-        // Stage 5: explorative fallback loop. The only hard-error exit —
-        // matched rather than `?`d so it emits a metrics record too.
+        // Stage 5: escalation. `agent.fallback = "llm"` (default) runs the
+        // explorative loop; `"off"` synthesizes disk-verified candidates with no
+        // LLM. The loop is the only hard-error exit — matched rather than `?`d so
+        // it emits a metrics record too.
+        if self.settings.fallback == FallbackMode::Off {
+            let result = self
+                .offline_fallback(
+                    repo_root,
+                    note.as_deref(),
+                    &outcome.candidates,
+                    escalate_scores.as_deref(),
+                )
+                .await;
+            return Ok(self
+                .finalize_and_complete(
+                    repo_root,
+                    &mut metrics,
+                    StageExit::Fallback,
+                    result,
+                    query,
+                    &budget,
+                    false,
+                    &query_key,
+                    fingerprint,
+                    &outcome.candidates,
+                )
+                .await);
+        }
         let looped = self
             .fallback_loop(
                 repo_root,
@@ -948,6 +1207,204 @@ where
             candidates,
         )
         .await
+    }
+
+    /// The `off`-mode LLM verification path, shared by `off`, the `laya`
+    /// judge-failure degrade (when providers exist), so the block is written
+    /// once. `Some(outcome)` when `finish` concluded (caller returns it),
+    /// `None` on escalation (caller falls through to Stage 5).
+    #[allow(clippy::too_many_arguments)]
+    async fn verify_and_complete(
+        &self,
+        repo_root: &Path,
+        metrics: &mut QueryMetrics,
+        query: &ExplorationQuery,
+        note: Option<&str>,
+        outcome: &pipeline::RetrievalOutcome,
+        budget: &mut TokenBudget,
+        query_key: &str,
+        fingerprint: &Option<RepoFingerprint>,
+    ) -> Option<ExplorationOutcome> {
+        match verify(
+            &self.memory,
+            &self.router,
+            repo_root,
+            query,
+            outcome.scope_hint_escaped,
+            note,
+            &outcome.candidates,
+            self.settings.max_verify_iterations,
+            budget,
+            &self.caps,
+        )
+        .await
+        {
+            VerifyOutcome::Finished(result, cited) => {
+                metrics.cited_candidate_ids = Some(cited);
+                Some(
+                    self.finalize_and_complete(
+                        repo_root,
+                        metrics,
+                        StageExit::Verify,
+                        result,
+                        query,
+                        budget,
+                        false,
+                        query_key,
+                        fingerprint.clone(),
+                        &outcome.candidates,
+                    )
+                    .await,
+                )
+            }
+            VerifyOutcome::Escalate => None,
+        }
+    }
+
+    /// Record the judge-path metrics for a run that reached a verdict
+    /// (`selected` or `escalated`). `judge_max_p` is the max over the judged
+    /// scores; the API key never enters any of these fields.
+    fn record_judge_metrics(
+        &self,
+        metrics: &mut QueryMetrics,
+        outcome: &'static str,
+        judged: u32,
+        selected: Option<u32>,
+        scores: &[Option<u32>],
+        elapsed_ms: u64,
+    ) {
+        metrics.judge_outcome = Some(outcome);
+        metrics.judge_ms = Some(elapsed_ms);
+        metrics.judge_candidates = Some(judged);
+        metrics.judge_selected = selected;
+        metrics.judge_max_p = scores.iter().flatten().copied().max();
+    }
+
+    /// Record a judge failure: `judge_candidates`/`judge_selected`/`judge_max_p`
+    /// stay `None` (no scores were produced).
+    fn record_judge_metrics_failed(&self, metrics: &mut QueryMetrics, elapsed_ms: u64) {
+        metrics.judge_outcome = Some("error");
+        metrics.judge_ms = Some(elapsed_ms);
+    }
+
+    /// Shared `JudgeVerifyOutcome` metrics dispatch for both the `laya` and
+    /// `shadow` arms: records judged/scores/elapsed_ms via
+    /// `record_judge_metrics`/`record_judge_metrics_failed` and returns the
+    /// selected candidate-index set (`Some` on `Finished`, `None` on
+    /// `Escalate`/`Failed`). Each caller still matches on `jv` itself for the
+    /// behaviour that differs (`laya` finalizes or escalates on it, `shadow`
+    /// only uses the set for agreement classification).
+    fn record_judge_outcome(
+        &self,
+        metrics: &mut QueryMetrics,
+        jv: &JudgeVerifyOutcome,
+    ) -> Option<Vec<usize>> {
+        match jv {
+            JudgeVerifyOutcome::Finished {
+                selected,
+                judged,
+                scores,
+                elapsed_ms,
+                ..
+            } => {
+                self.record_judge_metrics(
+                    metrics,
+                    "selected",
+                    *judged,
+                    Some(selected.len() as u32),
+                    scores,
+                    *elapsed_ms,
+                );
+                Some(selected.clone())
+            }
+            JudgeVerifyOutcome::Escalate {
+                judged,
+                scores,
+                elapsed_ms,
+            } => {
+                self.record_judge_metrics(
+                    metrics,
+                    "escalated",
+                    *judged,
+                    Some(0),
+                    scores,
+                    *elapsed_ms,
+                );
+                None
+            }
+            JudgeVerifyOutcome::Failed { elapsed_ms, .. } => {
+                self.record_judge_metrics_failed(metrics, *elapsed_ms);
+                None
+            }
+        }
+    }
+
+    /// Stage 5 with `agent.fallback = "off"`: deterministic offline synthesis of
+    /// up to [`OFFLINE_FALLBACK_MAX_FINDINGS`] disk-verified candidates, with no
+    /// LLM. Ordered by judge score descending (`None`/not-judged last, then by
+    /// retrieval rank); every finding is labelled unverified.
+    async fn offline_fallback(
+        &self,
+        repo_root: &Path,
+        note: Option<&str>,
+        candidates: &[Candidate],
+        scores: Option<&[Option<u32>]>,
+    ) -> ExplorationResult {
+        // Reuse `select_indices`'s score-desc/index-asc ordering (threshold 0
+        // keeps every scored candidate instead of filtering by a select
+        // threshold), then append the unscored candidates in retrieval-rank
+        // order — the same single rule `judge_verify`'s selection uses,
+        // rather than a second hand-written copy of it.
+        let mut order: Vec<usize> = scores.map(|s| select_indices(s, 0)).unwrap_or_default();
+        if order.len() < candidates.len() {
+            let seen: HashSet<usize> = order.iter().copied().collect();
+            order.extend((0..candidates.len()).filter(|i| !seen.contains(i)));
+        }
+        // Disk-verify in score-ordered chunks of the cap and stop as soon as
+        // enough survivors are found — the common case (most top-ranked
+        // candidates verify fine) pays for one chunk's worth of disk reads,
+        // not the whole candidate list, while a run of stale candidates still
+        // falls through to later chunks so the cap is filled when possible.
+        let mut findings = Vec::new();
+        for chunk in order.chunks(OFFLINE_FALLBACK_MAX_FINDINGS) {
+            if findings.len() >= OFFLINE_FALLBACK_MAX_FINDINGS {
+                break;
+            }
+            let chunk_refs: Vec<&Candidate> = chunk.iter().map(|&i| &candidates[i]).collect();
+            let verified = verified_candidate_findings(repo_root, &chunk_refs).await;
+            for (pos_in_chunk, mut finding) in verified {
+                if findings.len() >= OFFLINE_FALLBACK_MAX_FINDINGS {
+                    break;
+                }
+                let cand_index = chunk[pos_in_chunk];
+                let base = finding.note.take().unwrap_or_default();
+                let cand_score = scores.and_then(|s| s.get(cand_index).copied().flatten());
+                let suffix = match cand_score {
+                    Some(p) => format!("unverified candidate; judge p={:.2}", p as f64 / 1000.0),
+                    // 1-based retrieval rank when unscored (or this candidate
+                    // was never judged).
+                    None => format!("unverified candidate; retrieval rank {}", cand_index + 1),
+                };
+                finding.note = Some(format!("{base}; {suffix}"));
+                findings.push(finding);
+            }
+        }
+        let n = findings.len();
+        let mut summary = if scores.is_some() {
+            format!(
+                "No candidate reached the local judge's selection threshold ({}%) and the LLM fallback is disabled (agent.fallback = \"off\"); returning {n} unverified candidate(s) ranked by judge probability.",
+                self.judge_settings.select_threshold
+            )
+        } else {
+            format!(
+                "The LLM fallback is disabled (agent.fallback = \"off\"); returning {n} unverified candidate(s) ranked by retrieval score."
+            )
+        };
+        if let Some(note) = note {
+            summary.push(' ');
+            summary.push_str(note);
+        }
+        ExplorationResult { findings, summary }
     }
 
     /// The cache is usable this call only when caching is enabled and a
@@ -1140,36 +1597,12 @@ where
         index_note: Option<&str>,
         repo_root: &Path,
     ) -> ExplorationResult {
-        let canonical_root = canonical_repo_root(repo_root).await.ok();
-        let mut verified = Vec::with_capacity(candidates.len());
-        if let Some(root) = &canonical_root {
-            let mut line_counts: HashMap<PathBuf, Result<u32, String>> = HashMap::new();
-            for candidate in candidates {
-                let location = normalize_location(candidate.location.clone());
-                let line_count = match line_counts.get(&location.path) {
-                    Some(cached) => cached.clone(),
-                    None => {
-                        let result = read_verified_file(&location.path, repo_root, root)
-                            .await
-                            .map(|(_content, line_count)| line_count);
-                        line_counts.insert(location.path.clone(), result.clone());
-                        result
-                    }
-                };
-                match line_count.and_then(|line_count| clamp_location(location, line_count)) {
-                    Ok(location) => {
-                        // Keep the backend-provided snippet (not LLM-authored,
-                        // so F-18 does not apply); only the location is verified.
-                        let mut candidate = candidate.clone();
-                        candidate.location = location;
-                        verified.push(finding_from_candidate(candidate));
-                    }
-                    Err(reason) => {
-                        tracing::debug!(reason = %reason, "early-exit dropped an unverifiable candidate")
-                    }
-                }
-            }
-        }
+        let refs: Vec<&Candidate> = candidates.iter().collect();
+        let verified: Vec<ExplorationFinding> = verified_candidate_findings(repo_root, &refs)
+            .await
+            .into_iter()
+            .map(|(_, f)| f)
+            .collect();
         let findings = self.tidy_and_truncate(verified, query);
         let mut summary = format!(
             "Resolved deterministically by the retrieval pre-stage (confidence {confidence}/100, no LLM involved): {} location(s) matching \"{}\".",
@@ -1527,6 +1960,50 @@ fn index_status_label(result: &Result<IndexStatus, MemoryError>) -> &'static str
     }
 }
 
+/// Disk-verify each candidate (path exists in the repo, `line_start` within
+/// the file, `line_end` clamped), returning the input position and the
+/// resulting finding for every survivor, in input order. Caches the per-path
+/// line count so several candidates in one file cost one read. The single
+/// disk-verification path shared by the early-exit, judge and offline legs.
+/// Cap on findings synthesized by the `agent.fallback = "off"` offline path.
+const OFFLINE_FALLBACK_MAX_FINDINGS: usize = 5;
+
+pub(crate) async fn verified_candidate_findings(
+    repo_root: &Path,
+    candidates: &[&Candidate],
+) -> Vec<(usize, ExplorationFinding)> {
+    let canonical_root = match canonical_repo_root(repo_root).await {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut verified = Vec::with_capacity(candidates.len());
+    let mut line_counts: HashMap<PathBuf, Result<u32, String>> = HashMap::new();
+    for (i, candidate) in candidates.iter().enumerate() {
+        let location = normalize_location(candidate.location.clone());
+        let line_count = match line_counts.get(&location.path) {
+            Some(cached) => cached.clone(),
+            None => {
+                let result = read_verified_file(&location.path, repo_root, &canonical_root)
+                    .await
+                    .map(|(_content, line_count)| line_count);
+                line_counts.insert(location.path.clone(), result.clone());
+                result
+            }
+        };
+        match line_count.and_then(|line_count| clamp_location(location, line_count)) {
+            Ok(location) => {
+                let mut candidate = (*candidate).clone();
+                candidate.location = location;
+                verified.push((i, finding_from_candidate(candidate)));
+            }
+            Err(reason) => {
+                tracing::debug!(reason = %reason, "dropped an unverifiable candidate")
+            }
+        }
+    }
+    verified
+}
+
 /// The Stage-3 early-exit route choice, factored out of `AgentLoop::run` so the
 /// deterministic `snapshot::retrieval_snapshot` classifier can reuse the exact
 /// same rule. Pure; no behaviour change from the inlined form.
@@ -1725,6 +2202,8 @@ mod tests {
     use repo_explorer_core::domain::CandidateKind;
     use repo_explorer_core::fingerprint::RepoFingerprint;
     use repo_explorer_core::fingerprint::mock::MockRepoStateProbe;
+    use repo_explorer_core::judge::Judgement;
+    use repo_explorer_core::judge::mock::MockJudge;
     use repo_explorer_core::llm::mock::{FakeClock, MockLlmProvider};
     use repo_explorer_core::llm::{Completion, ToolCall};
     use repo_explorer_core::memory::mock::{Call, MockMemoryBackend};
@@ -1736,6 +2215,29 @@ mod tests {
     /// Trust-window TTL used across these tests — centralized so a future
     /// default change or edge-case TTL needs editing in one place.
     const TEST_INDEX_TRUST_TTL: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn query_metrics_new_seeds_judge_fields_off() {
+        let q = ExplorationQuery {
+            text: "q".to_string(),
+            scope_hint: None,
+            max_results: None,
+            detailed_snippets: false,
+        };
+        let m = QueryMetrics::new(Path::new("/repo"), &q, Instant::now());
+        assert_eq!(m.judge_mode, "off");
+        assert_eq!(m.fallback_mode, "llm");
+        assert_eq!(m.judge_outcome, None);
+        assert_eq!(m.judge_ms, None);
+        assert_eq!(m.judge_candidates, None);
+        assert_eq!(m.judge_selected, None);
+        assert_eq!(m.judge_max_p, None);
+        assert_eq!(m.shadow_agreement, None);
+        // Serializes cleanly (JSONL sink shape).
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"judge_mode\":\"off\""));
+        assert!(json.contains("\"fallback_mode\":\"llm\""));
+    }
 
     #[test]
     fn early_exit_route_selects_the_expected_branch() {
@@ -1907,6 +2409,388 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn with_judge_moves_fields_and_warm_judge_delegates() {
+        let provider = MockLlmProvider::new().with_responses(vec![tool_calls(vec![finish_call()])]);
+        let agent = agent_with(provider).with_judge(MockJudge::new(), JudgeSettings::default());
+        // warm_judge delegates to the judge's default warm_up (Ok).
+        assert!(agent.warm_judge().await.is_ok());
+        // The loop still runs end-to-end after the builder moved every field.
+        let query = ExplorationQuery {
+            text: "where is main".to_string(),
+            scope_hint: None,
+            max_results: None,
+            detailed_snippets: false,
+        };
+        let dir = temp_repo("with_judge_smoke");
+        let got = agent.run(&dir, &query).await.unwrap();
+        assert_eq!(got.result.summary, "done");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Stage-4/5 judge dispatch, offline fallback, cache key ---
+
+    /// A memory backend whose graph leg returns a `SymbolFuzzy` candidate for
+    /// every `(path, line_start, line_end)` seed. The note `"target"` never
+    /// matches the `"needle"` query token, so the hits classify fuzzy (base 400)
+    /// rather than exact: confidence lands in `[fallback_confidence,
+    /// early_exit_confidence)` with no trusted exact symbol, so the run reaches
+    /// Stage 4 (verification) instead of the early exit.
+    fn seed_memory(candidates: &[(&str, u32, u32)]) -> MockMemoryBackend {
+        graph_memory(
+            candidates
+                .iter()
+                .map(|(path, s, e)| ExplorationFinding {
+                    location: FileLocation {
+                        path: PathBuf::from(path),
+                        line_start: *s,
+                        line_end: *e,
+                    },
+                    snippet: None,
+                    note: Some("target".to_string()),
+                })
+                .collect(),
+        )
+    }
+
+    type JudgeTestLoop = AgentLoop<
+        MockMemoryBackend,
+        MockSearchBackend,
+        MockLlmProvider,
+        MockRepoStateProbe,
+        FakeClock,
+    >;
+
+    /// A loop (with an LLM provider that answers `finish`) whose retrieval
+    /// reaches Stage 4 with the given candidates, plus the temp dir and query.
+    fn loop_reaching_stage4_with(
+        name: &str,
+        candidates: &[(&str, u32, u32)],
+        file_content: &str,
+    ) -> (JudgeTestLoop, PathBuf, ExplorationQuery) {
+        let dir = crate::test_support::temp_repo_with(
+            "agent_run",
+            name,
+            &[("src/a.rs", file_content), ("src/lib.rs", "a\nb\nc\n")],
+        );
+        let provider = MockLlmProvider::new().with_responses(vec![tool_calls(vec![finish_call()])]);
+        let agent =
+            agent_with_settings(seed_memory(candidates), provider, AgentSettings::default());
+        (agent, dir, q("needle"))
+    }
+
+    /// Like [`loop_reaching_stage4_with`], but the router has no providers and
+    /// `agent.fallback = off` — the LLM-free judge-plus-offline configuration.
+    fn loop_reaching_stage4_no_providers(
+        name: &str,
+        candidates: &[(&str, u32, u32)],
+        file_content: &str,
+    ) -> (JudgeTestLoop, PathBuf, ExplorationQuery) {
+        let dir =
+            crate::test_support::temp_repo_with("agent_run", name, &[("src/a.rs", file_content)]);
+        let router = ProviderRouter::with_clock(vec![], 60, FakeClock::new());
+        let agent = AgentLoop::new(
+            seed_memory(candidates),
+            MockSearchBackend::new(),
+            router,
+            MockRepoStateProbe::new(),
+            AgentSettings {
+                fallback: FallbackMode::Off,
+                ..AgentSettings::default()
+            },
+            CacheSettings::default(),
+            TEST_INDEX_TRUST_TTL,
+        );
+        (agent, dir, q("needle"))
+    }
+
+    // Case 1: off mode never runs the judge path.
+    #[tokio::test]
+    async fn off_mode_never_runs_the_judge() {
+        let (agent_base, dir, query) =
+            loop_reaching_stage4_with("judge_off", &[("src/a.rs", 1, 1)], "l1\n");
+        // Default settings => mode off; the judge is present but must stay idle.
+        let agent = agent_base.with_judge(MockJudge::new(), JudgeSettings::default());
+        agent.run(&dir, &query).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let m = taped_metrics().pop().unwrap();
+        assert_eq!(m.judge_mode, "off");
+        assert_eq!(m.judge_outcome, None, "the judge must not run in off mode");
+        assert_eq!(m.path, "verify", "off mode still runs the LLM verify path");
+        assert!(m.llm_calls >= 1);
+    }
+
+    // Case 2: laya selects above threshold, verify exit, zero LLM.
+    #[tokio::test]
+    async fn laya_selects_above_threshold_verify_exit_zero_llm() {
+        let (agent_base, dir, query) = loop_reaching_stage4_with(
+            "judge_select",
+            &[
+                ("src/a.rs", 1, 1),
+                ("src/a.rs", 2, 2),
+                ("src/a.rs", 3, 3),
+                ("src/a.rs", 4, 4),
+                ("src/a.rs", 5, 5),
+            ],
+            "l1\nl2\nl3\nl4\nl5\n",
+        );
+        let judge = MockJudge::new().with_responses(vec![Ok(vec![
+            Judgement {
+                p_relevant_permille: 800,
+            },
+            Judgement {
+                p_relevant_permille: 100,
+            },
+            Judgement {
+                p_relevant_permille: 900,
+            },
+            Judgement {
+                p_relevant_permille: 100,
+            },
+            Judgement {
+                p_relevant_permille: 100,
+            },
+        ])]);
+        let settings = JudgeSettings {
+            mode: JudgeMode::Laya,
+            select_threshold: 50,
+            ..JudgeSettings::default()
+        };
+        let agent = agent_base.with_judge(judge, settings);
+        let got = agent.run(&dir, &query).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(got.stage_exit, StageExit::Verify);
+        // Findings ordered by p desc: candidate 2 (900) then candidate 0 (800).
+        assert_eq!(got.result.findings.len(), 2);
+        assert!(
+            got.result.findings[0]
+                .note
+                .as_ref()
+                .unwrap()
+                .contains("judge p=0.90")
+        );
+        assert!(
+            got.result.findings[1]
+                .note
+                .as_ref()
+                .unwrap()
+                .contains("judge p=0.80")
+        );
+        assert!(
+            got.result
+                .summary
+                .contains("Selected by the local judge (no LLM involved): 2 of 5")
+        );
+        let m = taped_metrics().pop().unwrap();
+        assert_eq!(m.llm_calls, 0);
+        assert_eq!(m.judge_mode, "laya");
+        assert_eq!(m.judge_outcome, Some("selected"));
+        assert_eq!(m.judge_selected, Some(2));
+        assert_eq!(m.judge_candidates, Some(5));
+        assert_eq!(m.judge_max_p, Some(900));
+    }
+
+    // Case 3: laya, all below threshold, escalates to the LLM when providers exist.
+    #[tokio::test]
+    async fn laya_all_below_threshold_escalates_to_llm_when_providers() {
+        let (agent_base, dir, query) =
+            loop_reaching_stage4_with("judge_escalate_llm", &[("src/a.rs", 1, 1)], "l1\n");
+        let judge = MockJudge::new().with_responses(vec![Ok(vec![Judgement {
+            p_relevant_permille: 100,
+        }])]);
+        let settings = JudgeSettings {
+            mode: JudgeMode::Laya,
+            ..JudgeSettings::default()
+        };
+        let agent = agent_base.with_judge(judge, settings);
+        agent.run(&dir, &query).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let m = taped_metrics().pop().unwrap();
+        // Escalate falls through to Stage 5; with fallback = llm the explorative
+        // loop runs, so an LLM call is made and the exit is the fallback path.
+        assert_eq!(m.judge_outcome, Some("escalated"));
+        assert_eq!(m.path, "fallback");
+        assert!(m.llm_calls >= 1);
+    }
+
+    // Case 4: laya + fallback=off, every candidate scored below threshold ->
+    // offline synthesis ordered by judge probability.
+    #[tokio::test]
+    async fn laya_offline_fallback_scored_when_no_providers_and_fallback_off() {
+        let (agent_base, dir, query) = loop_reaching_stage4_no_providers(
+            "judge_offline_scored",
+            &[("src/a.rs", 1, 1), ("src/a.rs", 2, 2)],
+            "l1\nl2\n",
+        );
+        let judge = MockJudge::new().with_responses(vec![Ok(vec![
+            Judgement {
+                p_relevant_permille: 100,
+            },
+            Judgement {
+                p_relevant_permille: 310,
+            },
+        ])]);
+        let settings = JudgeSettings {
+            mode: JudgeMode::Laya,
+            ..JudgeSettings::default()
+        };
+        let agent = agent_base.with_judge(judge, settings);
+        let got = agent.run(&dir, &query).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(got.stage_exit, StageExit::Fallback);
+        assert!(got.result.findings.len() <= 5);
+        assert!(got.result.findings.iter().all(|f| {
+            f.note
+                .as_ref()
+                .unwrap()
+                .contains("unverified candidate; judge p=")
+        }));
+        // Ordered by probability descending: candidate 1 (0.31) precedes candidate 0 (0.10).
+        assert!(
+            got.result.findings[0]
+                .note
+                .as_ref()
+                .unwrap()
+                .contains("judge p=0.31")
+        );
+        assert!(got.result.summary.contains("selection threshold (50%)"));
+        assert!(got.result.summary.contains("ranked by judge probability"));
+        let m = taped_metrics().pop().unwrap();
+        assert_eq!(m.llm_calls, 0);
+        assert_eq!(m.brief_tokens, None);
+        assert_eq!(m.judge_outcome, Some("escalated"));
+    }
+
+    // Case 6: laya + fallback=off, judge errors -> offline synthesis by retrieval rank.
+    #[tokio::test]
+    async fn laya_offline_fallback_judge_error_uses_retrieval_rank() {
+        let (agent_base, dir, query) = loop_reaching_stage4_no_providers(
+            "judge_offline_rank",
+            &[("src/a.rs", 1, 1), ("src/a.rs", 2, 2)],
+            "l1\nl2\n",
+        );
+        let judge = MockJudge::new().with_responses(vec![Err(JudgeError::Unavailable {
+            message: "down".to_string(),
+        })]);
+        let settings = JudgeSettings {
+            mode: JudgeMode::Laya,
+            ..JudgeSettings::default()
+        };
+        let agent = agent_base.with_judge(judge, settings);
+        let got = agent.run(&dir, &query).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(got.stage_exit, StageExit::Fallback);
+        assert!(got.result.findings.len() <= 5);
+        assert!(got.result.findings.iter().all(|f| {
+            let note = f.note.as_ref().unwrap();
+            note.contains("unverified candidate; retrieval rank") && !note.contains("judge p=")
+        }));
+        assert!(
+            got.result.findings[0]
+                .note
+                .as_ref()
+                .unwrap()
+                .contains("retrieval rank 1")
+        );
+        assert!(got.result.summary.contains("ranked by retrieval score"));
+        assert!(!got.result.summary.contains("selection threshold"));
+        let m = taped_metrics().pop().unwrap();
+        assert_eq!(m.llm_calls, 0);
+        assert_eq!(m.judge_outcome, Some("error"));
+        assert_eq!(m.judge_selected, None);
+        assert_eq!(m.brief_tokens, None);
+    }
+
+    // Case 7/8: shadow runs both, returns the LLM answer, records the judge's
+    // outcome and the agreement label.
+    #[tokio::test]
+    async fn shadow_returns_llm_answer_and_records_judge() {
+        let (agent_base, dir, query) =
+            loop_reaching_stage4_with("judge_shadow", &[("src/a.rs", 1, 1)], "l1\n");
+        // The judge selects the candidate; the LLM finishes at a disjoint
+        // location (src/lib.rs), so the agreement is "disjoint".
+        let judge = MockJudge::new().with_responses(vec![Ok(vec![Judgement {
+            p_relevant_permille: 900,
+        }])]);
+        let settings = JudgeSettings {
+            mode: JudgeMode::Shadow,
+            ..JudgeSettings::default()
+        };
+        let agent = agent_base.with_judge(judge, settings);
+        let got = agent.run(&dir, &query).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        // The LLM answer is the one returned.
+        assert_eq!(got.stage_exit, StageExit::Verify);
+        assert_eq!(got.result.summary, "done");
+        let m = taped_metrics().pop().unwrap();
+        assert_eq!(m.judge_mode, "shadow");
+        assert_eq!(m.judge_outcome, Some("selected"));
+        assert_eq!(m.shadow_agreement, Some("disjoint"));
+        assert!(m.llm_calls >= 1, "the LLM verify path also ran in shadow");
+    }
+
+    // Case 11: the query-cache key changes for laya/threshold/offline, and stays
+    // byte-identical for off and shadow.
+    #[tokio::test]
+    async fn run_query_key_differs_for_laya_and_threshold_and_offline() {
+        let q = ExplorationQuery {
+            text: "q".to_string(),
+            scope_hint: None,
+            max_results: None,
+            detailed_snippets: false,
+        };
+        let dir = temp_repo("run_query_key_judge");
+        let off = agent_with(MockLlmProvider::new()).run_query_key(&dir, &q);
+        let laya50 = {
+            let s = JudgeSettings {
+                mode: JudgeMode::Laya,
+                select_threshold: 50,
+                ..JudgeSettings::default()
+            };
+            agent_with(MockLlmProvider::new())
+                .with_judge(MockJudge::new(), s)
+                .run_query_key(&dir, &q)
+        };
+        let laya70 = {
+            let s = JudgeSettings {
+                mode: JudgeMode::Laya,
+                select_threshold: 70,
+                ..JudgeSettings::default()
+            };
+            agent_with(MockLlmProvider::new())
+                .with_judge(MockJudge::new(), s)
+                .run_query_key(&dir, &q)
+        };
+        let shadow = {
+            let s = JudgeSettings {
+                mode: JudgeMode::Shadow,
+                ..JudgeSettings::default()
+            };
+            agent_with(MockLlmProvider::new())
+                .with_judge(MockJudge::new(), s)
+                .run_query_key(&dir, &q)
+        };
+        let off_fallback = {
+            let s = AgentSettings {
+                fallback: FallbackMode::Off,
+                ..AgentSettings::default()
+            };
+            agent_with_settings(MockMemoryBackend::new(), MockLlmProvider::new(), s)
+                .run_query_key(&dir, &q)
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        assert_ne!(off, laya50);
+        assert_ne!(laya50, laya70);
+        assert_ne!(
+            off, off_fallback,
+            "fallback = off must change the cache key"
+        );
+        assert_eq!(
+            off, shadow,
+            "shadow must keep the off-mode key byte-identical"
+        );
+    }
+
+    #[tokio::test]
     async fn immediate_finish_returns_its_payload() {
         let provider = MockLlmProvider::new().with_responses(vec![tool_calls(vec![finish_call()])]);
         let agent = agent_with(provider);
@@ -2049,6 +2933,46 @@ mod tests {
             "pre-dedupe truncation must not drop the distinct 4th candidate"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn verified_candidate_findings_returns_positions_and_drops_missing() {
+        use crate::agent::verified_candidate_findings;
+        let dir = crate::test_support::temp_repo_with(
+            "verified_candidate_findings",
+            "basic",
+            &[("src/lib.rs", "a\nb\nc\nd\n")],
+        );
+        let c_ok = Candidate {
+            location: FileLocation {
+                path: PathBuf::from("src/lib.rs"),
+                line_start: 2,
+                line_end: 3,
+            },
+            symbol: Some("f".to_string()),
+            kind: CandidateKind::SymbolExact,
+            score: 0,
+            snippet: None,
+        };
+        let c_missing = Candidate {
+            location: FileLocation {
+                path: PathBuf::from("src/gone.rs"),
+                line_start: 1,
+                line_end: 1,
+            },
+            symbol: None,
+            kind: CandidateKind::ContentHit,
+            score: 0,
+            snippet: None,
+        };
+        let refs: Vec<&Candidate> = vec![&c_missing, &c_ok];
+        let out = verified_candidate_findings(&dir, &refs).await;
+        std::fs::remove_dir_all(&dir).ok();
+        // Only the existing file survives; its input position (1) is preserved.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 1);
+        assert_eq!(out[0].1.location.path, PathBuf::from("src/lib.rs"));
+        assert_eq!(out[0].1.location.line_end, 3);
     }
 
     #[tokio::test]

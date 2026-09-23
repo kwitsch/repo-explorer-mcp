@@ -7,6 +7,7 @@ use repo_explorer_agent::AgentLoop;
 use repo_explorer_core::domain::{ExplorationOutcome, ExplorationQuery, FileLocation};
 use repo_explorer_core::llm::SystemClock;
 use repo_explorer_core::retrieval::is_unknown_location;
+use repo_explorer_judge::ConfiguredJudge;
 use repo_explorer_llm::GenaiProvider;
 use repo_explorer_memory::MemoryClientBackend;
 use repo_explorer_search::{GitStateProbe, NativeSearchBackend};
@@ -29,8 +30,14 @@ use tracing::Instrument;
 /// The concrete agent type wired to the production backends. All backend trait
 /// methods and `AgentLoop::run` take `&self`, so a shared `Arc<Agent>` (no
 /// `Mutex`) supports concurrent tool calls.
-pub type Agent =
-    AgentLoop<MemoryClientBackend, NativeSearchBackend, GenaiProvider, GitStateProbe, SystemClock>;
+pub type Agent = AgentLoop<
+    MemoryClientBackend,
+    NativeSearchBackend,
+    GenaiProvider,
+    GitStateProbe,
+    SystemClock,
+    ConfiguredJudge,
+>;
 
 /// How much snippet text the response carries. Affects the *response* only —
 /// LLM prompt rendering always uses `agent.snippet_max_chars`.

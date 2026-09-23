@@ -1,0 +1,36 @@
+# Judge OFFLINE (LLM-free) eval config (docs/laya-judge.md, docs/eval/real-world-test-plan.md
+# §3.2, §8.1).
+#
+# `default.toml` with the entire `[llm]` section REMOVED, plus `[judge] mode = "laya"` and
+# `[agent] fallback = "off"`. This is the fully LLM-free configuration: Stage 4 is the local Laya
+# judge and Stage 5 synthesizes from disk-verified candidates instead of running the LLM fallback
+# loop. No provider key is read or needed, so this run makes no external LLM calls at all.
+#
+# The judge is a local service: start `judge-serve` on 127.0.0.1:8765 before running (see
+# judge-serve/README.md and docs/laya-judge.md). With no LLM configured there is no verification
+# fallback, so a judge outage yields the offline Stage-5 synthesis for every query.
+
+[codebase_memory]
+command = "codebase-memory-mcp"
+args = ["--stdio"]
+staleness_seconds = 3600
+
+[search]
+timeout_seconds = 30
+prefer_rtk = true
+
+[logging]
+level = "debug"
+
+[cache]
+# The on-disk L2 is OFF for the harness, same as default.toml — passes must stay independent
+# samples (see default.toml for the full rationale).
+persistent = false
+
+[judge]
+mode = "laya"
+base_url = "http://127.0.0.1:8765"
+select_threshold = 50
+
+[agent]
+fallback = "off"

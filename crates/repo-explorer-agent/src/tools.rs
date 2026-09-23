@@ -371,7 +371,12 @@ fn snaps_to_candidate(model: &FileLocation, candidate: &FileLocation) -> bool {
     if is_unknown_location(model) {
         return true;
     }
-    let overlaps = candidate.line_start <= model.line_end && model.line_start <= candidate.line_end;
+    let overlaps = crate::ranges_overlap(
+        candidate.line_start,
+        candidate.line_end,
+        model.line_start,
+        model.line_end,
+    );
     // Equal ranges are not "strictly inside" — the substitution is a no-op
     // there and must still count as a citation.
     let strictly_inside = candidate.line_start <= model.line_start

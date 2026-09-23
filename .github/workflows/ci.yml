@@ -47,6 +47,7 @@ jobs:
       - run: pip install pyyaml numpy
       - run: python eval/test_score.py
       - run: python -m py_compile eval/run.py
+      - run: python -m py_compile judge-serve/serve.py
       - run: python -m unittest discover -s train/laya/tests -t train/laya
       - run: python -m py_compile train/laya/bakeoff.py train/laya/prepare.py train/laya/train_ddp.py train/laya/calibrate.py train/laya/evaluate.py train/laya/judge_train/__init__.py train/laya/judge_train/constants.py train/laya/judge_train/data.py train/laya/judge_train/metrics.py train/laya/judge_train/logits.py
 

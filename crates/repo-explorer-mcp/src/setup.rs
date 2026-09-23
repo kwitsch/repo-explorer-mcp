@@ -9,8 +9,8 @@
 
 use anyhow::Context;
 use repo_explorer_core::config::{
-    self, CodebaseMemoryConfig, Config, KNOWN_PROVIDER_KINDS, LlmConfig, LoggingConfig,
-    ProviderConfig, SearchConfig, default_api_key_env, default_cooldown_seconds,
+    self, CodebaseMemoryConfig, Config, JudgeSettings, KNOWN_PROVIDER_KINDS, LlmConfig,
+    LoggingConfig, ProviderConfig, SearchConfig, default_api_key_env, default_cooldown_seconds,
     default_staleness_seconds, env_var_is_set,
 };
 use std::io::{BufRead, Write};
@@ -378,6 +378,7 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
         search,
         agent: Default::default(),
         cache: Default::default(),
+        judge: JudgeSettings::default(),
         logging: LoggingConfig::default(),
     };
 

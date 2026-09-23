@@ -402,6 +402,12 @@ impl<P: LlmProvider, C: Clock> ProviderRouter<P, C> {
         }
     }
 
+    /// True iff at least one provider entry was configured. The judge/offline
+    /// paths consult this to decide whether an LLM verify fallback is possible.
+    pub fn has_providers(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
     /// One pass over the entries in configured order. Returns the first success;
     /// on a limit error the entry is put on cooldown and the next is tried; a
     /// non-limit error is surfaced immediately (fail fast); if every entry is
@@ -1362,5 +1368,21 @@ mod tests {
             let got = router.complete_with_tools(&[], &[], &same_seed).await;
             assert_eq!(got, Ok(text("from b")));
         }
+    }
+
+    #[test]
+    fn has_providers_reflects_configuration() {
+        let empty: ProviderRouter<MockLlmProvider, FakeClock> =
+            ProviderRouter::with_clock(vec![], 60, FakeClock::new());
+        assert!(!empty.has_providers());
+        let one = ProviderRouter::with_clock(
+            vec![(
+                "p".to_string(),
+                vec![("m".to_string(), MockLlmProvider::new())],
+            )],
+            60,
+            FakeClock::new(),
+        );
+        assert!(one.has_providers());
     }
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/repo-explorer-core", "crates/repo-explorer-mcp", "crates/repo-explorer-memory", "crates/repo-explorer-llm", "crates/repo-explorer-search", "crates/repo-explorer-agent", "crates/repo-explorer-datagen"]
+members = ["crates/repo-explorer-core", "crates/repo-explorer-mcp", "crates/repo-explorer-memory", "crates/repo-explorer-llm", "crates/repo-explorer-search", "crates/repo-explorer-agent", "crates/repo-explorer-datagen", "crates/repo-explorer-judge"]
 
 [workspace.package]
 version = "0.10.3"
