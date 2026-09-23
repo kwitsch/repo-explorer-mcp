@@ -84,6 +84,9 @@ snippet_max_chars = 400       # snippet cap in prompts and tool results
 snippet_max_chars_detailed = 1500  # response-only cap for response_format = "detailed"
                               # (a floor: never narrower than snippet_max_chars)
 skip_verify_on_exact_symbol = true  # one exact symbol hit? answer without the LLM
+fallback = "llm"              # llm | off — "off" replaces Stage 5 with offline
+                              # synthesis of disk-verified, explicitly unverified
+                              # candidates and needs no LLM call
 
 # Deterministic repository brief prefetched once on entry to the explorative fallback
 # loop (Stage 5 only) and injected as its own system message, so the loop does not spend
@@ -108,10 +111,47 @@ dir = ""                             # "" = the per-user cache dir, resolved by 
 
 [logging]
 level = "info"            # trace | debug | info | warn | error
+
+# Local candidate judge (Stage 4). Optional; omit the whole section for
+# today's behaviour (LLM-only verification). See docs/laya-judge.md.
+[judge]
+mode = "off"                          # off | laya | shadow
+base_url = "http://127.0.0.1:8765"    # judge-serve endpoint; never proxied
+# api_key_env = "REX_JUDGE_KEY"       # names an env var; omit for no bearer auth
+model = "typed-decisions"             # sent as-is; the launcher maps this name
+timeout_ms = 20000                    # whole judge call, all candidates
+max_concurrency = 4                   # concurrent judge HTTP requests
+select_threshold = 50                 # 1-99 (percent); a candidate is selected
+                                      # at score >= select_threshold * 10 permille
 ```
 
 The env var named by each `api_key_env` must actually be set in the environment,
 or config loading fails with `MissingEnvVar`.
+
+## `[judge]` and `agent.fallback`
+
+`[judge]` configures the local candidate judge that can replace Stage-4 LLM
+verification; `agent.fallback` configures what Stage 5 does when Stage 4
+does not resolve a query. Both default to today's LLM-only behaviour, so an
+absent `[judge]` section and an absent `agent.fallback` key change nothing.
+Full mode matrix, rollout procedure and troubleshooting: `docs/laya-judge.md`.
+
+| Key                      | Default                   | Meaning                                                                                                                                                                               |
+| ------------------------ | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `judge.mode`             | `"off"`                   | `off` — LLM verifies Stage 4 (today's behaviour). `laya` — the judge verifies Stage 4. `shadow` — the LLM still answers; the judge runs alongside and only its agreement is recorded. |
+| `judge.base_url`         | `"http://127.0.0.1:8765"` | Base URL of a running `judge-serve` instance. Must be a valid `http(s)://` URL.                                                                                                       |
+| `judge.api_key_env`      | unset                     | Optional env var naming a bearer token sent as `Authorization: Bearer <token>`. If set, the variable must actually be set (`MissingJudgeEnvVar` otherwise).                           |
+| `judge.model`            | `"typed-decisions"`       | Model name sent in every judge request. Must not be blank.                                                                                                                            |
+| `judge.timeout_ms`       | `20000`                   | Timeout for the whole judge call (all candidates). Must be at least 1.                                                                                                                |
+| `judge.max_concurrency`  | `4`                       | Concurrent judge HTTP requests. Must be at least 1. Serving itself is serial upstream — see `docs/laya-judge.md`.                                                                     |
+| `judge.select_threshold` | `50`                      | Integer percent, `1..=99`. A candidate is selected when its judged probability is at least `select_threshold * 10` permille.                                                          |
+| `agent.fallback`         | `"llm"`                   | `llm` — Stage 5 runs the explorative fallback loop (today's behaviour). `off` — Stage 5 synthesizes up to five disk-verified, explicitly unverified candidates with no LLM call.      |
+
+These keys are only validated when `judge.mode != "off"` (`InvalidJudgeBaseUrl`,
+`InvalidJudgeSetting`, `MissingJudgeEnvVar`). `[llm]` stays required for every
+combination except `judge.mode = "laya"` with `agent.fallback = "off"`, which
+is the only fully LLM-free configuration — there `[llm]` may be empty or
+omitted entirely.
 
 ## On-disk result cache
 
