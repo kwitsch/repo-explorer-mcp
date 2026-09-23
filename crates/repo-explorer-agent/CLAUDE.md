@@ -172,3 +172,63 @@ refresh, no cache, no LLM) and classifies the result as `EarlyExit`/`Verify`/
 `Fallback` via the shared `early_exit_route`. The datagen generator labels rows
 only from `Verify`-stage snapshots (the only case 10b calls the judge). The disk
 authorization of the real early exit is not simulated — an accepted approximation.
+
+## Judge verification (Stage 4, `judge.mode`)
+
+`judge_verify.rs`'s `judge_verify` is the Stage-4 judge path, dispatched from
+`run` under the same `outcome.confidence >= fallback_confidence &&
+!candidates.is_empty()` gate the LLM path uses. It renders judge states with
+`judge_input::render_judge_states` (never anything else — train/serve
+parity), calls the loop's `J: CandidateJudge`, and selects the candidates at
+`score >= select_threshold * 10` permille (ordered by score descending, then
+index ascending), disk-verifying the selection through the shared
+`verified_candidate_findings` (below) exactly like every other verification
+path.
+
+- **`off`** (default) — unchanged: the LLM `verify` path runs, byte-identical
+  to before this feature existed.
+- **`laya`** — the judge path runs instead of the LLM. A selection that
+  survives disk verification finishes the query at `stage_exit = "verify"`
+  with zero LLM calls; an empty selection (`Escalate`) falls through to
+  Stage 5; a judge error (`Failed`) degrades to the LLM `verify` path when
+  `ProviderRouter::has_providers()` is true, otherwise falls through to
+  Stage 5 with no judge scores. A judge failure **never fails a query**.
+- **`shadow`** — both the LLM `verify` and `judge_verify` run concurrently
+  (`futures_util::future::join`); the LLM's answer is always the one
+  returned, and the judge's outcome is only recorded
+  (`QueryMetrics.judge_outcome`, `.shadow_agreement`). The judge's scores are
+  never passed on to Stage 5.
+
+`QueryMetrics` gains `judge_mode`/`fallback_mode` (set on every exit path,
+including cache) and, only on paths where the judge ran,
+`judge_outcome`/`judge_ms`/`judge_candidates`/`judge_selected`/`judge_max_p`/
+`shadow_agreement` — all `Option`, `None` (never a fabricated value) when the
+judge did not run.
+
+## Offline fallback (`agent.fallback = "off"`)
+
+When Stage 4 falls through to Stage 5 with `agent.fallback = "off"`,
+`AgentLoop::offline_fallback` replaces the LLM explorative fallback loop with
+deterministic synthesis: order the candidates by judge score descending
+(`None`/not-judged last, then by retrieval rank), disk-verify them in that
+order through `verified_candidate_findings`, and keep the first
+`OFFLINE_FALLBACK_MAX_FINDINGS = 5` survivors. Every finding is labelled
+**unverified** in its note (`"; unverified candidate; judge p=0.31"` or
+`"; unverified candidate; retrieval rank 2"` when no judge score exists), and
+the summary says so too. It exits through `finalize_and_complete` with
+`stage_exit = "fallback"`; no repo brief is fetched, so `brief_tokens` and
+`orientation_calls_in_loop` stay `None`. `agent.fallback = "llm"` (default)
+leaves Stage 5 exactly as it was before this feature.
+
+`verified_candidate_findings` (extracted from
+`AgentLoop::result_from_candidates`) is the single disk-verification path
+shared by the early exit, the judge path above, and offline fallback: one
+place enforces "never report a location that does not resolve on disk".
+
+## Judge query-cache key
+
+`AgentLoop::run_query_key` appends `judge=laya:<select_threshold>` when
+`judge.mode == "laya"`, and `fallback=off` when `agent.fallback == "off"`.
+`off`- and `shadow`-mode keys are byte-identical to before this feature, so
+existing L1/L2 entries stay valid; `disk_cache::SCHEMA_VERSION` is unchanged
+because the stored value shape did not change.

@@ -9,6 +9,18 @@ collects what is on `main` but not yet tagged.
 
 - **Training-data generator (`repo-explorer-datagen`, dev-only) and Laya
   fine-tune tooling (`train/laya/`)** for the upcoming local candidate judge.
+- **Local candidate judge (`[judge]`, `repo-explorer-judge`).** Stage-4
+  verification can now run against a local Laya HTTP judge instead of an
+  external LLM. `judge.mode` (`off` default / `laya` / `shadow`) and
+  `agent.fallback` (`llm` default / `off`) combine into five configurations,
+  including a fully LLM-free one (`laya` + `off`, `[llm]` optional); a judge
+  failure degrades to LLM verification and never fails a query. `shadow`
+  mode keeps returning the LLM answer while measuring judge agreement
+  (`QueryMetrics.shadow_agreement`) as a rollout safety net. New
+  `judge_mode`, `fallback_mode`, `judge_outcome`, `judge_ms`,
+  `judge_candidates`, `judge_selected`, `judge_max_p` and `shadow_agreement`
+  metrics fields. The `judge-serve/` Python launcher serves a fine-tuned
+  checkpoint through upstream `laya-serve`. See `docs/laya-judge.md`.
 - **Persistent cross-session result cache.** Results now survive a process
   restart: a second layer stores one JSON entry per query under
   `<cache dir>/<repo-id>/results/v1/`, behind the existing in-memory cache.
