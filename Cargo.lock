@@ -1796,6 +1796,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "repo-explorer-datagen"
+version = "0.10.3"
+dependencies = [
+ "anyhow",
+ "hex",
+ "ignore",
+ "repo-explorer-agent",
+ "repo-explorer-core",
+ "repo-explorer-memory",
+ "repo-explorer-search",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "repo-explorer-llm"
 version = "0.10.3"
 dependencies = [
