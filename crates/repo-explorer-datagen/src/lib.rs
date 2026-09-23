@@ -4,3 +4,4 @@
 //! so integration tests can reach the generator core directly.
 pub mod corpus;
 pub mod rng;
+pub mod symbols;
