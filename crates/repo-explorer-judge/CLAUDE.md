@@ -39,7 +39,7 @@ encoder config are identical across HTTP and candle backends; only the runtime d
 
 **Weight loading and renaming:**
 
-Checkpoint `model.safetensors` key prefix `encoder.` is renamed to `model.` during load (line 1494 in mod.rs) to match `candle-transformers` ModernBert's expected namespace.
+Checkpoint `model.safetensors` key prefix `encoder.` is renamed to `model.` during load (in `LoadedModel::load`, mod.rs) to match `candle-transformers` ModernBert's expected namespace.
 
 **Constraints:**
 

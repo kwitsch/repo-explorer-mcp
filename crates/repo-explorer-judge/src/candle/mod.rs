@@ -122,6 +122,7 @@ impl LoadedModel {
 
     /// D6 steps 1-6: pre-temperature logits per sequence, in input order.
     /// Chunks of at most 4 sequences per forward pass.
+    // ponytail: batch limit, per-chunk in raw_logits if throughput matters
     pub fn raw_logits(&self, batch: &[Encoded]) -> Result<Vec<[f32; 2]>, JudgeError> {
         let mut out = Vec::with_capacity(batch.len());
         for chunk in batch.chunks(4) {
