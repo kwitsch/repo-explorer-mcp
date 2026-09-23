@@ -29,6 +29,10 @@ Read the score report for:
 - `Stage mismatches` — P1/P1-DE now carry `stage: early-exit`; a P1 that lands in `verify` without an `early_exit_fallthrough` cause is a QW-2/confidence regression
 - hallucination flags (`fabricated_snippet`, `misaligned_snippet`) — cross-check against known `score.py` false positives before treating them as product bugs
 
+## Judge configs (10b)
+
+Three `eval/config/` variants drive the local Laya Stage-4 judge (see `docs/laya-judge.md`): `judge-shadow.toml` runs the judge alongside the LLM and only logs its agreement (answers unchanged), `judge-laya.toml` lets the judge decide Stage 4 (LLM kept for the Stage-5 fallback), and `judge-offline.toml` is fully LLM-free (judge Stage 4 + offline Stage-5 synthesis, no `[llm]`). Start `judge-serve` on `127.0.0.1:8765` first (`judge-serve/README.md`), and always run `judge-shadow` before `judge-laya` — read `score.py`'s `shadow_agreement_rate` off the shadow run before letting the judge change any answer. Pass a config with `--config eval/config/judge-shadow.toml`; the report's `Judge` section prints `judge not run` for any run without a judge.
+
 Before trusting numbers from an older `results/` run, rescore it with the _current_ `eval/score.py` — the scorer itself has had bugs (multi-line snippet matching, alignment-window width, `equivalent` shape) that materially changed prior counts.
 
 If a run surfaces a new reproducible defect, record it as a new F-NN row in `docs/eval/real-world-test-plan.md`'s candidate-defect table rather than only noting it in passing.
