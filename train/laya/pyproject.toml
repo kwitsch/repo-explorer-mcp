@@ -4,6 +4,9 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = ["laya==0.3.7", "numpy>=1.26"]
 
+[tool.uv.sources]
+laya = { git = "https://github.com/NandhaKishorM/laya", tag = "v0.3.7" }
+
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
