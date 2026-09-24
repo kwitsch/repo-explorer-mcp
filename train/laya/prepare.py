@@ -38,7 +38,7 @@ def main():
         gold = json.loads(row["gold"])["relevant"]["probabilities"]
         target = [gold["A"], gold["B"]]
         label = 0 if gold["A"] >= gold["B"] else 1
-        items.append({"seq": seq, "markers": markers, "target": target, "label": label, "qtype": QTYPES["choice"]})
+        items.append({"ids": seq, "markers": markers, "target": target, "label": label, "qtype": QTYPES["choice"]})
 
     torch.save(items, args.out)
     print(json.dumps({"items": len(items), "dropped": dropped}))

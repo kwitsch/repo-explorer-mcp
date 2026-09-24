@@ -26,8 +26,8 @@ def main():
         router = laya.Router(max_loaded=1, device=args.device)
         probs, labels = [], []
         for row in rows:
-            answers = router.predict(json.loads(row["state"]), json.loads(row["questions"]), model=name)
-            probs.append(answers["relevant"]["probabilities"]["A"])
+            res = router.predict(json.loads(row["state"]), json.loads(row["questions"]), model=name)
+            probs.append(res["answers"]["relevant"]["probabilities"]["A"])
             labels.append(1 if row["label"] == "A" else 0)
         result[name] = _row_metrics(rows, probs, labels, metrics)
 

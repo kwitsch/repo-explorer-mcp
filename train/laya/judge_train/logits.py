@@ -34,30 +34,34 @@ def resolve_checkpoint(name_or_dir):
 def raw_logits(agent, states):
     """Pre-temperature logits [n, 2] of the judge question for each state.
 
-    Avoids `Agent.predict`'s 4-decimal probability rounding.
+    Avoids `Agent.predict`'s 4-decimal probability rounding. Mirrors
+    `Agent.system_one` (laya 0.3.7): build_sequence -> collate_items -> model.
     """
     import numpy as np
     import torch
-    from laya.common import build_sequence, collate_items  # laya 0.3.7
+    from laya.common import QTYPES, build_sequence, collate_items  # laya 0.3.7
 
     q = agent._to_internal(QUESTION)  # laya 0.3.7
-    max_len = agent.cfg["max_len"]
-    head_max_len = agent.cfg["head_max_len"]
-    use_cuda = torch.cuda.is_available() and str(agent.device).startswith("cuda")
+    max_len = agent.cfg.get("max_len", 512)
+    head_max_len = agent.cfg.get("head_max_len", 192)
+    use_amp = agent.device.type == "cuda"  # same rule as Agent.system_one
 
     out = []
     for start in range(0, len(states), 16):
         items = []
         for state in states[start:start + 16]:
             seq, markers = build_sequence(agent.tok, state, q, max_len, head_max_len)
-            items.append((seq, markers))
-        batch = collate_items(items, agent.tok.pad_token_id)
-        batch = {k: (v.to(agent.device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
-        with torch.no_grad():
-            if use_cuda:
-                with torch.autocast("cuda", dtype=agent.dtype):  # same rule as Agent.system_one
-                    logits = agent.model(**batch)
-            else:
-                logits = agent.model(**batch)
+            if len(markers) != 2:
+                raise ValueError("judge question options exceed head_max_len=%d" % head_max_len)
+            items.append({"ids": seq, "markers": markers, "qtype": QTYPES["choice"]})
+        b = collate_items([items], agent.tok.pad_token_id)
+        with torch.no_grad(), torch.autocast(device_type=agent.device.type, dtype=agent.dtype, enabled=use_amp):
+            logits, _act = agent.model(
+                b["input_ids"].to(agent.device),
+                b["attention_mask"].to(agent.device),
+                b["marker_pos"].to(agent.device),
+                b["marker_mask"].to(agent.device),
+                b["qtype"].to(agent.device),
+            )
         out.append(logits[:, :2].float().cpu().numpy())
     return np.concatenate(out, axis=0) if out else np.zeros((0, 2), dtype="float32")

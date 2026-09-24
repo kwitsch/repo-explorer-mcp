@@ -59,8 +59,7 @@ def main():
 
     import torch
     import laya
-    from laya.common import build_sequence
-    from laya.collate import collate_items
+    from laya.common import QTYPES, build_sequence, collate_items  # laya 0.3.7
 
     out_path = args.out or os.path.join(args.checkpoint, "golden.jsonl")
     agent = laya.Agent(args.checkpoint, device="cpu")
@@ -94,10 +93,12 @@ def main():
             seq, markers = build_sequence(
                 agent.tok, state, question, agent.cfg["max_len"], agent.cfg["head_max_len"]
             )
-            item = {"seq": seq, "markers": markers}
-            batch = collate_items([item])
+            item = {"ids": seq, "markers": markers, "qtype": QTYPES["choice"]}
+            b = collate_items([[item]], agent.tok.pad_token_id)
             with torch.no_grad():
-                raw = agent.model(**batch)
+                raw, _act = agent.model(
+                    b["input_ids"], b["attention_mask"], b["marker_pos"], b["marker_mask"], b["qtype"]
+                )
             logits = raw[0, :2].to(torch.float32).tolist()
             import math
             a, b = logits[0] / t, logits[1] / t
