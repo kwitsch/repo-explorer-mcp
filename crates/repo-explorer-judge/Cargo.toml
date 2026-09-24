@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-repo-explorer-core = { version = "0.10.3", path = "../repo-explorer-core" }
+repo-explorer-core = { version = "0.11.0", path = "../repo-explorer-core" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
@@ -22,7 +22,7 @@ cuda = ["candle", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cud
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
-repo-explorer-core = { version = "0.10.3", path = "../repo-explorer-core", features = ["test-support"] }
+repo-explorer-core = { version = "0.11.0", path = "../repo-explorer-core", features = ["test-support"] }
 serde_json = "1"
 sha2 = "0.11"
 hex = "0.4"
