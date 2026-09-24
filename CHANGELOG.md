@@ -75,6 +75,8 @@ collects what is on `main` but not yet tagged.
 - The codebase-memory project name is derived from a canonical-path hash, so
   two checkouts with the same directory name stay separate.
 - Every user-facing surface states that queries are English-only.
+- `repo-explorer-datagen`'s query templates are English-only: the German
+  `words-de`/`define-de` templates are removed.
 
 ### Fixed
 

@@ -1,4 +1,4 @@
-//! Rule-based query templates over a symbol. Six template ids in two languages,
+//! Rule-based query templates over a symbol. Four English template ids,
 //! chosen by a seeded weighted draw so a run is byte-reproducible.
 
 use crate::rng::{Rng, fnv1a64, splitmix64};
@@ -60,16 +60,14 @@ fn lower_first(s: &str) -> String {
 
 #[derive(Clone, Copy)]
 enum Kind {
-    DefineEn,
-    WordsEn,
-    DocEn,
-    LiteralEn,
-    WordsDe,
-    DefineDe,
+    Define,
+    Words,
+    Doc,
+    Literal,
 }
 
 /// Build one query for a symbol, or `None` if none applies (never happens in
-/// practice — `define-en`/`define-de` always apply).
+/// practice — `define-en` always applies).
 pub fn build_query(
     repo: &str,
     symbol: &SymbolCandidate,
@@ -84,20 +82,16 @@ pub fn build_query(
 
     // Applicable templates in table order, each with its integer weight.
     let mut applicable: Vec<(u64, Kind)> = Vec::new();
-    applicable.push((2, Kind::DefineEn));
+    applicable.push((2, Kind::Define));
     if two_words {
-        applicable.push((6, Kind::WordsEn));
+        applicable.push((6, Kind::Words));
     }
     if doc.is_some() {
-        applicable.push((6, Kind::DocEn));
+        applicable.push((6, Kind::Doc));
     }
     if literal.is_some() {
-        applicable.push((4, Kind::LiteralEn));
+        applicable.push((4, Kind::Literal));
     }
-    if two_words {
-        applicable.push((2, Kind::WordsDe));
-    }
-    applicable.push((1, Kind::DefineDe));
 
     let total: u64 = applicable.iter().map(|(w, _)| *w).sum();
     if total == 0 {
@@ -121,8 +115,8 @@ pub fn build_query(
     }
 
     let (text, query_lang, template) = match chosen {
-        Kind::DefineEn => (format!("where is {n} defined"), "en", "define-en"),
-        Kind::WordsEn => {
+        Kind::Define => (format!("where is {n} defined"), "en", "define-en"),
+        Kind::Words => {
             let text = match rng.next_u64() % 3 {
                 0 => format!("where is the code that handles {w}"),
                 1 => format!("how does this project {w}"),
@@ -130,25 +124,16 @@ pub fn build_query(
             };
             (text, "en", "words-en")
         }
-        Kind::DocEn => {
+        Kind::Doc => {
             let d = lower_first(doc.unwrap());
             let d = d.strip_suffix('.').unwrap_or(&d);
             (format!("where is the code that {d}"), "en", "doc-en")
         }
-        Kind::LiteralEn => (
+        Kind::Literal => (
             format!("where is the error \"{}\" raised", literal.unwrap()),
             "en",
             "literal-en",
         ),
-        Kind::WordsDe => {
-            let text = if rng.next_u64().is_multiple_of(2) {
-                format!("wo wird {w} behandelt")
-            } else {
-                format!("wo ist die Logik für {w}")
-            };
-            (text, "de", "words-de")
-        }
-        Kind::DefineDe => (format!("wo ist {n} definiert"), "de", "define-de"),
     };
 
     Some(GeneratedQuery {
@@ -188,12 +173,8 @@ mod tests {
     fn single_word_symbol_only_defines() {
         let sym = symbol("m::fizzbuzz");
         let q = build_query("ripgrep", &sym, None, None, 20260923).unwrap();
-        assert!(
-            q.text == "where is fizzbuzz defined" || q.text == "wo ist fizzbuzz definiert",
-            "{}",
-            q.text
-        );
-        assert!(q.template == "define-en" || q.template == "define-de");
+        assert_eq!(q.text, "where is fizzbuzz defined");
+        assert_eq!(q.template, "define-en");
     }
 
     #[test]
@@ -256,15 +237,11 @@ mod tests {
     #[test]
     fn words_templates_use_split_words() {
         let sym = symbol("m::resolveRedirects");
-        let (mut en, mut de) = (None, None);
+        let mut en = None;
         for seed in 0..5000u64 {
             let q = build_query("repo", &sym, None, None, seed).unwrap();
-            match q.template {
-                "words-en" if en.is_none() => en = Some(q.text.clone()),
-                "words-de" if de.is_none() => de = Some(q.text.clone()),
-                _ => {}
-            }
-            if en.is_some() && de.is_some() {
+            if q.template == "words-en" {
+                en = Some(q.text.clone());
                 break;
             }
         }
@@ -275,11 +252,28 @@ mod tests {
                 || en == "where do we resolve redirects",
             "{en}"
         );
-        let de = de.expect("words-de reachable");
-        assert!(
-            de == "wo wird resolve redirects behandelt"
-                || de == "wo ist die Logik für resolve redirects",
-            "{de}"
-        );
+    }
+
+    #[test]
+    fn every_generated_query_is_english() {
+        let symbols = [
+            symbol("m::fizzbuzz"),
+            symbol("m::render_widget"),
+            symbol("m::resolveRedirects"),
+            symbol("m::do_thing_now"),
+        ];
+        for sym in &symbols {
+            for seed in 0..500u64 {
+                let q = build_query(
+                    "repo",
+                    sym,
+                    Some("Renders the widget."),
+                    Some("bad widget state here"),
+                    seed,
+                )
+                .unwrap();
+                assert_eq!(q.query_lang, "en", "{}: {}", q.template, q.text);
+            }
+        }
     }
 }

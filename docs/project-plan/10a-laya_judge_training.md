@@ -80,15 +80,15 @@ JSONL dataset.
 
 Alternatives rejected:
 
-| Alternative | Why it lost |
-|---|---|
-| `noul` question | Laya issue #156: `noul` can follow its `false:`/`true:` labels instead of the state on the English checkpoint |
-| One `choice` over all candidates | Softmax forces a single selection, but findings are multi-select. The head budget (256 tokens, 48 per option) and the state budget (~768 tokens) cannot hold 12 candidates' code |
-| JSON-object state | Laya re-serializes objects with Python `json.dumps` (`", "`/`": "` separators). serde_json writes compact JSON, so the candle port would need a json.dumps emulator. Plain text is also more token-efficient |
-| Teacher-LLM labels | Sends queries and snippets to a third-party model (data sovereignty), costs tokens, and is unnecessary: the ground truth can be derived programmatically |
-| Base `laya-typed-decisions` | Specialised to four business workflows. Rejected in favour of the same recipe from the neutral root checkpoint |
-| Base `laya-multilingual` | Weaker on English and code. Queries are mostly English, and German is measured separately |
-| Split by query | Leaks repo-specific vocabulary between splits, which inflates metrics |
+| Alternative                      | Why it lost                                                                                                                                                                                                  |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `noul` question                  | Laya issue #156: `noul` can follow its `false:`/`true:` labels instead of the state on the English checkpoint                                                                                                |
+| One `choice` over all candidates | Softmax forces a single selection, but findings are multi-select. The head budget (256 tokens, 48 per option) and the state budget (~768 tokens) cannot hold 12 candidates' code                             |
+| JSON-object state                | Laya re-serializes objects with Python `json.dumps` (`", "`/`": "` separators). serde_json writes compact JSON, so the candle port would need a json.dumps emulator. Plain text is also more token-efficient |
+| Teacher-LLM labels               | Sends queries and snippets to a third-party model (data sovereignty), costs tokens, and is unnecessary: the ground truth can be derived programmatically                                                     |
+| Base `laya-typed-decisions`      | Specialised to four business workflows. Rejected in favour of the same recipe from the neutral root checkpoint                                                                                               |
+| Base `laya-multilingual`         | Weaker on English and code. Queries are mostly English, and German is measured separately                                                                                                                    |
+| Split by query                   | Leaks repo-specific vocabulary between splits, which inflates metrics                                                                                                                                        |
 
 ## Detailed design
 
@@ -168,7 +168,7 @@ pub async fn render_judge_states<M: MemoryBackend>(
    - `<path>` is the candidate path via `to_string_lossy()`, with every `\`
      replaced by `/`.
    - Start and end come from `normalize_location`, so `line_end >=
-     line_start`.
+line_start`.
    - `<sym>` is `, symbol `<symbol>`` when `symbol` is `Some`, otherwise
      empty.
 3. Code section. The source text is `body` if it is `Some` and non-empty,
@@ -177,7 +177,7 @@ pub async fn render_judge_states<M: MemoryBackend>(
    - With a source text: a line `code:`, then the first `BODY_MAX_LINES`
      lines of the source. Split on `\n`, strip one trailing `\r` per line,
      and emit each line as `"  " + <first LINE_MAX_CHARS chars of the
-     line>`. The limit counts `char`s, not bytes, and tabs are kept as they
+line>`. The limit counts `char`s, not bytes, and tabs are kept as they
      are.
    - With no source text: the single line `code: (unavailable)`.
 4. Outline section, only when `outline` is `Some` and non-empty: a line
@@ -197,7 +197,7 @@ The outline is last on purpose: Laya truncates the state from the right
    `start = loc.line_start.saturating_sub(BODY_CONTEXT_BEFORE).max(1)` and
    `end = loc.line_end.saturating_add(BODY_CONTEXT_AFTER)`. Read the body
    with `crate::dispatch::read_file_canonical(repo_root, &canonical_root,
-   &path_str, Some(start), Some(end))`, where `path_str` is
+&path_str, Some(start), Some(end))`, where `path_str` is
    `loc.path.to_string_lossy()`. `Err` becomes `None`.
 4. Render each candidate's state with `render_judge_state`.
 
@@ -298,18 +298,18 @@ generate core. `src/lib.rs` declares every module below as `pub mod`, and
 
 Modules:
 
-| Module | Contents |
-|---|---|
-| `main.rs` | CLI parsing and dispatch (binary target only) |
-| `corpus.rs` | Schema and validation |
-| `fetch.rs` | The `fetch` subcommand |
-| `generate.rs` | The `generate` subcommand: `run_generate` (orchestration: git rev check, index refresh, output files, manifest) and the backend-generic core `generate_repo` (D4.4) |
-| `symbols.rs` | File walk, outline filtering, doc and literal extraction |
-| `templates.rs` | Query templates |
-| `label.rs` | Candidate labelling |
-| `rows.rs` | Row and manifest types |
-| `rng.rs` | splitmix64 + FNV-1a 64 |
-| `stats.rs` | The `stats` subcommand |
+| Module         | Contents                                                                                                                                                            |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `main.rs`      | CLI parsing and dispatch (binary target only)                                                                                                                       |
+| `corpus.rs`    | Schema and validation                                                                                                                                               |
+| `fetch.rs`     | The `fetch` subcommand                                                                                                                                              |
+| `generate.rs`  | The `generate` subcommand: `run_generate` (orchestration: git rev check, index refresh, output files, manifest) and the backend-generic core `generate_repo` (D4.4) |
+| `symbols.rs`   | File walk, outline filtering, doc and literal extraction                                                                                                            |
+| `templates.rs` | Query templates                                                                                                                                                     |
+| `label.rs`     | Candidate labelling                                                                                                                                                 |
+| `rows.rs`      | Row and manifest types                                                                                                                                              |
+| `rng.rs`       | splitmix64 + FNV-1a 64                                                                                                                                              |
+| `stats.rs`     | The `stats` subcommand                                                                                                                                              |
 
 Logs go to stderr via tracing-subscriber at `info`. stdout carries only the
 JSON printed by `stats` and the final JSON summary of `fetch`/`generate`.
@@ -742,13 +742,14 @@ pub async fn generate_repo<M: MemoryBackend, S: SearchBackend>(
    Dedupe on `(path, line_start, line_end)`, keeping the first occurrence.
    An outline error for one file skips that file only and counts it as
    `outline_errors`.
+
 5. **Sampling.** If the symbol count exceeds `3 × max_queries_per_repo`,
    select exactly `3 × max_queries_per_repo` of them with a partial
    Fisher–Yates shuffle, seeded with
    `splitmix64(seed ^ fnv1a64(repo name bytes))`. Then restore the original
    order of the selection.
 6. **Queries.** For each symbol, in order, try to build one query (D4.5).
-   Stop after `max_queries_per_repo` accepted queries. A query is *accepted*
+   Stop after `max_queries_per_repo` accepted queries. A query is _accepted_
    when it is built, whatever stage it reaches.
 7. **Snapshot.** For each query, call
    `retrieval_snapshot(&memory, &search, repo_root, &ExplorationQuery { text, scope_hint: None, max_results: None, detailed_snippets: false }, &settings)`.
@@ -773,20 +774,18 @@ Definitions:
 Templates. `N` is the short name, `D` the doc sentence (D4.5.1), `L` the
 error literal (D4.5.2):
 
-| id | lang | applicable when | text |
-|---|---|---|---|
-| `define-en` | en | always | `where is {N} defined` |
-| `words-en` | en | ≥ 2 words | one of: `where is the code that handles {w}`, `how does this project {w}`, `where do we {w}` (uniform pick) |
-| `doc-en` | en | doc sentence `D` exists | `where is the code that {d}`, where `d` = `D` with its first char lowercased and one trailing `.` removed |
-| `literal-en` | en | error literal `L` exists | `where is the error "{L}" raised` |
-| `words-de` | de | ≥ 2 words | one of: `wo wird {w} behandelt`, `wo ist die Logik für {w}` (uniform pick) |
-| `define-de` | de | always | `wo ist {N} definiert` |
+| id           | lang | applicable when          | text                                                                                                        |
+| ------------ | ---- | ------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| `define-en`  | en   | always                   | `where is {N} defined`                                                                                      |
+| `words-en`   | en   | ≥ 2 words                | one of: `where is the code that handles {w}`, `how does this project {w}`, `where do we {w}` (uniform pick) |
+| `doc-en`     | en   | doc sentence `D` exists  | `where is the code that {d}`, where `d` = `D` with its first char lowercased and one trailing `.` removed   |
+| `literal-en` | en   | error literal `L` exists | `where is the error "{L}" raised`                                                                           |
 
 Selection: draw one template from the applicable set with integer weights
-`define-en` 2, `words-en` 6, `doc-en` 6, `literal-en` 4, `words-de` 2,
-`define-de` 1. Use `rng.next_u64() % total_weight` walked over the
-applicable templates in table order. The same RNG then makes the phrasing
-pick inside the chosen template.
+`define-en` 2, `words-en` 6, `doc-en` 6, `literal-en` 4. Use
+`rng.next_u64() % total_weight` walked over the applicable templates in
+table order. The same RNG then makes the phrasing pick inside the chosen
+template.
 
 **D4.5.1 Doc sentence.** The file is read once and cached per file. Let
 `def = line_start` (1-based).
@@ -803,6 +802,7 @@ pick inside the chosen template.
    (the longest matching of `///`, `//!`, `/**`, `//`, `/*`, `*`, `#`) and
    any trailing `*/`, then trim. Drop empty lines and lines starting with
    `@`.
+
 2. **Python docstring.** Only for `.py` files, and only if step 1 found
    nothing. Take the first non-empty line in `(def, line_end]`. If its
    trimmed form starts with `"""` or `'''`, take the text after the opening
@@ -853,12 +853,23 @@ to `<name>.tmp` and renamed at the end of the run.
 Row keys, in exactly this struct field order:
 
 ```json
-{"id":"ripgrep:000017:03","workflow":"repo_explorer_verify","repo":"ripgrep","lang":"rust","split":"train",
- "query_id":"ripgrep:000017","query":"where is the code that searches a single file","query_lang":"en",
- "template":"doc-en","candidate_rank":3,"candidate_kind":"text match","label":"B",
- "state":"<JSON-encoded string of the rendered state>",
- "questions":"<JSON-encoded {\"relevant\":{\"criteria\":{\"A\":\"yes, this location answers the query\",\"B\":\"no, this location does not answer the query\"},\"instructions\":\"Does this code location answer the repository search query?\",\"type\":\"choice\"}}>",
- "gold":"<JSON-encoded {\"relevant\":{\"label\":\"A\"|\"B\",\"probabilities\":{\"A\":1.0,\"B\":0.0}|{\"A\":0.0,\"B\":1.0}}}>"}
+{
+  "id": "ripgrep:000017:03",
+  "workflow": "repo_explorer_verify",
+  "repo": "ripgrep",
+  "lang": "rust",
+  "split": "train",
+  "query_id": "ripgrep:000017",
+  "query": "where is the code that searches a single file",
+  "query_lang": "en",
+  "template": "doc-en",
+  "candidate_rank": 3,
+  "candidate_kind": "text match",
+  "label": "B",
+  "state": "<JSON-encoded string of the rendered state>",
+  "questions": "<JSON-encoded {\"relevant\":{\"criteria\":{\"A\":\"yes, this location answers the query\",\"B\":\"no, this location does not answer the query\"},\"instructions\":\"Does this code location answer the repository search query?\",\"type\":\"choice\"}}>",
+  "gold": "<JSON-encoded {\"relevant\":{\"label\":\"A\"|\"B\",\"probabilities\":{\"A\":1.0,\"B\":0.0}|{\"A\":0.0,\"B\":1.0}}}>"
+}
 ```
 
 - `state`, `questions` and `gold` are **strings containing JSON**, which is
@@ -963,7 +974,7 @@ Every script uses `argparse`, prints a JSON summary to stdout, and imports
   - Derived from the `%%writefile /kaggle/working/train_ddp.py` cell of
     `notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb` at laya tag
     `v0.3.7`. Keep an attribution header: `# Derived from NandhaKishorM/laya
-    (Apache-2.0), notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb @ v0.3.7`.
+(Apache-2.0), notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb @ v0.3.7`.
   - Changes versus the notebook, and nothing else:
     - argument parsing uses `argparse` with the signature above, replacing
       the notebook's positional `sys.argv`;
@@ -1045,12 +1056,12 @@ Every script uses `argparse`, prints a JSON summary to stdout, and imports
 
 #### D5.3 Offline acceptance gate (enforced by `evaluate.py`, test split)
 
-| Metric | Threshold |
-|---|---|
-| `query_top1` | ≥ 0.90 |
-| `auroc` | ≥ 0.90 |
-| `ece` (after calibration) | ≤ 0.10 |
-| candidate-level precision at `select_threshold` | ≥ 0.85 |
+| Metric                                          | Threshold |
+| ----------------------------------------------- | --------- |
+| `query_top1`                                    | ≥ 0.90    |
+| `auroc`                                         | ≥ 0.90    |
+| `ece` (after calibration)                       | ≤ 0.10    |
+| candidate-level precision at `select_threshold` | ≥ 0.85    |
 
 ### D6 — Docs, CI, housekeeping
 
@@ -1130,6 +1141,7 @@ Rust (CI, `cargo test --workspace`):
   (`test_support::temp_repo_with`): an unknown-location candidate gives
   `None`, the body window is `[start-3, end+5]` clamped at 1, and an outline
   is attached to both candidates of the same file.
+
 - **`agent::snapshot`** — with mocks: early-exit route → `EarlyExit`;
   confidence below `fallback_confidence` → `Fallback`; otherwise `Verify`.
   The existing `early_exit_*` and `symbol_free_query_is_vetoed_from_early_exit`
@@ -1216,10 +1228,10 @@ Manual gates (maintainer, a GPU host; commands are exact):
   - train rows ≥ 25,000;
   - the positive share of train rows is in [0.12, 0.50];
   - in the `stats` output (`train.per_template`, row counts), each of
-    `words-en`, `doc-en`, `literal-en` and `words-de` accounts for ≥ 3 % of
-    train rows. `define-en` and `define-de` are exempt, because
-    exact-symbol queries mostly take the early exit and produce few rows by
-    design;
+    `words-en`, `doc-en` and `literal-en` accounts for ≥ 3 % of train rows.
+    `define-en` is exempt, because exact-symbol queries mostly take the
+    early exit and produce few rows by design;
+  - `train.per_query_lang` contains only `en`;
   - test `queries_with_positive` ≥ 1,000.
 - **G2 — bake-off (recorded, no threshold).**
   `cd train/laya && uv run python bakeoff.py --data ~/judge-data/v1 --out ~/judge-data/v1/bakeoff.json --device cuda`
@@ -1239,8 +1251,8 @@ Manual gates (maintainer, a GPU host; commands are exact):
 ## Risks
 
 - **Template–reality mismatch.** Rule-made queries cover real phrasing only
-  partly. Mitigations: six template families, two of them German; the
-  per-template breakdown; the 10b end-to-end eval as the real gate.
+  partly. Mitigations: four template families; the per-template breakdown;
+  the 10b end-to-end eval as the real gate.
 - **Label noise.** A candidate may answer the query without overlapping the
   ground truth (for example a caller, or a second implementation).
   Mitigations: accepted, since those count as hard negatives for the "where
@@ -1251,9 +1263,6 @@ Manual gates (maintainer, a GPU host; commands are exact):
   determinism guarantee is scoped to the same CBM version.
 - **Large repos dominate.** Mitigations: the `max_queries_per_repo` cap and
   the sampling.
-- **German weakness.** ModernBERT is English- and code-pretrained, so
-  German queries may score worse. Mitigations: measured through the
-  `query_lang` breakdown, not gated.
 - **Drift of the notebook-derived trainer.** Mitigations: `laya==0.3.7`
   pinned, and the derivation source is recorded in the header.
 - **The notebook trainer may not fit in 16 GB at 1024 tokens.** The
@@ -1306,9 +1315,8 @@ Manual gates (maintainer, a GPU host; commands are exact):
    `laya-typed-decisions`.
 7. The corpus is the 36 pinned repos listed in D4.2: 6 language groups
    (TypeScript and JavaScript form one group) × (4 train, 1 val, 1 test).
-8. Query templates are exactly the six ids of D4.5 (`define-en`,
-   `words-en`, `doc-en`, `literal-en`, `words-de`, `define-de`). German
-   comes only from fixed templates; nothing is translated.
+8. Query templates are exactly the four English-only ids of D4.5
+   (`define-en`, `words-en`, `doc-en`, `literal-en`).
 9. One query per symbol, at most 400 queries per repo, and at most 4
    negatives per query (at most 2 when there is no positive).
 10. Datagen is a dev-only workspace binary (`publish = false`) and is not a
