@@ -214,9 +214,13 @@ def main():
             if accum_step % GRAD_ACCUM == 0 or (b_idx + MICRO_BATCH) >= len(my_items):
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), 1.0)
+                scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()
+                # GradScaler skips optimizer.step() on inf/NaN grads and shrinks the
+                # scale; only advance the LR schedule when a real step happened.
+                if scaler.get_scale() >= scale_before:
+                    scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 updates += 1
                 if args.max_steps is not None and updates >= args.max_steps:
