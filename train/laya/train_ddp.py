@@ -10,6 +10,7 @@
 #   * --epochs / --micro-batch replace the notebook constants;
 #   * --device cpu smoke path (gloo, single rank without torchrun, no cuda/autocast/GradScaler, fp32);
 #   * --max-steps stops early after N optimizer steps;
+#   * DDP find_unused_parameters=False (every parameter receives a gradient; the notebook flag only cost a graph traversal);
 #   * temperature fitting and its calibration hold-out slice are removed
 #     (calibrate.py owns calibration); saved temperature = [1.0, 1.0, 1.0],
 #     no temperature_by_options.
@@ -121,9 +122,9 @@ def main():
     model.train()
 
     if cpu:
-        ddp_model = DDP(model, find_unused_parameters=True)
+        ddp_model = DDP(model, find_unused_parameters=False)
     else:
-        ddp_model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        ddp_model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     all_items = torch.load(args.items_pt, weights_only=False)
     for it in all_items:
