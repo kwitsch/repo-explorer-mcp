@@ -123,8 +123,10 @@ def take_qw0_fields(out: dict, f: dict) -> None:
     meaning spend.
 
     The 10b judge fields (judge_mode, fallback_mode, judge_outcome, judge_ms, judge_candidates,
-    judge_selected, judge_max_p, shadow_agreement) are judge-run-only, on the same
-    `exploration complete` line: absent (None) on an off-mode or pre-10b binary, never zero."""
+    judge_selected, judge_max_p, shadow_agreement, judge_latency_ms) are judge-run-only, on the
+    same `exploration complete` line: absent (None) on an off-mode or pre-10b binary, never zero.
+    judge_mode is off|on|shadow (legacy "laya" is normalized by score.py);
+    judge_outcome is selected|escalated|escalated-uncertain|error."""
     for key in (
         "candidate_count",
         "early_exit_route",
@@ -139,7 +141,9 @@ def take_qw0_fields(out: dict, f: dict) -> None:
         "cited_candidate_ids",
         # 10b Stage-4 judge: all None until a judge run emits them (an off-mode or pre-10b
         # binary never does). judge_mode/fallback_mode/judge_outcome/shadow_agreement are
-        # string enums; judge_ms/judge_candidates/judge_selected/judge_max_p are integers.
+        # string enums; judge_ms/judge_candidates/judge_selected/judge_max_p/judge_latency_ms
+        # are integers (judge_latency_ms = server-reported usage.latency_ms, absent when the
+        # server reports none).
         "judge_mode",
         "fallback_mode",
         "judge_outcome",
@@ -148,6 +152,7 @@ def take_qw0_fields(out: dict, f: dict) -> None:
         "judge_selected",
         "judge_max_p",
         "shadow_agreement",
+        "judge_latency_ms",
     ):
         if f.get(key) is not None:
             out[key] = f[key]
@@ -310,7 +315,7 @@ def parse_call_lines(lines: list[str]) -> dict:
     early_exit_route, cache_read_tokens, cache_write_tokens, total_ms, brief_tokens,
     orientation_calls_in_loop, cache_layer, turns_saved_by_cache, tokens_saved_by_cache) and the
     10b Stage-4 judge fields (judge_mode, fallback_mode, judge_outcome, judge_ms, judge_candidates,
-    judge_selected, judge_max_p, shadow_agreement) via take_qw0_fields."""
+    judge_selected, judge_max_p, shadow_agreement, judge_latency_ms) via take_qw0_fields."""
     out = {
         "stage": None,
         "tokens": None,
@@ -357,11 +362,13 @@ def parse_call_lines(lines: list[str]) -> dict:
         # reverted.
         "cited_candidate_ids": None,
         # 10b Stage-4 judge, emitted on the `exploration complete` line only when a judge ran
-        # (mode "laya"/"shadow"). None means the judge did not run, or the binary predates 10b —
+        # (mode "on"/"shadow"). None means the judge did not run, or the binary predates 10b —
         # score.py's Judge section prints "judge not run" rather than a fabricated 0. The string
-        # enums: judge_mode ("laya"/"shadow"), fallback_mode ("llm"/"off"), judge_outcome
-        # ("selected"/"escalated"/...), shadow_agreement ("exact"/"overlap"/"disjoint"); the
-        # integers: judge_ms, judge_candidates, judge_selected, judge_max_p (per-mille).
+        # enums: judge_mode ("on"/"shadow"; legacy "laya" is normalized by score.py),
+        # fallback_mode ("llm"/"off"), judge_outcome ("selected"/"escalated"/
+        # "escalated-uncertain"/"error"), shadow_agreement ("exact"/"overlap"/"disjoint"); the
+        # integers: judge_ms, judge_candidates, judge_selected, judge_max_p (per-mille),
+        # judge_latency_ms (max server-reported latency; None when the server reports none).
         "judge_mode": None,
         "fallback_mode": None,
         "judge_outcome": None,
@@ -370,6 +377,7 @@ def parse_call_lines(lines: list[str]) -> dict:
         "judge_selected": None,
         "judge_max_p": None,
         "shadow_agreement": None,
+        "judge_latency_ms": None,
     }
     for line in lines:
         kind = line_kind(line)
