@@ -858,7 +858,7 @@ async fn end_to_end_laya_run_selects_the_scored_candidate() {
     let judge =
         MockJudge::new().with_scorer(|state| if state.contains("fresh_a") { 900 } else { 100 });
     let settings = JudgeSettings {
-        mode: JudgeMode::Laya,
+        mode: JudgeMode::On,
         select_threshold: 50,
         ..JudgeSettings::default()
     };
