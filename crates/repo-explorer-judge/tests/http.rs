@@ -65,7 +65,7 @@ fn http_response(code: u16, reason: &str, body: &str) -> String {
 
 fn settings(base_url: String) -> JudgeSettings {
     JudgeSettings {
-        mode: JudgeMode::Laya,
+        mode: JudgeMode::On,
         base_url,
         api_key_env: None,
         model: "typed-decisions".to_string(),

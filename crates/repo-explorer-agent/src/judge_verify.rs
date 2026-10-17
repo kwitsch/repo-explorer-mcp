@@ -242,7 +242,7 @@ mod tests {
 
     fn settings(threshold: u32) -> JudgeSettings {
         JudgeSettings {
-            mode: JudgeMode::Laya,
+            mode: JudgeMode::On,
             select_threshold: threshold,
             ..JudgeSettings::default()
         }

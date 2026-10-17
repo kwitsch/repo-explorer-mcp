@@ -610,7 +610,7 @@ where
         // existing L1/L2 entries stay valid. Only `laya` (whose answer depends
         // on the selection threshold) and `fallback = off` (a different Stage 5)
         // extend the key.
-        if self.judge_settings.mode == JudgeMode::Laya {
+        if self.judge_settings.mode == JudgeMode::On {
             crate::cache::encode_field_into(
                 &mut key,
                 &format!("judge=laya:{}", self.judge_settings.select_threshold),
@@ -635,7 +635,7 @@ where
         // Set on every path, including the cache-hit early return below.
         metrics.judge_mode = match self.judge_settings.mode {
             JudgeMode::Off => "off",
-            JudgeMode::Laya => "laya",
+            JudgeMode::On => "on",
             JudgeMode::Shadow => "shadow",
         };
         metrics.fallback_mode = match self.settings.fallback {
@@ -883,7 +883,7 @@ where
                     }
                     tracing::info!("verification escalated to the fallback loop");
                 }
-                JudgeMode::Laya => {
+                JudgeMode::On => {
                     let jv = judge_verify(
                         &self.memory,
                         &self.judge,
@@ -2551,7 +2551,7 @@ mod tests {
             },
         ])]);
         let settings = JudgeSettings {
-            mode: JudgeMode::Laya,
+            mode: JudgeMode::On,
             select_threshold: 50,
             ..JudgeSettings::default()
         };
@@ -2582,7 +2582,7 @@ mod tests {
         );
         let m = taped_metrics().pop().unwrap();
         assert_eq!(m.llm_calls, 0);
-        assert_eq!(m.judge_mode, "laya");
+        assert_eq!(m.judge_mode, "on");
         assert_eq!(m.judge_outcome, Some("selected"));
         assert_eq!(m.judge_selected, Some(2));
         assert_eq!(m.judge_candidates, Some(5));
@@ -2598,7 +2598,7 @@ mod tests {
             p_relevant_permille: 100,
         }])]);
         let settings = JudgeSettings {
-            mode: JudgeMode::Laya,
+            mode: JudgeMode::On,
             ..JudgeSettings::default()
         };
         let agent = agent_base.with_judge(judge, settings);
@@ -2630,7 +2630,7 @@ mod tests {
             },
         ])]);
         let settings = JudgeSettings {
-            mode: JudgeMode::Laya,
+            mode: JudgeMode::On,
             ..JudgeSettings::default()
         };
         let agent = agent_base.with_judge(judge, settings);
@@ -2672,7 +2672,7 @@ mod tests {
             message: "down".to_string(),
         })]);
         let settings = JudgeSettings {
-            mode: JudgeMode::Laya,
+            mode: JudgeMode::On,
             ..JudgeSettings::default()
         };
         let agent = agent_base.with_judge(judge, settings);
@@ -2742,7 +2742,7 @@ mod tests {
         let off = agent_with(MockLlmProvider::new()).run_query_key(&dir, &q);
         let laya50 = {
             let s = JudgeSettings {
-                mode: JudgeMode::Laya,
+                mode: JudgeMode::On,
                 select_threshold: 50,
                 ..JudgeSettings::default()
             };
@@ -2752,7 +2752,7 @@ mod tests {
         };
         let laya70 = {
             let s = JudgeSettings {
-                mode: JudgeMode::Laya,
+                mode: JudgeMode::On,
                 select_threshold: 70,
                 ..JudgeSettings::default()
             };
