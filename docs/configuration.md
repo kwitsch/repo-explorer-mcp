@@ -141,8 +141,6 @@ Full mode matrix, rollout procedure and troubleshooting: `docs/judge.md`.
 
 | Key                      | Default                    | Meaning                                                                                                                                                                             |
 | ------------------------ | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Key                      | Default                    | Meaning                                                                                                                                                                             |
-| ------------------------ | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `judge.mode`             | `"off"`                    | `off` — LLM verifies Stage 4 (today's behaviour). `on` — the judge verifies Stage 4. `shadow` — the LLM still answers; the judge runs alongside and only its agreement is recorded. |
 | `judge.base_url`         | `"http://127.0.0.1:8741"`  | Base URL of any `/v1/systemone` judge server (e.g. the H2O shim). Must be a valid `http(s)://` URL.                                                                                 |
 | `judge.api_key_env`      | unset                      | Optional env var naming a bearer token sent as `Authorization: Bearer <token>`. If set, the variable must actually be set (`MissingJudgeEnvVar` otherwise).                         |
