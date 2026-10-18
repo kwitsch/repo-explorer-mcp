@@ -164,8 +164,8 @@ call it, so training and serving see byte-identical input — **train/serve pari
 by construction**. `render_judge_states` batches the per-candidate reads
 (outline once per file, body window `[start-3, end+5]`), returning `None` for
 unknown-location candidates (never judged). **Bump `JUDGE_STATE_VERSION`
-(in core) on any change to the rendering or the D1 constants** — a checkpoint is
-valid only for the version it was trained on.
+(in core) on any change to the rendering or the D1 constants** — a calibration is
+valid only for the version it was computed on.
 
 `snapshot::retrieval_snapshot` runs the deterministic pre-stage alone (no index
 refresh, no cache, no LLM) and classifies the result as `EarlyExit`/`Verify`/
@@ -187,23 +187,32 @@ path.
 
 - **`off`** (default) — unchanged: the LLM `verify` path runs, byte-identical
   to before this feature existed.
-- **`laya`** — the judge path runs instead of the LLM. A selection that
+- **`on`** — the judge path runs instead of the LLM. A selection that
   survives disk verification finishes the query at `stage_exit = "verify"`
   with zero LLM calls; an empty selection (`Escalate`) falls through to
-  Stage 5; a judge error (`Failed`) degrades to the LLM `verify` path when
-  `ProviderRouter::has_providers()` is true, otherwise falls through to
-  Stage 5 with no judge scores. A judge failure **never fails a query**.
+  Stage 5. A judge error (`Failed`) or an uncertain judgement
+  (`EscalateUncertain`: `judge.escalate_below > 0` and any judged candidate's
+  confidence `max(p, 1000 - p)` is below it — checked before selection)
+  degrades to the LLM `verify` path when `ProviderRouter::has_providers()` is
+  true, otherwise falls through to Stage 5: `Failed` with no judge scores,
+  `EscalateUncertain` with its scores and an offline summary that names the
+  uncertainty (`judge.escalate_below = N`) instead of the selection
+  threshold. A judge failure **never fails a query**.
 - **`shadow`** — both the LLM `verify` and `judge_verify` run concurrently
   (`futures_util::future::join`); the LLM's answer is always the one
   returned, and the judge's outcome is only recorded
   (`QueryMetrics.judge_outcome`, `.shadow_agreement`). The judge's scores are
-  never passed on to Stage 5.
+  never passed on to Stage 5. `escalate_below` is not applied in shadow, so
+  shadow never yields `EscalateUncertain`: the judge always computes its
+  selection and the agreement metric compares like with like.
 
-`QueryMetrics` gains `judge_mode`/`fallback_mode` (set on every exit path,
-including cache) and, only on paths where the judge ran,
-`judge_outcome`/`judge_ms`/`judge_candidates`/`judge_selected`/`judge_max_p`/
-`shadow_agreement` — all `Option`, `None` (never a fabricated value) when the
-judge did not run.
+`QueryMetrics` gains `judge_mode` (`off`/`on`/`shadow`) and `fallback_mode`
+(set on every exit path, including cache) and, only on paths where the judge
+ran, `judge_outcome` (`selected`/`escalated`/`escalated-uncertain`/`error`),
+`judge_ms`, `judge_candidates`, `judge_selected`, `judge_max_p`,
+`judge_latency_ms` (max server-reported `usage.latency_ms`, `None` when the
+server reports none) and `shadow_agreement` — all `Option`, `None` (never a
+fabricated value) when the judge did not run.
 
 ## Offline fallback (`agent.fallback = "off"`)
 
@@ -227,8 +236,11 @@ place enforces "never report a location that does not resolve on disk".
 
 ## Judge query-cache key
 
-`AgentLoop::run_query_key` appends `judge=laya:<select_threshold>` when
-`judge.mode == "laya"`, and `fallback=off` when `agent.fallback == "off"`.
-`off`- and `shadow`-mode keys are byte-identical to before this feature, so
-existing L1/L2 entries stay valid; `disk_cache::SCHEMA_VERSION` is unchanged
-because the stored value shape did not change.
+`AgentLoop::run_query_key` appends `judge=on:<select_threshold>:<escalate_below>:<model>:<base_url>`
+when `judge.mode == "on"` (`escalate_below` is `0` when off), and `fallback=off`
+when `agent.fallback == "off"`. `off`- and `shadow`-mode keys are
+byte-identical to before this feature, so existing L1/L2 entries stay valid;
+the former judge-key entries were invalidated once on purpose when the judge
+model changed.
+`disk_cache::SCHEMA_VERSION` is unchanged because the stored value shape did
+not change.

@@ -846,7 +846,7 @@ async fn repo_brief_disabled_makes_no_backend_call() {
 }
 
 #[tokio::test]
-async fn end_to_end_laya_run_selects_the_scored_candidate() {
+async fn end_to_end_judge_on_run_selects_the_scored_candidate() {
     use repo_explorer_core::config::{JudgeMode, JudgeSettings};
     use repo_explorer_core::judge::mock::MockJudge;
 
@@ -858,7 +858,7 @@ async fn end_to_end_laya_run_selects_the_scored_candidate() {
     let judge =
         MockJudge::new().with_scorer(|state| if state.contains("fresh_a") { 900 } else { 100 });
     let settings = JudgeSettings {
-        mode: JudgeMode::Laya,
+        mode: JudgeMode::On,
         select_threshold: 50,
         ..JudgeSettings::default()
     };
@@ -872,7 +872,7 @@ async fn end_to_end_laya_run_selects_the_scored_candidate() {
         TEST_INDEX_TRUST_TTL,
     )
     .with_judge(judge, settings);
-    let dir = temp_repo("e2e_laya");
+    let dir = temp_repo("e2e_judge_on");
     let got = agent.run(&dir, &query("decide_freshness")).await.unwrap();
     std::fs::remove_dir_all(&dir).ok();
 

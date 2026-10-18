@@ -1,6 +1,6 @@
 # repo-explorer-datagen (dev-only training-data generator)
 
-Builds labelled judge rows for the Stage-10 Laya judge from a pinned public-repo
+Builds labelled judge rows for the Stage-10 local judge from a pinned public-repo
 corpus. A library plus a thin binary; **not shipped** — `release.yml` builds
 `--package repo-explorer-mcp` only, and this crate is `publish = false`.
 

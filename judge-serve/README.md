@@ -2,7 +2,7 @@
 
 A small launcher that serves a locally fine-tuned Laya checkpoint through
 upstream `laya.serve.create_app`, for `repo-explorer-mcp`'s `[judge]`
-config (`judge.mode = "laya"` or `"shadow"`).
+config (`judge.mode = "on"` or `"shadow"`).
 
 Upstream `laya-serve` (and its NixOS module) has no environment variable or
 option to point at a custom, locally fine-tuned checkpoint directory — it
@@ -34,7 +34,7 @@ REPO_EXPLORER_LAYA_CHECKPOINT=~/laya-ckpt/v1 LAYA_DEVICE=cuda \
 
 ```toml
 [judge]
-mode = "laya"                        # or "shadow"
+mode = "on"                          # or "shadow"
 base_url = "http://127.0.0.1:8765"
 model = "typed-decisions"
 select_threshold = 50                # the value serve.py prints at startup

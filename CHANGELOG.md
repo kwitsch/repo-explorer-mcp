@@ -5,27 +5,48 @@ collects what is on `main` but not yet tagged.
 
 ## [Unreleased] — 0.9.0
 
+### Changed
+
+- **Breaking: `judge.mode = "laya"` is now `judge.mode = "on"`.** The old
+  spelling is rejected at config parse time; the `judge_mode` metric reports
+  `"on"`. Cache entries written
+  under the old judge key are invalidated once.
+- **Breaking: new judge defaults.** `judge.base_url` defaults to
+  `http://127.0.0.1:8741` and `judge.model` to `h2oai/h2o-lightning-4b`;
+  configs that relied on the old defaults must set both explicitly. The
+  removed keys `checkpoint_dir`, `device` and `backend = "candle"` make the
+  config fail to load (`backend = "http"` is still accepted).
+
+### Removed
+
+- **In-process candle judge backend** and the `candle-judge` / `cuda-judge`
+  build features. The judge is now HTTP-only (`/v1/systemone`).
+
 ### Added
 
-- **In-process candle judge backend (`judge.backend = "candle"`).** An
-  alternative to the HTTP backend that runs the fine-tuned Laya checkpoint
-  inside the binary with no Python sidecar. CPU is in the default build, CUDA
-  via the `cuda-judge` feature. Same parity and decision semantics as the HTTP
-  backend; no per-request HTTP overhead. See `docs/laya-judge.md`.
+- **`judge.escalate_below` confidence cascade.** An integer permille cutoff
+  (default `0` = off); a query whose judged candidates include an uncertain
+  one degrades to LLM verification (`judge_outcome = "escalated-uncertain"`).
+- **`judge_latency_ms` metric** (server-reported `usage.latency_ms`),
+  reported by `eval/score.py` as p50/p95. HTTP 503 now counts as "judge
+  unavailable", and warm-up probes `GET /v1/models` plus one request.
+  `docs/laya-judge.md` is renamed to `docs/judge.md`; the setup wizard asks
+  for the judge mode and base URL.
+
 - **Training-data generator (`repo-explorer-datagen`, dev-only) and Laya
   fine-tune tooling (`train/laya/`)** for the upcoming local candidate judge.
 - **Local candidate judge (`[judge]`, `repo-explorer-judge`).** Stage-4
-  verification can now run against a local Laya HTTP judge instead of an
-  external LLM. `judge.mode` (`off` default / `laya` / `shadow`) and
+  verification can now run against a local HTTP judge instead of an
+  external LLM. `judge.mode` (`off` default / `on` / `shadow`) and
   `agent.fallback` (`llm` default / `off`) combine into five configurations,
-  including a fully LLM-free one (`laya` + `off`, `[llm]` optional); a judge
+  including a fully LLM-free one (`on` + `off`, `[llm]` optional); a judge
   failure degrades to LLM verification and never fails a query. `shadow`
   mode keeps returning the LLM answer while measuring judge agreement
   (`QueryMetrics.shadow_agreement`) as a rollout safety net. New
   `judge_mode`, `fallback_mode`, `judge_outcome`, `judge_ms`,
   `judge_candidates`, `judge_selected`, `judge_max_p` and `shadow_agreement`
   metrics fields. The `judge-serve/` Python launcher serves a fine-tuned
-  checkpoint through upstream `laya-serve`. See `docs/laya-judge.md`.
+  checkpoint through upstream `laya-serve`. See `docs/judge.md`.
 - **Persistent cross-session result cache.** Results now survive a process
   restart: a second layer stores one JSON entry per query under
   `<cache dir>/<repo-id>/results/v1/`, behind the existing in-memory cache.
