@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 pub const USAGE: &str = "\
-repo-explorer-datagen — dev-only Laya judge training-data generator
+repo-explorer-datagen — dev-only local judge training-data generator
 
 USAGE:
   repo-explorer-datagen fetch    --corpus <file> --checkouts <dir>

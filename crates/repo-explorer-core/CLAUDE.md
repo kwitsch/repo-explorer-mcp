@@ -25,8 +25,8 @@ crate, `disk_cache::tests::stage_exit_wire_strings_are_pinned`).
 `NEGATIVE_KEY`/`NEGATIVE_CRITERION`) plus `JUDGE_STATE_VERSION`, which pins the
 plain-text state format rendered by `repo_explorer_agent::judge_input::
 render_judge_state`. **Bump `JUDGE_STATE_VERSION` on any change to that
-rendering or to these constants** — a trained checkpoint is valid only for the
-version it was trained on. See `crates/repo-explorer-agent/CLAUDE.md` (Judge
+rendering or to these constants** — a calibration is valid only for the
+version it was computed on. See `crates/repo-explorer-agent/CLAUDE.md` (Judge
 input, Stage 10) for how the datagen and runtime crates consume this module.
 
 ## Crate-boundary rules
