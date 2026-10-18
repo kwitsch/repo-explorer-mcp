@@ -214,13 +214,13 @@ pub(crate) struct QueryMetrics {
     /// no-finish synthesis). A run of zeroes across an eval says the models
     /// ignore the field and it should be reverted.
     pub cited_candidate_ids: Option<u32>,
-    /// `"off"` | `"laya"` | `"shadow"` — set right after `QueryMetrics::new`,
+    /// `"off"` | `"on"` | `"shadow"` — set right after `QueryMetrics::new`,
     /// on every path including cache.
     pub judge_mode: &'static str,
     /// `"llm"` | `"off"` — set likewise.
     pub fallback_mode: &'static str,
-    /// `"selected"` | `"escalated"` | `"error"`; `None` when the judge did not
-    /// run.
+    /// `"selected"` | `"escalated"` | `"escalated-uncertain"` | `"error"`;
+    /// `None` when the judge did not run.
     pub judge_outcome: Option<&'static str>,
     /// Judge call wall time.
     pub judge_ms: Option<u64>,
@@ -231,6 +231,10 @@ pub(crate) struct QueryMetrics {
     pub judge_selected: Option<u32>,
     /// Max permille over the judged scores.
     pub judge_max_p: Option<u32>,
+    /// Max server-reported `usage.latency_ms` across the query's judge
+    /// requests; `None` when the judge did not run or the server did not
+    /// report it.
+    pub judge_latency_ms: Option<u64>,
     /// Shadow-mode agreement label (D3.4).
     pub shadow_agreement: Option<&'static str>,
 }
@@ -277,6 +281,7 @@ impl QueryMetrics {
             judge_candidates: None,
             judge_selected: None,
             judge_max_p: None,
+            judge_latency_ms: None,
             shadow_agreement: None,
         }
     }
@@ -327,6 +332,7 @@ async fn emit_metrics(metrics: &mut QueryMetrics, msg: &'static str) {
         judge_candidates = metrics.judge_candidates,
         judge_selected = metrics.judge_selected,
         judge_max_p = metrics.judge_max_p,
+        judge_latency_ms = metrics.judge_latency_ms,
         shadow_agreement = metrics.shadow_agreement,
         total_ms = metrics.total_ms,
         "{}",
@@ -607,14 +613,21 @@ where
             &self.response_caps(query).snippet_max_chars.to_string(),
         );
         // `off`/`shadow` runs keep the pre-feature key byte-identical, so
-        // existing L1/L2 entries stay valid. Only `laya` (whose answer depends
-        // on the selection threshold) and `fallback = off` (a different Stage 5)
-        // extend the key.
+        // existing L1/L2 entries stay valid. Only `on` (whose answer depends
+        // on the selection threshold and the uncertainty cutoff) and
+        // `fallback = off` (a different Stage 5) extend the key. The former
+        // judge-key cache entries are invalidated once on purpose (different
+        // model).
         if self.judge_settings.mode == JudgeMode::On {
-            crate::cache::encode_field_into(
-                &mut key,
-                &format!("judge=laya:{}", self.judge_settings.select_threshold),
-            );
+            let field = if self.judge_settings.escalate_below == 0 {
+                format!("judge=on:{}", self.judge_settings.select_threshold)
+            } else {
+                format!(
+                    "judge=on:{}:{}",
+                    self.judge_settings.select_threshold, self.judge_settings.escalate_below
+                )
+            };
+            crate::cache::encode_field_into(&mut key, &field);
         }
         if self.settings.fallback == FallbackMode::Off {
             crate::cache::encode_field_into(&mut key, "fallback=off");
@@ -857,11 +870,15 @@ where
         }
 
         // Stage 4: verification over the candidates. Which verifier runs is set
-        // by `judge.mode`: the LLM (`off`), the local judge (`laya`), or both
+        // by `judge.mode`: the LLM (`off`), the local judge (`on`), or both
         // concurrently with the LLM answer returned (`shadow`). A judge that
         // escalates carries its scores forward so offline synthesis can order by
-        // them; every other fall-through leaves `escalate_scores` at `None`.
+        // them; an uncertain judge (`escalate_below`) degrades to LLM verify like
+        // a failure but also hands its scores on, flagged by `escalate_uncertain`
+        // so the offline summary names the real cause. Every other fall-through
+        // leaves `escalate_scores` at `None`.
         let mut escalate_scores: Option<Vec<Option<u32>>> = None;
+        let mut escalate_uncertain = false;
         if outcome.confidence >= self.settings.fallback_confidence && !outcome.candidates.is_empty()
         {
             match self.judge_settings.mode {
@@ -922,6 +939,31 @@ where
                             // never happened.
                             if judged > 0 {
                                 escalate_scores = Some(scores);
+                            }
+                        }
+                        JudgeVerifyOutcome::EscalateUncertain { judged, scores, .. } => {
+                            tracing::info!("local judge not confident; degrading to LLM verify");
+                            escalate_uncertain = true;
+                            if judged > 0 {
+                                escalate_scores = Some(scores);
+                            }
+                            if self.router.has_providers() {
+                                if let Some(done) = self
+                                    .verify_and_complete(
+                                        repo_root,
+                                        &mut metrics,
+                                        query,
+                                        note.as_deref(),
+                                        &outcome,
+                                        &mut budget,
+                                        &query_key,
+                                        &fingerprint,
+                                    )
+                                    .await
+                                {
+                                    return Ok(done);
+                                }
+                                tracing::info!("verification escalated to the fallback loop");
                             }
                         }
                         JudgeVerifyOutcome::Failed { error, .. } => {
@@ -1022,6 +1064,7 @@ where
                     note.as_deref(),
                     &outcome.candidates,
                     escalate_scores.as_deref(),
+                    escalate_uncertain,
                 )
                 .await;
             return Ok(self
@@ -1209,10 +1252,10 @@ where
         .await
     }
 
-    /// The `off`-mode LLM verification path, shared by `off`, the `laya`
-    /// judge-failure degrade (when providers exist), so the block is written
-    /// once. `Some(outcome)` when `finish` concluded (caller returns it),
-    /// `None` on escalation (caller falls through to Stage 5).
+    /// The `off`-mode LLM verification path, shared by `off` and the `on`
+    /// judge's failure/uncertainty degrade (when providers exist), so the
+    /// block is written once. `Some(outcome)` when `finish` concluded (caller
+    /// returns it), `None` on escalation (caller falls through to Stage 5).
     #[allow(clippy::too_many_arguments)]
     async fn verify_and_complete(
         &self,
@@ -1262,8 +1305,10 @@ where
     }
 
     /// Record the judge-path metrics for a run that reached a verdict
-    /// (`selected` or `escalated`). `judge_max_p` is the max over the judged
-    /// scores; the API key never enters any of these fields.
+    /// (`selected`, `escalated` or `escalated-uncertain`). `judge_max_p` is
+    /// the max over the judged scores; the API key never enters any of these
+    /// fields.
+    #[allow(clippy::too_many_arguments)]
     fn record_judge_metrics(
         &self,
         metrics: &mut QueryMetrics,
@@ -1272,28 +1317,30 @@ where
         selected: Option<u32>,
         scores: &[Option<u32>],
         elapsed_ms: u64,
+        latency_ms: Option<u64>,
     ) {
         metrics.judge_outcome = Some(outcome);
         metrics.judge_ms = Some(elapsed_ms);
         metrics.judge_candidates = Some(judged);
         metrics.judge_selected = selected;
         metrics.judge_max_p = scores.iter().flatten().copied().max();
+        metrics.judge_latency_ms = latency_ms;
     }
 
-    /// Record a judge failure: `judge_candidates`/`judge_selected`/`judge_max_p`
-    /// stay `None` (no scores were produced).
+    /// Record a judge failure: `judge_candidates`/`judge_selected`/
+    /// `judge_max_p`/`judge_latency_ms` stay `None` (no scores were produced).
     fn record_judge_metrics_failed(&self, metrics: &mut QueryMetrics, elapsed_ms: u64) {
         metrics.judge_outcome = Some("error");
         metrics.judge_ms = Some(elapsed_ms);
     }
 
-    /// Shared `JudgeVerifyOutcome` metrics dispatch for both the `laya` and
-    /// `shadow` arms: records judged/scores/elapsed_ms via
+    /// Shared `JudgeVerifyOutcome` metrics dispatch for both the `on` and
+    /// `shadow` arms: records judged/scores/elapsed_ms/latency via
     /// `record_judge_metrics`/`record_judge_metrics_failed` and returns the
-    /// selected candidate-index set (`Some` on `Finished`, `None` on
-    /// `Escalate`/`Failed`). Each caller still matches on `jv` itself for the
-    /// behaviour that differs (`laya` finalizes or escalates on it, `shadow`
-    /// only uses the set for agreement classification).
+    /// selected candidate-index set (`Some` on `Finished`, `None` otherwise).
+    /// Each caller still matches on `jv` itself for the behaviour that differs
+    /// (`on` finalizes, escalates or degrades on it, `shadow` only uses the
+    /// set for agreement classification).
     fn record_judge_outcome(
         &self,
         metrics: &mut QueryMetrics,
@@ -1305,6 +1352,7 @@ where
                 judged,
                 scores,
                 elapsed_ms,
+                latency_ms,
                 ..
             } => {
                 self.record_judge_metrics(
@@ -1314,6 +1362,7 @@ where
                     Some(selected.len() as u32),
                     scores,
                     *elapsed_ms,
+                    *latency_ms,
                 );
                 Some(selected.clone())
             }
@@ -1321,6 +1370,7 @@ where
                 judged,
                 scores,
                 elapsed_ms,
+                latency_ms,
             } => {
                 self.record_judge_metrics(
                     metrics,
@@ -1329,6 +1379,24 @@ where
                     Some(0),
                     scores,
                     *elapsed_ms,
+                    *latency_ms,
+                );
+                None
+            }
+            JudgeVerifyOutcome::EscalateUncertain {
+                judged,
+                scores,
+                elapsed_ms,
+                latency_ms,
+            } => {
+                self.record_judge_metrics(
+                    metrics,
+                    "escalated-uncertain",
+                    *judged,
+                    Some(0),
+                    scores,
+                    *elapsed_ms,
+                    *latency_ms,
                 );
                 None
             }
@@ -1338,17 +1406,18 @@ where
             }
         }
     }
-
     /// Stage 5 with `agent.fallback = "off"`: deterministic offline synthesis of
     /// up to [`OFFLINE_FALLBACK_MAX_FINDINGS`] disk-verified candidates, with no
     /// LLM. Ordered by judge score descending (`None`/not-judged last, then by
     /// retrieval rank); every finding is labelled unverified.
+    /// `uncertain` (an `escalate_below` escalation) only changes the summary wording.
     async fn offline_fallback(
         &self,
         repo_root: &Path,
         note: Option<&str>,
         candidates: &[Candidate],
         scores: Option<&[Option<u32>]>,
+        uncertain: bool,
     ) -> ExplorationResult {
         // Reuse `select_indices`'s score-desc/index-asc ordering (threshold 0
         // keeps every scored candidate instead of filtering by a select
@@ -1390,7 +1459,12 @@ where
             }
         }
         let n = findings.len();
-        let mut summary = if scores.is_some() {
+        let mut summary = if scores.is_some() && uncertain {
+            format!(
+                "The local judge was not confident about the candidates (judge.escalate_below = {}) and the LLM fallback is disabled (agent.fallback = \"off\"); returning {n} unverified candidate(s) ranked by judge probability.",
+                self.judge_settings.escalate_below
+            )
+        } else if scores.is_some() {
             format!(
                 "No candidate reached the local judge's selection threshold ({}%) and the LLM fallback is disabled (agent.fallback = \"off\"); returning {n} unverified candidate(s) ranked by judge probability.",
                 self.judge_settings.select_threshold
@@ -2232,6 +2306,7 @@ mod tests {
         assert_eq!(m.judge_candidates, None);
         assert_eq!(m.judge_selected, None);
         assert_eq!(m.judge_max_p, None);
+        assert_eq!(m.judge_latency_ms, None);
         assert_eq!(m.shadow_agreement, None);
         // Serializes cleanly (JSONL sink shape).
         let json = serde_json::to_string(&m).unwrap();
@@ -2519,9 +2594,9 @@ mod tests {
         assert!(m.llm_calls >= 1);
     }
 
-    // Case 2: laya selects above threshold, verify exit, zero LLM.
+    // Case 2: on selects above threshold, verify exit, zero LLM.
     #[tokio::test]
-    async fn laya_selects_above_threshold_verify_exit_zero_llm() {
+    async fn judge_on_selects_above_threshold_verify_exit_zero_llm() {
         let (agent_base, dir, query) = loop_reaching_stage4_with(
             "judge_select",
             &[
@@ -2594,9 +2669,9 @@ mod tests {
         assert_eq!(m.judge_max_p, Some(900));
     }
 
-    // Case 3: laya, all below threshold, escalates to the LLM when providers exist.
+    // Case 3: on, all below threshold, escalates to the LLM when providers exist.
     #[tokio::test]
-    async fn laya_all_below_threshold_escalates_to_llm_when_providers() {
+    async fn judge_on_all_below_threshold_escalates_to_llm_when_providers() {
         let (agent_base, dir, query) =
             loop_reaching_stage4_with("judge_escalate_llm", &[("src/a.rs", 1, 1)], "l1\n");
         let judge = MockJudge::new().with_responses(vec![Ok(vec![Judgement {
@@ -2618,10 +2693,10 @@ mod tests {
         assert!(m.llm_calls >= 1);
     }
 
-    // Case 4: laya + fallback=off, every candidate scored below threshold ->
+    // Case 4: on + fallback=off, every candidate scored below threshold ->
     // offline synthesis ordered by judge probability.
     #[tokio::test]
-    async fn laya_offline_fallback_scored_when_no_providers_and_fallback_off() {
+    async fn judge_on_offline_fallback_scored_when_no_providers_and_fallback_off() {
         let (agent_base, dir, query) = loop_reaching_stage4_no_providers(
             "judge_offline_scored",
             &[("src/a.rs", 1, 1), ("src/a.rs", 2, 2)],
@@ -2668,9 +2743,9 @@ mod tests {
         assert_eq!(m.judge_outcome, Some("escalated"));
     }
 
-    // Case 6: laya + fallback=off, judge errors -> offline synthesis by retrieval rank.
+    // Case 6: on + fallback=off, judge errors -> offline synthesis by retrieval rank.
     #[tokio::test]
-    async fn laya_offline_fallback_judge_error_uses_retrieval_rank() {
+    async fn judge_on_offline_fallback_judge_error_uses_retrieval_rank() {
         let (agent_base, dir, query) = loop_reaching_stage4_no_providers(
             "judge_offline_rank",
             &[("src/a.rs", 1, 1), ("src/a.rs", 2, 2)],
@@ -2737,10 +2812,10 @@ mod tests {
         assert!(m.llm_calls >= 1, "the LLM verify path also ran in shadow");
     }
 
-    // Case 11: the query-cache key changes for laya/threshold/offline, and stays
-    // byte-identical for off and shadow.
+    // Case 11: the query-cache key changes for on/threshold/escalate_below/offline,
+    // and stays byte-identical for off and shadow.
     #[tokio::test]
-    async fn run_query_key_differs_for_laya_and_threshold_and_offline() {
+    async fn run_query_key_differs_for_on_threshold_escalate_and_offline() {
         let q = ExplorationQuery {
             text: "q".to_string(),
             scope_hint: None,
@@ -2748,36 +2823,32 @@ mod tests {
             detailed_snippets: false,
         };
         let dir = temp_repo("run_query_key_judge");
+        let key_with = |s: JudgeSettings| {
+            agent_with(MockLlmProvider::new())
+                .with_judge(MockJudge::new(), s)
+                .run_query_key(&dir, &q)
+        };
         let off = agent_with(MockLlmProvider::new()).run_query_key(&dir, &q);
-        let laya50 = {
-            let s = JudgeSettings {
-                mode: JudgeMode::On,
-                select_threshold: 50,
-                ..JudgeSettings::default()
-            };
-            agent_with(MockLlmProvider::new())
-                .with_judge(MockJudge::new(), s)
-                .run_query_key(&dir, &q)
-        };
-        let laya70 = {
-            let s = JudgeSettings {
-                mode: JudgeMode::On,
-                select_threshold: 70,
-                ..JudgeSettings::default()
-            };
-            agent_with(MockLlmProvider::new())
-                .with_judge(MockJudge::new(), s)
-                .run_query_key(&dir, &q)
-        };
-        let shadow = {
-            let s = JudgeSettings {
-                mode: JudgeMode::Shadow,
-                ..JudgeSettings::default()
-            };
-            agent_with(MockLlmProvider::new())
-                .with_judge(MockJudge::new(), s)
-                .run_query_key(&dir, &q)
-        };
+        let on50 = key_with(JudgeSettings {
+            mode: JudgeMode::On,
+            select_threshold: 50,
+            ..JudgeSettings::default()
+        });
+        let on70 = key_with(JudgeSettings {
+            mode: JudgeMode::On,
+            select_threshold: 70,
+            ..JudgeSettings::default()
+        });
+        let on50_esc720 = key_with(JudgeSettings {
+            mode: JudgeMode::On,
+            select_threshold: 50,
+            escalate_below: 720,
+            ..JudgeSettings::default()
+        });
+        let shadow = key_with(JudgeSettings {
+            mode: JudgeMode::Shadow,
+            ..JudgeSettings::default()
+        });
         let off_fallback = {
             let s = AgentSettings {
                 fallback: FallbackMode::Off,
@@ -2787,8 +2858,18 @@ mod tests {
                 .run_query_key(&dir, &q)
         };
         std::fs::remove_dir_all(&dir).ok();
-        assert_ne!(off, laya50);
-        assert_ne!(laya50, laya70);
+        let mut plain_on50 = off.clone();
+        crate::cache::encode_field_into(&mut plain_on50, "judge=on:50");
+        assert_eq!(
+            on50, plain_on50,
+            "escalate_below = 0 keeps the plain judge=on:<sel> form"
+        );
+        let mut esc_on50 = off.clone();
+        crate::cache::encode_field_into(&mut esc_on50, "judge=on:50:720");
+        assert_eq!(on50_esc720, esc_on50);
+        assert_ne!(off, on50);
+        assert_ne!(on50, on70);
+        assert_ne!(on50, on50_esc720);
         assert_ne!(
             off, off_fallback,
             "fallback = off must change the cache key"
@@ -2797,6 +2878,81 @@ mod tests {
             off, shadow,
             "shadow must keep the off-mode key byte-identical"
         );
+    }
+
+    // Case 12: an uncertain judgement (escalate_below) degrades to LLM verify.
+    #[tokio::test]
+    async fn uncertain_judge_degrades_to_llm_verify() {
+        let (agent_base, dir, query) =
+            loop_reaching_stage4_with("judge_uncertain_llm", &[("src/a.rs", 1, 1)], "l1\n");
+        let judge = MockJudge::new().with_scorer(|_| 600);
+        let settings = JudgeSettings {
+            mode: JudgeMode::On,
+            escalate_below: 800,
+            ..JudgeSettings::default()
+        };
+        let agent = agent_base.with_judge(judge, settings);
+        let got = agent.run(&dir, &query).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(got.stage_exit, StageExit::Verify);
+        let m = taped_metrics().pop().unwrap();
+        assert_eq!(m.judge_outcome, Some("escalated-uncertain"));
+        assert_eq!(m.judge_selected, Some(0));
+        assert!(m.llm_calls >= 1, "the LLM verify path must run");
+        assert_eq!(m.path, "verify");
+    }
+
+    // Case 13: uncertain judge, no providers, fallback = off -> offline
+    // synthesis by judge probability with an accurate summary.
+    #[tokio::test]
+    async fn uncertain_judge_offline_fallback_without_providers() {
+        let (agent_base, dir, query) = loop_reaching_stage4_no_providers(
+            "judge_uncertain_offline",
+            &[("src/a.rs", 1, 1), ("src/a.rs", 2, 2)],
+            "l1\nl2\n",
+        );
+        let judge = MockJudge::new().with_scorer(|_| 600);
+        let settings = JudgeSettings {
+            mode: JudgeMode::On,
+            escalate_below: 800,
+            ..JudgeSettings::default()
+        };
+        let agent = agent_base.with_judge(judge, settings);
+        let got = agent.run(&dir, &query).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(got.stage_exit, StageExit::Fallback);
+        assert!(
+            got.result.summary.contains("not confident"),
+            "{}",
+            got.result.summary
+        );
+        assert!(got.result.summary.contains("judge.escalate_below = 800"));
+        assert!(got.result.summary.contains("ranked by judge probability"));
+        assert!(!got.result.summary.contains("selection threshold"));
+        let m = taped_metrics().pop().unwrap();
+        assert_eq!(m.llm_calls, 0);
+        assert_eq!(m.judge_outcome, Some("escalated-uncertain"));
+    }
+
+    // Case 14: the server-reported latency reaches QueryMetrics.
+    #[tokio::test]
+    async fn judge_latency_ms_recorded() {
+        let (agent_base, dir, query) =
+            loop_reaching_stage4_with("judge_latency", &[("src/a.rs", 1, 1)], "l1\n");
+        let judge = MockJudge::new().with_responses(vec![Ok(vec![Judgement {
+            p_relevant_permille: 900,
+            latency_ms: Some(42),
+        }])]);
+        let settings = JudgeSettings {
+            mode: JudgeMode::On,
+            ..JudgeSettings::default()
+        };
+        let agent = agent_base.with_judge(judge, settings);
+        agent.run(&dir, &query).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let m = taped_metrics().pop().unwrap();
+        assert_eq!(m.judge_outcome, Some("selected"));
+        assert_eq!(m.judge_latency_ms, Some(42));
     }
 
     #[tokio::test]
