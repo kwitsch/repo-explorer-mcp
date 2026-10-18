@@ -1,0 +1,410 @@
+//! In-process candle judge backend (feature `candle`). A faithful port of
+//! Laya 0.3.7 inference for the one fixed judge question.
+
+pub mod calib;
+pub(crate) mod checkpoint;
+pub(crate) mod head;
+mod sequence;
+
+pub use sequence::{Encoded, SpecialIds, build_sequence};
+
+use candle_core::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::modernbert::ModernBert;
+use head::DecisionHead;
+use repo_explorer_core::config::{JudgeBackend, JudgeDevice, JudgeSettings};
+use repo_explorer_core::judge::{self, CandidateJudge, JudgeError, Judgement};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokio::sync::{OnceCell, mpsc, oneshot};
+
+/// A fully loaded checkpoint: tokenizer, encoder, head and calibration.
+pub struct LoadedModel {
+    tokenizer: tokenizers::Tokenizer,
+    special: SpecialIds,
+    agent: checkpoint::AgentConfig,
+    encoder: ModernBert,
+    head: DecisionHead,
+    device: Device,
+    temperature: f32,
+    select_threshold: u32,
+}
+
+impl std::fmt::Debug for LoadedModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedModel")
+            .field("temperature", &self.temperature)
+            .field("select_threshold", &self.select_threshold)
+            .finish_non_exhaustive()
+    }
+}
+
+fn cerr(e: candle_core::Error) -> JudgeError {
+    JudgeError::Unavailable {
+        message: format!("loading checkpoint failed: {e}"),
+    }
+}
+
+impl LoadedModel {
+    /// Blocking. Full D4 load including the state-version check.
+    pub fn load(dir: &Path, device: JudgeDevice) -> Result<LoadedModel, JudgeError> {
+        let agent_p = checkpoint::required_file(dir, "rl_agent_config.json")?;
+        let weights_p = checkpoint::required_file(dir, "model.safetensors")?;
+        let tok_p = checkpoint::required_file(dir, "tokenizer/tokenizer.json")?;
+        let enc_cfg_p = checkpoint::required_file(dir, "encoder/config.json")?;
+        let meta_p = checkpoint::required_file(dir, "repo_explorer_judge.json")?;
+
+        let read_json = |p: &Path| -> Result<serde_json::Value, JudgeError> {
+            let s = std::fs::read_to_string(p).map_err(|e| JudgeError::Unavailable {
+                message: format!("checkpoint {}: {e}", p.display()),
+            })?;
+            serde_json::from_str(&s).map_err(|e| JudgeError::Unavailable {
+                message: format!("checkpoint {}: invalid JSON: {e}", p.display()),
+            })
+        };
+
+        let meta = checkpoint::parse_judge_meta(&read_json(&meta_p)?)?;
+        let agent = checkpoint::parse_agent_config(&read_json(&agent_p)?)?;
+        let enc_cfg = checkpoint::fixup_encoder_config(read_json(&enc_cfg_p)?)?;
+        let (tokenizer, special) = checkpoint::load_tokenizer(&tok_p)?;
+        let device = checkpoint::resolve_device(device)?;
+
+        let mut tensors = candle_core::safetensors::load(&weights_p, &device).map_err(cerr)?;
+        let renamed: HashMap<String, Tensor> = tensors
+            .drain()
+            .map(|(k, v)| {
+                let k = match k.strip_prefix("encoder.") {
+                    Some(rest) => format!("model.{rest}"),
+                    None => k,
+                };
+                (k, v)
+            })
+            .collect();
+        let vb = VarBuilder::from_tensors(renamed, DType::F32, &device);
+        let encoder = ModernBert::load(vb.clone(), &enc_cfg).map_err(cerr)?;
+        let hidden = enc_cfg.hidden_size;
+        let head = DecisionHead::load(&vb, hidden, agent.head_layers).map_err(cerr)?;
+        let temperature = calib::select_temperature(
+            agent.temperature_by_options.get("choice:2").copied(),
+            agent.temperature[0],
+        );
+
+        Ok(LoadedModel {
+            tokenizer,
+            special,
+            agent,
+            encoder,
+            head,
+            device,
+            temperature,
+            select_threshold: meta.select_threshold,
+        })
+    }
+
+    /// Build the judge sequence for one state (D5 with the fixed question).
+    pub fn encode(&self, state: &str) -> Result<Encoded, JudgeError> {
+        let options = [
+            format!("{}: {}", judge::POSITIVE_KEY, judge::POSITIVE_CRITERION),
+            format!("{}: {}", judge::NEGATIVE_KEY, judge::NEGATIVE_CRITERION),
+        ];
+        build_sequence(
+            &self.tokenizer,
+            &self.special,
+            state,
+            judge::QUESTION_INSTRUCTIONS,
+            &options,
+            self.agent.max_len,
+            self.agent.head_max_len,
+        )
+    }
+
+    /// D6 steps 1-6: pre-temperature logits per sequence, in input order.
+    /// Chunks of at most 4 sequences per forward pass.
+    // ponytail: batch limit, per-chunk in raw_logits if throughput matters
+    pub fn raw_logits(&self, batch: &[Encoded]) -> Result<Vec<[f32; 2]>, JudgeError> {
+        let mut out = Vec::with_capacity(batch.len());
+        for chunk in batch.chunks(4) {
+            let l = chunk.iter().map(|e| e.ids.len()).max().unwrap_or(0);
+            let b = chunk.len();
+            let mut ids = Vec::with_capacity(b * l);
+            let mut mask = Vec::with_capacity(b * l);
+            let mut markers = Vec::with_capacity(b * 2);
+            for e in chunk {
+                for &id in &e.ids {
+                    ids.push(id);
+                    mask.push(1u32);
+                }
+                for _ in e.ids.len()..l {
+                    ids.push(self.special.pad);
+                    mask.push(0u32);
+                }
+                markers.push(e.markers[0] as u32);
+                markers.push(e.markers[1] as u32);
+            }
+            let ids_t = Tensor::from_vec(ids, (b, l), &self.device).map_err(cerr)?;
+            let mask_t = Tensor::from_vec(mask, (b, l), &self.device).map_err(cerr)?;
+            let marker_t = Tensor::from_vec(markers, (b, 2), &self.device).map_err(cerr)?;
+            let h = self.encoder.forward(&ids_t, &mask_t).map_err(cerr)?;
+            let h = h.to_dtype(DType::F32).map_err(cerr)?;
+            let logits = self.head.forward(&h, &mask_t, &marker_t).map_err(cerr)?;
+            let rows = logits.to_vec2::<f32>().map_err(cerr)?;
+            for row in rows {
+                out.push([row[0], row[1]]);
+            }
+        }
+        Ok(out)
+    }
+
+    /// D6 steps 7-8: encode each state, batch the forward pass, apply the
+    /// clamped temperature and produce a `Judgement` per state, in order.
+    pub fn judge_states(&self, states: &[String]) -> Result<Vec<Judgement>, JudgeError> {
+        if states.is_empty() {
+            return Ok(vec![]);
+        }
+        let encoded: Vec<Encoded> = states
+            .iter()
+            .map(|s| self.encode(s))
+            .collect::<Result<_, _>>()?;
+        let raw = self.raw_logits(&encoded)?;
+        Ok(raw
+            .iter()
+            .map(|&logits| {
+                let p = calib::softmax2(logits, self.temperature)[0];
+                Judgement {
+                    p_relevant_permille: calib::permille(p),
+                }
+            })
+            .collect())
+    }
+
+    pub fn temperature(&self) -> f32 {
+        self.temperature
+    }
+
+    pub fn select_threshold(&self) -> u32 {
+        self.select_threshold
+    }
+}
+
+/// One inference request sent to the dedicated worker thread.
+struct Job {
+    states: Vec<String>,
+    respond: oneshot::Sender<Result<Vec<Judgement>, JudgeError>>,
+}
+
+/// A handle to the dedicated OS thread that owns the loaded checkpoint and
+/// serializes inference. Unlike `spawn_blocking` + `Mutex`, a hung inference
+/// call only ever ties up this one thread: it never borrows from tokio's
+/// shared blocking pool, so it cannot starve unrelated `spawn_blocking` work
+/// elsewhere in the process. Queued requests simply time out.
+#[derive(Clone)]
+struct InferenceWorker {
+    tx: mpsc::UnboundedSender<Job>,
+}
+
+impl std::fmt::Debug for InferenceWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InferenceWorker").finish_non_exhaustive()
+    }
+}
+
+impl InferenceWorker {
+    /// Spawns the dedicated thread and awaits the checkpoint load. The
+    /// thread then loops forever, handling one job at a time.
+    async fn spawn(dir: PathBuf, device: JudgeDevice) -> Result<InferenceWorker, JudgeError> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
+        let (load_tx, load_rx) = oneshot::channel::<Result<(), JudgeError>>();
+        std::thread::Builder::new()
+            .name("candle-judge".to_string())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let model = match LoadedModel::load(&dir, device) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "candle judge load failed; queries will degrade");
+                        let _ = load_tx.send(Err(e));
+                        return;
+                    }
+                };
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "candle judge loaded"
+                );
+                if load_tx.send(Ok(())).is_err() {
+                    return;
+                }
+                while let Some(job) = rx.blocking_recv() {
+                    let res = model.judge_states(&job.states);
+                    let _ = job.respond.send(res);
+                }
+            })
+            .expect("failed to spawn candle judge worker thread");
+
+        match load_rx.await {
+            Ok(res) => res.map(|()| InferenceWorker { tx }),
+            Err(_recv_err) => Err(JudgeError::Unavailable {
+                message: "candle judge worker thread exited before loading".to_string(),
+            }),
+        }
+    }
+
+    /// Sends one job and awaits its response, bounded by `timeout_ms`. On
+    /// timeout the response is simply dropped: the worker thread (hung or
+    /// not) is left to finish in the background, exactly as before.
+    async fn judge(
+        &self,
+        states: Vec<String>,
+        timeout_ms: u64,
+    ) -> Result<Vec<Judgement>, JudgeError> {
+        let (respond, response) = oneshot::channel();
+        if self.tx.send(Job { states, respond }).is_err() {
+            return Err(JudgeError::Unavailable {
+                message: "candle judge worker thread is gone".to_string(),
+            });
+        }
+        match tokio::time::timeout(Duration::from_millis(timeout_ms), response).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(_recv_err)) => Err(JudgeError::Unavailable {
+                message: "candle judge worker thread is gone".to_string(),
+            }),
+            Err(_elapsed) => Err(JudgeError::Timeout { timeout_ms }),
+        }
+    }
+}
+
+/// In-process candle judge: lazily spawns the dedicated inference thread on
+/// first use, then serializes inference through it.
+#[derive(Debug)]
+pub struct LayaCandleJudge {
+    dir: PathBuf,
+    device: JudgeDevice,
+    timeout_ms: u64,
+    worker: OnceCell<Result<InferenceWorker, String>>,
+}
+
+impl LayaCandleJudge {
+    /// No I/O: validates the settings shape only; loading is lazy.
+    pub fn new(settings: &JudgeSettings) -> Result<Self, JudgeError> {
+        debug_assert_eq!(settings.backend, JudgeBackend::Candle);
+        // Fail fast on a device the build cannot serve.
+        #[cfg(not(feature = "cuda"))]
+        if settings.device == JudgeDevice::Cuda {
+            return Err(JudgeError::Unavailable {
+                message: "judge.device = \"cuda\" requires a build with the cuda-judge feature"
+                    .to_string(),
+            });
+        }
+        Ok(Self {
+            dir: PathBuf::from(settings.checkpoint_dir.trim()),
+            device: settings.device,
+            timeout_ms: settings.timeout_ms,
+            worker: OnceCell::new(),
+        })
+    }
+
+    async fn worker(&self) -> Result<InferenceWorker, JudgeError> {
+        let dir = self.dir.clone();
+        let device = self.device;
+        let cell = self
+            .worker
+            .get_or_init(|| async move {
+                InferenceWorker::spawn(dir, device)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await;
+        cell.clone()
+            .map_err(|message| JudgeError::Unavailable { message })
+    }
+}
+
+impl CandidateJudge for LayaCandleJudge {
+    async fn judge(&self, states: &[String]) -> Result<Vec<Judgement>, JudgeError> {
+        if states.is_empty() {
+            return Ok(vec![]);
+        }
+        let worker = self.worker().await?;
+        worker.judge(states.to_vec(), self.timeout_ms).await
+    }
+
+    async fn warm_up(&self) -> Result<(), JudgeError> {
+        self.worker().await.map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod judge_tests {
+    use super::LayaCandleJudge;
+    use repo_explorer_core::config::{JudgeBackend, JudgeDevice, JudgeMode, JudgeSettings};
+    use repo_explorer_core::judge::{CandidateJudge, JudgeError};
+
+    fn candle_settings(dir: &str) -> JudgeSettings {
+        JudgeSettings {
+            mode: JudgeMode::Laya,
+            backend: JudgeBackend::Candle,
+            device: JudgeDevice::Cpu,
+            checkpoint_dir: dir.to_string(),
+            ..JudgeSettings::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_states_returns_empty_without_loading() {
+        let j = LayaCandleJudge::new(&candle_settings("/does/not/exist")).unwrap();
+        assert_eq!(j.judge(&[]).await.unwrap(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn missing_checkpoint_is_cached_error() {
+        let j = LayaCandleJudge::new(&candle_settings("/does/not/exist")).unwrap();
+        let e1 = j.warm_up().await.unwrap_err();
+        assert!(matches!(e1, JudgeError::Unavailable { .. }));
+        // A second judge call returns the same cached error, no retry.
+        let e2 = j.judge(&["s".to_string()]).await.unwrap_err();
+        assert!(matches!(e2, JudgeError::Unavailable { .. }));
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::LoadedModel;
+    use repo_explorer_core::config::JudgeDevice;
+    use repo_explorer_core::judge::JudgeError;
+    use std::path::Path;
+
+    #[test]
+    fn load_names_the_first_missing_file() {
+        let dir = std::env::temp_dir().join(format!("judge_load_missing_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = LoadedModel::load(&dir, JudgeDevice::Cpu).unwrap_err();
+        match err {
+            JudgeError::Unavailable { message } => {
+                assert!(message.contains("missing"), "{message}")
+            }
+            _ => panic!("wrong variant: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn cuda_without_feature_is_unavailable() {
+        // resolve_device is only reached after files exist; test it via a dir
+        // whose files are all present but weights are absent is complex, so we
+        // assert the device resolver directly.
+        let err = super::checkpoint::resolve_device(JudgeDevice::Cuda).unwrap_err();
+        match err {
+            JudgeError::Unavailable { message } => {
+                assert!(
+                    message.contains("cuda-judge") || message.contains("cuda"),
+                    "{message}"
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // Sanity: the path type is what callers pass.
+    fn _typecheck(p: &Path) {
+        let _ = LoadedModel::load(p, JudgeDevice::Cpu);
+    }
+}

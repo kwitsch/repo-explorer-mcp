@@ -775,13 +775,6 @@ def qw0_m3(rows: list[dict]) -> dict:
     }
 
 
-def judge_mode_of(row: dict):
-    """`judge_mode` off a scored row, with the legacy "laya" spelling counted as "on" (one-release
-    compatibility for results/ dirs written before the rename). None when absent."""
-    v = qw0_field(row, "judge_mode")
-    return "on" if v == "laya" else v
-
-
 def qw0_judge(rows: list[dict]) -> dict:
     """10b Stage-4 judge aggregates. Same absent-vs-zero rule as the rest of QW-0: a run whose
     binary predates the judge (or ran it off) emits none of these fields, so every counter comes
@@ -794,7 +787,7 @@ def qw0_judge(rows: list[dict]) -> dict:
         return Counter(v for r in rows if (v := qw0_field(r, name)) is not None)
 
     outcomes = counted("judge_outcome")
-    modes = Counter(v for r in rows if (v := judge_mode_of(r)) is not None)
+    modes = counted("judge_mode")
     fallbacks = counted("fallback_mode")
     agree = counted("shadow_agreement")
     denom = agree.get("exact", 0) + agree.get("overlap", 0) + agree.get("disjoint", 0)
@@ -807,7 +800,6 @@ def qw0_judge(rows: list[dict]) -> dict:
         "judge_candidates": _dist(numeric_field(rows, "judge_candidates")),
         "judge_selected": _dist(numeric_field(rows, "judge_selected")),
         "judge_max_p": _dist(numeric_field(rows, "judge_max_p")),
-        "judge_latency_ms": _dist(numeric_field(rows, "judge_latency_ms")),
         "shadow_agreement": dict(agree) or None,
         "shadow_agreement_rate": rate,
     }
@@ -998,11 +990,10 @@ def print_qw0_report(agg: dict) -> None:
     else:
         print("  location hallucinations by stage (the M-3 proxy): none on any stage")
 
-    # 10b Stage-4 judge. Printed only when the judge actually ran (mode "on"/"shadow"): an
+    # 10b Stage-4 judge. Printed only when the judge actually ran (mode "laya"/"shadow"): an
     # off-mode or pre-10b run reports "judge not run", never a fabricated zero. In shadow mode
     # the agreement rate is the headline — the share of queries where the judge's selection
-    # overlapped the LLM's — read before promoting the judge from shadow to on. "judge latency"
-    # is the client-side wall time (judge_ms); "judge latency (shim)" the server-reported one.
+    # overlapped the LLM's — read before promoting the judge from shadow to laya.
     judge = agg["judge"]
     if not judge["judge_outcome"]:
         print("  judge: n/a - judge not run (mode off, or binary predates 10b)")
@@ -1012,8 +1003,6 @@ def print_qw0_report(agg: dict) -> None:
         outcomes = ", ".join(f"{o}={c}" for o, c in sorted(judge["judge_outcome"].items(), key=lambda kv: -kv[1]))
         print(f"  judge outcomes: {outcomes}")
         print(f"  judge latency: {_fmt_dist(judge['judge_ms'], unit='ms')}")
-        print(f"  judge latency (shim): "
-              f"{_fmt_dist(judge['judge_latency_ms'], unit='ms', keys=('p50', 'p95'))}")
         print(f"  judge candidates: {_fmt_dist(judge['judge_candidates'])}"
               f"   selected: {_fmt_dist(judge['judge_selected'])}")
         print(f"  judge max_p (per-mille): {_fmt_dist(judge['judge_max_p'])}")
@@ -1058,7 +1047,6 @@ CSV_COLUMNS = [
     "judge_selected",
     "judge_max_p",
     "shadow_agreement",
-    "judge_latency_ms",
 ]
 
 
@@ -1095,7 +1083,7 @@ def qw0_csv_rows(result: dict) -> list[dict]:
                 "turns_saved_by_cache": qw0_field(r, "turns_saved_by_cache"),
                 "tokens_saved_by_cache": qw0_field(r, "tokens_saved_by_cache"),
                 "cited_candidate_ids": qw0_field(r, "cited_candidate_ids"),
-                "judge_mode": judge_mode_of(r),
+                "judge_mode": qw0_field(r, "judge_mode"),
                 "fallback_mode": qw0_field(r, "fallback_mode"),
                 "judge_outcome": qw0_field(r, "judge_outcome"),
                 "judge_ms": qw0_field(r, "judge_ms"),
@@ -1103,7 +1091,6 @@ def qw0_csv_rows(result: dict) -> list[dict]:
                 "judge_selected": qw0_field(r, "judge_selected"),
                 "judge_max_p": qw0_field(r, "judge_max_p"),
                 "shadow_agreement": qw0_field(r, "shadow_agreement"),
-                "judge_latency_ms": qw0_field(r, "judge_latency_ms"),
             }
         )
     return out

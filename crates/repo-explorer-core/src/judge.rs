@@ -1,11 +1,11 @@
 //! The local candidate judge (Stage 10): the fixed question every judge
-//! backend asks about ONE retrieval candidate, plus the `CandidateJudge`
-//! trait every judge implements.
+//! backend asks about ONE retrieval candidate. Constants only; the
+//! `CandidateJudge` trait lives here too once Stage 10b adds it.
 
 /// Version of the plain-text state rendered by
 /// `repo_explorer_agent::judge_input::render_judge_state`. Bump on ANY change
-/// to that rendering or to the constants below: a calibration is valid only
-/// for the version it was computed on.
+/// to that rendering or to the constants below: a checkpoint is valid only
+/// for the version it was trained on.
 pub const JUDGE_STATE_VERSION: u32 = 1;
 pub const QUESTION_ID: &str = "relevant";
 pub const QUESTION_TYPE: &str = "choice";
@@ -21,8 +21,6 @@ pub const NEGATIVE_CRITERION: &str = "no, this location does not answer the quer
 pub struct Judgement {
     /// P(relevant) × 1000, rounded, clamped to 0..=1000.
     pub p_relevant_permille: u32,
-    /// Server-reported `usage.latency_ms`, rounded; `None` when absent.
-    pub latency_ms: Option<u64>,
 }
 
 /// Errors a [`CandidateJudge`] can return. The API key is never included.
@@ -46,7 +44,7 @@ pub trait CandidateJudge {
     async fn judge(&self, states: &[String]) -> Result<Vec<Judgement>, JudgeError>;
 
     /// Best-effort readiness step run once in the background at startup
-    /// (HTTP: models + probe request). Default: nothing.
+    /// (HTTP: health probe; 10c candle: model load). Default: nothing.
     async fn warm_up(&self) -> Result<(), JudgeError> {
         Ok(())
     }
@@ -125,7 +123,6 @@ pub mod mock {
                     .iter()
                     .map(|s| Judgement {
                         p_relevant_permille: f(s).min(1000),
-                        latency_ms: None,
                     })
                     .collect()),
                 None => Err(JudgeError::Unavailable {
@@ -181,15 +178,13 @@ mod tests {
         let j = MockJudge::new().with_responses(vec![
             Ok(vec![Judgement {
                 p_relevant_permille: 900,
-                latency_ms: None,
             }]),
             Err(JudgeError::Timeout { timeout_ms: 5 }),
         ]);
         assert_eq!(
             j.judge(&["a".to_string()]).await.unwrap(),
             vec![Judgement {
-                p_relevant_permille: 900,
-                latency_ms: None
+                p_relevant_permille: 900
             }]
         );
         assert_eq!(
