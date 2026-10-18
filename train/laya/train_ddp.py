@@ -157,7 +157,11 @@ def main():
     if rank == 0:
         print(f"Starting DDP training: {len(all_items)} train items | {len(my_items)} per rank | "
               f"{EPOCHS} epochs | world {world_size} | device {device}", flush=True)
+    state_path = os.path.join(output_dir, "resume_state.pt")
+    run = {"world_size": world_size, "micro_batch": MICRO_BATCH, "epochs": EPOCHS,
+           "n_items": len(all_items), "device": args.device}
     t0 = time.time()
+    last_save = time.monotonic()
     updates = 0
     stop = False
 
@@ -212,6 +216,8 @@ def main():
 
             scaler.scale(loss).backward()
             accum_step += 1
+            epoch_loss += loss.item() * GRAD_ACCUM
+            n_batches += 1
 
             if accum_step % GRAD_ACCUM == 0 or (b_idx + MICRO_BATCH) >= len(my_items):
                 scaler.unscale_(optimizer)
@@ -227,9 +233,22 @@ def main():
                 updates += 1
                 if args.max_steps is not None and updates >= args.max_steps:
                     stop = True
-
-            epoch_loss += loss.item() * GRAD_ACCUM
-            n_batches += 1
+                # Rank 0 alone decides: this block holds no collective, other ranks wait in the next all-reduce.
+                if rank == 0 and not stop and time.monotonic() - last_save >= args.checkpoint_minutes * 60:
+                    os.makedirs(output_dir, exist_ok=True)
+                    tmp = state_path + ".tmp"
+                    with open(tmp, "wb") as f:
+                        torch.save({"run": run, "model": model.state_dict(),
+                                    "optimizer": optimizer.state_dict(),
+                                    "scheduler": scheduler.state_dict(),
+                                    "scaler": scaler.state_dict(), "updates": updates,
+                                    "epoch": epoch, "next_b": b_idx + MICRO_BATCH,
+                                    "epoch_loss": epoch_loss, "n_batches": n_batches}, f)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, state_path)  # atomic: a kill mid-save keeps the previous state
+                    last_save = time.monotonic()
+                    print(f"  Saved resume state ({updates} updates) to {state_path}", flush=True)
 
             if rank == 0 and (n_batches % 50) == 0:
                 cur_lr = scheduler.get_last_lr()[0]
@@ -244,22 +263,6 @@ def main():
 
         dist.barrier()
 
-        # Overwrite a single rolling checkpoint after each epoch so a crash,
-        # OOM, or session timeout doesn't lose all prior training.
-        if rank == 0 and not stop:
-            ckpt_dir = os.path.join(output_dir, "checkpoint_latest")
-            os.makedirs(ckpt_dir, exist_ok=True)
-            ckpt_sd = {k: v.half().contiguous().cpu() for k, v in model.state_dict().items()}
-            save_file(ckpt_sd, os.path.join(ckpt_dir, "model.safetensors"))
-            model.encoder.config.save_pretrained(os.path.join(ckpt_dir, "encoder"))
-            tok.save_pretrained(os.path.join(ckpt_dir, "tokenizer"))
-            with open(os.path.join(ckpt_dir, "checkpoint_meta.json"), "w") as f:
-                json.dump({
-                    "epoch": epoch + 1,
-                    "total_epochs": EPOCHS,
-                    "avg_loss": epoch_loss / max(1, n_batches)
-                }, f, indent=2)
-            print(f"  Saved rolling checkpoint (epoch {epoch+1}/{EPOCHS}) to {ckpt_dir}", flush=True)
         if stop:
             break
 
@@ -279,6 +282,9 @@ def main():
         with open(os.path.join(output_dir, "rl_agent_config.json"), "w") as f:
             json.dump(cfg, f, indent=2)
         print(f"Model saved to {output_dir} ({updates} optimizer updates)", flush=True)
+        for p in (state_path, state_path + ".tmp"):
+            if os.path.exists(p):
+                os.remove(p)
 
     dist.destroy_process_group()
 
