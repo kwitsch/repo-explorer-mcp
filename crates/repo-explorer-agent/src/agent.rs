@@ -912,7 +912,9 @@ where
                     )
                     .await;
                     self.record_judge_outcome(&mut metrics, &jv);
-                    match jv {
+                    // `Failed` and `EscalateUncertain` share one degrade path: LLM
+                    // verify when providers exist, otherwise fall through to Stage 5.
+                    let degrade = match jv {
                         JudgeVerifyOutcome::Finished { result, .. } => {
                             return Ok(self
                                 .finalize_and_complete(
@@ -940,53 +942,40 @@ where
                             if judged > 0 {
                                 escalate_scores = Some(scores);
                             }
+                            false
                         }
                         JudgeVerifyOutcome::EscalateUncertain { judged, scores, .. } => {
                             tracing::info!("local judge not confident; degrading to LLM verify");
-                            escalate_uncertain = true;
+                            // Name the uncertainty offline only when the LLM verify
+                            // below will not run to add its own evidence.
+                            escalate_uncertain = !self.router.has_providers();
                             if judged > 0 {
                                 escalate_scores = Some(scores);
                             }
-                            if self.router.has_providers() {
-                                if let Some(done) = self
-                                    .verify_and_complete(
-                                        repo_root,
-                                        &mut metrics,
-                                        query,
-                                        note.as_deref(),
-                                        &outcome,
-                                        &mut budget,
-                                        &query_key,
-                                        &fingerprint,
-                                    )
-                                    .await
-                                {
-                                    return Ok(done);
-                                }
-                                tracing::info!("verification escalated to the fallback loop");
-                            }
+                            true
                         }
                         JudgeVerifyOutcome::Failed { error, .. } => {
                             tracing::warn!(error = %error, "local judge failed; degrading");
-                            if self.router.has_providers() {
-                                if let Some(done) = self
-                                    .verify_and_complete(
-                                        repo_root,
-                                        &mut metrics,
-                                        query,
-                                        note.as_deref(),
-                                        &outcome,
-                                        &mut budget,
-                                        &query_key,
-                                        &fingerprint,
-                                    )
-                                    .await
-                                {
-                                    return Ok(done);
-                                }
-                                tracing::info!("verification escalated to the fallback loop");
-                            }
+                            true
                         }
+                    };
+                    if degrade && self.router.has_providers() {
+                        if let Some(done) = self
+                            .verify_and_complete(
+                                repo_root,
+                                &mut metrics,
+                                query,
+                                note.as_deref(),
+                                &outcome,
+                                &mut budget,
+                                &query_key,
+                                &fingerprint,
+                            )
+                            .await
+                        {
+                            return Ok(done);
+                        }
+                        tracing::info!("verification escalated to the fallback loop");
                     }
                 }
                 JudgeMode::Shadow => {
@@ -1371,27 +1360,21 @@ where
                 scores,
                 elapsed_ms,
                 latency_ms,
-            } => {
-                self.record_judge_metrics(
-                    metrics,
-                    "escalated",
-                    *judged,
-                    Some(0),
-                    scores,
-                    *elapsed_ms,
-                    *latency_ms,
-                );
-                None
             }
-            JudgeVerifyOutcome::EscalateUncertain {
+            | JudgeVerifyOutcome::EscalateUncertain {
                 judged,
                 scores,
                 elapsed_ms,
                 latency_ms,
             } => {
+                let label = if matches!(jv, JudgeVerifyOutcome::Escalate { .. }) {
+                    "escalated"
+                } else {
+                    "escalated-uncertain"
+                };
                 self.record_judge_metrics(
                     metrics,
-                    "escalated-uncertain",
+                    label,
                     *judged,
                     Some(0),
                     scores,
