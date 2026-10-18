@@ -76,7 +76,7 @@ pub fn render_judge_state(view: &JudgeCandidateView<'_>) -> String {
         None => lines.push("code: (unavailable)".to_string()),
     }
 
-    // 4. Outline section (last: Laya truncates the tail).
+    // 4. Outline section (last: the model truncates the tail).
     if let Some(outline) = view.outline.filter(|s| !s.is_empty()) {
         lines.push("outline:".to_string());
         for line in outline.split('\n').take(OUTLINE_MAX_LINES) {
