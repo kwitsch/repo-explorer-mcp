@@ -35,8 +35,8 @@ token, or a timeout) never fails a query: in `on` mode it degrades to LLM
 verification when `[llm]` has providers, otherwise it falls through to
 Stage 5.
 
-The legacy spelling `judge.mode = "laya"` is still accepted as an alias of
-`on` for one release and logs a deprecation warning.
+The legacy spelling `judge.mode = "laya"` is rejected at parse time; use
+`judge.mode = "on"`.
 
 ## Serving the judge
 

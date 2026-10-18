@@ -5,7 +5,7 @@
 //! disk-verifies the selection, and builds a deterministic result with 0 LLM
 //! calls. See `crates/repo-explorer-agent/CLAUDE.md`.
 
-use repo_explorer_core::config::JudgeSettings;
+use repo_explorer_core::config::{JudgeMode, JudgeSettings};
 use repo_explorer_core::domain::{
     Candidate, ExplorationFinding, ExplorationQuery, ExplorationResult,
 };
@@ -182,7 +182,8 @@ pub(crate) async fn judge_verify<M: MemoryBackend, J: CandidateJudge>(
     }
     // The critical path under concurrent requests: the slowest server timing.
     let latency_ms = judgements.iter().filter_map(|j| j.latency_ms).max();
-    if any_uncertain(&scores, settings.escalate_below) {
+    // Shadow only records agreement, so it must still compute the selection `on` would make.
+    if settings.mode == JudgeMode::On && any_uncertain(&scores, settings.escalate_below) {
         return JudgeVerifyOutcome::EscalateUncertain {
             scores,
             judged,

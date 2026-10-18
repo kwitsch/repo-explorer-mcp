@@ -43,17 +43,19 @@ fn combined(out: &Output) -> String {
 const MEMORY: &str = "[codebase_memory]\ncommand = \"codebase-memory-mcp\"\nargs = [\"--stdio\"]\n";
 
 #[test]
-fn llm_free_legacy_mode_alias_config_is_valid() {
+fn legacy_mode_laya_config_is_rejected() {
     let cfg = write_config(
         "alias",
         &format!("{MEMORY}[judge]\nmode = \"laya\"\n[agent]\nfallback = \"off\"\n"),
     );
     let out = config_test(&cfg);
     std::fs::remove_file(&cfg).ok();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "expected success: {}", combined(&out));
-    assert!(stdout.contains("\"status\": \"valid\""), "stdout: {stdout}");
-    assert!(combined(&out).contains("deprecated"), "{}", combined(&out));
+    assert!(
+        !out.status.success(),
+        "expected failure: {}",
+        combined(&out)
+    );
+    assert!(combined(&out).contains("laya"), "{}", combined(&out));
 }
 
 #[test]

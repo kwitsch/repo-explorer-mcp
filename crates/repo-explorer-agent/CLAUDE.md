@@ -203,7 +203,9 @@ path.
   returned, and the judge's outcome is only recorded
   (`QueryMetrics.judge_outcome`, `.shadow_agreement`). An uncertain judgement
   classifies as `judge-escalated`/`both-escalated`. The judge's scores are
-  never passed on to Stage 5.
+  never passed on to Stage 5. `escalate_below` is not applied in shadow: the
+  judge always computes its selection, so the agreement metric compares like
+  with like.
 
 `QueryMetrics` gains `judge_mode` (`off`/`on`/`shadow`) and `fallback_mode`
 (set on every exit path, including cache) and, only on paths where the judge
@@ -235,11 +237,11 @@ place enforces "never report a location that does not resolve on disk".
 
 ## Judge query-cache key
 
-`AgentLoop::run_query_key` appends `judge=on:<select_threshold>` (or
-`judge=on:<select_threshold>:<escalate_below>` when `escalate_below > 0`)
-when `judge.mode == "on"`, and `fallback=off` when `agent.fallback == "off"`.
-`off`- and `shadow`-mode keys are byte-identical to before this feature, so
-existing L1/L2 entries stay valid; the former judge-key entries were
-invalidated once on purpose when the judge model changed.
+`AgentLoop::run_query_key` appends `judge=on:<select_threshold>:<escalate_below>`
+when `judge.mode == "on"` (`escalate_below` is `0` when off), and `fallback=off`
+when `agent.fallback == "off"`. `off`- and `shadow`-mode keys are
+byte-identical to before this feature, so existing L1/L2 entries stay valid;
+the former judge-key entries were invalidated once on purpose when the judge
+model changed.
 `disk_cache::SCHEMA_VERSION` is unchanged because the stored value shape did
 not change.

@@ -619,14 +619,10 @@ where
         // judge-key cache entries are invalidated once on purpose (different
         // model).
         if self.judge_settings.mode == JudgeMode::On {
-            let field = if self.judge_settings.escalate_below == 0 {
-                format!("judge=on:{}", self.judge_settings.select_threshold)
-            } else {
-                format!(
-                    "judge=on:{}:{}",
-                    self.judge_settings.select_threshold, self.judge_settings.escalate_below
-                )
-            };
+            let field = format!(
+                "judge=on:{}:{}",
+                self.judge_settings.select_threshold, self.judge_settings.escalate_below
+            );
             crate::cache::encode_field_into(&mut key, &field);
         }
         if self.settings.fallback == FallbackMode::Off {
@@ -2842,11 +2838,8 @@ mod tests {
         };
         std::fs::remove_dir_all(&dir).ok();
         let mut plain_on50 = off.clone();
-        crate::cache::encode_field_into(&mut plain_on50, "judge=on:50");
-        assert_eq!(
-            on50, plain_on50,
-            "escalate_below = 0 keeps the plain judge=on:<sel> form"
-        );
+        crate::cache::encode_field_into(&mut plain_on50, "judge=on:50:0");
+        assert_eq!(on50, plain_on50, "escalate_below = 0 is spelled out as :0");
         let mut esc_on50 = off.clone();
         crate::cache::encode_field_into(&mut esc_on50, "judge=on:50:720");
         assert_eq!(on50_esc720, esc_on50);

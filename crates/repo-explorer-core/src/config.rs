@@ -261,15 +261,14 @@ impl Default for RepoBriefSettings {
 
 /// Stage-4 judge mode. `off` (the default) keeps today's LLM verification;
 /// `on` replaces Stage 4 with the local judge; `shadow` runs both and only
-/// records the judge's agreement (the LLM decision still stands). The legacy
-/// spelling stays accepted as a deprecated alias of `on` for one release
-/// (`unknown_key_warnings` reports it).
+/// records the judge's agreement (the LLM decision still stands). The removed
+/// `laya` spelling is rejected at parse time, so a stale config fails loudly
+/// instead of pointing at the new default server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JudgeMode {
     #[default]
     Off,
-    #[serde(alias = "laya")]
     On,
     Shadow,
 }
@@ -602,6 +601,8 @@ impl ConfigError {
 pub enum ValidationError {
     #[error("llm.providers must contain at least one provider")]
     EmptyProviderList,
+    #[error("`judge.{key}` was removed with the candle backend; delete it from the config")]
+    RemovedJudgeKey { key: &'static str },
     #[error("duplicate provider name `{name}` in llm.providers")]
     DuplicateProviderName { index: usize, name: String },
     #[error("provider `{provider}` has an empty `models` list; at least one model is required")]
@@ -669,6 +670,7 @@ impl ValidationError {
             ValidationError::InvalidJudgeBaseUrl { .. } => "judge.base_url".to_string(),
             ValidationError::InvalidJudgeSetting { key, .. } => format!("judge.{key}"),
             ValidationError::MissingJudgeEnvVar { .. } => "judge.api_key_env".to_string(),
+            ValidationError::RemovedJudgeKey { key } => format!("judge.{key}"),
         }
     }
 }
@@ -690,6 +692,9 @@ pub fn load(path: &Path) -> Result<(Config, Vec<String>), ConfigError> {
         ConfigError::Parse { source, location }
     })?;
     config.validate()?;
+    if let Some(key) = removed_judge_key(&contents) {
+        return Err(ValidationError::RemovedJudgeKey { key }.into());
+    }
     let warnings = unknown_key_warnings(&contents);
     for warning in &warnings {
         tracing::warn!(warning = %warning, "unrecognized config key (ignored)");
@@ -815,15 +820,22 @@ pub fn unknown_key_warnings(raw: &str) -> Vec<String> {
             }
         }
     }
-    if root
-        .get("judge")
-        .and_then(|j| j.get("mode"))
-        .and_then(|m| m.as_str())
-        == Some("laya")
-    {
-        warnings.push("`judge.mode = \"laya\"` is deprecated; use \"on\"".to_string());
-    }
     warnings
+}
+
+/// `judge.*` keys removed with the candle backend. [`load`] rejects them
+/// rather than ignoring them: a stale candle config would otherwise run
+/// against the new default HTTP server without any hard signal.
+const REMOVED_JUDGE_KEYS: &[&str] = &["backend", "checkpoint_dir", "device"];
+
+/// First [`REMOVED_JUDGE_KEYS`] entry present under `[judge]`, if any.
+fn removed_judge_key(contents: &str) -> Option<&'static str> {
+    let root: toml::Table = toml::from_str(contents).ok()?;
+    let judge = root.get("judge")?.as_table()?;
+    REMOVED_JUDGE_KEYS
+        .iter()
+        .copied()
+        .find(|key| judge.contains_key(*key))
 }
 
 /// Render a byte offset into `text` as a `line N, column M` string (1-based).
@@ -1673,30 +1685,23 @@ escalate_below = 720
                 "unrecognized key `judge.device`",
             ]
         );
-        // Removed keys are ignored on load, never rejected.
-        let parsed: JudgeSettings = toml::from_str(
-            "mode = \"on\"\nbackend = \"http\"\ncheckpoint_dir = \"/x\"\ndevice = \"cpu\"\n",
-        )
-        .expect("removed keys must still parse");
-        assert_eq!(parsed.mode, JudgeMode::On);
+        // Removed candle keys are rejected by `load`, not silently ignored.
+        assert_eq!(
+            removed_judge_key("[judge]\nmode = \"on\"\ncheckpoint_dir = \"/x\"\n"),
+            Some("checkpoint_dir")
+        );
+        assert_eq!(removed_judge_key("[judge]\nmode = \"on\"\n"), None);
     }
 
     #[test]
-    fn legacy_mode_alias_parses_as_on_and_warns() {
+    fn legacy_mode_laya_is_rejected_at_parse() {
         let toml = r#"
 [codebase_memory]
 command = "codebase-memory-mcp"
 [judge]
 mode = "laya"
 "#;
-        let config: Config = toml::from_str(toml).expect("the legacy alias must parse");
-        assert_eq!(config.judge.mode, JudgeMode::On);
-        assert_eq!(
-            unknown_key_warnings(toml),
-            vec!["`judge.mode = \"laya\"` is deprecated; use \"on\""]
-        );
-        let out = to_toml_string(&config).expect("serialize");
-        assert!(out.contains("mode = \"on\""), "{out}");
+        assert!(toml::from_str::<Config>(toml).is_err());
     }
 
     #[test]
