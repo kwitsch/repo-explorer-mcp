@@ -9,6 +9,7 @@
 #   * cfg["max_len"]=MAX_LEN, cfg["head_max_len"]=HEAD_MAX_LEN;
 #   * --epochs / --micro-batch replace the notebook constants;
 #   * --device cpu smoke path (gloo, single rank without torchrun, no cuda/autocast/GradScaler, fp32);
+#   * every printed line is prefixed with a dd.MM.yyyy HH:mm:ss timestamp;
 #   * --max-steps stops early after N optimizer steps;
 #   * --checkpoint-minutes writes OUTPUT_DIR/resume_state.pt (optimizer/scheduler/scaler state + position); rerunning the same command resumes from it;
 #   * DDP find_unused_parameters=False (every parameter receives a gradient; the notebook flag only cost a graph traversal);
@@ -23,6 +24,13 @@ import os
 import random
 import socket
 import time
+
+# Prefix every output line with a timestamp (dd.MM.yyyy HH:mm:ss, 24-hour clock).
+_print = print
+
+
+def print(*args, **kwargs):
+    _print(time.strftime("%d.%m.%Y %H:%M:%S"), *args, **kwargs)
 
 
 def _free_port():
