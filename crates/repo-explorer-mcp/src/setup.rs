@@ -9,7 +9,7 @@
 
 use anyhow::Context;
 use repo_explorer_core::config::{
-    self, CodebaseMemoryConfig, Config, JudgeSettings, KNOWN_PROVIDER_KINDS, LlmConfig,
+    self, CodebaseMemoryConfig, Config, JudgeMode, JudgeSettings, KNOWN_PROVIDER_KINDS, LlmConfig,
     LoggingConfig, ProviderConfig, SearchConfig, default_api_key_env, default_cooldown_seconds,
     default_staleness_seconds, env_var_is_set,
 };
@@ -193,6 +193,17 @@ fn prompt_raw(prompt: &str) -> anyhow::Result<String> {
     }
 }
 
+/// The wizard's judge-mode menu: `1` off, `2` shadow, `3` on; anything else
+/// is `None` (re-prompt). The empty default is resolved by `prompt_default`.
+fn judge_mode_from_choice(s: &str) -> Option<JudgeMode> {
+    match s.trim() {
+        "1" => Some(JudgeMode::Off),
+        "2" => Some(JudgeMode::Shadow),
+        "3" => Some(JudgeMode::On),
+        _ => None,
+    }
+}
+
 /// Top-level wizard entry: detect -> prompt -> build Config -> write ->
 /// self-verify. Returns `SUCCESS` on a written+validated config, `FAILURE`
 /// otherwise (with a stderr diagnostic).
@@ -362,6 +373,37 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
         eprintln!("  proxy URL must be a valid http:// or https:// URL with a host.");
     };
 
+    // Local candidate judge (Stage 4, optional).
+    eprintln!();
+    eprintln!("Local candidate judge (Stage 4, optional):");
+    eprintln!("  1) off (default)");
+    eprintln!("  2) shadow: run beside LLM verification, record agreement only");
+    eprintln!("  3) on: replace LLM verification with the local judge");
+    let judge_mode = loop {
+        let raw = prompt_default("  choose 1, 2 or 3", "1")?;
+        match judge_mode_from_choice(&raw) {
+            Some(mode) => break mode,
+            None => eprintln!("  enter 1, 2 or 3"),
+        }
+    };
+    let judge = if judge_mode == JudgeMode::Off {
+        JudgeSettings::default()
+    } else {
+        let default_url = JudgeSettings::default().base_url;
+        let base_url = loop {
+            let raw = prompt_default("  judge base URL", &default_url)?;
+            if config::is_valid_https_proxy_url(&raw) {
+                break raw;
+            }
+            eprintln!("  judge base URL must be a valid http(s) URL");
+        };
+        JudgeSettings {
+            mode: judge_mode,
+            base_url,
+            ..JudgeSettings::default()
+        }
+    };
+
     // Search is in-process (no external `rg` binary), so `[search]` is left at
     // core defaults and there is nothing to probe or provision here.
     let search = SearchConfig::default();
@@ -378,7 +420,7 @@ fn run_setup_inner(config_path: &Path) -> anyhow::Result<()> {
         search,
         agent: Default::default(),
         cache: Default::default(),
-        judge: JudgeSettings::default(),
+        judge,
         logging: LoggingConfig::default(),
     };
 
@@ -538,5 +580,15 @@ mod tests {
         );
         assert_eq!(cfg.args, vec!["--stdio".to_string()]);
         assert!(cfg.endpoint.is_none());
+    }
+
+    #[test]
+    fn judge_mode_from_choice_maps_1_2_3() {
+        assert_eq!(judge_mode_from_choice("1"), Some(JudgeMode::Off));
+        assert_eq!(judge_mode_from_choice("2"), Some(JudgeMode::Shadow));
+        assert_eq!(judge_mode_from_choice("3"), Some(JudgeMode::On));
+        assert_eq!(judge_mode_from_choice(" 3 "), Some(JudgeMode::On));
+        assert_eq!(judge_mode_from_choice("4"), None);
+        assert_eq!(judge_mode_from_choice("on"), None);
     }
 }
