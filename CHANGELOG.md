@@ -5,7 +5,33 @@ collects what is on `main` but not yet tagged.
 
 ## [Unreleased] — 0.9.0
 
+### Changed
+
+- **Breaking: `judge.mode = "laya"` is now `judge.mode = "on"`.** The old
+  spelling still loads as an alias for one release and logs a deprecation
+  warning; the `judge_mode` metric reports `"on"`. Cache entries written
+  under the old judge key are invalidated once.
+- **Breaking: new judge defaults.** `judge.base_url` defaults to
+  `http://127.0.0.1:8741` and `judge.model` to `h2oai/h2o-lightning-4b`;
+  configs that relied on the old defaults must set both explicitly. The
+  removed keys `backend`, `checkpoint_dir` and `device` are ignored with a
+  warning.
+
+### Removed
+
+- **In-process candle judge backend** and the `candle-judge` / `cuda-judge`
+  build features. The judge is now HTTP-only (`/v1/systemone`).
+
 ### Added
+
+- **`judge.escalate_below` confidence cascade.** An integer permille cutoff
+  (default `0` = off); a query whose judged candidates include an uncertain
+  one degrades to LLM verification (`judge_outcome = "escalated-uncertain"`).
+- **`judge_latency_ms` metric** (server-reported `usage.latency_ms`),
+  reported by `eval/score.py` as p50/p95. HTTP 503 now counts as "judge
+  unavailable", and warm-up probes `GET /v1/models` plus one request.
+  `docs/laya-judge.md` is renamed to `docs/judge.md`; the setup wizard asks
+  for the judge mode and base URL.
 
 - **In-process candle judge backend (`judge.backend = "candle"`).** An
   alternative to the HTTP backend that runs the fine-tuned Laya checkpoint
