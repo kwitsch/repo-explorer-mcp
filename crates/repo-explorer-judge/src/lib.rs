@@ -1,6 +1,7 @@
-//! The local candidate judge over HTTP: the only crate that knows the upstream
-//! `laya-serve` wire format (`POST /v1/systemone`). Owns `reqwest` for the
-//! judge and never proxies (the judge is a local/LAN service).
+//! The local candidate judge over HTTP: the model-neutral `/v1/systemone`
+//! client (any server speaking that wire schema, e.g. the H2O shim). Owns
+//! `reqwest` for the judge and never proxies (the judge is a local/LAN
+//! service).
 
 use futures_util::future::try_join_all;
 use repo_explorer_core::config::{JudgeMode, JudgeSettings};
@@ -11,19 +12,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-/// A judge backed by an upstream `laya-serve` instance.
+/// A judge backed by any server speaking `POST /v1/systemone`.
 #[derive(Debug)]
-pub struct LayaHttpJudge {
+pub struct SystemOneHttpJudge {
     client: reqwest::Client,
     endpoint: String,
-    health_url: String,
+    models_url: String,
     api_key: Option<String>,
     model: String,
     timeout: Duration,
     semaphore: Arc<Semaphore>,
 }
 
-impl LayaHttpJudge {
+impl SystemOneHttpJudge {
     /// `new_with_env(settings, |v| std::env::var(v).ok())`.
     pub fn new(settings: &JudgeSettings) -> Result<Self, JudgeError> {
         Self::new_with_env(settings, |v| std::env::var(v).ok())
@@ -62,12 +63,20 @@ impl LayaHttpJudge {
         Ok(Self {
             client,
             endpoint: format!("{base}/v1/systemone"),
-            health_url: format!("{base}/health"),
+            models_url: format!("{base}/v1/models"),
             api_key,
             model: settings.model.clone(),
             timeout: Duration::from_millis(settings.timeout_ms),
             semaphore: Arc::new(Semaphore::new(settings.max_concurrency.max(1) as usize)),
         })
+    }
+
+    /// Attach the bearer header when a key is configured (never otherwise).
+    fn authorized(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.api_key {
+            Some(key) => req.header("authorization", format!("Bearer {key}")),
+            None => req,
+        }
     }
 
     async fn judge_one(&self, state: &str) -> Result<Judgement, JudgeError> {
@@ -92,14 +101,12 @@ impl LayaHttpJudge {
                 }
             }
         });
-        let mut req = self
-            .client
-            .post(&self.endpoint)
-            .header("content-type", "application/json")
-            .json(&body);
-        if let Some(key) = &self.api_key {
-            req = req.header("authorization", format!("Bearer {key}"));
-        }
+        let req = self.authorized(
+            self.client
+                .post(&self.endpoint)
+                .header("content-type", "application/json")
+                .json(&body),
+        );
         let resp = req.send().await.map_err(|e| JudgeError::Unavailable {
             message: format!("judge request failed: {}", sanitize(&e.to_string())),
         })?;
@@ -107,6 +114,15 @@ impl LayaHttpJudge {
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(JudgeError::Unavailable {
                 message: format!("judge rejected the bearer token (HTTP {})", status.as_u16()),
+            });
+        }
+        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            // Model still loading or overloaded: a readiness problem, not a
+            // protocol violation.
+            let text = resp.text().await.unwrap_or_default();
+            let head: String = text.chars().take(200).collect();
+            return Err(JudgeError::Unavailable {
+                message: format!("HTTP 503: {head}"),
             });
         }
         if !status.is_success() {
@@ -134,8 +150,16 @@ impl LayaHttpJudge {
                 message: "judge answer missing a finite answers.relevant.probabilities.A in [0,1]"
                     .to_string(),
             })?;
+        // Optional server timing; missing or garbled is `None`, never an error.
+        let latency_ms = v
+            .get("usage")
+            .and_then(|u| u.get("latency_ms"))
+            .and_then(|x| x.as_f64())
+            .filter(|x| x.is_finite() && *x >= 0.0)
+            .map(|x| x.round() as u64);
         Ok(Judgement {
             p_relevant_permille: ((p * 1000.0).round() as u32).min(1000),
+            latency_ms,
         })
     }
 }
@@ -155,7 +179,7 @@ fn sanitize(s: &str) -> String {
     out
 }
 
-impl CandidateJudge for LayaHttpJudge {
+impl CandidateJudge for SystemOneHttpJudge {
     async fn judge(&self, states: &[String]) -> Result<Vec<Judgement>, JudgeError> {
         if states.is_empty() {
             return Ok(vec![]);
@@ -178,23 +202,31 @@ impl CandidateJudge for LayaHttpJudge {
         Ok(out)
     }
 
+    /// `GET /v1/models` (server up?), then one 1-state probe request, which
+    /// exercises the model name and warms the server's prefix cache.
     async fn warm_up(&self) -> Result<(), JudgeError> {
         let resp = self
-            .client
-            .get(&self.health_url)
-            .timeout(Duration::from_secs(2))
+            .authorized(
+                self.client
+                    .get(&self.models_url)
+                    .timeout(Duration::from_secs(2)),
+            )
             .send()
             .await
             .map_err(|e| JudgeError::Unavailable {
-                message: format!("judge health probe failed: {}", sanitize(&e.to_string())),
+                message: format!("judge models probe failed: {}", sanitize(&e.to_string())),
             })?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            Err(JudgeError::Unavailable {
-                message: format!("judge health returned HTTP {}", resp.status().as_u16()),
-            })
+        if !resp.status().is_success() {
+            return Err(JudgeError::Unavailable {
+                message: format!(
+                    "judge models probe returned HTTP {}",
+                    resp.status().as_u16()
+                ),
+            });
         }
+        self.judge(&["query: warm-up probe".to_string()])
+            .await
+            .map(|_| ())
     }
 }
 
@@ -203,7 +235,7 @@ impl CandidateJudge for LayaHttpJudge {
 #[derive(Debug)]
 pub enum ConfiguredJudge {
     Disabled(NoJudge),
-    Laya(LayaHttpJudge),
+    Http(SystemOneHttpJudge),
 }
 
 impl ConfiguredJudge {
@@ -211,7 +243,7 @@ impl ConfiguredJudge {
         match settings.mode {
             JudgeMode::Off => Ok(ConfiguredJudge::Disabled(NoJudge)),
             JudgeMode::On | JudgeMode::Shadow => {
-                Ok(ConfiguredJudge::Laya(LayaHttpJudge::new(settings)?))
+                Ok(ConfiguredJudge::Http(SystemOneHttpJudge::new(settings)?))
             }
         }
     }
@@ -221,14 +253,14 @@ impl CandidateJudge for ConfiguredJudge {
     async fn judge(&self, states: &[String]) -> Result<Vec<Judgement>, JudgeError> {
         match self {
             ConfiguredJudge::Disabled(j) => j.judge(states).await,
-            ConfiguredJudge::Laya(j) => j.judge(states).await,
+            ConfiguredJudge::Http(j) => j.judge(states).await,
         }
     }
 
     async fn warm_up(&self) -> Result<(), JudgeError> {
         match self {
             ConfiguredJudge::Disabled(j) => j.warm_up().await,
-            ConfiguredJudge::Laya(j) => j.warm_up().await,
+            ConfiguredJudge::Http(j) => j.warm_up().await,
         }
     }
 }
