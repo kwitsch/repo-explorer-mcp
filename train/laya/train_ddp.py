@@ -10,6 +10,7 @@
 #   * --epochs / --micro-batch replace the notebook constants;
 #   * --device cpu smoke path (gloo, single rank without torchrun, no cuda/autocast/GradScaler, fp32);
 #   * --max-steps stops early after N optimizer steps;
+#   * --checkpoint-minutes writes OUTPUT_DIR/resume_state.pt (optimizer/scheduler/scaler state + position); rerunning the same command resumes from it;
 #   * DDP find_unused_parameters=False (every parameter receives a gradient; the notebook flag only cost a graph traversal);
 #   * temperature fitting and its calibration hold-out slice are removed
 #     (calibrate.py owns calibration); saved temperature = [1.0, 1.0, 1.0],
@@ -36,7 +37,7 @@ def parse_args():
     ap.add_argument("items_pt")
     ap.add_argument("output_dir")
     ap.add_argument("--epochs", type=int, default=4)
-    ap.add_argument("--micro-batch", type=int, default=8)
+    ap.add_argument("--micro-batch", type=int, default=2)
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--checkpoint-minutes", type=float, default=10.0)
@@ -164,18 +165,40 @@ def main():
     last_save = time.monotonic()
     updates = 0
     stop = False
+    start_epoch, start_b, resume_loss, resume_batches = 0, 0, 0.0, 0
 
-    for epoch in range(EPOCHS):
+    if os.path.exists(state_path):
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        if state["run"] != run:
+            raise SystemExit(f"{state_path} was written by a different run {state['run']}, "
+                             f"this run is {run}; delete it or use another OUTPUT_DIR")
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        scaler.load_state_dict(state["scaler"])
+        updates, start_epoch, start_b = state["updates"], state["epoch"], state["next_b"]
+        resume_loss, resume_batches = state["epoch_loss"], state["n_batches"]
+        # The shuffle is in place and cumulative: replay finished epochs to get the same order.
+        for e in range(start_epoch):
+            random.seed(42 + e + rank)
+            random.shuffle(my_items)
+        if rank == 0:
+            print(f"Resuming from {state_path}: {updates} updates, epoch {start_epoch+1}/{EPOCHS}, "
+                  f"item {start_b}", flush=True)
+        del state
+
+    for epoch in range(start_epoch, EPOCHS):
         random.seed(42 + epoch + rank)
         random.shuffle(my_items)
-        epoch_loss, n_batches = 0.0, 0
+        resumed = epoch == start_epoch
+        epoch_loss, n_batches = (resume_loss, resume_batches) if resumed else (0.0, 0)
         optimizer.zero_grad(set_to_none=True)
         accum_step = 0
 
         progress = epoch / max(1, EPOCHS - 1)
         sigma = SIGMA_START + (SIGMA_END - SIGMA_START) * progress
 
-        for b_idx in range(0, len(my_items), MICRO_BATCH):
+        for b_idx in range(start_b if resumed else 0, len(my_items), MICRO_BATCH):
             chunk = my_items[b_idx:b_idx + MICRO_BATCH]
             if not chunk:
                 continue

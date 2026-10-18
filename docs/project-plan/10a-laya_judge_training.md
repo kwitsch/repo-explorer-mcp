@@ -970,7 +970,7 @@ Every script uses `argparse`, prints a JSON summary to stdout, and imports
   - Drop and count rows whose `len(markers) != 2`.
   - Save with `torch.save(items, FILE)` and print
     `{"items": n, "dropped": m}`.
-- **`train_ddp.py BASE_MODEL ITEMS_PT OUTPUT_DIR [--epochs 4] [--micro-batch 8] [--max-steps N] [--device cuda|cpu]`**
+- **`train_ddp.py BASE_MODEL ITEMS_PT OUTPUT_DIR [--epochs 4] [--micro-batch 2] [--max-steps N] [--device cuda|cpu] [--checkpoint-minutes 10]`**
   - Derived from the `%%writefile /kaggle/working/train_ddp.py` cell of
     `notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb` at laya tag
     `v0.3.7`. Keep an attribution header: `# Derived from NandhaKishorM/laya
@@ -983,7 +983,7 @@ Every script uses `argparse`, prints a JSON summary to stdout, and imports
     - items are read from `ITEMS_PT`;
     - `cfg["max_len"] = MAX_LEN` and `cfg["head_max_len"] = HEAD_MAX_LEN`;
     - `--epochs` replaces the notebook's epoch constant, and `--micro-batch`
-      replaces its micro-batch constant (default 8, the notebook's value),
+      replaces its micro-batch constant (default 2; the notebook used 8),
       so the maintainer can lower it on out-of-memory at 1024 tokens;
     - `--device cpu` is for smoke runs:
       - `backend = "gloo"`;
