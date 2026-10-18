@@ -113,19 +113,16 @@ dir = ""                             # "" = the per-user cache dir, resolved by 
 level = "info"            # trace | debug | info | warn | error
 
 # Local candidate judge (Stage 4). Optional; omit the whole section for
-# today's behaviour (LLM-only verification). See docs/judge.md.
+# today's behaviour (LLM-only verification). See docs/laya-judge.md.
 [judge]
-mode = "off"                          # off | shadow | on
-base_url = "http://127.0.0.1:8741"    # any /v1/systemone server; never proxied
+mode = "off"                          # off | laya | shadow
+base_url = "http://127.0.0.1:8765"    # judge-serve endpoint; never proxied
 # api_key_env = "REX_JUDGE_KEY"       # names an env var; omit for no bearer auth
-model = "h2oai/h2o-lightning-4b"      # sent as-is in every judge request
+model = "typed-decisions"             # sent as-is; the launcher maps this name
 timeout_ms = 20000                    # whole judge call, all candidates
 max_concurrency = 4                   # concurrent judge HTTP requests
 select_threshold = 50                 # 1-99 (percent); a candidate is selected
                                       # at score >= select_threshold * 10 permille
-escalate_below = 0                    # 0 = off, else 501-999 (permille): any judged
-                                      # candidate less confident than this sends the
-                                      # query to LLM verification
 ```
 
 The env var named by each `api_key_env` must actually be set in the environment,
@@ -137,27 +134,27 @@ or config loading fails with `MissingEnvVar`.
 verification; `agent.fallback` configures what Stage 5 does when Stage 4
 does not resolve a query. Both default to today's LLM-only behaviour, so an
 absent `[judge]` section and an absent `agent.fallback` key change nothing.
-Full mode matrix, rollout procedure and troubleshooting: `docs/judge.md`.
+Full mode matrix, rollout procedure and troubleshooting: `docs/laya-judge.md`.
 
-| Key                      | Default                    | Meaning                                                                                                                                                                             |
-| ------------------------ | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `judge.mode`             | `"off"`                    | `off` — LLM verifies Stage 4 (today's behaviour). `on` — the judge verifies Stage 4. `shadow` — the LLM still answers; the judge runs alongside and only its agreement is recorded. |
-| `judge.base_url`         | `"http://127.0.0.1:8741"`  | Base URL of any `/v1/systemone` judge server (e.g. the H2O shim). Must be a valid `http(s)://` URL.                                                                                 |
-| `judge.api_key_env`      | unset                      | Optional env var naming a bearer token sent as `Authorization: Bearer <token>`. If set, the variable must actually be set (`MissingJudgeEnvVar` otherwise).                         |
-| `judge.model`            | `"h2oai/h2o-lightning-4b"` | Model name sent in every judge request. Must not be blank.                                                                                                                          |
-| `judge.timeout_ms`       | `20000`                    | Timeout for the whole judge call (all candidates). Must be at least 1.                                                                                                              |
-| `judge.max_concurrency`  | `4`                        | Concurrent judge HTTP requests. Must be at least 1. See `docs/judge.md`.                                                                                                            |
-| `judge.select_threshold` | `50`                       | Integer percent, `1..=99`. A candidate is selected when its judged probability is at least `select_threshold * 10` permille.                                                        |
-| `judge.escalate_below`   | `0`                        | Integer permille, `0` (off) or `501..=999`. If any judged candidate's confidence `max(p, 1000 - p)` is below it, the query degrades to LLM verification (`escalated-uncertain`).    |
-| `agent.fallback`         | `"llm"`                    | `llm` — Stage 5 runs the explorative fallback loop (today's behaviour). `off` — Stage 5 synthesizes up to five disk-verified, explicitly unverified candidates with no LLM call.    |
+| Key                      | Default                   | Meaning                                                                                                                                                                               |
+| ------------------------ | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `judge.mode`             | `"off"`                   | `off` — LLM verifies Stage 4 (today's behaviour). `laya` — the judge verifies Stage 4. `shadow` — the LLM still answers; the judge runs alongside and only its agreement is recorded. |
+| `judge.backend`          | `"http"`                  | `http` — judge runs in `judge-serve` (requires running the Python launcher). `candle` — in-process inference (no Python sidecar needed).                                              |
+| `judge.base_url`         | `"http://127.0.0.1:8765"` | Base URL of a running `judge-serve` instance. Required for `backend = "http"`. Must be a valid `http(s)://` URL.                                                                      |
+| `judge.api_key_env`      | unset                     | Optional env var naming a bearer token sent as `Authorization: Bearer <token>`. If set, the variable must actually be set (`MissingJudgeEnvVar` otherwise). HTTP backend only.        |
+| `judge.model`            | `"typed-decisions"`       | Model name sent in every judge request. Required for `backend = "http"`. Must not be blank.                                                                                           |
+| `judge.checkpoint_dir`   | `""`                      | Absolute path to the local checkpoint directory. Required for `backend = "candle"`. Must not be empty when using the candle backend.                                                  |
+| `judge.device`           | `"cpu"`                   | `cpu` or `cuda`. Inference device for the candle backend. CUDA requires a build with the `cuda-judge` feature. Candle backend only.                                                   |
+| `judge.timeout_ms`       | `20000`                   | Timeout for the whole judge call (all candidates). Must be at least 1.                                                                                                                |
+| `judge.max_concurrency`  | `4`                       | Concurrent judge HTTP requests. Must be at least 1. HTTP backend only. Serving itself is serial upstream — see `docs/laya-judge.md`.                                                  |
+| `judge.select_threshold` | `50`                      | Integer percent, `1..=99`. A candidate is selected when its judged probability is at least `select_threshold * 10` permille.                                                          |
+| `agent.fallback`         | `"llm"`                   | `llm` — Stage 5 runs the explorative fallback loop (today's behaviour). `off` — Stage 5 synthesizes up to five disk-verified, explicitly unverified candidates with no LLM call.      |
 
 These keys are only validated when `judge.mode != "off"` (`InvalidJudgeBaseUrl`,
-`InvalidJudgeSetting`, `MissingJudgeEnvVar`). The removed keys
-`judge.checkpoint_dir`, `judge.device` and `judge.backend = "candle"` make the config fail to load
-(`RemovedJudgeKey`), and `judge.mode = "laya"` is rejected at parse time.
-`[llm]` stays required for every combination except `judge.mode = "on"` with
-`agent.fallback = "off"`, which is the only fully LLM-free configuration —
-there `[llm]` may be empty or omitted entirely.
+`InvalidJudgeSetting`, `MissingJudgeEnvVar`). `[llm]` stays required for every
+combination except `judge.mode = "laya"` with `agent.fallback = "off"`, which
+is the only fully LLM-free configuration — there `[llm]` may be empty or
+omitted entirely.
 
 ## On-disk result cache
 

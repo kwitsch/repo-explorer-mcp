@@ -1,11 +1,10 @@
-//! Stage-4 verification by the local candidate judge (`judge.mode = "on"`
+//! Stage-4 verification by the local candidate judge (`judge.mode = "laya"`
 //! or `"shadow"`). Renders per-candidate states with the 10a renderer
-//! (train/serve parity), judges them, escalates when any judged candidate is
-//! below `escalate_below` confidence, else selects `p >= select_threshold`,
+//! (train/serve parity), judges them, selects `p >= select_threshold`,
 //! disk-verifies the selection, and builds a deterministic result with 0 LLM
 //! calls. See `crates/repo-explorer-agent/CLAUDE.md`.
 
-use repo_explorer_core::config::{JudgeMode, JudgeSettings};
+use repo_explorer_core::config::JudgeSettings;
 use repo_explorer_core::domain::{
     Candidate, ExplorationFinding, ExplorationQuery, ExplorationResult,
 };
@@ -19,46 +18,24 @@ use std::time::Instant;
 use crate::agent::verified_candidate_findings;
 use crate::judge_input::render_judge_states;
 
-/// What a judge call that reached the server produced; shared by every
-/// non-`Failed` outcome.
-#[derive(Debug)]
-pub(crate) struct JudgeRun {
-    pub scores: Vec<Option<u32>>,
-    pub judged: u32,
-    pub elapsed_ms: u64,
-    pub latency_ms: Option<u64>,
-}
-
 #[derive(Debug)]
 pub(crate) enum JudgeVerifyOutcome {
     Finished {
         result: ExplorationResult,
+        scores: Vec<Option<u32>>,
         selected: Vec<usize>,
-        run: JudgeRun,
+        judged: u32,
+        elapsed_ms: u64,
     },
     Escalate {
-        run: JudgeRun,
-    },
-    /// At least one judged candidate's confidence `max(p, 1000 - p)` is below
-    /// `judge.escalate_below`; selection was not attempted.
-    EscalateUncertain {
-        run: JudgeRun,
+        scores: Vec<Option<u32>>,
+        judged: u32,
+        elapsed_ms: u64,
     },
     Failed {
         error: JudgeError,
         elapsed_ms: u64,
     },
-}
-
-/// True when `escalate_below > 0` and any judged score's two-sided confidence
-/// `max(p, 1000 - p)` is below it (the per-query "any candidate uncertain"
-/// rule).
-pub(crate) fn any_uncertain(scores: &[Option<u32>], escalate_below: u32) -> bool {
-    escalate_below > 0
-        && scores
-            .iter()
-            .flatten()
-            .any(|&p| p.max(1000u32.saturating_sub(p)) < escalate_below)
 }
 
 /// Candidate indices with `score >= select_threshold * 10` permille, sorted by
@@ -148,12 +125,9 @@ pub(crate) async fn judge_verify<M: MemoryBackend, J: CandidateJudge>(
     if idx_states.is_empty() {
         // No judge call was made at all, so there is no latency to report.
         return JudgeVerifyOutcome::Escalate {
-            run: JudgeRun {
-                scores,
-                judged: 0,
-                elapsed_ms: 0,
-                latency_ms: None,
-            },
+            scores,
+            judged: 0,
+            elapsed_ms: 0,
         };
     }
     let judged = state_texts.len() as u32;
@@ -183,28 +157,12 @@ pub(crate) async fn judge_verify<M: MemoryBackend, J: CandidateJudge>(
     for (idx, j) in idx_states.iter().zip(&judgements) {
         scores[*idx] = Some(j.p_relevant_permille);
     }
-    // The critical path under concurrent requests: the slowest server timing.
-    let latency_ms = judgements.iter().filter_map(|j| j.latency_ms).max();
-    // Shadow only records agreement, so it must still compute the selection `on` would make.
-    if settings.mode == JudgeMode::On && any_uncertain(&scores, settings.escalate_below) {
-        return JudgeVerifyOutcome::EscalateUncertain {
-            run: JudgeRun {
-                scores,
-                judged,
-                elapsed_ms,
-                latency_ms,
-            },
-        };
-    }
     let selected = select_indices(&scores, settings.select_threshold);
     if selected.is_empty() {
         return JudgeVerifyOutcome::Escalate {
-            run: JudgeRun {
-                scores,
-                judged,
-                elapsed_ms,
-                latency_ms,
-            },
+            scores,
+            judged,
+            elapsed_ms,
         };
     }
     // Disk-verify the selection in selection order.
@@ -212,12 +170,9 @@ pub(crate) async fn judge_verify<M: MemoryBackend, J: CandidateJudge>(
     let verified = verified_candidate_findings(repo_root, &selected_refs).await;
     if verified.is_empty() {
         return JudgeVerifyOutcome::Escalate {
-            run: JudgeRun {
-                scores,
-                judged,
-                elapsed_ms,
-                latency_ms,
-            },
+            scores,
+            judged,
+            elapsed_ms,
         };
     }
     // Map each survivor back to its candidate index and attach the judge suffix.
@@ -242,13 +197,10 @@ pub(crate) async fn judge_verify<M: MemoryBackend, J: CandidateJudge>(
     }
     JudgeVerifyOutcome::Finished {
         result: ExplorationResult { findings, summary },
+        scores,
         selected: survivor_indices,
-        run: JudgeRun {
-            scores,
-            judged,
-            elapsed_ms,
-            latency_ms,
-        },
+        judged,
+        elapsed_ms,
     }
 }
 
@@ -290,7 +242,7 @@ mod tests {
 
     fn settings(threshold: u32) -> JudgeSettings {
         JudgeSettings {
-            mode: JudgeMode::On,
+            mode: JudgeMode::Laya,
             select_threshold: threshold,
             ..JudgeSettings::default()
         }
@@ -350,11 +302,9 @@ mod tests {
         let judge = MockJudge::new().with_responses(vec![Ok(vec![
             Judgement {
                 p_relevant_permille: 900,
-                latency_ms: None,
             },
             Judgement {
                 p_relevant_permille: 100,
-                latency_ms: None,
             },
         ])]);
         let out = judge_verify(
@@ -372,11 +322,13 @@ mod tests {
             JudgeVerifyOutcome::Finished {
                 result,
                 selected,
-                run,
+                judged,
+                scores,
+                ..
             } => {
-                assert_eq!(run.judged, 2);
+                assert_eq!(judged, 2);
                 assert_eq!(selected, vec![0]);
-                assert_eq!(run.scores, vec![Some(900), Some(100)]);
+                assert_eq!(scores, vec![Some(900), Some(100)]);
                 assert_eq!(result.findings.len(), 1);
                 assert!(
                     result.findings[0]
@@ -398,15 +350,12 @@ mod tests {
         let cands = vec![cand("a.rs", 1, 1)];
         let judge = MockJudge::new().with_responses(vec![Ok(vec![Judgement {
             p_relevant_permille: 100,
-            latency_ms: None,
         }])]);
         let out = judge_verify(&memory, &judge, &dir, &q("f"), None, &cands, &settings(50)).await;
         std::fs::remove_dir_all(&dir).ok();
         assert!(matches!(
             out,
-            JudgeVerifyOutcome::Escalate {
-                run: JudgeRun { judged: 1, .. }
-            }
+            JudgeVerifyOutcome::Escalate { judged: 1, .. }
         ));
     }
 
@@ -434,100 +383,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         assert!(matches!(
             out,
-            JudgeVerifyOutcome::Escalate {
-                run: JudgeRun { judged: 0, .. }
-            }
+            JudgeVerifyOutcome::Escalate { judged: 0, .. }
         ));
         assert!(
             judge.calls().is_empty(),
             "judge must not be called with no states"
         );
-    }
-
-    fn j(p: u32, latency_ms: Option<u64>) -> Judgement {
-        Judgement {
-            p_relevant_permille: p,
-            latency_ms,
-        }
-    }
-
-    #[test]
-    fn any_uncertain_uses_two_sided_confidence() {
-        // confidence = max(p, 1000 - p): 600 -> 600, 300 -> 700, 950 -> 950.
-        assert!(any_uncertain(&[Some(950), Some(600)], 800));
-        assert!(any_uncertain(&[Some(300)], 800));
-        assert!(!any_uncertain(&[Some(950), Some(30), None], 800));
-        assert!(!any_uncertain(&[Some(600)], 0), "0 = off");
-    }
-
-    #[tokio::test]
-    async fn uncertain_candidate_escalates_when_escalate_below_set() {
-        let dir = temp_repo_with("judge_verify", "uncertain", &[("a.rs", "l1\nl2\nl3\n")]);
-        let memory = MockMemoryBackend::new();
-        let cands = vec![cand("a.rs", 1, 1), cand("a.rs", 3, 3)];
-        let judge = MockJudge::new().with_responses(vec![Ok(vec![j(900, None), j(600, None)])]);
-        let s = JudgeSettings {
-            escalate_below: 800,
-            ..settings(50)
-        };
-        let out = judge_verify(&memory, &judge, &dir, &q("f"), None, &cands, &s).await;
-        std::fs::remove_dir_all(&dir).ok();
-        match out {
-            JudgeVerifyOutcome::EscalateUncertain { run } => {
-                assert_eq!(run.judged, 2);
-                assert_eq!(run.scores, vec![Some(900), Some(600)]);
-            }
-            other => panic!("expected EscalateUncertain, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn escalate_below_zero_never_escalates_uncertain() {
-        let dir = temp_repo_with("judge_verify", "uncertain_off", &[("a.rs", "l1\nl2\nl3\n")]);
-        let memory = MockMemoryBackend::new();
-        let cands = vec![cand("a.rs", 1, 1), cand("a.rs", 3, 3)];
-        let judge = MockJudge::new().with_responses(vec![Ok(vec![j(900, None), j(600, None)])]);
-        let out = judge_verify(&memory, &judge, &dir, &q("f"), None, &cands, &settings(50)).await;
-        std::fs::remove_dir_all(&dir).ok();
-        assert!(
-            matches!(out, JudgeVerifyOutcome::Finished { .. }),
-            "got {out:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn all_confident_candidates_select_normally() {
-        let dir = temp_repo_with("judge_verify", "confident", &[("a.rs", "l1\nl2\nl3\n")]);
-        let memory = MockMemoryBackend::new();
-        let cands = vec![cand("a.rs", 1, 1), cand("a.rs", 3, 3)];
-        let judge = MockJudge::new().with_responses(vec![Ok(vec![j(950, None), j(30, None)])]);
-        let s = JudgeSettings {
-            escalate_below: 800,
-            ..settings(50)
-        };
-        let out = judge_verify(&memory, &judge, &dir, &q("f"), None, &cands, &s).await;
-        std::fs::remove_dir_all(&dir).ok();
-        match out {
-            JudgeVerifyOutcome::Finished { selected, .. } => assert_eq!(selected, vec![0]),
-            other => panic!("expected Finished, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn latency_is_max_of_judgements() {
-        let dir = temp_repo_with("judge_verify", "latency", &[("a.rs", "l1\nl2\nl3\n")]);
-        let memory = MockMemoryBackend::new();
-        let cands = vec![cand("a.rs", 1, 1), cand("a.rs", 2, 2), cand("a.rs", 3, 3)];
-        let judge = MockJudge::new().with_responses(vec![Ok(vec![
-            j(900, Some(12)),
-            j(100, None),
-            j(100, Some(30)),
-        ])]);
-        let out = judge_verify(&memory, &judge, &dir, &q("f"), None, &cands, &settings(50)).await;
-        std::fs::remove_dir_all(&dir).ok();
-        match out {
-            JudgeVerifyOutcome::Finished { run, .. } => assert_eq!(run.latency_ms, Some(30)),
-            other => panic!("expected Finished, got {other:?}"),
-        }
     }
 }

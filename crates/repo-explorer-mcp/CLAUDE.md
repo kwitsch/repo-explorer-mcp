@@ -21,7 +21,6 @@ errors are consumed via `?`/`.context(...)`).
 - The wizard writes to the _resolved_ config path (the XDG default unless `--config`/`REPO_EXPLORER_CONFIG` overrides it).
 - It self-verifies the written file via `repo_explorer_core::config::load`.
 - The `[search]` section is left at core defaults because search is in-process (no external `rg` binary); `[agent]`, `[cache]`, and `[logging]` are likewise left at their (fully defaulted) core values. `main.rs::run` plumbs `config.agent`/`config.cache` into `AgentLoop::new` together with a `GitStateProbe` built from `config.search.timeout_seconds`.
-- The wizard asks for the Stage-4 judge mode (`1` off default / `2` shadow / `3` on, via `judge_mode_from_choice`) and, unless off, a judge base URL (default `http://127.0.0.1:8741`, validated with `config::is_valid_https_proxy_url`); every other `[judge]` key stays at its core default.
 - The judge is built by `ConfiguredJudge::from_settings`; startup never fails on an unreachable judge (warm-up is background, best-effort).
 
 ## Config path resolution

@@ -1,0 +1,52 @@
+# Judge LAYA eval config (docs/laya-judge.md, docs/eval/real-world-test-plan.md §3.2, §8.1).
+#
+# `default.toml` verbatim, plus `[judge] mode = "laya"`. Laya mode replaces the LLM Stage-4
+# verification with the local Laya judge: the judge's selection is what the query returns, and the
+# LLM is used only for the Stage-5 fallback loop (still configured below). Run judge-shadow FIRST
+# and read its agreement rate before trusting a laya run — laya changes the answers, shadow does
+# not.
+#
+# The judge is a local service: start `judge-serve` on 127.0.0.1:8765 before running (see
+# judge-serve/README.md and docs/laya-judge.md). A judge outage never fails a query — laya mode
+# falls back to the LLM verification when the judge is unavailable.
+#
+# api_key_env only NAMES the environment variable; the harness never reads or copies the key
+# itself, and this file is committed with that in mind.
+
+[llm]
+cooldown_seconds = 60
+
+[[llm.providers]]
+name = "gemini"
+kind = "gemini"
+api_key_env = "GOOGLE_API_KEY"
+models = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+]
+
+[codebase_memory]
+command = "codebase-memory-mcp"
+args = ["--stdio"]
+staleness_seconds = 3600
+
+[search]
+timeout_seconds = 30
+prefer_rtk = true
+
+[logging]
+level = "debug"
+
+[cache]
+# The on-disk L2 is OFF for the harness, same as default.toml — passes must stay independent
+# samples (see default.toml for the full rationale).
+persistent = false
+
+[judge]
+mode = "laya"
+base_url = "http://127.0.0.1:8765"
+select_threshold = 50
