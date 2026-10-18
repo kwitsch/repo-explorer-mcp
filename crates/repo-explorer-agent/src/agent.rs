@@ -620,8 +620,11 @@ where
         // model).
         if self.judge_settings.mode == JudgeMode::On {
             let field = format!(
-                "judge=on:{}:{}",
-                self.judge_settings.select_threshold, self.judge_settings.escalate_below
+                "judge=on:{}:{}:{}:{}",
+                self.judge_settings.select_threshold,
+                self.judge_settings.escalate_below,
+                self.judge_settings.model,
+                self.judge_settings.base_url
             );
             crate::cache::encode_field_into(&mut key, &field);
         }
@@ -942,9 +945,9 @@ where
                         }
                         JudgeVerifyOutcome::EscalateUncertain { judged, scores, .. } => {
                             tracing::info!("local judge not confident; degrading to LLM verify");
-                            // Name the uncertainty offline only when the LLM verify
-                            // below will not run to add its own evidence.
-                            escalate_uncertain = !self.router.has_providers();
+                            // The judge's cutoff is the cause whether or not LLM verify
+                            // runs next and then escalates too.
+                            escalate_uncertain = true;
                             if judged > 0 {
                                 escalate_scores = Some(scores);
                             }
@@ -1363,16 +1366,22 @@ where
                 elapsed_ms,
                 latency_ms,
             } => {
-                let label = if matches!(jv, JudgeVerifyOutcome::Escalate { .. }) {
-                    "escalated"
+                // `judged == 0`: escalated before the judge was ever called, so
+                // every judge field stays `None`.
+                if *judged == 0 {
+                    return None;
+                }
+                let (label, selected) = if matches!(jv, JudgeVerifyOutcome::Escalate { .. }) {
+                    ("escalated", Some(0))
                 } else {
-                    "escalated-uncertain"
+                    // Selection was not attempted, so there is no count to report.
+                    ("escalated-uncertain", None)
                 };
                 self.record_judge_metrics(
                     metrics,
                     label,
                     *judged,
-                    Some(0),
+                    selected,
                     scores,
                     *elapsed_ms,
                     *latency_ms,
@@ -2837,15 +2846,29 @@ mod tests {
                 .run_query_key(&dir, &q)
         };
         std::fs::remove_dir_all(&dir).ok();
+        let d = JudgeSettings::default();
         let mut plain_on50 = off.clone();
-        crate::cache::encode_field_into(&mut plain_on50, "judge=on:50:0");
+        crate::cache::encode_field_into(
+            &mut plain_on50,
+            &format!("judge=on:50:0:{}:{}", d.model, d.base_url),
+        );
         assert_eq!(on50, plain_on50, "escalate_below = 0 is spelled out as :0");
         let mut esc_on50 = off.clone();
-        crate::cache::encode_field_into(&mut esc_on50, "judge=on:50:720");
+        crate::cache::encode_field_into(
+            &mut esc_on50,
+            &format!("judge=on:50:720:{}:{}", d.model, d.base_url),
+        );
         assert_eq!(on50_esc720, esc_on50);
         assert_ne!(off, on50);
         assert_ne!(on50, on70);
         assert_ne!(on50, on50_esc720);
+        let other_model = key_with(JudgeSettings {
+            mode: JudgeMode::On,
+            select_threshold: 50,
+            model: "other/judge".to_string(),
+            ..JudgeSettings::default()
+        });
+        assert_ne!(on50, other_model, "the judge model must change the key");
         assert_ne!(
             off, off_fallback,
             "fallback = off must change the cache key"
@@ -2873,7 +2896,7 @@ mod tests {
         assert_eq!(got.stage_exit, StageExit::Verify);
         let m = taped_metrics().pop().unwrap();
         assert_eq!(m.judge_outcome, Some("escalated-uncertain"));
-        assert_eq!(m.judge_selected, Some(0));
+        assert_eq!(m.judge_selected, None);
         assert!(m.llm_calls >= 1, "the LLM verify path must run");
         assert_eq!(m.path, "verify");
     }

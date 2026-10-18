@@ -691,10 +691,11 @@ pub fn load(path: &Path) -> Result<(Config, Vec<String>), ConfigError> {
         let location = source.span().map(|span| line_col(&contents, span.start));
         ConfigError::Parse { source, location }
     })?;
-    config.validate()?;
+    // Before `validate`: an unrelated validation error must not hide the migration hint.
     if let Some(key) = removed_judge_key(&contents) {
         return Err(ValidationError::RemovedJudgeKey { key }.into());
     }
+    config.validate()?;
     let warnings = unknown_key_warnings(&contents);
     for warning in &warnings {
         tracing::warn!(warning = %warning, "unrecognized config key (ignored)");
@@ -829,13 +830,15 @@ pub fn unknown_key_warnings(raw: &str) -> Vec<String> {
 const REMOVED_JUDGE_KEYS: &[&str] = &["backend", "checkpoint_dir", "device"];
 
 /// First [`REMOVED_JUDGE_KEYS`] entry present under `[judge]`, if any.
+/// `backend = "http"` was the old default and names no candle setting, so it passes.
 fn removed_judge_key(contents: &str) -> Option<&'static str> {
     let root: toml::Table = toml::from_str(contents).ok()?;
     let judge = root.get("judge")?.as_table()?;
-    REMOVED_JUDGE_KEYS
-        .iter()
-        .copied()
-        .find(|key| judge.contains_key(*key))
+    REMOVED_JUDGE_KEYS.iter().copied().find(|key| {
+        judge
+            .get(*key)
+            .is_some_and(|v| !(*key == "backend" && v.as_str() == Some("http")))
+    })
 }
 
 /// Render a byte offset into `text` as a `line N, column M` string (1-based).
@@ -1691,6 +1694,11 @@ escalate_below = 720
             Some("checkpoint_dir")
         );
         assert_eq!(removed_judge_key("[judge]\nmode = \"on\"\n"), None);
+        assert_eq!(removed_judge_key("[judge]\nbackend = \"http\"\n"), None);
+        assert_eq!(
+            removed_judge_key("[judge]\nbackend = \"candle\"\n"),
+            Some("backend")
+        );
     }
 
     #[test]

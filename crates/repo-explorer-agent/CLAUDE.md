@@ -201,11 +201,10 @@ path.
 - **`shadow`** — both the LLM `verify` and `judge_verify` run concurrently
   (`futures_util::future::join`); the LLM's answer is always the one
   returned, and the judge's outcome is only recorded
-  (`QueryMetrics.judge_outcome`, `.shadow_agreement`). An uncertain judgement
-  classifies as `judge-escalated`/`both-escalated`. The judge's scores are
-  never passed on to Stage 5. `escalate_below` is not applied in shadow: the
-  judge always computes its selection, so the agreement metric compares like
-  with like.
+  (`QueryMetrics.judge_outcome`, `.shadow_agreement`). The judge's scores are
+  never passed on to Stage 5. `escalate_below` is not applied in shadow, so
+  shadow never yields `EscalateUncertain`: the judge always computes its
+  selection and the agreement metric compares like with like.
 
 `QueryMetrics` gains `judge_mode` (`off`/`on`/`shadow`) and `fallback_mode`
 (set on every exit path, including cache) and, only on paths where the judge
@@ -237,7 +236,7 @@ place enforces "never report a location that does not resolve on disk".
 
 ## Judge query-cache key
 
-`AgentLoop::run_query_key` appends `judge=on:<select_threshold>:<escalate_below>`
+`AgentLoop::run_query_key` appends `judge=on:<select_threshold>:<escalate_below>:<model>:<base_url>`
 when `judge.mode == "on"` (`escalate_below` is `0` when off), and `fallback=off`
 when `agent.fallback == "off"`. `off`- and `shadow`-mode keys are
 byte-identical to before this feature, so existing L1/L2 entries stay valid;
