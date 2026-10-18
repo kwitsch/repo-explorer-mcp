@@ -39,6 +39,7 @@ def parse_args():
     ap.add_argument("--micro-batch", type=int, default=8)
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    ap.add_argument("--checkpoint-minutes", type=float, default=10.0)
     return ap.parse_args()
 
 
