@@ -43,7 +43,7 @@ use crate::cache::{CappedMap, QueryEntry, ResultCache};
 use crate::disk_cache::{self, FileDep};
 use crate::dispatch::{canonical_repo_root, clamp_location, dispatch_inner, read_verified_file};
 use crate::judge_verify::{
-    JudgeVerifyOutcome, classify_agreement, judge_verify, llm_overlap_set, select_indices,
+    JudgeRun, JudgeVerifyOutcome, classify_agreement, judge_verify, llm_overlap_set, select_indices,
 };
 use crate::pipeline;
 use crate::render::{RenderCaps, dedupe_key, symbols_for, tidy_findings};
@@ -645,11 +645,7 @@ where
         let fingerprint = self.probe.fingerprint(repo_root).await;
         let mut metrics = QueryMetrics::new(repo_root, query, git_probe_start);
         // Set on every path, including the cache-hit early return below.
-        metrics.judge_mode = match self.judge_settings.mode {
-            JudgeMode::Off => "off",
-            JudgeMode::On => "on",
-            JudgeMode::Shadow => "shadow",
-        };
+        metrics.judge_mode = self.judge_settings.mode.as_str();
         metrics.fallback_mode = match self.settings.fallback {
             FallbackMode::Llm => "llm",
             FallbackMode::Off => "off",
@@ -930,7 +926,7 @@ where
                                 )
                                 .await);
                         }
-                        JudgeVerifyOutcome::Escalate { judged, scores, .. } => {
+                        JudgeVerifyOutcome::Escalate { run } => {
                             // `judged == 0` means judge_verify escalated before
                             // ever calling the judge (no candidate had a
                             // resolvable location) — `scores` is all-`None`
@@ -938,18 +934,18 @@ where
                             // `escalate_scores` at `None` rather than have
                             // offline_fallback report a threshold miss that
                             // never happened.
-                            if judged > 0 {
-                                escalate_scores = Some(scores);
+                            if run.judged > 0 {
+                                escalate_scores = Some(run.scores);
                             }
                             false
                         }
-                        JudgeVerifyOutcome::EscalateUncertain { judged, scores, .. } => {
+                        JudgeVerifyOutcome::EscalateUncertain { run } => {
                             tracing::info!("local judge not confident; degrading to LLM verify");
                             // The judge's cutoff is the cause whether or not LLM verify
                             // runs next and then escalates too.
                             escalate_uncertain = true;
-                            if judged > 0 {
-                                escalate_scores = Some(scores);
+                            if run.judged > 0 {
+                                escalate_scores = Some(run.scores);
                             }
                             true
                         }
@@ -1296,23 +1292,19 @@ where
     /// (`selected`, `escalated` or `escalated-uncertain`). `judge_max_p` is
     /// the max over the judged scores; the API key never enters any of these
     /// fields.
-    #[allow(clippy::too_many_arguments)]
     fn record_judge_metrics(
         &self,
         metrics: &mut QueryMetrics,
         outcome: &'static str,
-        judged: u32,
         selected: Option<u32>,
-        scores: &[Option<u32>],
-        elapsed_ms: u64,
-        latency_ms: Option<u64>,
+        run: &JudgeRun,
     ) {
         metrics.judge_outcome = Some(outcome);
-        metrics.judge_ms = Some(elapsed_ms);
-        metrics.judge_candidates = Some(judged);
+        metrics.judge_ms = Some(run.elapsed_ms);
+        metrics.judge_candidates = Some(run.judged);
         metrics.judge_selected = selected;
-        metrics.judge_max_p = scores.iter().flatten().copied().max();
-        metrics.judge_latency_ms = latency_ms;
+        metrics.judge_max_p = run.scores.iter().flatten().copied().max();
+        metrics.judge_latency_ms = run.latency_ms;
     }
 
     /// Record a judge failure: `judge_candidates`/`judge_selected`/
@@ -1335,40 +1327,15 @@ where
         jv: &JudgeVerifyOutcome,
     ) -> Option<Vec<usize>> {
         match jv {
-            JudgeVerifyOutcome::Finished {
-                selected,
-                judged,
-                scores,
-                elapsed_ms,
-                latency_ms,
-                ..
-            } => {
-                self.record_judge_metrics(
-                    metrics,
-                    "selected",
-                    *judged,
-                    Some(selected.len() as u32),
-                    scores,
-                    *elapsed_ms,
-                    *latency_ms,
-                );
+            JudgeVerifyOutcome::Finished { selected, run, .. } => {
+                self.record_judge_metrics(metrics, "selected", Some(selected.len() as u32), run);
                 Some(selected.clone())
             }
-            JudgeVerifyOutcome::Escalate {
-                judged,
-                scores,
-                elapsed_ms,
-                latency_ms,
-            }
-            | JudgeVerifyOutcome::EscalateUncertain {
-                judged,
-                scores,
-                elapsed_ms,
-                latency_ms,
-            } => {
+            JudgeVerifyOutcome::Escalate { run }
+            | JudgeVerifyOutcome::EscalateUncertain { run } => {
                 // `judged == 0`: escalated before the judge was ever called, so
                 // every judge field stays `None`.
-                if *judged == 0 {
+                if run.judged == 0 {
                     return None;
                 }
                 let (label, selected) = if matches!(jv, JudgeVerifyOutcome::Escalate { .. }) {
@@ -1377,15 +1344,7 @@ where
                     // Selection was not attempted, so there is no count to report.
                     ("escalated-uncertain", None)
                 };
-                self.record_judge_metrics(
-                    metrics,
-                    label,
-                    *judged,
-                    selected,
-                    scores,
-                    *elapsed_ms,
-                    *latency_ms,
-                );
+                self.record_judge_metrics(metrics, label, selected, run);
                 None
             }
             JudgeVerifyOutcome::Failed { elapsed_ms, .. } => {

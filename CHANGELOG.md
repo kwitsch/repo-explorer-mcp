@@ -8,14 +8,14 @@ collects what is on `main` but not yet tagged.
 ### Changed
 
 - **Breaking: `judge.mode = "laya"` is now `judge.mode = "on"`.** The old
-  spelling still loads as an alias for one release and logs a deprecation
-  warning; the `judge_mode` metric reports `"on"`. Cache entries written
+  spelling is rejected at config parse time; the `judge_mode` metric reports
+  `"on"`. Cache entries written
   under the old judge key are invalidated once.
 - **Breaking: new judge defaults.** `judge.base_url` defaults to
   `http://127.0.0.1:8741` and `judge.model` to `h2oai/h2o-lightning-4b`;
   configs that relied on the old defaults must set both explicitly. The
-  removed keys `backend`, `checkpoint_dir` and `device` are ignored with a
-  warning.
+  removed keys `checkpoint_dir`, `device` and `backend = "candle"` make the
+  config fail to load (`backend = "http"` is still accepted).
 
 ### Removed
 

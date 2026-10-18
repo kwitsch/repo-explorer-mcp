@@ -75,7 +75,7 @@ escalate_below = 0
 See `docs/configuration.md` for the full `[judge]` key reference
 (`mode`, `base_url`, `api_key_env`, `model`, `timeout_ms`, `max_concurrency`,
 `select_threshold`, `escalate_below`) and `agent.fallback`. The removed keys
-`backend`, `checkpoint_dir` and `device` are ignored with a WARN.
+`checkpoint_dir`, `device` and `backend = "candle"` fail config loading.
 
 ### Confidence cascade (`escalate_below`)
 
@@ -138,9 +138,9 @@ counted as `on`.
   server rejects (e.g. too long) or a wrong `model` name; check the server log.
 - **Judge down at startup.** Warm-up is background and best-effort: a WARN
   ("local judge not ready"), never a blocked startup.
-- **WARNs about `judge.backend` / `judge.checkpoint_dir` / `judge.device`.**
+- **Config fails on `judge.checkpoint_dir` / `judge.device` / `judge.backend = "candle"`.**
   These keys were removed with the in-process backend; delete them.
-- **WARN about `judge.mode = "laya"`.** Replace it with `"on"`.
+- **Parse error on `judge.mode = "laya"`.** Replace it with `"on"`.
 - **Threshold tuning.** `judge.select_threshold` is an integer percent
   (`1..=99`, default 50); a candidate is selected at
   `score >= select_threshold * 10` permille. Too high pushes queries to

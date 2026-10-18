@@ -153,7 +153,7 @@ Full mode matrix, rollout procedure and troubleshooting: `docs/judge.md`.
 
 These keys are only validated when `judge.mode != "off"` (`InvalidJudgeBaseUrl`,
 `InvalidJudgeSetting`, `MissingJudgeEnvVar`). The removed keys
-`judge.backend`, `judge.checkpoint_dir` and `judge.device` make the config fail to load
+`judge.checkpoint_dir`, `judge.device` and `judge.backend = "candle"` make the config fail to load
 (`RemovedJudgeKey`), and `judge.mode = "laya"` is rejected at parse time.
 `[llm]` stays required for every combination except `judge.mode = "on"` with
 `agent.fallback = "off"`, which is the only fully LLM-free configuration —

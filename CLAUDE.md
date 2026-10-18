@@ -13,7 +13,7 @@ Rust MCP server, shipped for Linux and Windows. Exposes the `explore_repository`
 - `crates/repo-explorer-judge/` — local candidate judge client (`SystemOneHttpJudge`) over the model-neutral HTTP `/v1/systemone` protocol; owns the judge wire format. Details in `crates/repo-explorer-judge/CLAUDE.md`.
 - `crates/repo-explorer-datagen/` — dev-only training-data generator for the Stage-10 local judge; a library + thin binary, `publish = false`, never built by `release.yml`. Details in `crates/repo-explorer-datagen/CLAUDE.md`.
 - `train/laya/` — Python fine-tune tooling for the Stage-10 Laya judge (dev-only; pinned `laya==0.3.7`; CI runs only the numpy-only tests). See `docs/laya-judge-training.md`.
-- `judge-serve/` — Python launcher serving a local Laya checkpoint through upstream `laya-serve`. See `docs/judge.md`.
+- `judge-serve/` — Legacy Python launcher serving a local Laya checkpoint through upstream `laya-serve` (port 8765, model `typed-decisions`; needs explicit `[judge]` `base_url`/`model`, and its missing `/v1/models` only logs a startup WARN). See `docs/judge.md`.
 - `.claude/rules/` — path-scoped rules Claude Code loads automatically when editing matching files.
 
 ## Build & test

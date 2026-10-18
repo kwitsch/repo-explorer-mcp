@@ -19,29 +19,30 @@ use std::time::Instant;
 use crate::agent::verified_candidate_findings;
 use crate::judge_input::render_judge_states;
 
+/// What a judge call that reached the server produced; shared by every
+/// non-`Failed` outcome.
+#[derive(Debug)]
+pub(crate) struct JudgeRun {
+    pub scores: Vec<Option<u32>>,
+    pub judged: u32,
+    pub elapsed_ms: u64,
+    pub latency_ms: Option<u64>,
+}
+
 #[derive(Debug)]
 pub(crate) enum JudgeVerifyOutcome {
     Finished {
         result: ExplorationResult,
-        scores: Vec<Option<u32>>,
         selected: Vec<usize>,
-        judged: u32,
-        elapsed_ms: u64,
-        latency_ms: Option<u64>,
+        run: JudgeRun,
     },
     Escalate {
-        scores: Vec<Option<u32>>,
-        judged: u32,
-        elapsed_ms: u64,
-        latency_ms: Option<u64>,
+        run: JudgeRun,
     },
     /// At least one judged candidate's confidence `max(p, 1000 - p)` is below
     /// `judge.escalate_below`; selection was not attempted.
     EscalateUncertain {
-        scores: Vec<Option<u32>>,
-        judged: u32,
-        elapsed_ms: u64,
-        latency_ms: Option<u64>,
+        run: JudgeRun,
     },
     Failed {
         error: JudgeError,
@@ -147,10 +148,12 @@ pub(crate) async fn judge_verify<M: MemoryBackend, J: CandidateJudge>(
     if idx_states.is_empty() {
         // No judge call was made at all, so there is no latency to report.
         return JudgeVerifyOutcome::Escalate {
-            scores,
-            judged: 0,
-            elapsed_ms: 0,
-            latency_ms: None,
+            run: JudgeRun {
+                scores,
+                judged: 0,
+                elapsed_ms: 0,
+                latency_ms: None,
+            },
         };
     }
     let judged = state_texts.len() as u32;
@@ -185,19 +188,23 @@ pub(crate) async fn judge_verify<M: MemoryBackend, J: CandidateJudge>(
     // Shadow only records agreement, so it must still compute the selection `on` would make.
     if settings.mode == JudgeMode::On && any_uncertain(&scores, settings.escalate_below) {
         return JudgeVerifyOutcome::EscalateUncertain {
-            scores,
-            judged,
-            elapsed_ms,
-            latency_ms,
+            run: JudgeRun {
+                scores,
+                judged,
+                elapsed_ms,
+                latency_ms,
+            },
         };
     }
     let selected = select_indices(&scores, settings.select_threshold);
     if selected.is_empty() {
         return JudgeVerifyOutcome::Escalate {
-            scores,
-            judged,
-            elapsed_ms,
-            latency_ms,
+            run: JudgeRun {
+                scores,
+                judged,
+                elapsed_ms,
+                latency_ms,
+            },
         };
     }
     // Disk-verify the selection in selection order.
@@ -205,10 +212,12 @@ pub(crate) async fn judge_verify<M: MemoryBackend, J: CandidateJudge>(
     let verified = verified_candidate_findings(repo_root, &selected_refs).await;
     if verified.is_empty() {
         return JudgeVerifyOutcome::Escalate {
-            scores,
-            judged,
-            elapsed_ms,
-            latency_ms,
+            run: JudgeRun {
+                scores,
+                judged,
+                elapsed_ms,
+                latency_ms,
+            },
         };
     }
     // Map each survivor back to its candidate index and attach the judge suffix.
@@ -233,11 +242,13 @@ pub(crate) async fn judge_verify<M: MemoryBackend, J: CandidateJudge>(
     }
     JudgeVerifyOutcome::Finished {
         result: ExplorationResult { findings, summary },
-        scores,
         selected: survivor_indices,
-        judged,
-        elapsed_ms,
-        latency_ms,
+        run: JudgeRun {
+            scores,
+            judged,
+            elapsed_ms,
+            latency_ms,
+        },
     }
 }
 
@@ -361,13 +372,11 @@ mod tests {
             JudgeVerifyOutcome::Finished {
                 result,
                 selected,
-                judged,
-                scores,
-                ..
+                run,
             } => {
-                assert_eq!(judged, 2);
+                assert_eq!(run.judged, 2);
                 assert_eq!(selected, vec![0]);
-                assert_eq!(scores, vec![Some(900), Some(100)]);
+                assert_eq!(run.scores, vec![Some(900), Some(100)]);
                 assert_eq!(result.findings.len(), 1);
                 assert!(
                     result.findings[0]
@@ -395,7 +404,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         assert!(matches!(
             out,
-            JudgeVerifyOutcome::Escalate { judged: 1, .. }
+            JudgeVerifyOutcome::Escalate {
+                run: JudgeRun { judged: 1, .. }
+            }
         ));
     }
 
@@ -423,7 +434,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         assert!(matches!(
             out,
-            JudgeVerifyOutcome::Escalate { judged: 0, .. }
+            JudgeVerifyOutcome::Escalate {
+                run: JudgeRun { judged: 0, .. }
+            }
         ));
         assert!(
             judge.calls().is_empty(),
@@ -460,9 +473,9 @@ mod tests {
         let out = judge_verify(&memory, &judge, &dir, &q("f"), None, &cands, &s).await;
         std::fs::remove_dir_all(&dir).ok();
         match out {
-            JudgeVerifyOutcome::EscalateUncertain { judged, scores, .. } => {
-                assert_eq!(judged, 2);
-                assert_eq!(scores, vec![Some(900), Some(600)]);
+            JudgeVerifyOutcome::EscalateUncertain { run } => {
+                assert_eq!(run.judged, 2);
+                assert_eq!(run.scores, vec![Some(900), Some(600)]);
             }
             other => panic!("expected EscalateUncertain, got {other:?}"),
         }
@@ -513,7 +526,7 @@ mod tests {
         let out = judge_verify(&memory, &judge, &dir, &q("f"), None, &cands, &settings(50)).await;
         std::fs::remove_dir_all(&dir).ok();
         match out {
-            JudgeVerifyOutcome::Finished { latency_ms, .. } => assert_eq!(latency_ms, Some(30)),
+            JudgeVerifyOutcome::Finished { run, .. } => assert_eq!(run.latency_ms, Some(30)),
             other => panic!("expected Finished, got {other:?}"),
         }
     }

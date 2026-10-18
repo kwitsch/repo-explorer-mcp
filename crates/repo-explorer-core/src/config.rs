@@ -273,6 +273,17 @@ pub enum JudgeMode {
     Shadow,
 }
 
+impl JudgeMode {
+    /// The config / metrics spelling, matching the serde `lowercase` rename.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JudgeMode::Off => "off",
+            JudgeMode::On => "on",
+            JudgeMode::Shadow => "shadow",
+        }
+    }
+}
+
 /// Stage-5 strategy. `llm` runs the explorative fallback loop (today's
 /// behaviour); `off` synthesizes disk-verified unverified candidates with no
 /// LLM, enabling a fully LLM-free configuration.
