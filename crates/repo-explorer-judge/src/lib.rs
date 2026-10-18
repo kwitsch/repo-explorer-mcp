@@ -116,20 +116,16 @@ impl SystemOneHttpJudge {
                 message: format!("judge rejected the bearer token (HTTP {})", status.as_u16()),
             });
         }
-        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-            // Model still loading or overloaded: a readiness problem, not a
-            // protocol violation.
-            let text = resp.text().await.unwrap_or_default();
-            let head: String = text.chars().take(200).collect();
-            return Err(JudgeError::Unavailable {
-                message: format!("HTTP 503: {head}"),
-            });
-        }
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             let head: String = text.chars().take(200).collect();
-            return Err(JudgeError::Protocol {
-                message: format!("HTTP {}: {head}", status.as_u16()),
+            let message = format!("HTTP {}: {head}", status.as_u16());
+            // 503 means the model is still loading or overloaded: a readiness
+            // problem, not a protocol violation.
+            return Err(if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                JudgeError::Unavailable { message }
+            } else {
+                JudgeError::Protocol { message }
             });
         }
         let text = resp.text().await.map_err(|e| JudgeError::Protocol {
