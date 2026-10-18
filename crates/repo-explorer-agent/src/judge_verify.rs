@@ -302,9 +302,11 @@ mod tests {
         let judge = MockJudge::new().with_responses(vec![Ok(vec![
             Judgement {
                 p_relevant_permille: 900,
+                latency_ms: None,
             },
             Judgement {
                 p_relevant_permille: 100,
+                latency_ms: None,
             },
         ])]);
         let out = judge_verify(
@@ -350,6 +352,7 @@ mod tests {
         let cands = vec![cand("a.rs", 1, 1)];
         let judge = MockJudge::new().with_responses(vec![Ok(vec![Judgement {
             p_relevant_permille: 100,
+            latency_ms: None,
         }])]);
         let out = judge_verify(&memory, &judge, &dir, &q("f"), None, &cands, &settings(50)).await;
         std::fs::remove_dir_all(&dir).ok();

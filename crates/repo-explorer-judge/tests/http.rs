@@ -1,6 +1,6 @@
 use repo_explorer_core::config::{JudgeMode, JudgeSettings};
 use repo_explorer_core::judge::{CandidateJudge, JudgeError};
-use repo_explorer_judge::{ConfiguredJudge, LayaHttpJudge};
+use repo_explorer_judge::{ConfiguredJudge, SystemOneHttpJudge};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -68,7 +68,7 @@ fn settings(base_url: String) -> JudgeSettings {
         mode: JudgeMode::On,
         base_url,
         api_key_env: None,
-        model: "typed-decisions".to_string(),
+        model: "h2oai/h2o-lightning-4b".to_string(),
         timeout_ms: 2000,
         max_concurrency: 2,
         select_threshold: 50,
@@ -116,7 +116,7 @@ async fn success_three_states_in_order_out_of_order_replies() {
         (Some(delay), ok_json(p))
     })
     .await;
-    let judge = LayaHttpJudge::new(&settings(base)).unwrap();
+    let judge = SystemOneHttpJudge::new(&settings(base)).unwrap();
     let out = judge
         .judge(&["s0".into(), "s1".into(), "s2".into()])
         .await
@@ -136,11 +136,11 @@ async fn request_body_is_the_pinned_json_with_model() {
         (None, ok_json(0.9))
     })
     .await;
-    let judge = LayaHttpJudge::new(&settings(base)).unwrap();
+    let judge = SystemOneHttpJudge::new(&settings(base)).unwrap();
     judge.judge(&["the-state".into()]).await.unwrap();
     let body = rx.recv_timeout(Duration::from_secs(2)).unwrap();
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(v["model"], "typed-decisions");
+    assert_eq!(v["model"], "h2oai/h2o-lightning-4b");
     assert_eq!(v["state"], "the-state");
     assert_eq!(v["questions"]["relevant"]["type"], "choice");
     assert_eq!(
@@ -159,22 +159,14 @@ async fn request_body_is_the_pinned_json_with_model() {
 
 #[tokio::test]
 async fn bearer_header_present_only_when_key_set() {
-    // With key.
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let tx = std::sync::Mutex::new(tx);
-    let base = spawn_server(move |_n, _body| {
-        // head is not captured here; re-read in a header-aware variant.
-        (None, ok_json(0.9))
-    })
-    .await;
-    let _ = (&tx, &rx); // header assertion covered by the header-capturing server below.
-    let mut s = settings(base.clone());
+    let base = spawn_server(|_n, _body| (None, ok_json(0.9))).await;
+    let mut s = settings(base);
     s.api_key_env = Some("REX_JUDGE_TEST_KEY".to_string());
-    // Set-but-blank / unset accessor → Unavailable at build time.
-    let unset = LayaHttpJudge::new_with_env(&s, |_| None);
+    // Unset accessor → Unavailable at build time.
+    let unset = SystemOneHttpJudge::new_with_env(&s, |_| None);
     assert!(matches!(unset, Err(JudgeError::Unavailable { .. })));
     // A present key builds successfully (accessor injected; process env untouched).
-    let ok = LayaHttpJudge::new_with_env(&s, |v| {
+    let ok = SystemOneHttpJudge::new_with_env(&s, |v| {
         (v == "REX_JUDGE_TEST_KEY").then(|| "secret".to_string())
     });
     assert!(ok.is_ok());
@@ -183,7 +175,7 @@ async fn bearer_header_present_only_when_key_set() {
 #[tokio::test]
 async fn http_401_is_unavailable() {
     let base = spawn_server(|_n, _b| (None, http_response(401, "Unauthorized", "no"))).await;
-    let judge = LayaHttpJudge::new(&settings(base)).unwrap();
+    let judge = SystemOneHttpJudge::new(&settings(base)).unwrap();
     assert!(matches!(
         judge.judge(&["s".into()]).await,
         Err(JudgeError::Unavailable { .. })
@@ -191,9 +183,43 @@ async fn http_401_is_unavailable() {
 }
 
 #[tokio::test]
+async fn http_503_is_unavailable() {
+    let base = spawn_server(|_n, _b| {
+        (
+            None,
+            http_response(503, "Service Unavailable", "model loading"),
+        )
+    })
+    .await;
+    let judge = SystemOneHttpJudge::new(&settings(base)).unwrap();
+    match judge.judge(&["s".into()]).await {
+        Err(JudgeError::Unavailable { message }) => {
+            assert!(message.contains("HTTP 503: model loading"), "{message}")
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn http_422_is_protocol() {
+    let base = spawn_server(|_n, _b| {
+        (
+            None,
+            http_response(422, "Unprocessable Entity", "state too long"),
+        )
+    })
+    .await;
+    let judge = SystemOneHttpJudge::new(&settings(base)).unwrap();
+    match judge.judge(&["s".into()]).await {
+        Err(JudgeError::Protocol { message }) => assert!(message.contains("HTTP 422"), "{message}"),
+        other => panic!("expected Protocol, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn http_500_is_protocol() {
     let base = spawn_server(|_n, _b| (None, http_response(500, "Server Error", "boom"))).await;
-    let judge = LayaHttpJudge::new(&settings(base)).unwrap();
+    let judge = SystemOneHttpJudge::new(&settings(base)).unwrap();
     match judge.judge(&["s".into()]).await {
         Err(JudgeError::Protocol { message }) => assert!(message.contains("HTTP 500")),
         other => panic!("expected Protocol, got {other:?}"),
@@ -201,9 +227,33 @@ async fn http_500_is_protocol() {
 }
 
 #[tokio::test]
+async fn latency_ms_is_parsed_when_present() {
+    let base = spawn_server(|_n, _b| {
+        (
+            None,
+            http_response(
+                200,
+                "OK",
+                r#"{"answers":{"relevant":{"probabilities":{"A":0.9,"B":0.1}}},"usage":{"latency_ms":12.6}}"#,
+            ),
+        )
+    })
+    .await;
+    let judge = SystemOneHttpJudge::new(&settings(base)).unwrap();
+    let out = judge.judge(&["s".into()]).await.unwrap();
+    assert_eq!(out[0].p_relevant_permille, 900);
+    assert_eq!(out[0].latency_ms, Some(13));
+    // No `usage` block -> None, never an error.
+    let plain = spawn_server(|_n, _b| (None, ok_json(0.9))).await;
+    let judge = SystemOneHttpJudge::new(&settings(plain)).unwrap();
+    let out = judge.judge(&["s".into()]).await.unwrap();
+    assert_eq!(out[0].latency_ms, None);
+}
+
+#[tokio::test]
 async fn non_json_body_is_protocol() {
     let base = spawn_server(|_n, _b| (None, http_response(200, "OK", "not json"))).await;
-    let judge = LayaHttpJudge::new(&settings(base)).unwrap();
+    let judge = SystemOneHttpJudge::new(&settings(base)).unwrap();
     assert!(matches!(
         judge.judge(&["s".into()]).await,
         Err(JudgeError::Protocol { .. })
@@ -223,7 +273,7 @@ async fn missing_probability_is_protocol() {
         )
     })
     .await;
-    let judge = LayaHttpJudge::new(&settings(base)).unwrap();
+    let judge = SystemOneHttpJudge::new(&settings(base)).unwrap();
     assert!(matches!(
         judge.judge(&["s".into()]).await,
         Err(JudgeError::Protocol { .. })
@@ -233,7 +283,7 @@ async fn missing_probability_is_protocol() {
 #[tokio::test]
 async fn out_of_range_probability_is_protocol() {
     let base = spawn_server(|_n, _b| (None, ok_json(1.2))).await;
-    let judge = LayaHttpJudge::new(&settings(base)).unwrap();
+    let judge = SystemOneHttpJudge::new(&settings(base)).unwrap();
     assert!(matches!(
         judge.judge(&["s".into()]).await,
         Err(JudgeError::Protocol { .. })
@@ -245,7 +295,7 @@ async fn timeout_elapses() {
     let base = spawn_server(|_n, _b| (Some(Duration::from_millis(600)), ok_json(0.9))).await;
     let mut s = settings(base);
     s.timeout_ms = 200;
-    let judge = LayaHttpJudge::new(&s).unwrap();
+    let judge = SystemOneHttpJudge::new(&s).unwrap();
     assert_eq!(
         judge.judge(&["s".into()]).await,
         Err(JudgeError::Timeout { timeout_ms: 200 })
@@ -255,25 +305,48 @@ async fn timeout_elapses() {
 #[tokio::test]
 async fn empty_states_is_ok_without_request() {
     // Point at a closed port: no connection must be attempted.
-    let judge = LayaHttpJudge::new(&settings("http://127.0.0.1:9".to_string())).unwrap();
+    let judge = SystemOneHttpJudge::new(&settings("http://127.0.0.1:9".to_string())).unwrap();
     assert_eq!(judge.judge(&[]).await.unwrap(), vec![]);
 }
 
 #[tokio::test]
-async fn warm_up_health() {
-    let base = spawn_server(|_n, _b| (None, http_response(200, "OK", "ok"))).await;
-    let judge = LayaHttpJudge::new(&settings(base)).unwrap();
+async fn warm_up_probes_models_and_one_state() {
+    // Connection 0 is the body-less `GET /v1/models`, connection 1 the JSON
+    // probe POST; record (connection, body empty?) for each.
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, bool)>();
+    let tx = std::sync::Mutex::new(tx);
+    let base = spawn_server(move |n, body| {
+        tx.lock().unwrap().send((n, body.is_empty())).ok();
+        let resp = if n == 0 {
+            http_response(200, "OK", r#"{"data":[]}"#)
+        } else {
+            ok_json(0.9)
+        };
+        (None, resp)
+    })
+    .await;
+    let judge = SystemOneHttpJudge::new(&settings(base)).unwrap();
     assert!(judge.warm_up().await.is_ok());
-    let closed = LayaHttpJudge::new(&settings("http://127.0.0.1:9".to_string())).unwrap();
-    assert!(matches!(
-        closed.warm_up().await,
-        Err(JudgeError::Unavailable { .. })
-    ));
+    let got: Vec<(usize, bool)> = (0..2)
+        .map(|_| rx.recv_timeout(Duration::from_secs(2)).unwrap())
+        .collect();
+    assert_eq!(got, vec![(0, true), (1, false)]);
+}
+
+#[tokio::test]
+async fn warm_up_unavailable_on_closed_port() {
+    let closed = SystemOneHttpJudge::new(&settings("http://127.0.0.1:9".to_string())).unwrap();
+    match closed.warm_up().await {
+        Err(JudgeError::Unavailable { message }) => {
+            assert!(message.contains("models probe failed"), "{message}")
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
 }
 
 #[tokio::test]
 async fn configured_judge_off_is_disabled() {
-    let mut s = settings("http://127.0.0.1:8765".to_string());
+    let mut s = settings("http://127.0.0.1:9".to_string());
     s.mode = JudgeMode::Off;
     let j = ConfiguredJudge::from_settings(&s).unwrap();
     assert!(matches!(j, ConfiguredJudge::Disabled(_)));
@@ -281,4 +354,14 @@ async fn configured_judge_off_is_disabled() {
         j.judge(&["s".into()]).await,
         Err(JudgeError::Unavailable { .. })
     ));
+}
+
+#[tokio::test]
+async fn configured_judge_on_and_shadow_are_http() {
+    for mode in [JudgeMode::On, JudgeMode::Shadow] {
+        let mut s = settings("http://127.0.0.1:9".to_string());
+        s.mode = mode;
+        let j = ConfiguredJudge::from_settings(&s).unwrap();
+        assert!(matches!(j, ConfiguredJudge::Http(_)));
+    }
 }

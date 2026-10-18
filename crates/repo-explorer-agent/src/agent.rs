@@ -2536,18 +2536,23 @@ mod tests {
         let judge = MockJudge::new().with_responses(vec![Ok(vec![
             Judgement {
                 p_relevant_permille: 800,
+                latency_ms: None,
             },
             Judgement {
                 p_relevant_permille: 100,
+                latency_ms: None,
             },
             Judgement {
                 p_relevant_permille: 900,
+                latency_ms: None,
             },
             Judgement {
                 p_relevant_permille: 100,
+                latency_ms: None,
             },
             Judgement {
                 p_relevant_permille: 100,
+                latency_ms: None,
             },
         ])]);
         let settings = JudgeSettings {
@@ -2596,6 +2601,7 @@ mod tests {
             loop_reaching_stage4_with("judge_escalate_llm", &[("src/a.rs", 1, 1)], "l1\n");
         let judge = MockJudge::new().with_responses(vec![Ok(vec![Judgement {
             p_relevant_permille: 100,
+            latency_ms: None,
         }])]);
         let settings = JudgeSettings {
             mode: JudgeMode::On,
@@ -2624,9 +2630,11 @@ mod tests {
         let judge = MockJudge::new().with_responses(vec![Ok(vec![
             Judgement {
                 p_relevant_permille: 100,
+                latency_ms: None,
             },
             Judgement {
                 p_relevant_permille: 310,
+                latency_ms: None,
             },
         ])]);
         let settings = JudgeSettings {
@@ -2710,6 +2718,7 @@ mod tests {
         // location (src/lib.rs), so the agreement is "disjoint".
         let judge = MockJudge::new().with_responses(vec![Ok(vec![Judgement {
             p_relevant_permille: 900,
+            latency_ms: None,
         }])]);
         let settings = JudgeSettings {
             mode: JudgeMode::Shadow,
