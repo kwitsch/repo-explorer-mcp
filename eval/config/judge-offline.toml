@@ -1,14 +1,16 @@
-# Judge OFFLINE (LLM-free) eval config (docs/laya-judge.md, docs/eval/real-world-test-plan.md
+# Judge OFFLINE (LLM-free) eval config (docs/judge.md, docs/eval/real-world-test-plan.md
 # §3.2, §8.1).
 #
-# `default.toml` with the entire `[llm]` section REMOVED, plus `[judge] mode = "laya"` and
-# `[agent] fallback = "off"`. This is the fully LLM-free configuration: Stage 4 is the local Laya
-# judge and Stage 5 synthesizes from disk-verified candidates instead of running the LLM fallback
-# loop. No provider key is read or needed, so this run makes no external LLM calls at all.
+# `default.toml` with the entire `[llm]` section REMOVED (and the inert `[search] prefer_rtk` key
+# dropped), plus `[judge] mode = "on"` and `[agent] fallback = "off"`. This is the fully LLM-free
+# configuration: Stage 4 is the local judge and Stage 5 synthesizes from disk-verified candidates
+# instead of running the LLM fallback loop. No provider key is read or needed, so this run makes
+# no external LLM calls at all.
 #
-# The judge is a local service: start `judge-serve` on 127.0.0.1:8765 before running (see
-# judge-serve/README.md and docs/laya-judge.md). With no LLM configured there is no verification
-# fallback, so a judge outage yields the offline Stage-5 synthesis for every query.
+# The judge is a local service: start an H2O shim / any `/v1/systemone` server on 127.0.0.1:8741
+# before running (see docs/judge.md). `model` is not set, so the default applies. With no LLM
+# configured there is no verification fallback, so a judge outage yields the offline Stage-5
+# synthesis for every query.
 
 [codebase_memory]
 command = "codebase-memory-mcp"
@@ -17,7 +19,6 @@ staleness_seconds = 3600
 
 [search]
 timeout_seconds = 30
-prefer_rtk = true
 
 [logging]
 level = "debug"
@@ -28,8 +29,8 @@ level = "debug"
 persistent = false
 
 [judge]
-mode = "laya"
-base_url = "http://127.0.0.1:8765"
+mode = "on"
+base_url = "http://127.0.0.1:8741"
 select_threshold = 50
 
 [agent]
