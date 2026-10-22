@@ -90,11 +90,14 @@ and `train_ddp.py` in cells on `GPU T4 x2`:
 !torchrun --standalone --nproc_per_node=2 train_ddp.py convaiinnovations/laya /kaggle/working/train.pt /kaggle/working/ckpt --epochs 4
 ```
 
-Lower `--micro-batch` (default 2) if training OOMs at 1024 tokens.
+Lower `--micro-batch` (default 2) if training OOMs at 1024 tokens. fp32 AdamW on the
+421M-parameter encoder needs ~6.3 GiB on its own; a 4 GiB card only runs through the WSL2
+sysmem fallback, and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` buys back the
+fragmentation headroom there.
 
 ### Resuming an interrupted run
 
-Rank 0 writes `OUTPUT_DIR/resume_state.pt` every `--checkpoint-minutes` (default 10)
+Rank 0 writes `OUTPUT_DIR/resume_state.pt` every `--checkpoint-minutes` (default 60)
 at an optimizer-step boundary. Rerun the identical command to continue from it;
 the file is deleted when the final model is written. A resume with a different GPU
 count, `--micro-batch`, `--epochs`, `--device` or item count is refused.
