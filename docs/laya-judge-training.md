@@ -97,7 +97,7 @@ fragmentation headroom there.
 
 ### Resuming an interrupted run
 
-Rank 0 writes `OUTPUT_DIR/resume_state.pt` every `--checkpoint-minutes` (default 10)
+Rank 0 writes `OUTPUT_DIR/resume_state.pt` every `--checkpoint-minutes` (default 60)
 at an optimizer-step boundary. Rerun the identical command to continue from it;
 the file is deleted when the final model is written. A resume with a different GPU
 count, `--micro-batch`, `--epochs`, `--device` or item count is refused.

@@ -970,7 +970,7 @@ Every script uses `argparse`, prints a JSON summary to stdout, and imports
   - Drop and count rows whose `len(markers) != 2`.
   - Save with `torch.save(items, FILE)` and print
     `{"items": n, "dropped": m}`.
-- **`train_ddp.py BASE_MODEL ITEMS_PT OUTPUT_DIR [--epochs 4] [--micro-batch 2] [--max-steps N] [--device cuda|cpu] [--checkpoint-minutes 10]`**
+- **`train_ddp.py BASE_MODEL ITEMS_PT OUTPUT_DIR [--epochs 4] [--micro-batch 2] [--max-steps N] [--device cuda|cpu] [--checkpoint-minutes 60]`**
   - Derived from the `%%writefile /kaggle/working/train_ddp.py` cell of
     `notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb` at laya tag
     `v0.3.7`. Keep an attribution header: `# Derived from NandhaKishorM/laya
