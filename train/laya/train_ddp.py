@@ -12,6 +12,7 @@
 #   * every printed line is prefixed with a dd.MM.yyyy HH:mm:ss timestamp;
 #   * --max-steps stops early after N optimizer steps;
 #   * --checkpoint-minutes writes OUTPUT_DIR/resume_state.pt (optimizer/scheduler/scaler state + position); rerunning the same command resumes from it;
+#   * AdamW foreach=False and the raw weights dict is dropped after loading (4 GiB-GPU memory peak);
 #   * DDP find_unused_parameters=False (every parameter receives a gradient; the notebook flag only cost a graph traversal);
 #   * temperature fitting and its calibration hold-out slice are removed
 #     (calibrate.py owns calibration); saved temperature = [1.0, 1.0, 1.0],
@@ -48,7 +49,7 @@ def parse_args():
     ap.add_argument("--micro-batch", type=int, default=2)
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
-    ap.add_argument("--checkpoint-minutes", type=float, default=10.0)
+    ap.add_argument("--checkpoint-minutes", type=float, default=60.0)
     return ap.parse_args()
 
 
@@ -125,6 +126,7 @@ def main():
 
     weights = load_file(os.path.join(model_dir, "model.safetensors"))
     model.load_state_dict(weights, strict=True)
+    del weights  # 1.6 GiB of host RAM; the WSL sysmem-fallback pool and the resume save need it
 
     model.encoder.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.head_checkpointing = True
@@ -157,7 +159,7 @@ def main():
     optimizer = torch.optim.AdamW([
         {"params": enc_params, "lr": LR_ENCODER},
         {"params": head_params, "lr": LR_HEAD}
-    ], weight_decay=0.01)
+    ], weight_decay=0.01, foreach=False)  # the foreach path clones exp_avg_sq per step (+1.6 GiB peak)
 
     total_updates = (len(my_items) // (MICRO_BATCH * GRAD_ACCUM)) * EPOCHS
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total_updates), eta_min=1e-6)
